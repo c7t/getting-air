@@ -1,7 +1,8 @@
 const canvas   = document.getElementById('c');
 const statusEl = document.getElementById('status');
-canvas.width  = window.innerWidth;
-canvas.height = window.innerHeight;
+const dpr = window.devicePixelRatio || 1;
+canvas.width  = Math.round(canvas.clientWidth  * dpr);
+canvas.height = Math.round(canvas.clientHeight * dpr);
 
 const W = 256, H = 512;
 const NCELLS = W * H;
