@@ -10,7 +10,11 @@ struct Params {
   cy   : f32,
   a    : f32,
   theta: f32,
-  _pad : f32,
+  vx   : f32,
+  vy   : f32,
+  omega: f32,
+  _p0  : f32,
+  _p1  : f32,
 }
 
 @group(0) @binding(0) var<uniform>             params : Params;
