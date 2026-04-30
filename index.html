@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>getting-air</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #111; color: #eee; font-family: monospace; overflow: hidden; }
+    canvas { display: block; }
+    #status {
+      position: absolute; top: 8px; left: 8px;
+      font-size: 12px; color: #7f7; background: rgba(0,0,0,0.6);
+      padding: 4px 8px; border-radius: 3px; pointer-events: none;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="c"></canvas>
+  <div id="status">initializing...</div>
+  <script type="module" src="main.js"></script>
+</body>
+</html>
