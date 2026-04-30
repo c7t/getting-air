@@ -5,62 +5,86 @@ const dpr = window.devicePixelRatio || 1;
 canvas.width  = Math.round(canvas.clientWidth  * dpr);
 canvas.height = Math.round(canvas.clientHeight * dpr);
 
-const W = 256, H = 512;
-const NCELLS = W * H;
+// ── Grid ──────────────────────────────────────────────────────────────────────
+const W = 256, H = 512, NCELLS = W * H;
 
-// --- Pesavento & Wang (2004) ellipse parameters ---
-const A     = 32;          // semi-major axis [lu]
-const B     = 4;           // semi-minor axis [lu] → e = B/A = 0.125
-const THETA = 0.2;         // initial angle from horizontal [rad]
-const CX    = W / 2;       // ellipse centre x
-const CY    = H / 2;       // ellipse centre y
+// ── Pesavento & Wang (2004) physical parameters ───────────────────────────────
+const A     = 32;        // semi-major axis [lu]
+const B     = 4;         // semi-minor axis [lu]  e = B/A = 0.125
+const E     = B / A;     // aspect ratio
 
-// LBM parameters targeting Re = 1100
-// ν = (τ - 0.5) * cs² = (τ - 0.5)/3
-// Re = u * 2A / ν  →  u = Re * ν / (2A)
-const TAU     = 0.52;
-const NU      = (TAU - 0.5) / 3;
-const U_INLET = 1100 * NU / (2 * A);   // ≈ 0.1146 lu/step
+// Dimensionless moment of inertia: I* = b(a²+b²)ρ_b / (2a³ρ_f)  = 0.17
+// → ρ_b/ρ_f = I* · 2a³ / (b·(a²+b²))
+const I_STAR = 0.17;
+const RHO_B  = I_STAR * 2 * A**3 / (B * (A**2 + B**2));  // ≈ 2.678
+const PI_AB  = Math.PI * A * B;
 
-// body force: tiny constant x-acceleration to sustain flow against drag
-// set empirically; ~1e-6 is a good starting point
-const GX = 1e-6;
+const MASS   = RHO_B * PI_AB;                          // card mass [lu²]
+const I_BODY = RHO_B * PI_AB * (A**2 + B**2) / 4;     // moment of inertia
 
-// D2Q9
+// LBM parameters.
+// Re=1100 needs τ≈0.509 which is BGK-unstable in the transient.
+// Use τ=0.6 (Re≈220 at u_t=0.05) for Phase 3 stability; will tighten τ later.
+const TAU     = 0.6;
+const NU      = (TAU - 0.5) / 3;                       // ≈ 0.0333
+// Target u_t small enough to keep Ma < 0.1 during free-fall transient
+const U_T     = 0.05;                                  // lu/step
+// u_t = sqrt(π·b·g·(ρ_b/ρ_f − 1))  →  g = u_t² / (π·b·(ρ_b−1))
+const G_LU    = U_T**2 / (Math.PI * B * (RHO_B - 1)); // ≈ 1.19e-4 lu/step²
+// Net downward acceleration on card (gravity minus buoyancy)
+const G_EFF   = G_LU * (1 - 1 / RHO_B);               // ≈ 7.44e-5
+
+// Force scale for int32 atomic accumulation
+const FSCALE  = 1e3;
+
+const CARD_ENABLED = true;
+
+// ── D2Q9 (JS side for initialisation) ────────────────────────────────────────
 const EX = [0, 1, 0,-1, 0, 1,-1,-1, 1];
 const EY = [0, 0, 1, 0,-1, 1, 1,-1,-1];
 const WT = [4/9, 1/9, 1/9, 1/9, 1/9, 1/36, 1/36, 1/36, 1/36];
 
 function feq(rho, ux, uy, i) {
   const eu = EX[i]*ux + EY[i]*uy;
-  const u2 = ux*ux + uy*uy;
-  return WT[i] * rho * (1 + eu*3 + eu*eu*4.5 - u2*1.5);
+  return WT[i] * rho * (1 + eu*3 + eu*eu*4.5 - (ux*ux+uy*uy)*1.5);
 }
 
-function buildSolid() {
+// ── Card state ────────────────────────────────────────────────────────────────
+let cardCX    = W / 2;
+let cardCY    = H / 4;      // start in upper quarter, falls down
+let cardTheta = 0.2;        // initial angle [rad], matches the paper
+let cardVX    = 0;
+let cardVY    = 0;
+let cardOmega = 0;
+
+function buildSolid(cx, cy, theta) {
   const s  = new Uint32Array(NCELLS);
-  const ca = Math.cos(THETA), sa = Math.sin(THETA);
+  if (!CARD_ENABLED) return s;   // fluid-only sanity check mode
+  const ca = Math.cos(theta), sa = Math.sin(theta);
+  const halfLen = A - B;
   for (let y = 0; y < H; y++) {
     for (let x = 0; x < W; x++) {
-      const dx = x - CX, dy = y - CY;
-      const lx = dx*ca + dy*sa;   // along major axis
-      const ly = -dx*sa + dy*ca;  // along minor axis
-      if ((lx/A)**2 + (ly/B)**2 <= 1) s[y*W + x] = 1;
+      const dx = x - cx, dy = y - cy;
+      const lx = dx*ca + dy*sa;
+      const ly = -dx*sa + dy*ca;
+      const capDist = Math.max(0, Math.abs(lx) - halfLen);
+      if (capDist*capDist + ly*ly <= B*B) s[y*W + x] = 1;
     }
   }
   return s;
 }
 
 function initF() {
-  const f  = new Float32Array(NCELLS * 9);
-  const ux = U_INLET, uy = 0;
-  for (let y = 0; y < H; y++) {
-    for (let x = 0; x < W; x++) {
-      const base = (y*W + x) * 9;
-      for (let i = 0; i < 9; i++) f[base+i] = feq(1.0, ux, uy, i);
-    }
+  const f = new Float32Array(NCELLS * 9);
+  for (let c = 0; c < NCELLS; c++) {
+    const base = c * 9;
+    for (let i = 0; i < 9; i++) f[base+i] = feq(1, 0, 0, i);
   }
   return f;
+}
+
+function makeParams(cx, cy) {
+  return new Float32Array([TAU, 0, 0, cx, cy, A, cardTheta, 0]);
 }
 
 async function loadShader(device, path) {
@@ -69,46 +93,47 @@ async function loadShader(device, path) {
   return device.createShaderModule({ code: await r.text() });
 }
 
+// ── WebGPU init ───────────────────────────────────────────────────────────────
 async function init() {
   if (!navigator.gpu) { statusEl.textContent = 'WebGPU not available'; return; }
   const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
   if (!adapter) { statusEl.textContent = 'no adapter'; return; }
   const device = await adapter.requestDevice();
-  const ctx    = canvas.getContext('webgpu');
-  const fmt    = navigator.gpu.getPreferredCanvasFormat();
+  const ctx = canvas.getContext('webgpu');
+  const fmt = navigator.gpu.getPreferredCanvasFormat();
   ctx.configure({ device, format: fmt, alphaMode: 'opaque' });
 
-  // --- buffers ---
-  const fSize    = NCELLS * 9 * 4;
-  const velSize  = NCELLS * 2 * 4;
-  const solSize  = NCELLS * 4;
   const U = GPUBufferUsage;
-
   const mkBuf = (size, usage) => device.createBuffer({ size, usage });
 
-  const f_a    = mkBuf(fSize,   U.STORAGE | U.COPY_DST);
-  const f_b    = mkBuf(fSize,   U.STORAGE);
-  const f_c    = mkBuf(fSize,   U.STORAGE | U.COPY_SRC);
-  const velBuf = mkBuf(velSize, U.STORAGE);
-  const solBuf = mkBuf(solSize, U.STORAGE | U.COPY_DST);
+  const fSize   = NCELLS * 9 * 4;
+  const velSize = NCELLS * 2 * 4;
+  const solSize = NCELLS * 4;
 
-  const solidData = buildSolid();
+  const f_a       = mkBuf(fSize,   U.STORAGE | U.COPY_DST);
+  const f_b       = mkBuf(fSize,   U.STORAGE);
+  const f_c       = mkBuf(fSize,   U.STORAGE | U.COPY_SRC);
+  const velBuf    = mkBuf(velSize, U.STORAGE);
+  const solBuf    = mkBuf(solSize, U.STORAGE | U.COPY_DST);
+  // Force accumulator: [Fx, Fy, Tz, pad] as atomic i32
+  const forceBuf  = mkBuf(16, U.STORAGE | U.COPY_SRC | U.COPY_DST);
+  const forceStage= mkBuf(16, U.COPY_DST | U.MAP_READ);
+
+  let solidData = buildSolid(cardCX, cardCY, cardTheta);
   device.queue.writeBuffer(solBuf, 0, solidData);
   device.queue.writeBuffer(f_a,   0, initF());
 
-  // params: tau, u_inlet, gx, gy
-  const paramsArr = new Float32Array([TAU, U_INLET, GX, 0.0]);
-  const paramsBuf = mkBuf(16, U.UNIFORM | U.COPY_DST);
-  device.queue.writeBuffer(paramsBuf, 0, paramsArr);
+  const paramsBuf = mkBuf(32, U.UNIFORM | U.COPY_DST);
+  device.queue.writeBuffer(paramsBuf, 0, makeParams(cardCX, cardCY));
 
-  // --- shaders ---
-  const [colSM, strSM, renSM] = await Promise.all([
+  const [colSM, strSM, frcSM, renSM] = await Promise.all([
     loadShader(device, 'shaders/lbm_collide.wgsl'),
     loadShader(device, 'shaders/lbm_stream.wgsl'),
+    loadShader(device, 'shaders/lbm_force.wgsl'),
     loadShader(device, 'shaders/render.wgsl'),
   ]);
 
-  // --- bind group layouts ---
+  // ── Bind group layouts ─────────────────────────────────────────────────────
   const colBGL = device.createBindGroupLayout({ entries: [
     { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
     { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
@@ -121,31 +146,31 @@ async function init() {
     { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
     { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
   ]});
+  const frcBGL = device.createBindGroupLayout({ entries: [
+    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+  ]});
   const renBGL = device.createBindGroupLayout({ entries: [
     { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
     { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
+    { binding: 2, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
   ]});
 
-  // --- pipelines ---
-  const mkLayout = (...bgls) =>
+  const mkPL = (...bgls) =>
     device.createPipelineLayout({ bindGroupLayouts: bgls });
 
-  const colPL = device.createComputePipeline({
-    layout: mkLayout(colBGL),
-    compute: { module: colSM, entryPoint: 'main' },
-  });
-  const strPL = device.createComputePipeline({
-    layout: mkLayout(strBGL),
-    compute: { module: strSM, entryPoint: 'main' },
-  });
+  const colPL = device.createComputePipeline({ layout: mkPL(colBGL), compute: { module: colSM, entryPoint: 'main' } });
+  const strPL = device.createComputePipeline({ layout: mkPL(strBGL), compute: { module: strSM, entryPoint: 'main' } });
+  const frcPL = device.createComputePipeline({ layout: mkPL(frcBGL), compute: { module: frcSM, entryPoint: 'main' } });
   const renPL = device.createRenderPipeline({
-    layout: mkLayout(renBGL),
+    layout: mkPL(renBGL),
     vertex:   { module: renSM, entryPoint: 'vs_main' },
     fragment: { module: renSM, entryPoint: 'fs_main', targets: [{ format: fmt }] },
     primitive: { topology: 'triangle-list' },
   });
 
-  // --- bind groups ---
   const colBG = device.createBindGroup({ layout: colBGL, entries: [
     { binding: 0, resource: { buffer: paramsBuf } },
     { binding: 1, resource: { buffer: f_a } },
@@ -158,19 +183,67 @@ async function init() {
     { binding: 1, resource: { buffer: f_c } },
     { binding: 2, resource: { buffer: solBuf } },
   ]});
+  const frcBG = device.createBindGroup({ layout: frcBGL, entries: [
+    { binding: 0, resource: { buffer: f_b } },   // post-collision distributions
+    { binding: 1, resource: { buffer: solBuf } },
+    { binding: 2, resource: { buffer: forceBuf } },
+    { binding: 3, resource: { buffer: paramsBuf } },
+  ]});
   const renBG = device.createBindGroup({ layout: renBGL, entries: [
     { binding: 0, resource: { buffer: velBuf } },
     { binding: 1, resource: { buffer: solBuf } },
+    { binding: 2, resource: { buffer: paramsBuf } },
   ]});
 
   const WGX = Math.ceil(W / 8), WGY = Math.ceil(H / 8);
+  const STEPS_PER_FRAME = 4;
+
   let step = 0, lastT = performance.now();
 
-  function frame() {
-    const stepsPerFrame = 8;
-    const enc = device.createCommandEncoder();
+  // ── Rigid body integration ─────────────────────────────────────────────────
+  function integrateBody(Fx, Fy, Tz, dt) {
+    // Fx/Fy/Tz are the total impulse accumulated over dt LBM steps.
+    const V_MAX = 0.15;   // max translation speed  (Ma ≈ 0.26, well within LBM stability)
+    const O_MAX = 0.02;   // max angular speed [rad/step]
 
-    for (let s = 0; s < stepsPerFrame; s++) {
+    cardVX    += Fx / MASS;
+    cardVY    += (Fy + MASS * G_EFF * dt) / MASS;
+    cardOmega += Tz / I_BODY;
+
+    // Clamp to physical bounds — prevents LBM garbage forces from running away
+    cardVX    = Math.max(-V_MAX, Math.min(V_MAX,  cardVX));
+    cardVY    = Math.max(-V_MAX, Math.min(V_MAX,  cardVY));
+    cardOmega = Math.max(-O_MAX, Math.min(O_MAX,  cardOmega));
+
+    cardCX    += cardVX * dt;
+    cardCY    += cardVY * dt;
+    cardTheta += cardOmega * dt;
+    cardCX = ((cardCX % W) + W) % W;
+    cardCY = ((cardCY % H) + H) % H;
+  }
+
+  function uploadSolid(cx, cy, theta) {
+    const oldSolid = solidData;
+    solidData = buildSolid(cx, cy, theta);
+
+    // Refill solid→fluid transitions with card-velocity feq
+    const fRefill = new Float32Array(9);
+    for (let idx = 0; idx < NCELLS; idx++) {
+      if (oldSolid[idx] === 1 && solidData[idx] === 0) {
+        for (let i = 0; i < 9; i++) fRefill[i] = feq(1, cardVX, cardVY, i);
+        device.queue.writeBuffer(f_a, idx * 9 * 4, fRefill);
+      }
+    }
+    device.queue.writeBuffer(solBuf,   0, solidData);
+    device.queue.writeBuffer(paramsBuf, 0, makeParams(cx, cy));
+  }
+
+  // ── Render loop (async to allow synchronous GPU readback) ─────────────────
+  async function frame() {
+    const enc = device.createCommandEncoder();
+    enc.clearBuffer(forceBuf, 0, 16);
+
+    for (let s = 0; s < STEPS_PER_FRAME; s++) {
       const col = enc.beginComputePass();
       col.setPipeline(colPL); col.setBindGroup(0, colBG);
       col.dispatchWorkgroups(WGX, WGY); col.end();
@@ -180,8 +253,14 @@ async function init() {
       str.dispatchWorkgroups(WGX, WGY); str.end();
 
       enc.copyBufferToBuffer(f_c, 0, f_a, 0, fSize);
+
+      const frc = enc.beginComputePass();
+      frc.setPipeline(frcPL); frc.setBindGroup(0, frcBG);
+      frc.dispatchWorkgroups(WGX, WGY); frc.end();
     }
-    step += stepsPerFrame;
+    step += STEPS_PER_FRAME;
+
+    enc.copyBufferToBuffer(forceBuf, 0, forceStage, 0, 16);
 
     const rp = enc.beginRenderPass({ colorAttachments: [{
       view: ctx.getCurrentTexture().createView(),
@@ -192,12 +271,26 @@ async function init() {
 
     device.queue.submit([enc.finish()]);
 
-    const now = performance.now();
-    if (now - lastT > 300) {
-      statusEl.textContent =
-        `step ${step}  Re≈1100  τ=${TAU}  u_in=${U_INLET.toFixed(4)}`;
-      lastT = now;
+    // Synchronous readback: wait for GPU to finish, THEN update body state.
+    // This guarantees writeBuffer calls below land before the next submit.
+    await forceStage.mapAsync(GPUMapMode.READ);
+    const d  = new Int32Array(forceStage.getMappedRange());
+    const Fx = d[0] / FSCALE, Fy = d[1] / FSCALE, Tz = d[2] / FSCALE;
+    forceStage.unmap();
+
+    if (step <= STEPS_PER_FRAME * 3)
+      console.log(`step ${step} Fx=${Fx.toExponential(3)} Fy=${Fy.toExponential(3)} Tz=${Tz.toExponential(3)}`);
+
+    integrateBody(Fx, Fy, Tz, STEPS_PER_FRAME);
+    uploadSolid(cardCX, cardCY, cardTheta);
+
+    if (step <= 200 || performance.now() - lastT > 300) {
+      statusEl.textContent = CARD_ENABLED
+        ? `step ${step}  vy=${cardVY.toFixed(4)}  Fy=${Fy.toExponential(2)}  Tz=${Tz.toExponential(2)}  θ=${cardTheta.toFixed(2)}`
+        : `step ${step}  (no card — fluid check)`;
+      lastT = performance.now();
     }
+
     requestAnimationFrame(frame);
   }
 
