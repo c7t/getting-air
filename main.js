@@ -84,7 +84,9 @@ function initF() {
 }
 
 function makeParams(cx, cy) {
-  return new Float32Array([TAU, 0, 0, cx, cy, A, cardTheta, 0]);
+  // Must match Params struct in all shaders: 12 floats = 48 bytes
+  return new Float32Array([TAU, 0, 0, cx, cy, A, cardTheta,
+                           cardVX, cardVY, cardOmega, 0, 0]);
 }
 
 async function loadShader(device, path) {
@@ -123,7 +125,7 @@ async function init() {
   device.queue.writeBuffer(solBuf, 0, solidData);
   device.queue.writeBuffer(f_a,   0, initF());
 
-  const paramsBuf = mkBuf(32, U.UNIFORM | U.COPY_DST);
+  const paramsBuf = mkBuf(48, U.UNIFORM | U.COPY_DST);
   device.queue.writeBuffer(paramsBuf, 0, makeParams(cardCX, cardCY));
 
   const [colSM, strSM, frcSM, renSM] = await Promise.all([
@@ -145,6 +147,7 @@ async function init() {
     { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
     { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
   ]});
   const frcBGL = device.createBindGroupLayout({ entries: [
     { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
@@ -182,6 +185,7 @@ async function init() {
     { binding: 0, resource: { buffer: f_b } },
     { binding: 1, resource: { buffer: f_c } },
     { binding: 2, resource: { buffer: solBuf } },
+    { binding: 3, resource: { buffer: paramsBuf } },
   ]});
   const frcBG = device.createBindGroup({ layout: frcBGL, entries: [
     { binding: 0, resource: { buffer: f_b } },   // post-collision distributions
@@ -196,7 +200,7 @@ async function init() {
   ]});
 
   const WGX = Math.ceil(W / 8), WGY = Math.ceil(H / 8);
-  const STEPS_PER_FRAME = 4;
+  const STEPS_PER_FRAME = 8;
 
   let step = 0, lastT = performance.now();
 
@@ -238,8 +242,10 @@ async function init() {
     device.queue.writeBuffer(paramsBuf, 0, makeParams(cx, cy));
   }
 
-  // ── Render loop (async to allow synchronous GPU readback) ─────────────────
-  async function frame() {
+  // ── Render loop — async force readback (1-frame lag, correct forces) ────────
+  let forceReadPending = false;
+
+  function frame() {
     const enc = device.createCommandEncoder();
     enc.clearBuffer(forceBuf, 0, 16);
 
@@ -271,24 +277,25 @@ async function init() {
 
     device.queue.submit([enc.finish()]);
 
-    // Synchronous readback: wait for GPU to finish, THEN update body state.
-    // This guarantees writeBuffer calls below land before the next submit.
-    await forceStage.mapAsync(GPUMapMode.READ);
-    const d  = new Int32Array(forceStage.getMappedRange());
-    const Fx = d[0] / FSCALE, Fy = d[1] / FSCALE, Tz = d[2] / FSCALE;
-    forceStage.unmap();
+    // Async readback — integrates body with previous frame's forces (1-step lag).
+    // Physics is now self-limiting (correct drag sign), so the lag is safe.
+    if (!forceReadPending) {
+      forceReadPending = true;
+      forceStage.mapAsync(GPUMapMode.READ).then(() => {
+        const d  = new Int32Array(forceStage.getMappedRange());
+        const Fx = d[0] / FSCALE, Fy = d[1] / FSCALE, Tz = d[2] / FSCALE;
+        forceStage.unmap();
+        forceReadPending = false;
+        integrateBody(Fx, Fy, Tz, STEPS_PER_FRAME);
+        uploadSolid(cardCX, cardCY, cardTheta);
 
-    if (step <= STEPS_PER_FRAME * 3)
-      console.log(`step ${step} Fx=${Fx.toExponential(3)} Fy=${Fy.toExponential(3)} Tz=${Tz.toExponential(3)}`);
-
-    integrateBody(Fx, Fy, Tz, STEPS_PER_FRAME);
-    uploadSolid(cardCX, cardCY, cardTheta);
-
-    if (step <= 200 || performance.now() - lastT > 300) {
-      statusEl.textContent = CARD_ENABLED
-        ? `step ${step}  vy=${cardVY.toFixed(4)}  Fy=${Fy.toExponential(2)}  Tz=${Tz.toExponential(2)}  θ=${cardTheta.toFixed(2)}`
-        : `step ${step}  (no card — fluid check)`;
-      lastT = performance.now();
+        if (performance.now() - lastT > 300) {
+          statusEl.textContent = CARD_ENABLED
+            ? `step ${step}  vy=${cardVY.toFixed(4)}  Fy=${Fy.toExponential(2)}  Tz=${Tz.toExponential(2)}  θ=${cardTheta.toFixed(2)}`
+            : `step ${step}  (no card)`;
+          lastT = performance.now();
+        }
+      });
     }
 
     requestAnimationFrame(frame);
