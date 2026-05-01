@@ -62,8 +62,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       // Card velocity at that point: v_cm + ω × r
       let mx   = f32(x) - 0.5f * f32(ex[i]);
       let my   = f32(y) - 0.5f * f32(ey[i]);
-      let rx   = mx - params.cx;
-      let ry   = my - params.cy;
+
+      // Toroidal wrapping (minimum image)
+      var rx = mx - params.cx;
+      var ry = my - params.cy;
+      rx -= f32(W) * round(rx / f32(W));
+      ry -= f32(H) * round(ry / f32(H));
+
       let ubx  = params.vx - params.omega * ry;
       let uby  = params.vy + params.omega * rx;
       let ei_ub = f32(ex[i]) * ubx + f32(ey[i]) * uby;

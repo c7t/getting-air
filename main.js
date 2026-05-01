@@ -63,7 +63,12 @@ function buildSolid(cx, cy, theta) {
   const halfLen = A - B;
   for (let y = 0; y < H; y++) {
     for (let x = 0; x < W; x++) {
-      const dx = x - cx, dy = y - cy;
+      let dx = x - cx;
+      let dy = y - cy;
+      // Minimum image convention for toroidal wrapping
+      dx -= W * Math.round(dx / W);
+      dy -= H * Math.round(dy / H);
+
       const lx = dx*ca + dy*sa;
       const ly = -dx*sa + dy*ca;
       const capDist = Math.max(0, Math.abs(lx) - halfLen);
@@ -206,14 +211,14 @@ async function init() {
   // ── Rigid body integration ─────────────────────────────────────────────────
   function integrateBody(Fx, Fy, Tz, dt) {
     // Fx/Fy/Tz are the total impulse accumulated over dt LBM steps.
-    const V_MAX = 0.20;   // max translation speed  (Ma < 0.35, within LBM stability)
-    const O_MAX = 0.02;   // max angular speed [rad/step]  tip vel <= 0.64 lu/step
+    const V_MAX = 0.30;   // Increased to allow full transient (Ma < 0.5)
+    const O_MAX = 0.05;   // Increased to allow faster rotation
 
     cardVX    += Fx / MASS;
     cardVY    += (Fy + MASS * G_EFF * dt) / MASS;
     cardOmega += Tz / I_BODY;
 
-    // Clamp to physical bounds — prevents LBM garbage forces from running away
+    // Clamp to physical bounds
     cardVX    = Math.max(-V_MAX, Math.min(V_MAX,  cardVX));
     cardVY    = Math.max(-V_MAX, Math.min(V_MAX,  cardVY));
     cardOmega = Math.max(-O_MAX, Math.min(O_MAX,  cardOmega));

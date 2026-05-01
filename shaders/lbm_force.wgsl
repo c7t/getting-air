@@ -61,29 +61,35 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let ny = u32((i32(y) + ey[i] + i32(H)) % i32(H));
 
     if (solid[ny * W + nx] != 0u) {
-      // f going *toward* the solid is f_col[opp(i)] (direction opp = from fluid toward solid)
-      let fi = clamp(f_col[base + opp[i]], 0f, FI_MAX);
+      // momentum exchange: F_solid = sum over links (2*f_i - correction) * e_i
+      // where e_i is the direction from fluid to solid.
+      let fi = clamp(f_col[base + i], 0f, FI_MAX);
 
       // Moving-BC correction: boundary velocity at link midpoint
       let mx   = f32(x) + 0.5f * f32(ex[i]);
       let my   = f32(y) + 0.5f * f32(ey[i]);
-      let ubx  = params.vx - params.omega * (my - params.cy);
-      let uby  = params.vy + params.omega * (mx - params.cx);
+      
+      // Toroidal wrapping for rx, ry (minimum image)
+      var rx = mx - params.cx;
+      var ry = my - params.cy;
+      rx -= f32(W) * round(rx / f32(W));
+      ry -= f32(H) * round(ry / f32(H));
+
+      let ubx  = params.vx - params.omega * ry;
+      let uby  = params.vy + params.omega * rx;
       let ei_ub = f32(ex[i]) * ubx + f32(ey[i]) * uby;
 
-      // Total momentum exchange per link
-      let mag  = 2f * fi + 2f * wt[i] * ei_ub / CS2;
+      // mag = 2*f_i - 2*w_i*rho*(e_i·u_b)/cs²
+      // assume rho=1 for force calc as standard
+      let mag  = 2f * fi - 2f * wt[i] * ei_ub / CS2;
       let fx   = mag * f32(ex[i]);
       let fy   = mag * f32(ey[i]);
 
-      let rx   = mx - params.cx;
-      let ry   = my - params.cy;
       let tz   = rx * fy - ry * fx;
 
-      // Negate: formula gives force of solid-on-fluid; we need fluid-on-solid.
-      atomicAdd(&forces[0], i32(-fx * FSCALE));
-      atomicAdd(&forces[1], i32(-fy * FSCALE));
-      atomicAdd(&forces[2], i32(-tz * FSCALE));
+      atomicAdd(&forces[0], i32(fx * FSCALE));
+      atomicAdd(&forces[1], i32(fy * FSCALE));
+      atomicAdd(&forces[2], i32(tz * FSCALE));
     }
   }
 }
