@@ -78,9 +78,9 @@ async function init() {
   const velBuf  = device.createBuffer({ size: NCELLS * 2 * 4, usage: U.STORAGE });
   const forceBuf = device.createBuffer({ size: 16, usage: U.STORAGE | U.COPY_SRC | U.COPY_DST });
 
-  // CardState: 20 floats
-  const cardStateBuf   = device.createBuffer({ size: 80, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
-  const cardStateStage = device.createBuffer({ size: 80, usage: U.MAP_READ | U.COPY_DST });
+  // CardState: 22 floats = 88 bytes
+  const cardStateBuf   = device.createBuffer({ size: 88, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
+  const cardStateStage = device.createBuffer({ size: 88, usage: U.MAP_READ | U.COPY_DST });
 
   const cardInit = new Float32Array([
     W/2, H/4, 0.2,   // cx, cy, theta
@@ -90,7 +90,8 @@ async function init() {
     A, B,
     0.3, 0.05,       // v_max, o_max
     W/2, H/4, 0.2,   // cx_old, cy_old, th_old
-    TAU              // tau
+    TAU,             // tau
+    0, 0             // y_total, _p1
   ]);
   device.queue.writeBuffer(cardStateBuf, 0, cardInit);
   device.queue.writeBuffer(f_a, 0, initF());
@@ -167,16 +168,17 @@ async function init() {
       const rp = enc.beginRenderPass({ colorAttachments: [{ view: ctx.getCurrentTexture().createView(), clearValue: { r:0.07, g:0.07, b:0.1, a:1 }, loadOp: 'clear', storeOp: 'store' }]});
       rp.setPipeline(renPL); rp.setBindGroup(0, renBG); rp.draw(6); rp.end();
       
-      enc.copyBufferToBuffer(cardStateBuf, 0, cardStateStage, 0, 80);
+      enc.copyBufferToBuffer(cardStateBuf, 0, cardStateStage, 0, 88);
       device.queue.submit([enc.finish()]);
 
       if (performance.now() - lastT > 300) {
         await cardStateStage.mapAsync(GPUMapMode.READ);
         const d = new Float32Array(cardStateStage.getMappedRange());
-        statusEl.textContent = `step ${step}  vy=${d[4].toFixed(4)}  Fy=${d[7].toExponential(2)}  θ=${d[2].toFixed(2)}`;
+        statusEl.textContent = `step ${step}  y=${d[20].toFixed(1)}  vy=${d[4].toFixed(4)}  Fy=${d[7].toExponential(2)}  θ=${d[2].toFixed(2)}`;
         cardStateStage.unmap();
         lastT = performance.now();
       }
+
       requestAnimationFrame(() => frame().catch(handleErr));
     } catch (e) {
       handleErr(e);
