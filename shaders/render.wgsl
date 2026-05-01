@@ -20,7 +20,7 @@ struct CardState {
   cx_old : f32,
   cy_old : f32,
   th_old : f32,
-  _p0    : f32,
+  tau    : f32,
 }
 
 @group(0) @binding(0) var<storage, read> vel   : array<f32>;

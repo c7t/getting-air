@@ -12,6 +12,7 @@ const RHO_B  = I_STAR * 2 * A**3 / (B * (A**2 + B**2));
 const MASS   = RHO_B * Math.PI * A * B;
 const I_BODY = RHO_B * Math.PI * A * B * (A**2 + B**2) / 4;
 
+const TAU     = 0.52;
 const U_T     = 0.05;
 const G_LU    = U_T**2 / (Math.PI * B * (RHO_B - 1));
 const G_EFF   = G_LU * (1 - 1 / RHO_B);
@@ -39,12 +40,20 @@ function initF() {
 async function loadShader(device, path) {
   const r = await fetch(path);
   if (!r.ok) throw new Error(`failed to load ${path}`);
-  return device.createShaderModule({ code: await r.text() });
+  const code = await r.text();
+  return device.createShaderModule({ code });
+}
+
+function handleErr(e) {
+  statusEl.textContent = `error: ${e.message}`;
+  statusEl.style.color = '#f77';
+  console.error(e);
 }
 
 async function init() {
   if (!navigator.gpu) { statusEl.textContent = 'WebGPU not available'; return; }
   const adapter = await navigator.gpu.requestAdapter();
+  if (!adapter) { statusEl.textContent = 'No adapter'; return; }
   const device = await adapter.requestDevice();
   const ctx = canvas.getContext('webgpu');
   const fmt = navigator.gpu.getPreferredCanvasFormat();
@@ -59,7 +68,9 @@ async function init() {
   const forceBuf = device.createBuffer({ size: 16, usage: U.STORAGE | U.COPY_SRC | U.COPY_DST });
 
   // CardState: 20 floats
-  const cardStateBuf = device.createBuffer({ size: 80, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC | U.MAP_READ });
+  const cardStateBuf   = device.createBuffer({ size: 80, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
+  const cardStateStage = device.createBuffer({ size: 80, usage: U.MAP_READ | U.COPY_DST });
+
   const cardInit = new Float32Array([
     W/2, H/4, 0.2,   // cx, cy, theta
     0, 0, 0,         // vx, vy, omega
@@ -68,7 +79,7 @@ async function init() {
     A, B,
     0.3, 0.05,       // v_max, o_max
     W/2, H/4, 0.2,   // cx_old, cy_old, th_old
-    0                // pad
+    TAU              // tau (reusing _p0)
   ]);
   device.queue.writeBuffer(cardStateBuf, 0, cardInit);
   device.queue.writeBuffer(f_a, 0, initF());
@@ -83,21 +94,21 @@ async function init() {
 
   const mkBGL = (entries) => device.createBindGroupLayout({ entries });
   const mkBG  = (layout, entries) => device.createBindGroup({ layout, entries });
-  const mkPL  = (layout, sm) => device.createComputePipeline({ layout, compute: { module: sm, entryPoint: 'main' } });
-
-  const stateEntry = { binding: 0, visibility: GPUShaderStage.COMPUTE | GPUShaderStage.FRAGMENT, buffer: { type: 'storage' } };
-  const forceEntry = { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }; // for lbm_force
   
-  const colBGL = mkBGL([stateEntry, { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }, { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }]);
-  const strBGL = mkBGL([stateEntry, { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }]);
-  const frcBGL = mkBGL([stateEntry, { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }]);
-  const phyBGL = mkBGL([{ binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }, { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }]);
-  const renBGL = mkBGL([{ binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } }, stateEntry]);
+  const stateRO = { binding: 0, visibility: GPUShaderStage.COMPUTE | GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } };
+  const stateRW = { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } };
+  
+  const colBGL = mkBGL([stateRO, { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }, { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }]);
+  const strBGL = mkBGL([stateRO, { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }]);
+  const frcBGL = mkBGL([stateRO, { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }]);
+  const phyBGL = mkBGL([stateRW, { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }]);
+  const renBGL = mkBGL([{ binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } }, stateRO]);
 
-  const colPL = mkPL(device.createPipelineLayout({ bindGroupLayouts: [colBGL] }), colSM);
-  const strPL = mkPL(device.createPipelineLayout({ bindGroupLayouts: [strBGL] }), strSM);
-  const frcPL = mkPL(device.createPipelineLayout({ bindGroupLayouts: [frcBGL] }), frcSM);
-  const phyPL = mkPL(device.createPipelineLayout({ bindGroupLayouts: [phyBGL] }), phySM);
+  const colPL = device.createComputePipeline({ layout: device.createPipelineLayout({ bindGroupLayouts: [colBGL] }), compute: { module: colSM, entryPoint: 'main' } });
+  const strPL = device.createComputePipeline({ layout: device.createPipelineLayout({ bindGroupLayouts: [strBGL] }), compute: { module: strSM, entryPoint: 'main' } });
+  const frcPL = device.createComputePipeline({ layout: device.createPipelineLayout({ bindGroupLayouts: [frcBGL] }), compute: { module: frcSM, entryPoint: 'main' } });
+  const phyPL = device.createComputePipeline({ layout: device.createPipelineLayout({ bindGroupLayouts: [phyBGL] }), compute: { module: phySM, entryPoint: 'main' } });
+
   const renPL = device.createRenderPipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [renBGL] }),
     vertex: { module: renSM, entryPoint: 'vs_main' },
@@ -128,17 +139,19 @@ async function init() {
 
     const rp = enc.beginRenderPass({ colorAttachments: [{ view: ctx.getCurrentTexture().createView(), clearValue: { r:0.07, g:0.07, b:0.1, a:1 }, loadOp: 'clear', storeOp: 'store' }]});
     rp.setPipeline(renPL); rp.setBindGroup(0, renBG); rp.draw(6); rp.end();
+    
+    enc.copyBufferToBuffer(cardStateBuf, 0, cardStateStage, 0, 80);
     device.queue.submit([enc.finish()]);
 
     if (performance.now() - lastT > 300) {
-      await cardStateBuf.mapAsync(GPUMapMode.READ);
-      const d = new Float32Array(cardStateBuf.getMappedRange());
+      await cardStateStage.mapAsync(GPUMapMode.READ);
+      const d = new Float32Array(cardStateStage.getMappedRange());
       statusEl.textContent = `step ${step}  vy=${d[4].toFixed(4)}  Fy=${d[7].toExponential(2)}  θ=${d[2].toFixed(2)}`;
-      cardStateBuf.unmap();
+      cardStateStage.unmap();
       lastT = performance.now();
     }
-    requestAnimationFrame(frame);
+    requestAnimationFrame(() => frame().catch(handleErr));
   }
-  frame();
+  frame().catch(handleErr);
 }
-init().catch(console.error);
+init().catch(handleErr);
