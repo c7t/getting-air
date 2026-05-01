@@ -153,6 +153,19 @@ async function init() {
   const STEPS_PER_FRAME = 8;
   let step = 0, lastT = performance.now();
 
+  const trajectory = [];
+
+  document.getElementById('download').onclick = () => {
+    const header = "step,cx,cy_total,theta,vx,vy,omega,fx,fy,tz\n";
+    const rows = trajectory.map(r => r.map(v => v.toFixed(6)).join(",")).join("\n");
+    const blob = new Blob([header + rows], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `trajectory_${W}x${H}.csv`;
+    a.click();
+  };
+
   async function frame() {
     try {
       const enc = device.createCommandEncoder();
@@ -171,13 +184,17 @@ async function init() {
       enc.copyBufferToBuffer(cardStateBuf, 0, cardStateStage, 0, 88);
       device.queue.submit([enc.finish()]);
 
+      // Read back state every frame for trajectory
+      await cardStateStage.mapAsync(GPUMapMode.READ);
+      const d = new Float32Array(cardStateStage.getMappedRange());
+      // Record: step, cx, cy_total, theta, vx, vy, omega, fx, fy, tz
+      trajectory.push([step, d[0], d[20], d[2], d[3], d[4], d[5], d[6], d[7], d[8]]);
+
       if (performance.now() - lastT > 300) {
-        await cardStateStage.mapAsync(GPUMapMode.READ);
-        const d = new Float32Array(cardStateStage.getMappedRange());
         statusEl.textContent = `step ${step}  y=${d[20].toFixed(1)}  vy=${d[4].toFixed(4)}  Fy=${d[7].toExponential(2)}  θ=${d[2].toFixed(2)}`;
-        cardStateStage.unmap();
         lastT = performance.now();
       }
+      cardStateStage.unmap();
 
       requestAnimationFrame(() => frame().catch(handleErr));
     } catch (e) {
