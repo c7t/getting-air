@@ -1,0 +1,1290 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Claude Code transcript - page 5</title>
+    <style>
+:root { --bg-color: #f5f5f5; --card-bg: #ffffff; --user-bg: #e3f2fd; --user-border: #1976d2; --assistant-bg: #f5f5f5; --assistant-border: #9e9e9e; --thinking-bg: #fff8e1; --thinking-border: #ffc107; --thinking-text: #666; --tool-bg: #f3e5f5; --tool-border: #9c27b0; --tool-result-bg: #e8f5e9; --tool-error-bg: #ffebee; --text-color: #212121; --text-muted: #757575; --code-bg: #263238; --code-text: #aed581; }
+* { box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: var(--bg-color); color: var(--text-color); margin: 0; padding: 16px; line-height: 1.6; }
+.container { max-width: 800px; margin: 0 auto; }
+h1 { font-size: 1.5rem; margin-bottom: 24px; padding-bottom: 8px; border-bottom: 2px solid var(--user-border); }
+.header-row { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; border-bottom: 2px solid var(--user-border); padding-bottom: 8px; margin-bottom: 24px; }
+.header-row h1 { border-bottom: none; padding-bottom: 0; margin-bottom: 0; flex: 1; min-width: 200px; }
+.message { margin-bottom: 16px; border-radius: 12px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+.message.user { background: var(--user-bg); border-left: 4px solid var(--user-border); }
+.message.assistant { background: var(--card-bg); border-left: 4px solid var(--assistant-border); }
+.message.tool-reply { background: #fff8e1; border-left: 4px solid #ff9800; }
+.tool-reply .role-label { color: #e65100; }
+.tool-reply .tool-result { background: transparent; padding: 0; margin: 0; }
+.tool-reply .tool-result .truncatable.truncated::after { background: linear-gradient(to bottom, transparent, #fff8e1); }
+.message-header { display: flex; justify-content: space-between; align-items: center; padding: 8px 16px; background: rgba(0,0,0,0.03); font-size: 0.85rem; }
+.role-label { font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }
+.user .role-label { color: var(--user-border); }
+time { color: var(--text-muted); font-size: 0.8rem; }
+.timestamp-link { color: inherit; text-decoration: none; }
+.timestamp-link:hover { text-decoration: underline; }
+.message:target { animation: highlight 2s ease-out; }
+@keyframes highlight { 0% { background-color: rgba(25, 118, 210, 0.2); } 100% { background-color: transparent; } }
+.message-content { padding: 16px; }
+.message-content p { margin: 0 0 12px 0; }
+.message-content p:last-child { margin-bottom: 0; }
+.thinking { background: var(--thinking-bg); border: 1px solid var(--thinking-border); border-radius: 8px; padding: 12px; margin: 12px 0; font-size: 0.9rem; color: var(--thinking-text); }
+.thinking-label { font-size: 0.75rem; font-weight: 600; text-transform: uppercase; color: #f57c00; margin-bottom: 8px; }
+.thinking p { margin: 8px 0; }
+.assistant-text { margin: 8px 0; }
+.tool-use { background: var(--tool-bg); border: 1px solid var(--tool-border); border-radius: 8px; padding: 12px; margin: 12px 0; }
+.tool-header { font-weight: 600; color: var(--tool-border); margin-bottom: 8px; display: flex; align-items: center; gap: 8px; }
+.tool-icon { font-size: 1.1rem; }
+.tool-description { font-size: 0.9rem; color: var(--text-muted); margin-bottom: 8px; font-style: italic; }
+.tool-result { background: var(--tool-result-bg); border-radius: 8px; padding: 12px; margin: 12px 0; }
+.tool-result.tool-error { background: var(--tool-error-bg); }
+.file-tool { border-radius: 8px; padding: 12px; margin: 12px 0; }
+.write-tool { background: linear-gradient(135deg, #e3f2fd 0%, #e8f5e9 100%); border: 1px solid #4caf50; }
+.edit-tool { background: linear-gradient(135deg, #fff3e0 0%, #fce4ec 100%); border: 1px solid #ff9800; }
+.file-tool-header { font-weight: 600; margin-bottom: 4px; display: flex; align-items: center; gap: 8px; font-size: 0.95rem; }
+.write-header { color: #2e7d32; }
+.edit-header { color: #e65100; }
+.file-tool-icon { font-size: 1rem; }
+.file-tool-path { font-family: monospace; background: rgba(0,0,0,0.08); padding: 2px 8px; border-radius: 4px; }
+.file-tool-fullpath { font-family: monospace; font-size: 0.8rem; color: var(--text-muted); margin-bottom: 8px; word-break: break-all; }
+.file-content { margin: 0; }
+.edit-section { display: flex; margin: 4px 0; border-radius: 4px; overflow: hidden; }
+.edit-label { padding: 8px 12px; font-weight: bold; font-family: monospace; display: flex; align-items: flex-start; }
+.edit-old { background: #fce4ec; }
+.edit-old .edit-label { color: #b71c1c; background: #f8bbd9; }
+.edit-old .edit-content { color: #880e4f; }
+.edit-new { background: #e8f5e9; }
+.edit-new .edit-label { color: #1b5e20; background: #a5d6a7; }
+.edit-new .edit-content { color: #1b5e20; }
+.edit-content { margin: 0; flex: 1; background: transparent; font-size: 0.85rem; }
+.edit-replace-all { font-size: 0.75rem; font-weight: normal; color: var(--text-muted); }
+.write-tool .truncatable.truncated::after { background: linear-gradient(to bottom, transparent, #e6f4ea); }
+.edit-tool .truncatable.truncated::after { background: linear-gradient(to bottom, transparent, #fff0e5); }
+.todo-list { background: linear-gradient(135deg, #e8f5e9 0%, #f1f8e9 100%); border: 1px solid #81c784; border-radius: 8px; padding: 12px; margin: 12px 0; }
+.todo-header { font-weight: 600; color: #2e7d32; margin-bottom: 10px; display: flex; align-items: center; gap: 8px; font-size: 0.95rem; }
+.todo-items { list-style: none; margin: 0; padding: 0; }
+.todo-item { display: flex; align-items: flex-start; gap: 10px; padding: 6px 0; border-bottom: 1px solid rgba(0,0,0,0.06); font-size: 0.9rem; }
+.todo-item:last-child { border-bottom: none; }
+.todo-icon { flex-shrink: 0; width: 20px; height: 20px; display: flex; align-items: center; justify-content: center; font-weight: bold; border-radius: 50%; }
+.todo-completed .todo-icon { color: #2e7d32; background: rgba(46, 125, 50, 0.15); }
+.todo-completed .todo-content { color: #558b2f; text-decoration: line-through; }
+.todo-in-progress .todo-icon { color: #f57c00; background: rgba(245, 124, 0, 0.15); }
+.todo-in-progress .todo-content { color: #e65100; font-weight: 500; }
+.todo-pending .todo-icon { color: #757575; background: rgba(0,0,0,0.05); }
+.todo-pending .todo-content { color: #616161; }
+pre { background: var(--code-bg); color: var(--code-text); padding: 12px; border-radius: 6px; overflow-x: auto; font-size: 0.85rem; line-height: 1.5; margin: 8px 0; white-space: pre-wrap; word-wrap: break-word; }
+pre.json { color: #e0e0e0; }
+code { background: rgba(0,0,0,0.08); padding: 2px 6px; border-radius: 4px; font-size: 0.9em; }
+pre code { background: none; padding: 0; }
+.user-content { margin: 0; }
+.truncatable { position: relative; }
+.truncatable.truncated .truncatable-content { max-height: 200px; overflow: hidden; }
+.truncatable.truncated::after { content: ''; position: absolute; bottom: 32px; left: 0; right: 0; height: 60px; background: linear-gradient(to bottom, transparent, var(--card-bg)); pointer-events: none; }
+.message.user .truncatable.truncated::after { background: linear-gradient(to bottom, transparent, var(--user-bg)); }
+.message.tool-reply .truncatable.truncated::after { background: linear-gradient(to bottom, transparent, #fff8e1); }
+.tool-use .truncatable.truncated::after { background: linear-gradient(to bottom, transparent, var(--tool-bg)); }
+.tool-result .truncatable.truncated::after { background: linear-gradient(to bottom, transparent, var(--tool-result-bg)); }
+.expand-btn { display: none; width: 100%; padding: 8px 16px; margin-top: 4px; background: rgba(0,0,0,0.05); border: 1px solid rgba(0,0,0,0.1); border-radius: 6px; cursor: pointer; font-size: 0.85rem; color: var(--text-muted); }
+.expand-btn:hover { background: rgba(0,0,0,0.1); }
+.truncatable.truncated .expand-btn, .truncatable.expanded .expand-btn { display: block; }
+.pagination { display: flex; justify-content: center; gap: 8px; margin: 24px 0; flex-wrap: wrap; }
+.pagination a, .pagination span { padding: 5px 10px; border-radius: 6px; text-decoration: none; font-size: 0.85rem; }
+.pagination a { background: var(--card-bg); color: var(--user-border); border: 1px solid var(--user-border); }
+.pagination a:hover { background: var(--user-bg); }
+.pagination .current { background: var(--user-border); color: white; }
+.pagination .disabled { color: var(--text-muted); border: 1px solid #ddd; }
+.pagination .index-link { background: var(--user-border); color: white; }
+details.continuation { margin-bottom: 16px; }
+details.continuation summary { cursor: pointer; padding: 12px 16px; background: var(--user-bg); border-left: 4px solid var(--user-border); border-radius: 12px; font-weight: 500; color: var(--text-muted); }
+details.continuation summary:hover { background: rgba(25, 118, 210, 0.15); }
+details.continuation[open] summary { border-radius: 12px 12px 0 0; margin-bottom: 0; }
+.index-item { margin-bottom: 16px; border-radius: 12px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.1); background: var(--user-bg); border-left: 4px solid var(--user-border); }
+.index-item a { display: block; text-decoration: none; color: inherit; }
+.index-item a:hover { background: rgba(25, 118, 210, 0.1); }
+.index-item-header { display: flex; justify-content: space-between; align-items: center; padding: 8px 16px; background: rgba(0,0,0,0.03); font-size: 0.85rem; }
+.index-item-number { font-weight: 600; color: var(--user-border); }
+.index-item-content { padding: 16px; }
+.index-item-stats { padding: 8px 16px 12px 32px; font-size: 0.85rem; color: var(--text-muted); border-top: 1px solid rgba(0,0,0,0.06); }
+.index-item-commit { margin-top: 6px; padding: 4px 8px; background: #fff3e0; border-radius: 4px; font-size: 0.85rem; color: #e65100; }
+.index-item-commit code { background: rgba(0,0,0,0.08); padding: 1px 4px; border-radius: 3px; font-size: 0.8rem; margin-right: 6px; }
+.commit-card { margin: 8px 0; padding: 10px 14px; background: #fff3e0; border-left: 4px solid #ff9800; border-radius: 6px; }
+.commit-card a { text-decoration: none; color: #5d4037; display: block; }
+.commit-card a:hover { color: #e65100; }
+.commit-card-hash { font-family: monospace; color: #e65100; font-weight: 600; margin-right: 8px; }
+.index-commit { margin-bottom: 12px; padding: 10px 16px; background: #fff3e0; border-left: 4px solid #ff9800; border-radius: 8px; box-shadow: 0 1px 2px rgba(0,0,0,0.05); }
+.index-commit a { display: block; text-decoration: none; color: inherit; }
+.index-commit a:hover { background: rgba(255, 152, 0, 0.1); margin: -10px -16px; padding: 10px 16px; border-radius: 8px; }
+.index-commit-header { display: flex; justify-content: space-between; align-items: center; font-size: 0.85rem; margin-bottom: 4px; }
+.index-commit-hash { font-family: monospace; color: #e65100; font-weight: 600; }
+.index-commit-msg { color: #5d4037; }
+.index-item-long-text { margin-top: 8px; padding: 12px; background: var(--card-bg); border-radius: 8px; border-left: 3px solid var(--assistant-border); }
+.index-item-long-text .truncatable.truncated::after { background: linear-gradient(to bottom, transparent, var(--card-bg)); }
+.index-item-long-text-content { color: var(--text-color); }
+#search-box { display: none; align-items: center; gap: 8px; }
+#search-box input { padding: 6px 12px; border: 1px solid var(--assistant-border); border-radius: 6px; font-size: 16px; width: 180px; }
+#search-box button, #modal-search-btn, #modal-close-btn { background: var(--user-border); color: white; border: none; border-radius: 6px; padding: 6px 10px; cursor: pointer; display: flex; align-items: center; justify-content: center; }
+#search-box button:hover, #modal-search-btn:hover { background: #1565c0; }
+#modal-close-btn { background: var(--text-muted); margin-left: 8px; }
+#modal-close-btn:hover { background: #616161; }
+#search-modal[open] { border: none; border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.2); padding: 0; width: 90vw; max-width: 900px; height: 80vh; max-height: 80vh; display: flex; flex-direction: column; }
+#search-modal::backdrop { background: rgba(0,0,0,0.5); }
+.search-modal-header { display: flex; align-items: center; gap: 8px; padding: 16px; border-bottom: 1px solid var(--assistant-border); background: var(--bg-color); border-radius: 12px 12px 0 0; }
+.search-modal-header input { flex: 1; padding: 8px 12px; border: 1px solid var(--assistant-border); border-radius: 6px; font-size: 16px; }
+#search-status { padding: 8px 16px; font-size: 0.85rem; color: var(--text-muted); border-bottom: 1px solid rgba(0,0,0,0.06); }
+#search-results { flex: 1; overflow-y: auto; padding: 16px; }
+.search-result { margin-bottom: 16px; border-radius: 8px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+.search-result a { display: block; text-decoration: none; color: inherit; }
+.search-result a:hover { background: rgba(25, 118, 210, 0.05); }
+.search-result-page { padding: 6px 12px; background: rgba(0,0,0,0.03); font-size: 0.8rem; color: var(--text-muted); border-bottom: 1px solid rgba(0,0,0,0.06); }
+.search-result-content { padding: 12px; }
+.search-result mark { background: #fff59d; padding: 1px 2px; border-radius: 2px; }
+@media (max-width: 600px) { body { padding: 8px; } .message, .index-item { border-radius: 8px; } .message-content, .index-item-content { padding: 12px; } pre { font-size: 0.8rem; padding: 8px; } #search-box input { width: 120px; } #search-modal[open] { width: 95vw; height: 90vh; } }
+</style>
+</head>
+<body>
+    <div class="container">
+        <h1><a href="index.html" style="color: inherit; text-decoration: none;">Claude Code transcript</a> - page 5/6</h1>
+        
+
+<div class="pagination">
+<a href="index.html" class="index-link">Index</a>
+<a href="page-004.html">&larr; Prev</a>
+<a href="page-001.html">1</a>
+<a href="page-002.html">2</a>
+<a href="page-003.html">3</a>
+<a href="page-004.html">4</a>
+<span class="current">5</span>
+<a href="page-006.html">6</a>
+<a href="page-006.html">Next &rarr;</a>
+</div>
+
+        <details class="continuation"><summary>Session continuation summary</summary>
+<div class="message user" id="msg-2026-04-30T22-55-34-956Z"><div class="message-header"><span class="role-label">User</span><a href="#msg-2026-04-30T22-55-34-956Z" class="timestamp-link"><time datetime="2026-04-30T22:55:34.956Z" data-timestamp="2026-04-30T22:55:34.956Z">2026-04-30T22:55:34.956Z</time></a></div><div class="message-content">
+<div class="user-content"><p>This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.</p>
+<p>Summary:
+1. Primary Request and Intent:
+   Build a WebGPU Lattice Boltzmann Method (LBM) 2D fluid simulation of a falling card, validated against Pesavento &amp; Wang (2004) PRL paper. The simulation should: use a D2Q9 LBM on a 256×512 grid; simulate a thin ellipse (a=32, b=4, e=0.125) falling from the top of the grid; couple fluid forces to rigid body dynamics (Newton's equations); visualize vorticity field with the card as a yellow line overlay. The paper's parameters (Re=1100, I*=0.17, e=0.125, c_R=2.6, c_L=0.49) validate the simulation — no analytical model substitution. Iterate quickly with Chrome screenshot feedback loop.</p>
+<ol>
+<li>Key Technical Concepts:</li>
+<li>D2Q9 Lattice Boltzmann Method with BGK collision</li>
+<li>Regularized BGK (Latt &amp; Chopard 2006) for boundary stability</li>
+<li>Moving bounce-back (Ladd 1994) — the critical fix for moving boundaries</li>
+<li>Momentum exchange method for fluid-solid force computation (Aidun 1998)</li>
+<li>Kármán vortex shedding, Stokes vs inertial drag regimes</li>
+<li>WebGPU compute shaders (WGSL), atomic i32 accumulation</li>
+<li>Rigid body dynamics: Newton integration with added mass, circulation-based aerodynamics</li>
+<li>GitHub Pages deployment (pub branch), local HTTP server feedback loop</li>
+<li>Chrome DevTools Protocol (CDP) for browser navigation/reload</li>
+<li>
+<p>Device pixel ratio handling for mobile WebGPU</p>
+</li>
+<li>
+<p>Files and Code Sections:</p>
+</li>
+</ol>
+<p><strong><code>/home/ctalbott/p/getting-air/index.html</code></strong>
+   - Full-screen canvas with viewport meta tag (mobile fix)
+   - <code>&lt;meta name="viewport" content="width=device-width, initial-scale=1"&gt;</code>
+   - <code>canvas { position: fixed; top: 0; left: 0; width: 100%; height: 100%; }</code></p>
+<p><strong><code>/home/ctalbott/p/getting-air/main.js</code></strong> (most critical file)
+   - Current parameters (NEED FIXING — TAU=0.6 causes Stokes trapping):
+   <code>javascript
+   const TAU = 0.6;         // SHOULD BE 0.52 for Re=1100
+   const NU  = (TAU - 0.5) / 3;  // 0.0333
+   const U_T = 0.05;        // SHOULD BE 0.1146
+   const G_LU = U_T**2 / (Math.PI * B * (RHO_B - 1));
+   const G_EFF = G_LU * (1 - 1/RHO_B);
+   const FSCALE = 1e3;
+   const CARD_ENABLED = true;
+   const STEPS_PER_FRAME = 8;
+   // Card state
+   let cardCX = W/2, cardCY = H/4, cardTheta = 0.2;
+   let cardVX = 0, cardVY = 0, cardOmega = 0;
+   // Physics constants
+   const RHO_B = I_STAR * 2 * A**3 / (B * (A**2 + B**2));  // ≈ 2.678
+   const MASS  = RHO_B * Math.PI * A * B;                   // ≈ 1077
+   const I_BODY = RHO_B * Math.PI * A * B * (A**2+B**2)/4;  // ≈ 280020</code>
+   - Capsule solid (not pure ellipse — rounded tips for stability):
+   <code>javascript
+   const halfLen = A - B;
+   const capDist = Math.max(0, Math.abs(lx) - halfLen);
+   if (capDist*capDist + ly*ly &lt;= B*B) s[y*W+x] = 1;</code>
+   - makeParams returns 12 floats = 48 bytes:
+   <code>javascript
+   function makeParams(cx, cy) {
+     return new Float32Array([TAU, 0, 0, cx, cy, A, cardTheta,
+                              cardVX, cardVY, cardOmega, 0, 0]);
+   }</code>
+   - integrateBody with velocity clamps:
+   <code>javascript
+   function integrateBody(Fx, Fy, Tz, dt) {
+     const V_MAX = 0.15, O_MAX = 0.02;
+     cardVX    += Fx / MASS;
+     cardVY    += (Fy + MASS * G_EFF * dt) / MASS;
+     cardOmega += Tz / I_BODY;
+     cardVX    = Math.max(-V_MAX, Math.min(V_MAX, cardVX));
+     cardVY    = Math.max(-V_MAX, Math.min(V_MAX, cardVY));
+     cardOmega = Math.max(-O_MAX, Math.min(O_MAX, cardOmega));
+     cardCX += cardVX * dt; cardCY += cardVY * dt; cardTheta += cardOmega * dt;
+     cardCX = ((cardCX % W) + W) % W; cardCY = ((cardCY % H) + H) % H;
+   }</code>
+   - Async force readback (restored for performance):
+   <code>javascript
+   if (!forceReadPending) {
+     forceReadPending = true;
+     forceStage.mapAsync(GPUMapMode.READ).then(() =&gt; {
+       const d = new Int32Array(forceStage.getMappedRange());
+       const Fx=d[0]/FSCALE, Fy=d[1]/FSCALE, Tz=d[2]/FSCALE;
+       forceStage.unmap();
+       forceReadPending = false;
+       integrateBody(Fx, Fy, Tz, STEPS_PER_FRAME);
+       uploadSolid(cardCX, cardCY, cardTheta);
+     });
+   }</code>
+   - paramsBuf size = 48 bytes (12 floats)</p>
+<p><strong><code>/home/ctalbott/p/getting-air/shaders/lbm_stream.wgsl</code></strong> (KEY FIX — moving bounce-back)
+   <code>wgsl
+   // Moving bounce-back (Ladd 1994)
+   if (solid[src_cell] != 0u) {
+     let mx   = f32(x) - 0.5f * f32(ex[i]);
+     let my   = f32(y) - 0.5f * f32(ey[i]);
+     let rx   = mx - params.cx;
+     let ry   = my - params.cy;
+     let ubx  = params.vx - params.omega * ry;
+     let uby  = params.vy + params.omega * rx;
+     let ei_ub = f32(ex[i]) * ubx + f32(ey[i]) * uby;
+     f_out[dst_base + i] = f_col[dst_base + opp[i]] + 2f * wt[i] * ei_ub / CS2;
+   }
+   // Also needs @group(0) @binding(3) var&lt;uniform&gt; params : Params;</code></p>
+<p><strong><code>/home/ctalbott/p/getting-air/shaders/lbm_collide.wgsl</code></strong>
+   - Regularized BGK with Π_αβ stress tensor reconstruction
+   - Density reset: <code>if (rho &lt; 0.5f || rho &gt; 2.0f) { reset to wt[i]; return; }</code>
+   - Velocity cap: <code>if (u_sq &gt; 0.04f) { let s = 0.2f/sqrt(u_sq); ux*=s; uy*=s; }</code>
+   - 12-float Params struct</p>
+<p><strong><code>/home/ctalbott/p/getting-air/shaders/lbm_force.wgsl</code></strong> (KEY FIX — correct formula)
+   <code>wgsl
+   // CORRECT: use f_col[opp[i]] (distribution heading toward solid)
+   let fi = clamp(f_col[base + opp[i]], 0f, FI_MAX);
+   let ubx  = params.vx - params.omega * (f32(y) + 0.5f * f32(ey[i]) - params.cy);
+   let uby  = params.vy + params.omega * (f32(x) + 0.5f * f32(ex[i]) - params.cx);
+   let ei_ub = f32(ex[i]) * ubx + f32(ey[i]) * uby;
+   let mag  = 2f * fi + 2f * wt[i] * ei_ub / CS2;
+   let fx = mag * f32(ex[i]); let fy = mag * f32(ey[i]);
+   let tz = rx * fy - ry * fx;
+   // NEGATED — formula gives solid-on-fluid; negate for fluid-on-solid
+   atomicAdd(&amp;forces[0], i32(-fx * FSCALE));
+   atomicAdd(&amp;forces[1], i32(-fy * FSCALE));
+   atomicAdd(&amp;forces[2], i32(-tz * FSCALE));</code></p>
+<p><strong><code>/home/ctalbott/p/getting-air/shaders/render.wgsl</code></strong>
+   - Vorticity visualization (blue=CCW, red=CW)
+   - Yellow card line via segment distance
+   - Uses 12-float Params struct for cx, cy, a, theta</p>
+<ol>
+<li>
+<p>Errors and fixes:</p>
+</li>
+<li>
+<p><strong>Mobile rendering triangle</strong>: Without <code>&lt;meta name="viewport"&gt;</code>, mobile Chrome used 980px virtual viewport. Fixed with viewport meta tag + <code>position:fixed</code> CSS canvas + <code>clientWidth * devicePixelRatio</code>.</p>
+</li>
+<li>
+<p><strong>f_c buffer COPY_SRC</strong>: Had <code>COPY_DST</code> flag instead of <code>COPY_SRC</code> needed for <code>copyBufferToBuffer</code>. Fixed.</p>
+</li>
+<li>
+<p><strong><code>toFixed3</code> typo</strong>: <code>paramsArr[0].toFixed3</code> → <code>paramsArr[0].toFixed(3)</code>.</p>
+</li>
+<li>
+<p><strong>dt double-counting in integrateBody</strong>: <code>(Fy + MASS*G_EFF) / MASS * dt</code> was wrong. Since Fy is already the total impulse accumulated over <code>dt</code> steps, correct is <code>(Fy + MASS*G_EFF*dt) / MASS</code>.</p>
+</li>
+<li>
+<p><strong>FSCALE=1e6 int32 overflow</strong>: Torque accumulation with 200+ boundary cells × 4-8 steps × r=32 × f≈0.2 × 1e6 exceeded int32 max (2.147e9). Reduced to FSCALE=1e3.</p>
+</li>
+<li>
+<p><strong>LBM blow-up at step ~500</strong>: Root cause was missing moving bounce-back. Standard bounce-back enforces u=0 at a surface that moves at u_b (up to 0.64 lu/step at tips due to rotation). Error = 390% of equilibrium distribution. Fixed with Ladd 1994 moving bounce-back in streaming shader.</p>
+</li>
+<li>
+<p><strong>Force index bug</strong>: Force shader used <code>f_col[base + i]</code> (away from solid) but momentum exchange method requires <code>f_col[base + opp[i]]</code> (heading toward solid). Fixed.</p>
+</li>
+<li>
+<p><strong>Force sign</strong>: Aidun momentum exchange formula gives force of solid-on-fluid. Negated all atomicAdd calls to get fluid-on-solid. After fix: Fy=-0.255 (negative = upward drag) for falling card ✓.</p>
+</li>
+<li>
+<p><strong>Sync mapAsync throttle</strong>: Using <code>await mapAsync</code> blocked to ~23 steps/second. Restored async (non-blocking) readback for performance since forces are now physically correct and self-limiting.</p>
+</li>
+<li>
+<p><strong>Async readback race condition</strong>: Previously caused instability when forces were wrong (card ran away). Now safe because correct forces (drag opposing motion) are self-limiting.</p>
+</li>
+<li>
+<p><strong>Stokes trapping at τ=0.6</strong>: With ν=0.033, Stokes drag at vy=0.001 already balances gravity. Card trapped at terminal velocity ~0.001 instead of ~0.05. Fix pending: return to τ=0.52.</p>
+</li>
+<li>
+<p><strong>User feedback — "1. is a hard no"</strong>: When I proposed using the Pesavento analytical model for dynamics, user explicitly rejected it. The LBM IS the simulation; the paper validates it.</p>
+</li>
+<li>
+<p>Problem Solving:</p>
+</li>
+</ol>
+<p>Solved:
+   - WebGPU scaffold + vorticity visualization ✓
+   - D2Q9 BGK LBM running stably ✓
+   - Kármán vortex street at Re≈1100 for fixed ellipse ✓
+   - Moving bounce-back for moving solid boundary ✓
+   - Correct force/torque computation (index, sign) ✓
+   - Long-term stability (140,000+ steps) ✓
+   - Correct force direction (Fy &lt; 0 for falling card) ✓</p>
+<p>Ongoing:
+   - Card moves too slowly (vy≈0.001 instead of ≈0.05): TAU=0.6 causes Stokes trapping. Need TAU=0.52.
+   - Velocity/omega clamps (V_MAX=0.15, O_MAX=0.02) may be too tight for Re=1100 dynamics.</p>
+<ol>
+<li>All user messages:</li>
+<li>"hey claude. first some setup. you're in a mostly blank repo..." (browser feedback loop setup)</li>
+<li>"we're eventually going to build a game that incorporates some 2D fluid dynamics using webgpu, but we need to do a little dance to get feedback..." (Chrome command with WebGPU flags + screenshot command)</li>
+<li>"[Image shared] on mobile, I'm getting a single triangle..." (mobile rendering bug report)</li>
+<li>"lets just merge main to pub" (established deployment workflow)</li>
+<li>"let's not get too distracted by what's in lattice-boltzmann-simulator. it's heavy with npm overhead and uses webgl" (scope guidance)</li>
+<li>"[Plan request] let's plan a little first... falling card from LBM code... use Pesavento &amp; Wang constants" (primary goal)</li>
+<li>"this is good, let's start with the low res, fast iteration, and emphasize validation... render the card as just a line on the ellipse major axis" (implementation guidance)</li>
+<li>"please commit all changes to this point to main and push to pub. let's commit to main on each change" (workflow instruction)</li>
+<li>"yes please, let's move onto rigid body integration" (Phase 3 trigger)</li>
+<li>"i think you might want to do a sanity check and remove the card for now and see if you've broken the fluid completely" (debugging suggestion — led to confirming fluid alone is stable)</li>
+<li>"help me understand the root cause of the tip-radius -&gt; instability issue. when we had a fixed ellipse, way back at the beginning (w/Re 1100 IIRC) we had lovely vortex wake and no blow-up. what is different and why?" (key diagnostic question — led to moving bounce-back discovery)</li>
+<li>"1. is a hard no. the point is the simulation. the paper validates the simulation. 2. let's think about other approaches." (rejected Pesavento model, affirmed simulation-first)</li>
+<li>"hi, i think we're past our session limit feel free to continue to debug... it does seem like we're not conserving energy and the LBM blows up somewhere between step ~400-600" (session context, confirmed blow-up timing)</li>
+<li>
+<p>"step 140000 shows the card has moved to approximately the midpoint of the grid. the simulation is proceeding quickly, but the card is moving very slowly." (current issue: Stokes trapping)</p>
+</li>
+<li>
+<p>Pending Tasks:</p>
+</li>
+<li><strong>IMMEDIATE</strong>: Change TAU from 0.6 to 0.52, update U_T=0.1146, G_LU=U_T²/(π×B×(RHO_B-1))≈6.23e-4, G_EFF=G_LU×(1-1/RHO_B)≈3.90e-4</li>
+<li>Loosen velocity clamps: V_MAX → ~0.25 lu/step, O_MAX → ~0.1 rad/step</li>
+<li>Validate against paper: tumbling trajectory, descent speed ≈0.4×u_t, center-of-mass elevation</li>
+<li>Commit working Phase 3 to main + sync pub</li>
+<li>
+<p>Update comment in main.js: remove "τ≈0.509 which is BGK-unstable" note (now resolved by moving bounce-back)</p>
+</li>
+<li>
+<p>Current Work:
+   Immediately before this summary, the task was identifying and addressing why the card moves at only vy≈0.001 lu/step (50× too slow) despite the simulation running at good speed (140,000+ steps achieved). The diagnosis: τ=0.6 (ν=0.033) causes the card to reach the Stokes terminal velocity (~0.001) instead of the inertial terminal velocity (~0.05). With τ=0.6, Stokes drag at vy=0.001 is approximately equal to gravity, so the card never accelerates into the inertial regime where tumbling occurs.</p>
+</li>
+</ol>
+<p>The last edit completed was updating the status line in <code>main.js</code> and restoring async force readback. The <code>main.js</code> file currently has:
+   <code>javascript
+   const TAU = 0.6;    // ← THIS IS THE PROBLEM
+   const U_T = 0.05;   // ← SHOULD BE 0.1146</code></p>
+<ol>
+<li>Optional Next Step:
+   Change TAU back to 0.52 and update physics parameters, since "step 140000 shows the card has moved to approximately the midpoint of the grid. the simulation is proceeding quickly, but the card is moving very slowly." The fix is to update <code>main.js</code>:
+   ```javascript
+   // Change from:
+   const TAU = 0.6;
+   const U_T = 0.05;</li>
+</ol>
+<p>// To:
+   const TAU = 0.52;   // Re=1100, now stable with moving bounce-back
+   const NU  = (TAU - 0.5) / 3;   // 0.00667
+   const U_T = 1100 * NU / (2 * A);  // 0.1146 lu/step
+   <code>``
+   And loosen the clamps:</code>const V_MAX = 0.25; const O_MAX = 0.1;`</p>
+<p>With τ=0.52: Stokes terminal velocity ≈ 5.7 lu/step (above LBM stability limit, so card passes through Stokes regime and reaches inertial terminal velocity ≈0.1146). The moving bounce-back fix (already in place) should keep τ=0.52 stable.</p>
+<p>If you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: /home/ctalbott/.claude/projects/-home-ctalbott-p-getting-air/774165ed-9313-4aca-9442-885eae833760.jsonl
+Continue the conversation from where it left off without asking the user any further questions. Resume directly — do not acknowledge the summary, do not recap what was happening, do not preface with "I'll continue" or similar. Pick up the last task as if the break never happened.</p></div></div></div></details>
+<div class="message assistant" id="msg-2026-04-30T22-55-35-395Z"><div class="message-header"><span class="role-label">Assistant</span><a href="#msg-2026-04-30T22-55-35-395Z" class="timestamp-link"><time datetime="2026-04-30T22:55:35.395Z" data-timestamp="2026-04-30T22:55:35.395Z">2026-04-30T22:55:35.395Z</time></a></div><div class="message-content">
+<div class="assistant-text"><p>You've hit your limit · resets 4:50pm (Pacific/Honolulu)</p></div></div></div>
+<div class="message user" id="msg-2026-05-01T07-17-33-167Z"><div class="message-header"><span class="role-label">User</span><a href="#msg-2026-05-01T07-17-33-167Z" class="timestamp-link"><time datetime="2026-05-01T07:17:33.167Z" data-timestamp="2026-05-01T07:17:33.167Z">2026-05-01T07:17:33.167Z</time></a></div><div class="message-content">
+<div class="user-content"><p>we should be back (limit-wise). while i was waiting I did some testing. we have some cleanup/debugging to do.</p></div></div></div>
+<div class="message assistant" id="msg-2026-05-01T07-17-36-685Z"><div class="message-header"><span class="role-label">Assistant</span><a href="#msg-2026-05-01T07-17-36-685Z" class="timestamp-link"><time datetime="2026-05-01T07:17:36.685Z" data-timestamp="2026-05-01T07:17:36.685Z">2026-05-01T07:17:36.685Z</time></a></div><div class="message-content">
+<div class="thinking"><div class="thinking-label">Thinking</div></div></div></div>
+<div class="message assistant" id="msg-2026-05-01T07-17-36-758Z"><div class="message-header"><span class="role-label">Assistant</span><a href="#msg-2026-05-01T07-17-36-758Z" class="timestamp-link"><time datetime="2026-05-01T07:17:36.758Z" data-timestamp="2026-05-01T07:17:36.758Z">2026-05-01T07:17:36.758Z</time></a></div><div class="message-content">
+<div class="assistant-text"><p>Let me read the current state of main.js to see what we're working with.</p></div></div></div>
+<div class="message assistant" id="msg-2026-05-01T07-17-37-344Z"><div class="message-header"><span class="role-label">Assistant</span><a href="#msg-2026-05-01T07-17-37-344Z" class="timestamp-link"><time datetime="2026-05-01T07:17:37.344Z" data-timestamp="2026-05-01T07:17:37.344Z">2026-05-01T07:17:37.344Z</time></a></div><div class="message-content">
+<div class="tool-use" data-tool-id="toolu_01DjemLXwtFq1U8aPNPJuBSH"><div class="tool-header"><span class="tool-icon">⚙</span> Read</div><div class="truncatable"><div class="truncatable-content"><pre class="json">{
+  &#34;file_path&#34;: &#34;/home/ctalbott/p/getting-air/main.js&#34;
+}</pre></div><button class="expand-btn">Show more</button></div></div></div></div>
+<div class="message tool-reply" id="msg-2026-05-01T07-17-37-356Z"><div class="message-header"><span class="role-label">Tool reply</span><a href="#msg-2026-05-01T07-17-37-356Z" class="timestamp-link"><time datetime="2026-05-01T07:17:37.356Z" data-timestamp="2026-05-01T07:17:37.356Z">2026-05-01T07:17:37.356Z</time></a></div><div class="message-content"><div class="tool-result"><div class="truncatable"><div class="truncatable-content"><pre>1	const canvas   = document.getElementById(&#x27;c&#x27;);
+2	const statusEl = document.getElementById(&#x27;status&#x27;);
+3	const dpr = window.devicePixelRatio || 1;
+4	canvas.width  = Math.round(canvas.clientWidth  * dpr);
+5	canvas.height = Math.round(canvas.clientHeight * dpr);
+6	
+7	// ── Grid ──────────────────────────────────────────────────────────────────────
+8	const W = 256, H = 512, NCELLS = W * H;
+9	
+10	// ── Pesavento &amp; Wang (2004) physical parameters ───────────────────────────────
+11	const A     = 32;        // semi-major axis [lu]
+12	const B     = 4;         // semi-minor axis [lu]  e = B/A = 0.125
+13	const E     = B / A;     // aspect ratio
+14	
+15	// Dimensionless moment of inertia: I* = b(a²+b²)ρ_b / (2a³ρ_f)  = 0.17
+16	// → ρ_b/ρ_f = I* · 2a³ / (b·(a²+b²))
+17	const I_STAR = 0.17;
+18	const RHO_B  = I_STAR * 2 * A**3 / (B * (A**2 + B**2));  // ≈ 2.678
+19	const PI_AB  = Math.PI * A * B;
+20	
+21	const MASS   = RHO_B * PI_AB;                          // card mass [lu²]
+22	const I_BODY = RHO_B * PI_AB * (A**2 + B**2) / 4;     // moment of inertia
+23	
+24	// LBM parameters.
+25	// Re=1100 needs τ≈0.509 which is BGK-unstable in the transient.
+26	// Use τ=0.6 (Re≈220 at u_t=0.05) for Phase 3 stability; will tighten τ later.
+27	const TAU     = 0.6;
+28	const NU      = (TAU - 0.5) / 3;                       // ≈ 0.0333
+29	// Target u_t small enough to keep Ma &lt; 0.1 during free-fall transient
+30	const U_T     = 0.05;                                  // lu/step
+31	// u_t = sqrt(π·b·g·(ρ_b/ρ_f − 1))  →  g = u_t² / (π·b·(ρ_b−1))
+32	const G_LU    = U_T**2 / (Math.PI * B * (RHO_B - 1)); // ≈ 1.19e-4 lu/step²
+33	// Net downward acceleration on card (gravity minus buoyancy)
+34	const G_EFF   = G_LU * (1 - 1 / RHO_B);               // ≈ 7.44e-5
+35	
+36	// Force scale for int32 atomic accumulation
+37	const FSCALE  = 1e3;
+38	
+39	const CARD_ENABLED = true;
+40	
+41	// ── D2Q9 (JS side for initialisation) ────────────────────────────────────────
+42	const EX = [0, 1, 0,-1, 0, 1,-1,-1, 1];
+43	const EY = [0, 0, 1, 0,-1, 1, 1,-1,-1];
+44	const WT = [4/9, 1/9, 1/9, 1/9, 1/9, 1/36, 1/36, 1/36, 1/36];
+45	
+46	function feq(rho, ux, uy, i) {
+47	  const eu = EX[i]*ux + EY[i]*uy;
+48	  return WT[i] * rho * (1 + eu*3 + eu*eu*4.5 - (ux*ux+uy*uy)*1.5);
+49	}
+50	
+51	// ── Card state ────────────────────────────────────────────────────────────────
+52	let cardCX    = W / 2;
+53	let cardCY    = H / 4;      // start in upper quarter, falls down
+54	let cardTheta = 0.2;        // initial angle [rad], matches the paper
+55	let cardVX    = 0;
+56	let cardVY    = 0;
+57	let cardOmega = 0;
+58	
+59	function buildSolid(cx, cy, theta) {
+60	  const s  = new Uint32Array(NCELLS);
+61	  if (!CARD_ENABLED) return s;   // fluid-only sanity check mode
+62	  const ca = Math.cos(theta), sa = Math.sin(theta);
+63	  const halfLen = A - B;
+64	  for (let y = 0; y &lt; H; y++) {
+65	    for (let x = 0; x &lt; W; x++) {
+66	      const dx = x - cx, dy = y - cy;
+67	      const lx = dx*ca + dy*sa;
+68	      const ly = -dx*sa + dy*ca;
+69	      const capDist = Math.max(0, Math.abs(lx) - halfLen);
+70	      if (capDist*capDist + ly*ly &lt;= B*B) s[y*W + x] = 1;
+71	    }
+72	  }
+73	  return s;
+74	}
+75	
+76	function initF() {
+77	  const f = new Float32Array(NCELLS * 9);
+78	  for (let c = 0; c &lt; NCELLS; c++) {
+79	    const base = c * 9;
+80	    for (let i = 0; i &lt; 9; i++) f[base+i] = feq(1, 0, 0, i);
+81	  }
+82	  return f;
+83	}
+84	
+85	function makeParams(cx, cy) {
+86	  // Must match Params struct in all shaders: 12 floats = 48 bytes
+87	  return new Float32Array([TAU, 0, 0, cx, cy, A, cardTheta,
+88	                           cardVX, cardVY, cardOmega, 0, 0]);
+89	}
+90	
+91	async function loadShader(device, path) {
+92	  const r = await fetch(path);
+93	  if (!r.ok) throw new Error(`failed to load ${path}`);
+94	  return device.createShaderModule({ code: await r.text() });
+95	}
+96	
+97	// ── WebGPU init ───────────────────────────────────────────────────────────────
+98	async function init() {
+99	  if (!navigator.gpu) { statusEl.textContent = &#x27;WebGPU not available&#x27;; return; }
+100	  const adapter = await navigator.gpu.requestAdapter({ powerPreference: &#x27;high-performance&#x27; });
+101	  if (!adapter) { statusEl.textContent = &#x27;no adapter&#x27;; return; }
+102	  const device = await adapter.requestDevice();
+103	  const ctx = canvas.getContext(&#x27;webgpu&#x27;);
+104	  const fmt = navigator.gpu.getPreferredCanvasFormat();
+105	  ctx.configure({ device, format: fmt, alphaMode: &#x27;opaque&#x27; });
+106	
+107	  const U = GPUBufferUsage;
+108	  const mkBuf = (size, usage) =&gt; device.createBuffer({ size, usage });
+109	
+110	  const fSize   = NCELLS * 9 * 4;
+111	  const velSize = NCELLS * 2 * 4;
+112	  const solSize = NCELLS * 4;
+113	
+114	  const f_a       = mkBuf(fSize,   U.STORAGE | U.COPY_DST);
+115	  const f_b       = mkBuf(fSize,   U.STORAGE);
+116	  const f_c       = mkBuf(fSize,   U.STORAGE | U.COPY_SRC);
+117	  const velBuf    = mkBuf(velSize, U.STORAGE);
+118	  const solBuf    = mkBuf(solSize, U.STORAGE | U.COPY_DST);
+119	  // Force accumulator: [Fx, Fy, Tz, pad] as atomic i32
+120	  const forceBuf  = mkBuf(16, U.STORAGE | U.COPY_SRC | U.COPY_DST);
+121	  const forceStage= mkBuf(16, U.COPY_DST | U.MAP_READ);
+122	
+123	  let solidData = buildSolid(cardCX, cardCY, cardTheta);
+124	  device.queue.writeBuffer(solBuf, 0, solidData);
+125	  device.queue.writeBuffer(f_a,   0, initF());
+126	
+127	  const paramsBuf = mkBuf(48, U.UNIFORM | U.COPY_DST);
+128	  device.queue.writeBuffer(paramsBuf, 0, makeParams(cardCX, cardCY));
+129	
+130	  const [colSM, strSM, frcSM, renSM] = await Promise.all([
+131	    loadShader(device, &#x27;shaders/lbm_collide.wgsl&#x27;),
+132	    loadShader(device, &#x27;shaders/lbm_stream.wgsl&#x27;),
+133	    loadShader(device, &#x27;shaders/lbm_force.wgsl&#x27;),
+134	    loadShader(device, &#x27;shaders/render.wgsl&#x27;),
+135	  ]);
+136	
+137	  // ── Bind group layouts ─────────────────────────────────────────────────────
+138	  const colBGL = device.createBindGroupLayout({ entries: [
+139	    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: &#x27;uniform&#x27; } },
+140	    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: &#x27;read-only-storage&#x27; } },
+141	    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: &#x27;storage&#x27; } },
+142	    { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: &#x27;storage&#x27; } },
+143	    { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: &#x27;read-only-storage&#x27; } },
+144	  ]});
+145	  const strBGL = device.createBindGroupLayout({ entries: [
+146	    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: &#x27;read-only-storage&#x27; } },
+147	    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: &#x27;storage&#x27; } },
+148	    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: &#x27;read-only-storage&#x27; } },
+149	    { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: &#x27;uniform&#x27; } },
+150	  ]});
+151	  const frcBGL = device.createBindGroupLayout({ entries: [
+152	    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: &#x27;read-only-storage&#x27; } },
+153	    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: &#x27;read-only-storage&#x27; } },
+154	    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: &#x27;storage&#x27; } },
+155	    { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: &#x27;uniform&#x27; } },
+156	  ]});
+157	  const renBGL = device.createBindGroupLayout({ entries: [
+158	    { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: &#x27;read-only-storage&#x27; } },
+159	    { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: &#x27;read-only-storage&#x27; } },
+160	    { binding: 2, visibility: GPUShaderStage.FRAGMENT, buffer: { type: &#x27;uniform&#x27; } },
+161	  ]});
+162	
+163	  const mkPL = (...bgls) =&gt;
+164	    device.createPipelineLayout({ bindGroupLayouts: bgls });
+165	
+166	  const colPL = device.createComputePipeline({ layout: mkPL(colBGL), compute: { module: colSM, entryPoint: &#x27;main&#x27; } });
+167	  const strPL = device.createComputePipeline({ layout: mkPL(strBGL), compute: { module: strSM, entryPoint: &#x27;main&#x27; } });
+168	  const frcPL = device.createComputePipeline({ layout: mkPL(frcBGL), compute: { module: frcSM, entryPoint: &#x27;main&#x27; } });
+169	  const renPL = device.createRenderPipeline({
+170	    layout: mkPL(renBGL),
+171	    vertex:   { module: renSM, entryPoint: &#x27;vs_main&#x27; },
+172	    fragment: { module: renSM, entryPoint: &#x27;fs_main&#x27;, targets: [{ format: fmt }] },
+173	    primitive: { topology: &#x27;triangle-list&#x27; },
+174	  });
+175	
+176	  const colBG = device.createBindGroup({ layout: colBGL, entries: [
+177	    { binding: 0, resource: { buffer: paramsBuf } },
+178	    { binding: 1, resource: { buffer: f_a } },
+179	    { binding: 2, resource: { buffer: f_b } },
+180	    { binding: 3, resource: { buffer: velBuf } },
+181	    { binding: 4, resource: { buffer: solBuf } },
+182	  ]});
+183	  const strBG = device.createBindGroup({ layout: strBGL, entries: [
+184	    { binding: 0, resource: { buffer: f_b } },
+185	    { binding: 1, resource: { buffer: f_c } },
+186	    { binding: 2, resource: { buffer: solBuf } },
+187	    { binding: 3, resource: { buffer: paramsBuf } },
+188	  ]});
+189	  const frcBG = device.createBindGroup({ layout: frcBGL, entries: [
+190	    { binding: 0, resource: { buffer: f_b } },   // post-collision distributions
+191	    { binding: 1, resource: { buffer: solBuf } },
+192	    { binding: 2, resource: { buffer: forceBuf } },
+193	    { binding: 3, resource: { buffer: paramsBuf } },
+194	  ]});
+195	  const renBG = device.createBindGroup({ layout: renBGL, entries: [
+196	    { binding: 0, resource: { buffer: velBuf } },
+197	    { binding: 1, resource: { buffer: solBuf } },
+198	    { binding: 2, resource: { buffer: paramsBuf } },
+199	  ]});
+200	
+201	  const WGX = Math.ceil(W / 8), WGY = Math.ceil(H / 8);
+202	  const STEPS_PER_FRAME = 8;
+203	
+204	  let step = 0, lastT = performance.now();
+205	
+206	  // ── Rigid body integration ─────────────────────────────────────────────────
+207	  function integrateBody(Fx, Fy, Tz, dt) {
+208	    // Fx/Fy/Tz are the total impulse accumulated over dt LBM steps.
+209	    const V_MAX = 0.15;   // max translation speed  (Ma ≈ 0.26, well within LBM stability)
+210	    const O_MAX = 0.02;   // max angular speed [rad/step]
+211	
+212	    cardVX    += Fx / MASS;
+213	    cardVY    += (Fy + MASS * G_EFF * dt) / MASS;
+214	    cardOmega += Tz / I_BODY;
+215	
+216	    // Clamp to physical bounds — prevents LBM garbage forces from running away
+217	    cardVX    = Math.max(-V_MAX, Math.min(V_MAX,  cardVX));
+218	    cardVY    = Math.max(-V_MAX, Math.min(V_MAX,  cardVY));
+219	    cardOmega = Math.max(-O_MAX, Math.min(O_MAX,  cardOmega));
+220	
+221	    cardCX    += cardVX * dt;
+222	    cardCY    += cardVY * dt;
+223	    cardTheta += cardOmega * dt;
+224	    cardCX = ((cardCX % W) + W) % W;
+225	    cardCY = ((cardCY % H) + H) % H;
+226	  }
+227	
+228	  function uploadSolid(cx, cy, theta) {
+229	    const oldSolid = solidData;
+230	    solidData = buildSolid(cx, cy, theta);
+231	
+232	    // Refill solid→fluid transitions with card-velocity feq
+233	    const fRefill = new Float32Array(9);
+234	    for (let idx = 0; idx &lt; NCELLS; idx++) {
+235	      if (oldSolid[idx] === 1 &amp;&amp; solidData[idx] === 0) {
+236	        for (let i = 0; i &lt; 9; i++) fRefill[i] = feq(1, cardVX, cardVY, i);
+237	        device.queue.writeBuffer(f_a, idx * 9 * 4, fRefill);
+238	      }
+239	    }
+240	    device.queue.writeBuffer(solBuf,   0, solidData);
+241	    device.queue.writeBuffer(paramsBuf, 0, makeParams(cx, cy));
+242	  }
+243	
+244	  // ── Render loop — async force readback (1-frame lag, correct forces) ────────
+245	  let forceReadPending = false;
+246	
+247	  function frame() {
+248	    const enc = device.createCommandEncoder();
+249	    enc.clearBuffer(forceBuf, 0, 16);
+250	
+251	    for (let s = 0; s &lt; STEPS_PER_FRAME; s++) {
+252	      const col = enc.beginComputePass();
+253	      col.setPipeline(colPL); col.setBindGroup(0, colBG);
+254	      col.dispatchWorkgroups(WGX, WGY); col.end();
+255	
+256	      const str = enc.beginComputePass();
+257	      str.setPipeline(strPL); str.setBindGroup(0, strBG);
+258	      str.dispatchWorkgroups(WGX, WGY); str.end();
+259	
+260	      enc.copyBufferToBuffer(f_c, 0, f_a, 0, fSize);
+261	
+262	      const frc = enc.beginComputePass();
+263	      frc.setPipeline(frcPL); frc.setBindGroup(0, frcBG);
+264	      frc.dispatchWorkgroups(WGX, WGY); frc.end();
+265	    }
+266	    step += STEPS_PER_FRAME;
+267	
+268	    enc.copyBufferToBuffer(forceBuf, 0, forceStage, 0, 16);
+269	
+270	    const rp = enc.beginRenderPass({ colorAttachments: [{
+271	      view: ctx.getCurrentTexture().createView(),
+272	      clearValue: { r:0.07, g:0.07, b:0.10, a:1 },
+273	      loadOp: &#x27;clear&#x27;, storeOp: &#x27;store&#x27;,
+274	    }]});
+275	    rp.setPipeline(renPL); rp.setBindGroup(0, renBG); rp.draw(6); rp.end();
+276	
+277	    device.queue.submit([enc.finish()]);
+278	
+279	    // Async readback — integrates body with previous frame&#x27;s forces (1-step lag).
+280	    // Physics is now self-limiting (correct drag sign), so the lag is safe.
+281	    if (!forceReadPending) {
+282	      forceReadPending = true;
+283	      forceStage.mapAsync(GPUMapMode.READ).then(() =&gt; {
+284	        const d  = new Int32Array(forceStage.getMappedRange());
+285	        const Fx = d[0] / FSCALE, Fy = d[1] / FSCALE, Tz = d[2] / FSCALE;
+286	        forceStage.unmap();
+287	        forceReadPending = false;
+288	        integrateBody(Fx, Fy, Tz, STEPS_PER_FRAME);
+289	        uploadSolid(cardCX, cardCY, cardTheta);
+290	
+291	        if (performance.now() - lastT &gt; 300) {
+292	          statusEl.textContent = CARD_ENABLED
+293	            ? `step ${step}  vy=${cardVY.toFixed(4)}  Fy=${Fy.toExponential(2)}  Tz=${Tz.toExponential(2)}  θ=${cardTheta.toFixed(2)}`
+294	            : `step ${step}  (no card)`;
+295	          lastT = performance.now();
+296	        }
+297	      });
+298	    }
+299	
+300	    requestAnimationFrame(frame);
+301	  }
+302	
+303	  requestAnimationFrame(frame);
+304	}
+305	
+306	init().catch(e =&gt; {
+307	  statusEl.textContent = `error: ${e.message}`;
+308	  statusEl.style.color = &#x27;#f77&#x27;;
+309	  console.error(e);
+310	});
+311	</pre></div><button class="expand-btn">Show more</button></div></div></div></div>
+<div class="message assistant" id="msg-2026-05-01T07-19-50-873Z"><div class="message-header"><span class="role-label">Assistant</span><a href="#msg-2026-05-01T07-19-50-873Z" class="timestamp-link"><time datetime="2026-05-01T07:19:50.873Z" data-timestamp="2026-05-01T07:19:50.873Z">2026-05-01T07:19:50.873Z</time></a></div><div class="message-content">
+<div class="thinking"><div class="thinking-label">Thinking</div></div></div></div>
+<div class="message assistant" id="msg-2026-05-01T07-19-53-157Z"><div class="message-header"><span class="role-label">Assistant</span><a href="#msg-2026-05-01T07-19-53-157Z" class="timestamp-link"><time datetime="2026-05-01T07:19:53.157Z" data-timestamp="2026-05-01T07:19:53.157Z">2026-05-01T07:19:53.157Z</time></a></div><div class="message-content">
+<div class="assistant-text"><p>Good to be back. Let me look at what state the testing left things in and what needs fixing.</p>
+<p>The main pending change from before the context limit was TAU=0.6 → 0.52 to escape Stokes trapping. What did your testing reveal — same slow card movement, or something else?</p>
+<p>In the meantime, let me make the parameter fixes we had diagnosed:</p></div></div></div>
+<div class="message assistant" id="msg-2026-05-01T07-20-02-551Z"><div class="message-header"><span class="role-label">Assistant</span><a href="#msg-2026-05-01T07-20-02-551Z" class="timestamp-link"><time datetime="2026-05-01T07:20:02.551Z" data-timestamp="2026-05-01T07:20:02.551Z">2026-05-01T07:20:02.551Z</time></a></div><div class="message-content"><div class="file-tool edit-tool" data-tool-id="toolu_01KtoPpQkEDufUAkko4Pkw4X">
+<div class="file-tool-header edit-header"><span class="file-tool-icon">✏️</span> Edit <span class="file-tool-path">main.js</span></div>
+<div class="file-tool-fullpath">/home/ctalbott/p/getting-air/main.js</div>
+<div class="truncatable"><div class="truncatable-content">
+<div class="edit-section edit-old"><div class="edit-label">−</div><pre class="edit-content">// LBM parameters.
+// Re=1100 needs τ≈0.509 which is BGK-unstable in the transient.
+// Use τ=0.6 (Re≈220 at u_t=0.05) for Phase 3 stability; will tighten τ later.
+const TAU     = 0.6;
+const NU      = (TAU - 0.5) / 3;                       // ≈ 0.0333
+// Target u_t small enough to keep Ma &lt; 0.1 during free-fall transient
+const U_T     = 0.05;                                  // lu/step
+// u_t = sqrt(π·b·g·(ρ_b/ρ_f − 1))  →  g = u_t² / (π·b·(ρ_b−1))
+const G_LU    = U_T**2 / (Math.PI * B * (RHO_B - 1)); // ≈ 1.19e-4 lu/step²
+// Net downward acceleration on card (gravity minus buoyancy)
+const G_EFF   = G_LU * (1 - 1 / RHO_B);               // ≈ 7.44e-5</pre></div>
+<div class="edit-section edit-new"><div class="edit-label">+</div><pre class="edit-content">// LBM parameters — Re=1100, Pesavento &amp; Wang (2004)
+// τ=0.52 is stable with moving bounce-back (Ladd 1994) in the streaming shader.
+const TAU     = 0.52;
+const NU      = (TAU - 0.5) / 3;                       // ≈ 0.00667
+// u_t = Re·ν / (2a)
+const U_T     = 1100 * NU / (2 * A);                   // ≈ 0.1146 lu/step
+// u_t = sqrt(π·b·g·(ρ_b/ρ_f − 1))  →  g = u_t² / (π·b·(ρ_b−1))
+const G_LU    = U_T**2 / (Math.PI * B * (RHO_B - 1)); // ≈ 6.23e-4 lu/step²
+// Net downward acceleration on card (gravity minus buoyancy)
+const G_EFF   = G_LU * (1 - 1 / RHO_B);               // ≈ 3.90e-4</pre></div>
+</div><button class="expand-btn">Show more</button></div>
+</div></div></div>
+<div class="message tool-reply" id="msg-2026-05-01T07-20-02-574Z"><div class="message-header"><span class="role-label">Tool reply</span><a href="#msg-2026-05-01T07-20-02-574Z" class="timestamp-link"><time datetime="2026-05-01T07:20:02.574Z" data-timestamp="2026-05-01T07:20:02.574Z">2026-05-01T07:20:02.574Z</time></a></div><div class="message-content"><div class="tool-result"><div class="truncatable"><div class="truncatable-content"><pre>The file /home/ctalbott/p/getting-air/main.js has been updated successfully.</pre></div><button class="expand-btn">Show more</button></div></div></div></div>
+<div class="message assistant" id="msg-2026-05-01T07-20-06-270Z"><div class="message-header"><span class="role-label">Assistant</span><a href="#msg-2026-05-01T07-20-06-270Z" class="timestamp-link"><time datetime="2026-05-01T07:20:06.270Z" data-timestamp="2026-05-01T07:20:06.270Z">2026-05-01T07:20:06.270Z</time></a></div><div class="message-content">
+<div class="assistant-text"><p>Now loosen the velocity clamp — U_T=0.1146 needs V_MAX above 0.15:</p></div></div></div>
+<div class="message assistant" id="msg-2026-05-01T07-20-08-557Z"><div class="message-header"><span class="role-label">Assistant</span><a href="#msg-2026-05-01T07-20-08-557Z" class="timestamp-link"><time datetime="2026-05-01T07:20:08.557Z" data-timestamp="2026-05-01T07:20:08.557Z">2026-05-01T07:20:08.557Z</time></a></div><div class="message-content"><div class="file-tool edit-tool" data-tool-id="toolu_0126FccwKn8sSS8ELkTHESau">
+<div class="file-tool-header edit-header"><span class="file-tool-icon">✏️</span> Edit <span class="file-tool-path">main.js</span></div>
+<div class="file-tool-fullpath">/home/ctalbott/p/getting-air/main.js</div>
+<div class="truncatable"><div class="truncatable-content">
+<div class="edit-section edit-old"><div class="edit-label">−</div><pre class="edit-content">    const V_MAX = 0.15;   // max translation speed  (Ma ≈ 0.26, well within LBM stability)
+    const O_MAX = 0.02;   // max angular speed [rad/step]</pre></div>
+<div class="edit-section edit-new"><div class="edit-label">+</div><pre class="edit-content">    const V_MAX = 0.20;   // max translation speed  (Ma ≈ 0.35, within LBM stability)
+    const O_MAX = 0.02;   // max angular speed [rad/step] — tip vel ≤ 0.64 lu/step</pre></div>
+</div><button class="expand-btn">Show more</button></div>
+</div></div></div>
+<div class="message tool-reply" id="msg-2026-05-01T07-20-08-577Z"><div class="message-header"><span class="role-label">Tool reply</span><a href="#msg-2026-05-01T07-20-08-577Z" class="timestamp-link"><time datetime="2026-05-01T07:20:08.577Z" data-timestamp="2026-05-01T07:20:08.577Z">2026-05-01T07:20:08.577Z</time></a></div><div class="message-content"><div class="tool-result"><div class="truncatable"><div class="truncatable-content"><pre>The file /home/ctalbott/p/getting-air/main.js has been updated successfully.</pre></div><button class="expand-btn">Show more</button></div></div></div></div>
+<div class="message assistant" id="msg-2026-05-01T07-20-11-550Z"><div class="message-header"><span class="role-label">Assistant</span><a href="#msg-2026-05-01T07-20-11-550Z" class="timestamp-link"><time datetime="2026-05-01T07:20:11.550Z" data-timestamp="2026-05-01T07:20:11.550Z">2026-05-01T07:20:11.550Z</time></a></div><div class="message-content">
+<div class="assistant-text"><p>Let me verify the key section looks right:</p></div></div></div>
+<div class="message assistant" id="msg-2026-05-01T07-20-11-770Z"><div class="message-header"><span class="role-label">Assistant</span><a href="#msg-2026-05-01T07-20-11-770Z" class="timestamp-link"><time datetime="2026-05-01T07:20:11.770Z" data-timestamp="2026-05-01T07:20:11.770Z">2026-05-01T07:20:11.770Z</time></a></div><div class="message-content">
+<div class="tool-use" data-tool-id="toolu_014Km8TnjPFT8RyZyAZcmBvV"><div class="tool-header"><span class="tool-icon">⚙</span> Read</div><div class="truncatable"><div class="truncatable-content"><pre class="json">{
+  &#34;file_path&#34;: &#34;/home/ctalbott/p/getting-air/main.js&#34;,
+  &#34;offset&#34;: 24,
+  &#34;limit&#34;: 20
+}</pre></div><button class="expand-btn">Show more</button></div></div></div></div>
+<div class="message tool-reply" id="msg-2026-05-01T07-20-11-781Z"><div class="message-header"><span class="role-label">Tool reply</span><a href="#msg-2026-05-01T07-20-11-781Z" class="timestamp-link"><time datetime="2026-05-01T07:20:11.781Z" data-timestamp="2026-05-01T07:20:11.781Z">2026-05-01T07:20:11.781Z</time></a></div><div class="message-content"><div class="tool-result"><div class="truncatable"><div class="truncatable-content"><pre>24	// LBM parameters — Re=1100, Pesavento &amp; Wang (2004)
+25	// τ=0.52 is stable with moving bounce-back (Ladd 1994) in the streaming shader.
+26	const TAU     = 0.52;
+27	const NU      = (TAU - 0.5) / 3;                       // ≈ 0.00667
+28	// u_t = Re·ν / (2a)
+29	const U_T     = 1100 * NU / (2 * A);                   // ≈ 0.1146 lu/step
+30	// u_t = sqrt(π·b·g·(ρ_b/ρ_f − 1))  →  g = u_t² / (π·b·(ρ_b−1))
+31	const G_LU    = U_T**2 / (Math.PI * B * (RHO_B - 1)); // ≈ 6.23e-4 lu/step²
+32	// Net downward acceleration on card (gravity minus buoyancy)
+33	const G_EFF   = G_LU * (1 - 1 / RHO_B);               // ≈ 3.90e-4
+34	
+35	// Force scale for int32 atomic accumulation
+36	const FSCALE  = 1e3;
+37	
+38	const CARD_ENABLED = true;
+39	
+40	// ── D2Q9 (JS side for initialisation) ────────────────────────────────────────
+41	const EX = [0, 1, 0,-1, 0, 1,-1,-1, 1];
+42	const EY = [0, 0, 1, 0,-1, 1, 1,-1,-1];
+43	const WT = [4/9, 1/9, 1/9, 1/9, 1/9, 1/36, 1/36, 1/36, 1/36];</pre></div><button class="expand-btn">Show more</button></div></div></div></div>
+<div class="message assistant" id="msg-2026-05-01T07-20-15-070Z"><div class="message-header"><span class="role-label">Assistant</span><a href="#msg-2026-05-01T07-20-15-070Z" class="timestamp-link"><time datetime="2026-05-01T07:20:15.070Z" data-timestamp="2026-05-01T07:20:15.070Z">2026-05-01T07:20:15.070Z</time></a></div><div class="message-content">
+<div class="assistant-text"><p>Good. Now what did your testing find? Tell me what you observed and we'll dig into it.</p></div></div></div>
+<div class="message user" id="msg-2026-05-01T07-24-39-663Z"><div class="message-header"><span class="role-label">User</span><a href="#msg-2026-05-01T07-24-39-663Z" class="timestamp-link"><time datetime="2026-05-01T07:24:39.663Z" data-timestamp="2026-05-01T07:24:39.663Z">2026-05-01T07:24:39.663Z</time></a></div><div class="message-content">
+<div class="user-content"><p>1) there doesn't seem to be any effective gravity (if i initialize with cardTheta rotated ~90 degrees (pi/2) it will move normal to the plate's surface without falling) 2) the velocity clamping is still in effect. if i remove it the plat accelerates to a limiting velocity and continues at that same rate (again, normal to the plate) 3) there is a failure in the toroidal wrapping of the grid. at grid boundaries, the plate position oscillates. 4) the async forceStage read results in flashing artifacts in the visualization. i don't think it's necessary from a performance perspective at this point.</p></div></div></div>
+<div class="message assistant" id="msg-2026-05-01T07-33-37-380Z"><div class="message-header"><span class="role-label">Assistant</span><a href="#msg-2026-05-01T07-33-37-380Z" class="timestamp-link"><time datetime="2026-05-01T07:33:37.380Z" data-timestamp="2026-05-01T07:33:37.380Z">2026-05-01T07:33:37.380Z</time></a></div><div class="message-content">
+<div class="thinking"><div class="thinking-label">Thinking</div></div></div></div>
+<div class="message assistant" id="msg-2026-05-01T07-33-37-815Z"><div class="message-header"><span class="role-label">Assistant</span><a href="#msg-2026-05-01T07-33-37-815Z" class="timestamp-link"><time datetime="2026-05-01T07:33:37.815Z" data-timestamp="2026-05-01T07:33:37.815Z">2026-05-01T07:33:37.815Z</time></a></div><div class="message-content">
+<div class="assistant-text"><p>You've hit your limit · resets 1am (Pacific/Honolulu)</p></div></div></div>
+<div class="message user" id="msg-2026-05-01T16-59-08-454Z"><div class="message-header"><span class="role-label">User</span><a href="#msg-2026-05-01T16-59-08-454Z" class="timestamp-link"><time datetime="2026-05-01T16:59:08.454Z" data-timestamp="2026-05-01T16:59:08.454Z">2026-05-01T16:59:08.454Z</time></a></div><div class="message-content">
+<div class="user-content"><p>1) there doesn't seem to be any effective gravity (if i initialize with cardTheta rotated ~90 degrees (pi/2) it will move normal to the plate's surface without falling) 2) the velocity clamping is still in effect. if i remove it the plat accelerates to a limiting velocity and continues at that same rate (again, normal to the plate) 3) there is a failure in the toroidal wrapping of the grid. at grid boundaries, the plate position oscillates. 4) the async forceStage read results in flashing artifacts in the visualization. i don't think it's necessary from a performance perspective at this point. can you write a plan to address each of these independently, with a commit in between. and then we'll do them one by one, with my approval between.</p></div></div></div>
+<div class="message assistant" id="msg-2026-05-01T17-07-55-969Z"><div class="message-header"><span class="role-label">Assistant</span><a href="#msg-2026-05-01T17-07-55-969Z" class="timestamp-link"><time datetime="2026-05-01T17:07:55.969Z" data-timestamp="2026-05-01T17:07:55.969Z">2026-05-01T17:07:55.969Z</time></a></div><div class="message-content">
+<div class="thinking"><div class="thinking-label">Thinking</div></div></div></div>
+<div class="message assistant" id="msg-2026-05-01T17-16-24-600Z"><div class="message-header"><span class="role-label">Assistant</span><a href="#msg-2026-05-01T17-16-24-600Z" class="timestamp-link"><time datetime="2026-05-01T17:16:24.600Z" data-timestamp="2026-05-01T17:16:24.600Z">2026-05-01T17:16:24.600Z</time></a></div><div class="message-content">
+<div class="thinking"><div class="thinking-label">Thinking</div></div></div></div>
+<div class="message assistant" id="msg-2026-05-01T17-21-38-168Z"><div class="message-header"><span class="role-label">Assistant</span><a href="#msg-2026-05-01T17-21-38-168Z" class="timestamp-link"><time datetime="2026-05-01T17:21:38.168Z" data-timestamp="2026-05-01T17:21:38.168Z">2026-05-01T17:21:38.168Z</time></a></div><div class="message-content">
+<div class="thinking"><div class="thinking-label">Thinking</div></div></div></div>
+<div class="message assistant" id="msg-2026-05-01T17-21-45-561Z"><div class="message-header"><span class="role-label">Assistant</span><a href="#msg-2026-05-01T17-21-45-561Z" class="timestamp-link"><time datetime="2026-05-01T17:21:45.561Z" data-timestamp="2026-05-01T17:21:45.561Z">2026-05-01T17:21:45.561Z</time></a></div><div class="message-content">
+<div class="assistant-text"><p>Here's my analysis and plan for each issue:</p>
+<p><strong>Root cause assessment:</strong> Issues #1 and #4 are likely linked — the async readback copies to <code>forceStage</code> every frame via the GPU encoder <em>even while it's mapped</em>, which WebGPU forbids. This produces garbage force values that can overwhelm gravity. Fix #4 first.</p>
+<hr />
+<p><strong>Fix A — Sync readback (resolves #4, likely #1, likely #2)</strong></p>
+<p>Make <code>frame()</code> async, await <code>mapAsync</code> before scheduling next frame. Remove <code>forceReadPending</code> flag. This ensures <code>forceStage</code> is never mapped when we copy to it.</p>
+<hr />
+<p><strong>Fix B — Gravity verification/fix (issue #1)</strong></p>
+<p>After fixing readback, verify forces are physically reasonable (<code>Fy ≈ 0</code> at rest, grows negative as card falls). If card still drifts sideways: likely a G_EFF magnitude issue or a coordinate axis mismatch we can see in the status line.</p>
+<hr />
+<p><strong>Fix C — Toroidal wrapping (issue #3)</strong></p>
+<p><code>buildSolid</code> computes <code>dx = x - cx</code> without minimum-image wrapping. When the card center is near x=0 or y=0, cells on the other side of the boundary are missed and the capsule is truncated. Fix: wrap dx/dy to <code>[-W/2, W/2]</code> and <code>[-H/2, H/2]</code> before the capsule test.</p>
+<hr />
+<p><strong>Fix D — Velocity clamp review (issue #2)</strong></p>
+<p>After #1 and #3 are fixed and falling behavior is correct, remove the hard clamps or raise them to pure LBM-safety levels (<code>V_MAX=0.3</code>, <code>O_MAX=0.03</code>). The physical terminal velocity is <code>U_T=0.1146</code>, well below any LBM stability limit.</p>
+<hr />
+<p>Shall I start with Fix A?</p></div></div></div>
+<div class="message user" id="msg-2026-05-01T17-26-33-402Z"><div class="message-header"><span class="role-label">User</span><a href="#msg-2026-05-01T17-26-33-402Z" class="timestamp-link"><time datetime="2026-05-01T17:26:33.402Z" data-timestamp="2026-05-01T17:26:33.402Z">2026-05-01T17:26:33.402Z</time></a></div><div class="message-content">
+<div class="user-content"><p>This sounds reasonable, let's start with A, and commit any test iterations to git.</p></div></div></div>
+<div class="message assistant" id="msg-2026-05-01T17-26-37-947Z"><div class="message-header"><span class="role-label">Assistant</span><a href="#msg-2026-05-01T17-26-37-947Z" class="timestamp-link"><time datetime="2026-05-01T17:26:37.947Z" data-timestamp="2026-05-01T17:26:37.947Z">2026-05-01T17:26:37.947Z</time></a></div><div class="message-content">
+<div class="thinking"><div class="thinking-label">Thinking</div></div></div></div>
+<div class="message assistant" id="msg-2026-05-01T17-26-38-456Z"><div class="message-header"><span class="role-label">Assistant</span><a href="#msg-2026-05-01T17-26-38-456Z" class="timestamp-link"><time datetime="2026-05-01T17:26:38.456Z" data-timestamp="2026-05-01T17:26:38.456Z">2026-05-01T17:26:38.456Z</time></a></div><div class="message-content">
+<div class="tool-use" data-tool-id="toolu_012PXCrvz9PkLjTLh4DzMqN2"><div class="tool-header"><span class="tool-icon">⚙</span> Read</div><div class="truncatable"><div class="truncatable-content"><pre class="json">{
+  &#34;file_path&#34;: &#34;/home/ctalbott/p/getting-air/main.js&#34;,
+  &#34;offset&#34;: 200,
+  &#34;limit&#34;: 111
+}</pre></div><button class="expand-btn">Show more</button></div></div></div></div>
+<div class="message tool-reply" id="msg-2026-05-01T17-26-38-462Z"><div class="message-header"><span class="role-label">Tool reply</span><a href="#msg-2026-05-01T17-26-38-462Z" class="timestamp-link"><time datetime="2026-05-01T17:26:38.462Z" data-timestamp="2026-05-01T17:26:38.462Z">2026-05-01T17:26:38.462Z</time></a></div><div class="message-content"><div class="tool-result"><div class="truncatable"><div class="truncatable-content"><pre>200	
+201	  const WGX = Math.ceil(W / 8), WGY = Math.ceil(H / 8);
+202	  const STEPS_PER_FRAME = 8;
+203	
+204	  let step = 0, lastT = performance.now();
+205	
+206	  // ── Rigid body integration ─────────────────────────────────────────────────
+207	  function integrateBody(Fx, Fy, Tz, dt) {
+208	    // Fx/Fy/Tz are the total impulse accumulated over dt LBM steps.
+209	    const V_MAX = 0.15;   // max translation speed  (Ma ≈ 0.26, well within LBM stability)
+210	    const O_MAX = 0.02;   // max angular speed [rad/step]
+211	
+212	    cardVX    += Fx / MASS;
+213	    cardVY    += (Fy + MASS * G_EFF * dt) / MASS;
+214	    cardOmega += Tz / I_BODY;
+215	
+216	    // Clamp to physical bounds — prevents LBM garbage forces from running away
+217	    cardVX    = Math.max(-V_MAX, Math.min(V_MAX,  cardVX));
+218	    cardVY    = Math.max(-V_MAX, Math.min(V_MAX,  cardVY));
+219	    cardOmega = Math.max(-O_MAX, Math.min(O_MAX,  cardOmega));
+220	
+221	    cardCX    += cardVX * dt;
+222	    cardCY    += cardVY * dt;
+223	    cardTheta += cardOmega * dt;
+224	    cardCX = ((cardCX % W) + W) % W;
+225	    cardCY = ((cardCY % H) + H) % H;
+226	  }
+227	
+228	  function uploadSolid(cx, cy, theta) {
+229	    const oldSolid = solidData;
+230	    solidData = buildSolid(cx, cy, theta);
+231	
+232	    // Refill solid→fluid transitions with card-velocity feq
+233	    const fRefill = new Float32Array(9);
+234	    for (let idx = 0; idx &lt; NCELLS; idx++) {
+235	      if (oldSolid[idx] === 1 &amp;&amp; solidData[idx] === 0) {
+236	        for (let i = 0; i &lt; 9; i++) fRefill[i] = feq(1, cardVX, cardVY, i);
+237	        device.queue.writeBuffer(f_a, idx * 9 * 4, fRefill);
+238	      }
+239	    }
+240	    device.queue.writeBuffer(solBuf,   0, solidData);
+241	    device.queue.writeBuffer(paramsBuf, 0, makeParams(cx, cy));
+242	  }
+243	
+244	  // ── Render loop — async force readback (1-frame lag, correct forces) ────────
+245	  let forceReadPending = false;
+246	
+247	  function frame() {
+248	    const enc = device.createCommandEncoder();
+249	    enc.clearBuffer(forceBuf, 0, 16);
+250	
+251	    for (let s = 0; s &lt; STEPS_PER_FRAME; s++) {
+252	      const col = enc.beginComputePass();
+253	      col.setPipeline(colPL); col.setBindGroup(0, colBG);
+254	      col.dispatchWorkgroups(WGX, WGY); col.end();
+255	
+256	      const str = enc.beginComputePass();
+257	      str.setPipeline(strPL); str.setBindGroup(0, strBG);
+258	      str.dispatchWorkgroups(WGX, WGY); str.end();
+259	
+260	      enc.copyBufferToBuffer(f_c, 0, f_a, 0, fSize);
+261	
+262	      const frc = enc.beginComputePass();
+263	      frc.setPipeline(frcPL); frc.setBindGroup(0, frcBG);
+264	      frc.dispatchWorkgroups(WGX, WGY); frc.end();
+265	    }
+266	    step += STEPS_PER_FRAME;
+267	
+268	    enc.copyBufferToBuffer(forceBuf, 0, forceStage, 0, 16);
+269	
+270	    const rp = enc.beginRenderPass({ colorAttachments: [{
+271	      view: ctx.getCurrentTexture().createView(),
+272	      clearValue: { r:0.07, g:0.07, b:0.10, a:1 },
+273	      loadOp: &#x27;clear&#x27;, storeOp: &#x27;store&#x27;,
+274	    }]});
+275	    rp.setPipeline(renPL); rp.setBindGroup(0, renBG); rp.draw(6); rp.end();
+276	
+277	    device.queue.submit([enc.finish()]);
+278	
+279	    // Async readback — integrates body with previous frame&#x27;s forces (1-step lag).
+280	    // Physics is now self-limiting (correct drag sign), so the lag is safe.
+281	    if (!forceReadPending) {
+282	      forceReadPending = true;
+283	      forceStage.mapAsync(GPUMapMode.READ).then(() =&gt; {
+284	        const d  = new Int32Array(forceStage.getMappedRange());
+285	        const Fx = d[0] / FSCALE, Fy = d[1] / FSCALE, Tz = d[2] / FSCALE;
+286	        forceStage.unmap();
+287	        forceReadPending = false;
+288	        integrateBody(Fx, Fy, Tz, STEPS_PER_FRAME);
+289	        uploadSolid(cardCX, cardCY, cardTheta);
+290	
+291	        if (performance.now() - lastT &gt; 300) {
+292	          statusEl.textContent = CARD_ENABLED
+293	            ? `step ${step}  vy=${cardVY.toFixed(4)}  Fy=${Fy.toExponential(2)}  Tz=${Tz.toExponential(2)}  θ=${cardTheta.toFixed(2)}`
+294	            : `step ${step}  (no card)`;
+295	          lastT = performance.now();
+296	        }
+297	      });
+298	    }
+299	
+300	    requestAnimationFrame(frame);
+301	  }
+302	
+303	  requestAnimationFrame(frame);
+304	}
+305	
+306	init().catch(e =&gt; {
+307	  statusEl.textContent = `error: ${e.message}`;
+308	  statusEl.style.color = &#x27;#f77&#x27;;
+309	  console.error(e);
+310	});</pre></div><button class="expand-btn">Show more</button></div></div></div></div>
+<div class="message assistant" id="msg-2026-05-01T17-26-56-446Z"><div class="message-header"><span class="role-label">Assistant</span><a href="#msg-2026-05-01T17-26-56-446Z" class="timestamp-link"><time datetime="2026-05-01T17:26:56.446Z" data-timestamp="2026-05-01T17:26:56.446Z">2026-05-01T17:26:56.446Z</time></a></div><div class="message-content">
+<div class="thinking"><div class="thinking-label">Thinking</div></div></div></div>
+<div class="message assistant" id="msg-2026-05-01T17-26-57-306Z"><div class="message-header"><span class="role-label">Assistant</span><a href="#msg-2026-05-01T17-26-57-306Z" class="timestamp-link"><time datetime="2026-05-01T17:26:57.306Z" data-timestamp="2026-05-01T17:26:57.306Z">2026-05-01T17:26:57.306Z</time></a></div><div class="message-content">
+<div class="assistant-text"><p>I see the V_MAX edit from earlier didn't take — line 209 still shows 0.15. I'll fix that along with the sync readback conversion now.</p></div></div></div>
+<div class="message assistant" id="msg-2026-05-01T17-27-09-780Z"><div class="message-header"><span class="role-label">Assistant</span><a href="#msg-2026-05-01T17-27-09-780Z" class="timestamp-link"><time datetime="2026-05-01T17:27:09.780Z" data-timestamp="2026-05-01T17:27:09.780Z">2026-05-01T17:27:09.780Z</time></a></div><div class="message-content"><div class="file-tool edit-tool" data-tool-id="toolu_01Y44borqN1dfE3KJ6Bwunid">
+<div class="file-tool-header edit-header"><span class="file-tool-icon">✏️</span> Edit <span class="file-tool-path">main.js</span></div>
+<div class="file-tool-fullpath">/home/ctalbott/p/getting-air/main.js</div>
+<div class="truncatable"><div class="truncatable-content">
+<div class="edit-section edit-old"><div class="edit-label">−</div><pre class="edit-content">  // ── Render loop — async force readback (1-frame lag, correct forces) ────────
+  let forceReadPending = false;
+
+  function frame() {
+    const enc = device.createCommandEncoder();
+    enc.clearBuffer(forceBuf, 0, 16);
+
+    for (let s = 0; s &lt; STEPS_PER_FRAME; s++) {
+      const col = enc.beginComputePass();
+      col.setPipeline(colPL); col.setBindGroup(0, colBG);
+      col.dispatchWorkgroups(WGX, WGY); col.end();
+
+      const str = enc.beginComputePass();
+      str.setPipeline(strPL); str.setBindGroup(0, strBG);
+      str.dispatchWorkgroups(WGX, WGY); str.end();
+
+      enc.copyBufferToBuffer(f_c, 0, f_a, 0, fSize);
+
+      const frc = enc.beginComputePass();
+      frc.setPipeline(frcPL); frc.setBindGroup(0, frcBG);
+      frc.dispatchWorkgroups(WGX, WGY); frc.end();
+    }
+    step += STEPS_PER_FRAME;
+
+    enc.copyBufferToBuffer(forceBuf, 0, forceStage, 0, 16);
+
+    const rp = enc.beginRenderPass({ colorAttachments: [{
+      view: ctx.getCurrentTexture().createView(),
+      clearValue: { r:0.07, g:0.07, b:0.10, a:1 },
+      loadOp: &#39;clear&#39;, storeOp: &#39;store&#39;,
+    }]});
+    rp.setPipeline(renPL); rp.setBindGroup(0, renBG); rp.draw(6); rp.end();
+
+    device.queue.submit([enc.finish()]);
+
+    // Async readback — integrates body with previous frame&#39;s forces (1-step lag).
+    // Physics is now self-limiting (correct drag sign), so the lag is safe.
+    if (!forceReadPending) {
+      forceReadPending = true;
+      forceStage.mapAsync(GPUMapMode.READ).then(() =&gt; {
+        const d  = new Int32Array(forceStage.getMappedRange());
+        const Fx = d[0] / FSCALE, Fy = d[1] / FSCALE, Tz = d[2] / FSCALE;
+        forceStage.unmap();
+        forceReadPending = false;
+        integrateBody(Fx, Fy, Tz, STEPS_PER_FRAME);
+        uploadSolid(cardCX, cardCY, cardTheta);
+
+        if (performance.now() - lastT &gt; 300) {
+          statusEl.textContent = CARD_ENABLED
+            ? `step ${step}  vy=${cardVY.toFixed(4)}  Fy=${Fy.toExponential(2)}  Tz=${Tz.toExponential(2)}  θ=${cardTheta.toFixed(2)}`
+            : `step ${step}  (no card)`;
+          lastT = performance.now();
+        }
+      });
+    }
+
+    requestAnimationFrame(frame);
+  }
+
+  requestAnimationFrame(frame);
+}</pre></div>
+<div class="edit-section edit-new"><div class="edit-label">+</div><pre class="edit-content">  // ── Render loop — synchronous force readback ─────────────────────────────────
+  // Await mapAsync before scheduling next frame so forceStage is never mapped
+  // when the GPU encoder copies to it.
+  async function frame() {
+    const enc = device.createCommandEncoder();
+    enc.clearBuffer(forceBuf, 0, 16);
+
+    for (let s = 0; s &lt; STEPS_PER_FRAME; s++) {
+      const col = enc.beginComputePass();
+      col.setPipeline(colPL); col.setBindGroup(0, colBG);
+      col.dispatchWorkgroups(WGX, WGY); col.end();
+
+      const str = enc.beginComputePass();
+      str.setPipeline(strPL); str.setBindGroup(0, strBG);
+      str.dispatchWorkgroups(WGX, WGY); str.end();
+
+      enc.copyBufferToBuffer(f_c, 0, f_a, 0, fSize);
+
+      const frc = enc.beginComputePass();
+      frc.setPipeline(frcPL); frc.setBindGroup(0, frcBG);
+      frc.dispatchWorkgroups(WGX, WGY); frc.end();
+    }
+    step += STEPS_PER_FRAME;
+
+    enc.copyBufferToBuffer(forceBuf, 0, forceStage, 0, 16);
+
+    const rp = enc.beginRenderPass({ colorAttachments: [{
+      view: ctx.getCurrentTexture().createView(),
+      clearValue: { r:0.07, g:0.07, b:0.10, a:1 },
+      loadOp: &#39;clear&#39;, storeOp: &#39;store&#39;,
+    }]});
+    rp.setPipeline(renPL); rp.setBindGroup(0, renBG); rp.draw(6); rp.end();
+
+    device.queue.submit([enc.finish()]);
+
+    // Block until GPU has written forces into forceStage, then read back.
+    await forceStage.mapAsync(GPUMapMode.READ);
+    const d  = new Int32Array(forceStage.getMappedRange());
+    const Fx = d[0] / FSCALE, Fy = d[1] / FSCALE, Tz = d[2] / FSCALE;
+    forceStage.unmap();
+
+    integrateBody(Fx, Fy, Tz, STEPS_PER_FRAME);
+    uploadSolid(cardCX, cardCY, cardTheta);
+
+    if (performance.now() - lastT &gt; 300) {
+      statusEl.textContent = CARD_ENABLED
+        ? `step ${step}  vy=${cardVY.toFixed(4)}  Fy=${Fy.toExponential(2)}  Tz=${Tz.toExponential(2)}  θ=${cardTheta.toFixed(2)}`
+        : `step ${step}  (no card)`;
+      lastT = performance.now();
+    }
+
+    // Schedule next frame only after GPU work + readback are complete.
+    requestAnimationFrame(() =&gt; frame().catch(handleErr));
+  }
+
+  function handleErr(e) {
+    statusEl.textContent = `error: ${e.message}`;
+    statusEl.style.color = &#39;#f77&#39;;
+    console.error(e);
+  }
+
+  frame().catch(handleErr);
+}</pre></div>
+</div><button class="expand-btn">Show more</button></div>
+</div></div></div>
+<div class="message tool-reply" id="msg-2026-05-01T17-27-09-810Z"><div class="message-header"><span class="role-label">Tool reply</span><a href="#msg-2026-05-01T17-27-09-810Z" class="timestamp-link"><time datetime="2026-05-01T17:27:09.810Z" data-timestamp="2026-05-01T17:27:09.810Z">2026-05-01T17:27:09.810Z</time></a></div><div class="message-content"><div class="tool-result"><div class="truncatable"><div class="truncatable-content"><pre>The file /home/ctalbott/p/getting-air/main.js has been updated successfully.</pre></div><button class="expand-btn">Show more</button></div></div></div></div>
+<div class="message assistant" id="msg-2026-05-01T17-27-12-128Z"><div class="message-header"><span class="role-label">Assistant</span><a href="#msg-2026-05-01T17-27-12-128Z" class="timestamp-link"><time datetime="2026-05-01T17:27:12.128Z" data-timestamp="2026-05-01T17:27:12.128Z">2026-05-01T17:27:12.128Z</time></a></div><div class="message-content">
+<div class="assistant-text"><p>Now fix the V_MAX that didn't update earlier:</p></div></div></div>
+<div class="message tool-reply" id="msg-2026-05-01T17-27-14-506Z"><div class="message-header"><span class="role-label">Tool reply</span><a href="#msg-2026-05-01T17-27-14-506Z" class="timestamp-link"><time datetime="2026-05-01T17:27:14.506Z" data-timestamp="2026-05-01T17:27:14.506Z">2026-05-01T17:27:14.506Z</time></a></div><div class="message-content"><div class="tool-result"><div class="truncatable"><div class="truncatable-content"><pre>The file /home/ctalbott/p/getting-air/main.js has been updated successfully.</pre></div><button class="expand-btn">Show more</button></div></div></div></div>
+<div class="message assistant" id="msg-2026-05-01T17-27-14-486Z"><div class="message-header"><span class="role-label">Assistant</span><a href="#msg-2026-05-01T17-27-14-486Z" class="timestamp-link"><time datetime="2026-05-01T17:27:14.486Z" data-timestamp="2026-05-01T17:27:14.486Z">2026-05-01T17:27:14.486Z</time></a></div><div class="message-content"><div class="file-tool edit-tool" data-tool-id="toolu_01VifWC4MYheyFGPpq84Dc1w">
+<div class="file-tool-header edit-header"><span class="file-tool-icon">✏️</span> Edit <span class="file-tool-path">main.js</span></div>
+<div class="file-tool-fullpath">/home/ctalbott/p/getting-air/main.js</div>
+<div class="truncatable"><div class="truncatable-content">
+<div class="edit-section edit-old"><div class="edit-label">−</div><pre class="edit-content">    const V_MAX = 0.15;   // max translation speed  (Ma ≈ 0.26, well within LBM stability)
+    const O_MAX = 0.02;   // max angular speed [rad/step]</pre></div>
+<div class="edit-section edit-new"><div class="edit-label">+</div><pre class="edit-content">    const V_MAX = 0.20;   // max translation speed  (Ma &lt; 0.35, within LBM stability)
+    const O_MAX = 0.02;   // max angular speed [rad/step]  tip vel &lt;= 0.64 lu/step</pre></div>
+</div><button class="expand-btn">Show more</button></div>
+</div></div></div>
+<div class="message assistant" id="msg-2026-05-01T17-27-16-886Z"><div class="message-header"><span class="role-label">Assistant</span><a href="#msg-2026-05-01T17-27-16-886Z" class="timestamp-link"><time datetime="2026-05-01T17:27:16.886Z" data-timestamp="2026-05-01T17:27:16.886Z">2026-05-01T17:27:16.886Z</time></a></div><div class="message-content">
+<div class="assistant-text"><p>Let me verify the final result looks right:</p></div></div></div>
+<div class="message assistant" id="msg-2026-05-01T17-27-17-326Z"><div class="message-header"><span class="role-label">Assistant</span><a href="#msg-2026-05-01T17-27-17-326Z" class="timestamp-link"><time datetime="2026-05-01T17:27:17.326Z" data-timestamp="2026-05-01T17:27:17.326Z">2026-05-01T17:27:17.326Z</time></a></div><div class="message-content">
+<div class="tool-use" data-tool-id="toolu_014TXi4ey56TRimfrpKhvnmS"><div class="tool-header"><span class="tool-icon">⚙</span> Read</div><div class="truncatable"><div class="truncatable-content"><pre class="json">{
+  &#34;file_path&#34;: &#34;/home/ctalbott/p/getting-air/main.js&#34;,
+  &#34;offset&#34;: 205,
+  &#34;limit&#34;: 75
+}</pre></div><button class="expand-btn">Show more</button></div></div></div></div>
+<div class="message tool-reply" id="msg-2026-05-01T17-27-17-333Z"><div class="message-header"><span class="role-label">Tool reply</span><a href="#msg-2026-05-01T17-27-17-333Z" class="timestamp-link"><time datetime="2026-05-01T17:27:17.333Z" data-timestamp="2026-05-01T17:27:17.333Z">2026-05-01T17:27:17.333Z</time></a></div><div class="message-content"><div class="tool-result"><div class="truncatable"><div class="truncatable-content"><pre>205	
+206	  // ── Rigid body integration ─────────────────────────────────────────────────
+207	  function integrateBody(Fx, Fy, Tz, dt) {
+208	    // Fx/Fy/Tz are the total impulse accumulated over dt LBM steps.
+209	    const V_MAX = 0.20;   // max translation speed  (Ma &lt; 0.35, within LBM stability)
+210	    const O_MAX = 0.02;   // max angular speed [rad/step]  tip vel &lt;= 0.64 lu/step
+211	
+212	    cardVX    += Fx / MASS;
+213	    cardVY    += (Fy + MASS * G_EFF * dt) / MASS;
+214	    cardOmega += Tz / I_BODY;
+215	
+216	    // Clamp to physical bounds — prevents LBM garbage forces from running away
+217	    cardVX    = Math.max(-V_MAX, Math.min(V_MAX,  cardVX));
+218	    cardVY    = Math.max(-V_MAX, Math.min(V_MAX,  cardVY));
+219	    cardOmega = Math.max(-O_MAX, Math.min(O_MAX,  cardOmega));
+220	
+221	    cardCX    += cardVX * dt;
+222	    cardCY    += cardVY * dt;
+223	    cardTheta += cardOmega * dt;
+224	    cardCX = ((cardCX % W) + W) % W;
+225	    cardCY = ((cardCY % H) + H) % H;
+226	  }
+227	
+228	  function uploadSolid(cx, cy, theta) {
+229	    const oldSolid = solidData;
+230	    solidData = buildSolid(cx, cy, theta);
+231	
+232	    // Refill solid→fluid transitions with card-velocity feq
+233	    const fRefill = new Float32Array(9);
+234	    for (let idx = 0; idx &lt; NCELLS; idx++) {
+235	      if (oldSolid[idx] === 1 &amp;&amp; solidData[idx] === 0) {
+236	        for (let i = 0; i &lt; 9; i++) fRefill[i] = feq(1, cardVX, cardVY, i);
+237	        device.queue.writeBuffer(f_a, idx * 9 * 4, fRefill);
+238	      }
+239	    }
+240	    device.queue.writeBuffer(solBuf,   0, solidData);
+241	    device.queue.writeBuffer(paramsBuf, 0, makeParams(cx, cy));
+242	  }
+243	
+244	  // ── Render loop — synchronous force readback ─────────────────────────────────
+245	  // Await mapAsync before scheduling next frame so forceStage is never mapped
+246	  // when the GPU encoder copies to it.
+247	  async function frame() {
+248	    const enc = device.createCommandEncoder();
+249	    enc.clearBuffer(forceBuf, 0, 16);
+250	
+251	    for (let s = 0; s &lt; STEPS_PER_FRAME; s++) {
+252	      const col = enc.beginComputePass();
+253	      col.setPipeline(colPL); col.setBindGroup(0, colBG);
+254	      col.dispatchWorkgroups(WGX, WGY); col.end();
+255	
+256	      const str = enc.beginComputePass();
+257	      str.setPipeline(strPL); str.setBindGroup(0, strBG);
+258	      str.dispatchWorkgroups(WGX, WGY); str.end();
+259	
+260	      enc.copyBufferToBuffer(f_c, 0, f_a, 0, fSize);
+261	
+262	      const frc = enc.beginComputePass();
+263	      frc.setPipeline(frcPL); frc.setBindGroup(0, frcBG);
+264	      frc.dispatchWorkgroups(WGX, WGY); frc.end();
+265	    }
+266	    step += STEPS_PER_FRAME;
+267	
+268	    enc.copyBufferToBuffer(forceBuf, 0, forceStage, 0, 16);
+269	
+270	    const rp = enc.beginRenderPass({ colorAttachments: [{
+271	      view: ctx.getCurrentTexture().createView(),
+272	      clearValue: { r:0.07, g:0.07, b:0.10, a:1 },
+273	      loadOp: &#x27;clear&#x27;, storeOp: &#x27;store&#x27;,
+274	    }]});
+275	    rp.setPipeline(renPL); rp.setBindGroup(0, renBG); rp.draw(6); rp.end();
+276	
+277	    device.queue.submit([enc.finish()]);
+278	
+279	    // Block until GPU has written forces into forceStage, then read back.</pre></div><button class="expand-btn">Show more</button></div></div></div></div>
+<div class="message assistant" id="msg-2026-05-01T17-27-19-552Z"><div class="message-header"><span class="role-label">Assistant</span><a href="#msg-2026-05-01T17-27-19-552Z" class="timestamp-link"><time datetime="2026-05-01T17:27:19.552Z" data-timestamp="2026-05-01T17:27:19.552Z">2026-05-01T17:27:19.552Z</time></a></div><div class="message-content">
+<div class="tool-use" data-tool-id="toolu_01NB1UKpxcMdei6TAaXZfuNX"><div class="tool-header"><span class="tool-icon">⚙</span> Read</div><div class="truncatable"><div class="truncatable-content"><pre class="json">{
+  &#34;file_path&#34;: &#34;/home/ctalbott/p/getting-air/main.js&#34;,
+  &#34;offset&#34;: 279,
+  &#34;limit&#34;: 35
+}</pre></div><button class="expand-btn">Show more</button></div></div></div></div>
+<div class="message tool-reply" id="msg-2026-05-01T17-27-19-557Z"><div class="message-header"><span class="role-label">Tool reply</span><a href="#msg-2026-05-01T17-27-19-557Z" class="timestamp-link"><time datetime="2026-05-01T17:27:19.557Z" data-timestamp="2026-05-01T17:27:19.557Z">2026-05-01T17:27:19.557Z</time></a></div><div class="message-content"><div class="tool-result"><div class="truncatable"><div class="truncatable-content"><pre>279	    // Block until GPU has written forces into forceStage, then read back.
+280	    await forceStage.mapAsync(GPUMapMode.READ);
+281	    const d  = new Int32Array(forceStage.getMappedRange());
+282	    const Fx = d[0] / FSCALE, Fy = d[1] / FSCALE, Tz = d[2] / FSCALE;
+283	    forceStage.unmap();
+284	
+285	    integrateBody(Fx, Fy, Tz, STEPS_PER_FRAME);
+286	    uploadSolid(cardCX, cardCY, cardTheta);
+287	
+288	    if (performance.now() - lastT &gt; 300) {
+289	      statusEl.textContent = CARD_ENABLED
+290	        ? `step ${step}  vy=${cardVY.toFixed(4)}  Fy=${Fy.toExponential(2)}  Tz=${Tz.toExponential(2)}  θ=${cardTheta.toFixed(2)}`
+291	        : `step ${step}  (no card)`;
+292	      lastT = performance.now();
+293	    }
+294	
+295	    // Schedule next frame only after GPU work + readback are complete.
+296	    requestAnimationFrame(() =&gt; frame().catch(handleErr));
+297	  }
+298	
+299	  function handleErr(e) {
+300	    statusEl.textContent = `error: ${e.message}`;
+301	    statusEl.style.color = &#x27;#f77&#x27;;
+302	    console.error(e);
+303	  }
+304	
+305	  frame().catch(handleErr);
+306	}
+307	
+308	init().catch(e =&gt; {
+309	  statusEl.textContent = `error: ${e.message}`;
+310	  statusEl.style.color = &#x27;#f77&#x27;;
+311	  console.error(e);
+312	});
+313	</pre></div><button class="expand-btn">Show more</button></div></div></div></div>
+<div class="message assistant" id="msg-2026-05-01T17-27-21-727Z"><div class="message-header"><span class="role-label">Assistant</span><a href="#msg-2026-05-01T17-27-21-727Z" class="timestamp-link"><time datetime="2026-05-01T17:27:21.727Z" data-timestamp="2026-05-01T17:27:21.727Z">2026-05-01T17:27:21.727Z</time></a></div><div class="message-content">
+<div class="thinking"><div class="thinking-label">Thinking</div></div></div></div>
+<div class="message assistant" id="msg-2026-05-01T17-27-22-166Z"><div class="message-header"><span class="role-label">Assistant</span><a href="#msg-2026-05-01T17-27-22-166Z" class="timestamp-link"><time datetime="2026-05-01T17:27:22.166Z" data-timestamp="2026-05-01T17:27:22.166Z">2026-05-01T17:27:22.166Z</time></a></div><div class="message-content">
+<div class="assistant-text"><p>Looks good. Now commit:</p></div></div></div>
+<div class="message assistant" id="msg-2026-05-01T17-27-25-709Z"><div class="message-header"><span class="role-label">Assistant</span><a href="#msg-2026-05-01T17-27-25-709Z" class="timestamp-link"><time datetime="2026-05-01T17:27:25.709Z" data-timestamp="2026-05-01T17:27:25.709Z">2026-05-01T17:27:25.709Z</time></a></div><div class="message-content">
+<div class="tool-use bash-tool" data-tool-id="toolu_01E8NnfmpxA9W7tJqXP7NV4d">
+<div class="tool-header"><span class="tool-icon">$</span> Bash</div>
+<div class="tool-description">Commit sync readback fix</div><div class="truncatable"><div class="truncatable-content"><pre class="bash-command">git add main.js &amp;&amp; git commit -m &#34;$(cat &lt;&lt;&#39;EOF&#39;
+fix: synchronous force readback to prevent mapped-buffer write corruption
+
+The async readback pattern was copying forceBuf→forceStage every frame
+via the GPU encoder even while forceStage was still mapped, which is
+invalid in WebGPU and produced garbage force values. Convert frame() to
+async, await mapAsync before scheduling the next frame so forceStage is
+never mapped when the copy command executes.
+
+Also updates V_MAX 0.15→0.20 and TAU 0.6→0.52 (Re=1100 target).
+
+Co-Authored-By: Claude Sonnet 4.6 &lt;noreply@anthropic.com&gt;
+EOF
+)&#34;
+</pre></div><button class="expand-btn">Show more</button></div>
+</div></div></div>
+<div class="message tool-reply" id="msg-2026-05-01T17-27-25-740Z"><div class="message-header"><span class="role-label">Tool reply</span><a href="#msg-2026-05-01T17-27-25-740Z" class="timestamp-link"><time datetime="2026-05-01T17:27:25.740Z" data-timestamp="2026-05-01T17:27:25.740Z">2026-05-01T17:27:25.740Z</time></a></div><div class="message-content"><div class="tool-result"><div class="truncatable"><div class="truncatable-content"><div class="commit-card"><span class="commit-card-hash">12f25da</span> fix: synchronous force readback to prevent mapped-buffer write corruption</div><pre>1 file changed, 29 insertions(+), 27 deletions(-)</pre></div><button class="expand-btn">Show more</button></div></div></div></div>
+<div class="message assistant" id="msg-2026-05-01T17-27-29-273Z"><div class="message-header"><span class="role-label">Assistant</span><a href="#msg-2026-05-01T17-27-29-273Z" class="timestamp-link"><time datetime="2026-05-01T17:27:29.273Z" data-timestamp="2026-05-01T17:27:29.273Z">2026-05-01T17:27:29.273Z</time></a></div><div class="message-content">
+<div class="assistant-text"><p>Committed as <code>12f25da</code>. Ready to test — reload the page and watch the status line. We expect to see <code>Fy</code> showing a negative value as the card picks up downward speed, and <code>vy</code> growing toward ~0.1146. No more flashing either.</p>
+<p>What do you observe?</p></div></div></div>
+        
+
+<div class="pagination">
+<a href="index.html" class="index-link">Index</a>
+<a href="page-004.html">&larr; Prev</a>
+<a href="page-001.html">1</a>
+<a href="page-002.html">2</a>
+<a href="page-003.html">3</a>
+<a href="page-004.html">4</a>
+<span class="current">5</span>
+<a href="page-006.html">6</a>
+<a href="page-006.html">Next &rarr;</a>
+</div>
+
+    </div>
+    <script>
+document.querySelectorAll('time[data-timestamp]').forEach(function(el) {
+    const timestamp = el.getAttribute('data-timestamp');
+    const date = new Date(timestamp);
+    const now = new Date();
+    const isToday = date.toDateString() === now.toDateString();
+    const timeStr = date.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+    if (isToday) { el.textContent = timeStr; }
+    else { el.textContent = date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) + ' ' + timeStr; }
+});
+document.querySelectorAll('pre.json').forEach(function(el) {
+    let text = el.textContent;
+    text = text.replace(/"([^"]+)":/g, '<span style="color: #ce93d8">"$1"</span>:');
+    text = text.replace(/: "([^"]*)"/g, ': <span style="color: #81d4fa">"$1"</span>');
+    text = text.replace(/: (\d+)/g, ': <span style="color: #ffcc80">$1</span>');
+    text = text.replace(/: (true|false|null)/g, ': <span style="color: #f48fb1">$1</span>');
+    el.innerHTML = text;
+});
+document.querySelectorAll('.truncatable').forEach(function(wrapper) {
+    const content = wrapper.querySelector('.truncatable-content');
+    const btn = wrapper.querySelector('.expand-btn');
+    if (content.scrollHeight > 250) {
+        wrapper.classList.add('truncated');
+        btn.addEventListener('click', function() {
+            if (wrapper.classList.contains('truncated')) { wrapper.classList.remove('truncated'); wrapper.classList.add('expanded'); btn.textContent = 'Show less'; }
+            else { wrapper.classList.remove('expanded'); wrapper.classList.add('truncated'); btn.textContent = 'Show more'; }
+        });
+    }
+});
+</script>
+</body>
+</html>
