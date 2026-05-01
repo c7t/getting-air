@@ -206,8 +206,8 @@ async function init() {
   // ── Rigid body integration ─────────────────────────────────────────────────
   function integrateBody(Fx, Fy, Tz, dt) {
     // Fx/Fy/Tz are the total impulse accumulated over dt LBM steps.
-    const V_MAX = 0.15;   // max translation speed  (Ma ≈ 0.26, well within LBM stability)
-    const O_MAX = 0.02;   // max angular speed [rad/step]
+    const V_MAX = 0.20;   // max translation speed  (Ma < 0.35, within LBM stability)
+    const O_MAX = 0.02;   // max angular speed [rad/step]  tip vel <= 0.64 lu/step
 
     cardVX    += Fx / MASS;
     cardVY    += (Fy + MASS * G_EFF * dt) / MASS;
@@ -241,10 +241,10 @@ async function init() {
     device.queue.writeBuffer(paramsBuf, 0, makeParams(cx, cy));
   }
 
-  // ── Render loop — async force readback (1-frame lag, correct forces) ────────
-  let forceReadPending = false;
-
-  function frame() {
+  // ── Render loop — synchronous force readback ─────────────────────────────────
+  // Await mapAsync before scheduling next frame so forceStage is never mapped
+  // when the GPU encoder copies to it.
+  async function frame() {
     const enc = device.createCommandEncoder();
     enc.clearBuffer(forceBuf, 0, 16);
 
@@ -276,31 +276,33 @@ async function init() {
 
     device.queue.submit([enc.finish()]);
 
-    // Async readback — integrates body with previous frame's forces (1-step lag).
-    // Physics is now self-limiting (correct drag sign), so the lag is safe.
-    if (!forceReadPending) {
-      forceReadPending = true;
-      forceStage.mapAsync(GPUMapMode.READ).then(() => {
-        const d  = new Int32Array(forceStage.getMappedRange());
-        const Fx = d[0] / FSCALE, Fy = d[1] / FSCALE, Tz = d[2] / FSCALE;
-        forceStage.unmap();
-        forceReadPending = false;
-        integrateBody(Fx, Fy, Tz, STEPS_PER_FRAME);
-        uploadSolid(cardCX, cardCY, cardTheta);
+    // Block until GPU has written forces into forceStage, then read back.
+    await forceStage.mapAsync(GPUMapMode.READ);
+    const d  = new Int32Array(forceStage.getMappedRange());
+    const Fx = d[0] / FSCALE, Fy = d[1] / FSCALE, Tz = d[2] / FSCALE;
+    forceStage.unmap();
 
-        if (performance.now() - lastT > 300) {
-          statusEl.textContent = CARD_ENABLED
-            ? `step ${step}  vy=${cardVY.toFixed(4)}  Fy=${Fy.toExponential(2)}  Tz=${Tz.toExponential(2)}  θ=${cardTheta.toFixed(2)}`
-            : `step ${step}  (no card)`;
-          lastT = performance.now();
-        }
-      });
+    integrateBody(Fx, Fy, Tz, STEPS_PER_FRAME);
+    uploadSolid(cardCX, cardCY, cardTheta);
+
+    if (performance.now() - lastT > 300) {
+      statusEl.textContent = CARD_ENABLED
+        ? `step ${step}  vy=${cardVY.toFixed(4)}  Fy=${Fy.toExponential(2)}  Tz=${Tz.toExponential(2)}  θ=${cardTheta.toFixed(2)}`
+        : `step ${step}  (no card)`;
+      lastT = performance.now();
     }
 
-    requestAnimationFrame(frame);
+    // Schedule next frame only after GPU work + readback are complete.
+    requestAnimationFrame(() => frame().catch(handleErr));
   }
 
-  requestAnimationFrame(frame);
+  function handleErr(e) {
+    statusEl.textContent = `error: ${e.message}`;
+    statusEl.style.color = '#f77';
+    console.error(e);
+  }
+
+  frame().catch(handleErr);
 }
 
 init().catch(e => {
