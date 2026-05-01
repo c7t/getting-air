@@ -44,15 +44,13 @@ const wt  = array<f32,9>(
 fn is_solid(p: vec2<f32>, cx: f32, cy: f32, theta: f32, a: f32, b: f32) -> bool {
     let ca = cos(theta);
     let sa = sin(theta);
-    let half_len = a - b;
     var dx = p.x - cx;
     var dy = p.y - cy;
     dx -= f32(W) * round(dx / f32(W));
     dy -= f32(H) * round(dy / f32(H));
     let lx = dx * ca + dy * sa;
     let ly = -dx * sa + dy * ca;
-    let cap_dist = max(0.0, abs(lx) - half_len);
-    return (cap_dist * cap_dist + ly * ly) <= (b * b);
+    return (lx*lx)/(a*a) + (ly*ly)/(b*b) <= 1.0;
 }
 
 @compute @workgroup_size(8, 8)
