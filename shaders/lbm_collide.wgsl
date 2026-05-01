@@ -119,7 +119,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let Q = sqrt(2.0f * (Pxx*Pxx + Pyy*Pyy + 2.0f*Pxy*Pxy));
 
   // 3. Calculate Eddy Relaxation Time (Smagorinsky model)
-  let Cs = 0.16f;
+  let Cs = 0.4f;
   let tau0 = state.tau;
   // tau_total = tau0 + 0.5 * (sqrt(tau0^2 + (18*Cs^2 / cs2) * Q) - tau0)
   // With cs2 = 1/3, 18/cs2 = 54.
