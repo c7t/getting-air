@@ -29,8 +29,8 @@ struct CardState {
 @group(0) @binding(2) var<storage, read_write> f_col : array<f32>;
 @group(0) @binding(3) var<storage, read_write> vel   : array<f32>;
 
-const W   = 256u;
-const H   = 512u;
+const W   = 512u;
+const H   = 1024u;
 const CS2 = 0.33333333f;
 const CS4 = 0.11111111f;
 
