@@ -6,12 +6,20 @@ canvas.height = Math.round(canvas.clientHeight * dpr);
 
 const W = 256, H = 512, NCELLS = W * H;
 
+// ── Pesavento & Wang (2004) physical parameters ───────────────────────────────
+// Paper: "Falling Paper: Navigating the Trade-Off between Density and Aspect Ratio"
+// Semi-axes: a=32, b=4 [lu].  Aspect ratio e = b/a = 0.125.
 const A = 32, B = 4;
+
+// Dimensionless moment of inertia: I* = b(a²+b²)ρ_b / (2a³ρ_f)  = 0.17
+// → ρ_b/ρ_f = I* · 2a³ / (b·(a²+b²)) ≈ 2.678
 const I_STAR = 0.17;
 const RHO_B  = I_STAR * 2 * A**3 / (B * (A**2 + B**2));
 const MASS   = RHO_B * Math.PI * A * B;
 const I_BODY = RHO_B * Math.PI * A * B * (A**2 + B**2) / 4;
 
+// Target u_t small enough to keep Ma < 0.1 during free-fall transient.
+// Target Re = 1100 requires τ ≈ 0.509; we start at 0.52 for stability.
 const TAU     = 0.52;
 const U_T     = 0.05;
 const G_LU    = U_T**2 / (Math.PI * B * (RHO_B - 1));
@@ -38,7 +46,7 @@ function initF() {
 }
 
 async function loadShader(device, path) {
-  const r = await fetch(path);
+  const r = await fetch(path + '?v=' + Date.now());
   if (!r.ok) throw new Error(`failed to load ${path}`);
   const code = await r.text();
   return device.createShaderModule({ code });
@@ -47,7 +55,7 @@ async function loadShader(device, path) {
 function handleErr(e) {
   statusEl.textContent = `error: ${e.message}`;
   statusEl.style.color = '#f77';
-  console.error(e);
+  console.error('WebGPU Error:', e);
 }
 
 async function init() {
@@ -55,6 +63,9 @@ async function init() {
   const adapter = await navigator.gpu.requestAdapter();
   if (!adapter) { statusEl.textContent = 'No adapter'; return; }
   const device = await adapter.requestDevice();
+  
+  device.pushErrorScope('validation');
+
   const ctx = canvas.getContext('webgpu');
   const fmt = navigator.gpu.getPreferredCanvasFormat();
   ctx.configure({ device, format: fmt, alphaMode: 'opaque' });
@@ -79,7 +90,7 @@ async function init() {
     A, B,
     0.3, 0.05,       // v_max, o_max
     W/2, H/4, 0.2,   // cx_old, cy_old, th_old
-    TAU              // tau (reusing _p0)
+    TAU              // tau
   ]);
   device.queue.writeBuffer(cardStateBuf, 0, cardInit);
   device.queue.writeBuffer(f_a, 0, initF());
@@ -92,39 +103,35 @@ async function init() {
     loadShader(device, 'shaders/render.wgsl'),
   ]);
 
-  const mkBGL = (entries) => device.createBindGroupLayout({ entries });
-  const mkBG  = (layout, entries) => device.createBindGroup({ layout, entries });
-  
-  const colBGL = mkBGL([
+  const colBGL = device.createBindGroupLayout({ label: 'colBGL', entries: [
     { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
     { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }
-  ]);
-  const strBGL = mkBGL([
+  ]});
+  const strBGL = device.createBindGroupLayout({ label: 'strBGL', entries: [
     { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }
-  ]);
-  const frcBGL = mkBGL([
+  ]});
+  const frcBGL = device.createBindGroupLayout({ label: 'frcBGL', entries: [
     { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }
-  ]);
-  const phyBGL = mkBGL([
+  ]});
+  const phyBGL = device.createBindGroupLayout({ label: 'phyBGL', entries: [
     { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
     { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }
-  ]);
-  const renBGL = mkBGL([
+  ]});
+  const renBGL = device.createBindGroupLayout({ label: 'renBGL', entries: [
     { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
     { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } }
-  ]);
+  ]});
 
   const colPL = device.createComputePipeline({ layout: device.createPipelineLayout({ bindGroupLayouts: [colBGL] }), compute: { module: colSM, entryPoint: 'main' } });
   const strPL = device.createComputePipeline({ layout: device.createPipelineLayout({ bindGroupLayouts: [strBGL] }), compute: { module: strSM, entryPoint: 'main' } });
   const frcPL = device.createComputePipeline({ layout: device.createPipelineLayout({ bindGroupLayouts: [frcBGL] }), compute: { module: frcSM, entryPoint: 'main' } });
   const phyPL = device.createComputePipeline({ layout: device.createPipelineLayout({ bindGroupLayouts: [phyBGL] }), compute: { module: phySM, entryPoint: 'main' } });
-
   const renPL = device.createRenderPipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [renBGL] }),
     vertex: { module: renSM, entryPoint: 'vs_main' },
@@ -132,41 +139,48 @@ async function init() {
     primitive: { topology: 'triangle-list' },
   });
 
-  const colBG = mkBG(colBGL, [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_a } }, { binding: 2, resource: { buffer: f_b } }, { binding: 3, resource: { buffer: velBuf } }]);
-  const strBG = mkBG(strBGL, [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_b } }, { binding: 2, resource: { buffer: f_c } }]);
-  const frcBG = mkBG(frcBGL, [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_b } }, { binding: 2, resource: { buffer: forceBuf } }]);
-  const phyBG = mkBG(phyBGL, [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: forceBuf } }]);
-  const renBG = mkBG(renBGL, [{ binding: 0, resource: { buffer: velBuf } }, { binding: 1, resource: { buffer: cardStateBuf } }]);
+  const colBG = device.createBindGroup({ layout: colBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_a } }, { binding: 2, resource: { buffer: f_b } }, { binding: 3, resource: { buffer: velBuf } }]});
+  const strBG = device.createBindGroup({ layout: strBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_b } }, { binding: 2, resource: { buffer: f_c } }]});
+  const frcBG = device.createBindGroup({ layout: frcBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_b } }, { binding: 2, resource: { buffer: forceBuf } }]});
+  const phyBG = device.createBindGroup({ layout: phyBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: forceBuf } }]});
+  const renBG = device.createBindGroup({ layout: renBGL, entries: [{ binding: 0, resource: { buffer: velBuf } }, { binding: 1, resource: { buffer: cardStateBuf } }]});
+
+  const error = await device.popErrorScope();
+  if (error) { handleErr(error); return; }
 
   const WGX = Math.ceil(W / 8), WGY = Math.ceil(H / 8);
   const STEPS_PER_FRAME = 8;
   let step = 0, lastT = performance.now();
 
   async function frame() {
-    const enc = device.createCommandEncoder();
-    for (let s = 0; s < STEPS_PER_FRAME; s++) {
-      const col = enc.beginComputePass(); col.setPipeline(colPL); col.setBindGroup(0, colBG); col.dispatchWorkgroups(WGX, WGY); col.end();
-      const str = enc.beginComputePass(); str.setPipeline(strPL); str.setBindGroup(0, strBG); str.dispatchWorkgroups(WGX, WGY); str.end();
-      enc.copyBufferToBuffer(f_c, 0, f_a, 0, fSize);
-      const frc = enc.beginComputePass(); frc.setPipeline(frcPL); frc.setBindGroup(0, frcBG); frc.dispatchWorkgroups(WGX, WGY); frc.end();
-      const phy = enc.beginComputePass(); phy.setPipeline(phyPL); phy.setBindGroup(0, phyBG); phy.dispatchWorkgroups(1); phy.end();
-    }
-    step += STEPS_PER_FRAME;
+    try {
+      const enc = device.createCommandEncoder();
+      for (let s = 0; s < STEPS_PER_FRAME; s++) {
+        const col = enc.beginComputePass(); col.setPipeline(colPL); col.setBindGroup(0, colBG); col.dispatchWorkgroups(WGX, WGY); col.end();
+        const str = enc.beginComputePass(); str.setPipeline(strPL); str.setBindGroup(0, strBG); str.dispatchWorkgroups(WGX, WGY); str.end();
+        enc.copyBufferToBuffer(f_c, 0, f_a, 0, fSize);
+        const frc = enc.beginComputePass(); frc.setPipeline(frcPL); frc.setBindGroup(0, frcBG); frc.dispatchWorkgroups(WGX, WGY); frc.end();
+        const phy = enc.beginComputePass(); phy.setPipeline(phyPL); phy.setBindGroup(0, phyBG); phy.dispatchWorkgroups(1); phy.end();
+      }
+      step += STEPS_PER_FRAME;
 
-    const rp = enc.beginRenderPass({ colorAttachments: [{ view: ctx.getCurrentTexture().createView(), clearValue: { r:0.07, g:0.07, b:0.1, a:1 }, loadOp: 'clear', storeOp: 'store' }]});
-    rp.setPipeline(renPL); rp.setBindGroup(0, renBG); rp.draw(6); rp.end();
-    
-    enc.copyBufferToBuffer(cardStateBuf, 0, cardStateStage, 0, 80);
-    device.queue.submit([enc.finish()]);
+      const rp = enc.beginRenderPass({ colorAttachments: [{ view: ctx.getCurrentTexture().createView(), clearValue: { r:0.07, g:0.07, b:0.1, a:1 }, loadOp: 'clear', storeOp: 'store' }]});
+      rp.setPipeline(renPL); rp.setBindGroup(0, renBG); rp.draw(6); rp.end();
+      
+      enc.copyBufferToBuffer(cardStateBuf, 0, cardStateStage, 0, 80);
+      device.queue.submit([enc.finish()]);
 
-    if (performance.now() - lastT > 300) {
-      await cardStateStage.mapAsync(GPUMapMode.READ);
-      const d = new Float32Array(cardStateStage.getMappedRange());
-      statusEl.textContent = `step ${step}  vy=${d[4].toFixed(4)}  Fy=${d[7].toExponential(2)}  θ=${d[2].toFixed(2)}`;
-      cardStateStage.unmap();
-      lastT = performance.now();
+      if (performance.now() - lastT > 300) {
+        await cardStateStage.mapAsync(GPUMapMode.READ);
+        const d = new Float32Array(cardStateStage.getMappedRange());
+        statusEl.textContent = `step ${step}  vy=${d[4].toFixed(4)}  Fy=${d[7].toExponential(2)}  θ=${d[2].toFixed(2)}`;
+        cardStateStage.unmap();
+        lastT = performance.now();
+      }
+      requestAnimationFrame(() => frame().catch(handleErr));
+    } catch (e) {
+      handleErr(e);
     }
-    requestAnimationFrame(() => frame().catch(handleErr));
   }
   frame().catch(handleErr);
 }
