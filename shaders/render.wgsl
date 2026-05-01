@@ -1,4 +1,4 @@
-// Visualization shader with analytical solid mask and vorticity calculation.
+// Visualization shader with smooth analytical mask and vorticity calculation.
 
 struct CardState {
   cx     : f32,
@@ -21,6 +21,8 @@ struct CardState {
   cy_old : f32,
   th_old : f32,
   tau    : f32,
+  y_total: f32,
+  x_total: f32,
 }
 
 @group(0) @binding(0) var<storage, read> vel   : array<f32>;
@@ -46,16 +48,22 @@ fn vs_main(@builtin(vertex_index) vi : u32) -> VSOut {
   return out;
 }
 
-fn is_solid(p: vec2<f32>, cx: f32, cy: f32, theta: f32, a: f32, b: f32) -> bool {
-    let ca = cos(theta);
-    let sa = sin(theta);
-    var dx = p.x - cx;
-    var dy = p.y - cy;
+fn get_phi(p: vec2<f32>, state: CardState) -> f32 {
+    let ca = cos(state.theta);
+    let sa = sin(state.theta);
+    var dx = p.x - state.cx;
+    var dy = p.y - state.cy;
     dx -= W * round(dx / W);
     dy -= H * round(dy / H);
     let lx = dx * ca + dy * sa;
     let ly = -dx * sa + dy * ca;
-    return (lx*lx)/(a*a) + (ly*ly)/(b*b) <= 1.0;
+    let d = sqrt((lx*lx)/(state.a*state.a) + (ly*ly)/(state.b*state.b)) - 1.0;
+    return d * state.b; 
+}
+
+fn get_chi(phi: f32) -> f32 {
+    let epsilon = 1.5f;
+    return 0.5f * (1.0f - tanh(phi / epsilon));
 }
 
 fn get_uy(x: i32, y: i32) -> f32 {
@@ -75,9 +83,7 @@ fn fs_main(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> {
   let fx = uv.x * W; let fy = (1.0 - uv.y) * H;
   let ix = i32(fx); let iy = i32(fy);
   
-  if (is_solid(vec2(fx, fy), state.cx, state.cy, state.theta, state.a, state.b)) {
-    return vec4(1.0, 0.8, 0.4, 1.0);
-  }
+  let chi = get_chi(get_phi(vec2(fx, fy), state));
 
   // Discrete vorticity: du_y/dx - du_x/dy
   let omega = (get_uy(ix + 1, iy) - get_uy(ix - 1, iy)) * 0.5f
@@ -91,6 +97,10 @@ fn fs_main(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> {
   } else {
     c = mix(vec3(0.05, 0.05, 0.1), vec3(0.1, 0.4, 0.9), -val);
   }
+  
+  // Blend with solid color
+  let solid_color = vec3(1.0, 0.8, 0.4);
+  c = mix(c, solid_color, chi);
   
   return vec4(c, 1.0);
 }

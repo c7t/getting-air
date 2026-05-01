@@ -1,5 +1,4 @@
-// D2Q9 Regularized BGK collision with GPU-side solid refilling.
-// Uses an analytical distance function to determine the solid mask.
+// Volume Penalization IB-LBM (Direct Forcing) with Guo's scheme.
 
 struct CardState {
   cx     : f32,
@@ -22,6 +21,8 @@ struct CardState {
   cy_old : f32,
   th_old : f32,
   tau    : f32,
+  y_total: f32,
+  x_total: f32,
 }
 
 @group(0) @binding(0) var<storage, read>       state : CardState;
@@ -31,8 +32,6 @@ struct CardState {
 
 const W   = 512u;
 const H   = 1024u;
-const CS2 = 0.33333333f;
-const CS4 = 0.11111111f;
 
 const ex = array<i32,9>( 0, 1, 0,-1, 0, 1,-1,-1, 1);
 const ey = array<i32,9>( 0, 0, 1, 0,-1, 1, 1,-1,-1);
@@ -42,16 +41,24 @@ const wt = array<f32,9>(
   0.02777778f, 0.02777778f, 0.02777778f, 0.02777778f
 );
 
-fn is_solid(p: vec2<f32>, cx: f32, cy: f32, theta: f32, a: f32, b: f32) -> bool {
-    let ca = cos(theta);
-    let sa = sin(theta);
-    var dx = p.x - cx;
-    var dy = p.y - cy;
+fn get_phi(p: vec2<f32>, state: CardState) -> f32 {
+    let ca = cos(state.theta);
+    let sa = sin(state.theta);
+    var dx = p.x - state.cx;
+    var dy = p.y - state.cy;
     dx -= f32(W) * round(dx / f32(W));
     dy -= f32(H) * round(dy / f32(H));
     let lx = dx * ca + dy * sa;
     let ly = -dx * sa + dy * ca;
-    return (lx*lx)/(a*a) + (ly*ly)/(b*b) <= 1.0;
+    
+    // Algebraic distance approximation for ellipse
+    let d = sqrt((lx*lx)/(state.a*state.a) + (ly*ly)/(state.b*state.b)) - 1.0;
+    return d * state.b; 
+}
+
+fn get_chi(phi: f32) -> f32 {
+    let epsilon = 1.5f;
+    return 0.5f * (1.0f - tanh(phi / epsilon));
 }
 
 @compute @workgroup_size(8, 8)
@@ -63,73 +70,51 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let base = cell * 9u;
   let p = vec2<f32>(f32(x), f32(y));
 
-  let solid_now = is_solid(p, state.cx, state.cy, state.theta, state.a, state.b);
-  let solid_old = is_solid(p, state.cx_old, state.cy_old, state.th_old, state.a, state.b);
-
-  if (solid_now) { return; }
-
-  // Refilling: if was solid and is now fluid, initialize with LOCAL card velocity
-  if (solid_old) {
-    // Local velocity at point p: v_cm + omega x (p - cx)
-    var rx = p.x - state.cx;
-    var ry = p.y - state.cy;
-    rx -= f32(W) * round(rx / f32(W));
-    ry -= f32(H) * round(ry / f32(H));
-    
-    let ulx = state.vx - state.omega * ry;
-    let uly = state.vy + state.omega * rx;
-    let u2  = ulx*ulx + uly*uly;
-
-    for (var i = 0u; i < 9u; i++) {
-      let exf = f32(ex[i]); let eyf = f32(ey[i]);
-      let eu  = exf * ulx + eyf * uly;
-      f_col[base + i] = wt[i] * 1.0f * (1f + eu/CS2 + eu*eu/(2f*CS2*CS2) - u2/(2f*CS2));
-    }
-    vel[cell * 2u] = ulx; vel[cell * 2u + 1u] = uly;
-    return;
-  }
-
   var f: array<f32,9>;
   for (var i = 0u; i < 9u; i++) { f[i] = f_in[base + i]; }
 
-  var rho = 0f; var ux = 0f; var uy = 0f;
+  var rho = 0f; var ux_star = 0f; var uy_star = 0f;
   for (var i = 0u; i < 9u; i++) {
-    rho += f[i];
-    ux  += f[i] * f32(ex[i]);
-    uy  += f[i] * f32(ey[i]);
+    rho     += f[i];
+    ux_star += f[i] * f32(ex[i]);
+    uy_star += f[i] * f32(ey[i]);
   }
-  ux /= rho; uy /= rho;
-
-  if (rho < 0.5f || rho > 2.0f) {
-    for (var i = 0u; i < 9u; i++) { f_col[base + i] = wt[i]; }
-    return;
-  }
-
-  // Velocity cap (safety)
+  ux_star /= rho; uy_star /= rho;
+  
+  // Local solid velocity Us
+  var rx = p.x - state.cx;
+  var ry = p.y - state.cy;
+  rx -= f32(W) * round(rx / f32(W));
+  ry -= f32(H) * round(ry / f32(H));
+  let usx = state.vx - state.omega * ry;
+  let usy = state.vy + state.omega * rx;
+  
+  let phi = get_phi(p, state);
+  let chi = get_chi(phi);
+  
+  // Penalty Force F = rho * chi * (Us - u*)
+  let Fx = rho * chi * (usx - ux_star);
+  let Fy = rho * chi * (usy - uy_star);
+  
+  // Actual fluid velocity u = u* + F/(2rho)
+  let ux = ux_star + Fx / (2.0f * rho);
+  let uy = uy_star + Fy / (2.0f * rho);
   let u_sq = ux*ux + uy*uy;
-  if (u_sq > 0.09f) {
-    let s = 0.3f / sqrt(u_sq);
-    ux *= s; uy *= s;
-  }
 
   vel[cell * 2u] = ux; vel[cell * 2u + 1u] = uy;
 
-  var Pxx = -(rho * (ux*ux + CS2));
-  var Pyy = -(rho * (uy*uy + CS2));
-  var Pxy = -(rho * ux * uy);
-  for (var i = 0u; i < 9u; i++) {
-    let exf = f32(ex[i]); let eyf = f32(ey[i]);
-    Pxx += f[i] * exf * exf;
-    Pyy += f[i] * eyf * eyf;
-    Pxy += f[i] * exf * eyf;
-  }
-
-  let omgT = 1f - 1f / state.tau;
+  let omg = 1.0f / state.tau;
   for (var i = 0u; i < 9u; i++) {
     let exf = f32(ex[i]); let eyf = f32(ey[i]);
     let eu  = exf*ux + eyf*uy;
-    let feq = wt[i] * rho * (1f + eu/CS2 + eu*eu/(2f*CS2*CS2) - u_sq/(2f*CS2));
-    let f_neq_reg = wt[i] * 4.5f * ((exf*exf - CS2)*Pxx + 2f*exf*eyf*Pxy + (eyf*eyf - CS2)*Pyy);
-    f_col[base + i] = feq + omgT * f_neq_reg;
+    let feq = wt[i] * rho * (1f + 3f*eu + 4.5f*eu*eu - 1.5f*u_sq);
+    
+    // Guo's Source Term Si = (1 - 1/(2tau)) * wi * [ (ei-u)/cs2 + (ei.u)/cs4 * ei ] . F
+    let term1x = (exf - ux) * 3.0f;
+    let term1y = (eyf - uy) * 3.0f;
+    let term2  = (exf*ux + eyf*uy) * 9.0f;
+    let Si = (1.0f - 0.5f * omg) * wt[i] * ( (term1x + term2*exf)*Fx + (term1y + term2*eyf)*Fy );
+    
+    f_col[base + i] = f[i] - omg * (f[i] - feq) + Si;
   }
 }
