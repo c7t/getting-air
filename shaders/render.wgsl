@@ -1,88 +1,79 @@
-// Vorticity field + card major-axis line overlay.
+// Visualization shader with analytical solid mask.
 
-struct Params {
-  tau  : f32,
-  gx   : f32,
-  gy   : f32,
-  cx   : f32,
-  cy   : f32,
-  a    : f32,
-  theta: f32,
-  vx   : f32,
-  vy   : f32,
-  omega: f32,
-  _p0  : f32,
-  _p1  : f32,
+struct CardState {
+  cx     : f32,
+  cy     : f32,
+  theta  : f32,
+  vx     : f32,
+  vy     : f32,
+  omega  : f32,
+  fx     : f32,
+  fy     : f32,
+  tz     : f32,
+  mass   : f32,
+  i_body : f32,
+  g_eff  : f32,
+  a      : f32,
+  b      : f32,
+  v_max  : f32,
+  o_max  : f32,
+  cx_old : f32,
+  cy_old : f32,
+  th_old : f32,
+  _p0    : f32,
 }
 
 @group(0) @binding(0) var<storage, read> vel   : array<f32>;
-@group(0) @binding(1) var<storage, read> solid : array<u32>;
-@group(0) @binding(2) var<uniform>       params: Params;
+@group(0) @binding(1) var<storage, read> state : CardState;
 
-const W  = 256u;
-const H  = 512u;
-const Wf = 256f;
-const Hf = 512f;
+const W = 256.0f;
+const H = 512.0f;
 
-fn getVel(x: u32, y: u32) -> vec2f {
-  let cx = clamp(x, 0u, W-1u);
-  let cy = clamp(y, 0u, H-1u);
-  let b  = (cy * W + cx) * 2u;
-  return vec2f(vel[b], vel[b+1u]);
+struct VSOut {
+  @builtin(position) pos : vec4<f32>,
+  @location(0) uv : vec2<f32>,
 }
-
-struct VSOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f }
 
 @vertex
-fn vs_main(@builtin(vertex_index) vi: u32) -> VSOut {
-  var p = array<vec2f,6>(
-    vec2f(-1,-1), vec2f(1,-1), vec2f(-1, 1),
-    vec2f(-1, 1), vec2f(1,-1), vec2f( 1, 1)
+fn vs_main(@builtin(vertex_index) vi : u32) -> VSOut {
+  let p = array<vec2<f32>,6>(
+    vec2(-1f,-1f), vec2( 1f,-1f), vec2(-1f, 1f),
+    vec2(-1f, 1f), vec2( 1f,-1f), vec2( 1f, 1f)
   );
-  var o: VSOut;
-  o.pos = vec4f(p[vi], 0, 1);
-  o.uv  = p[vi] * 0.5 + 0.5;
-  return o;
+  var out: VSOut;
+  out.pos = vec4(p[vi], 0f, 1f);
+  out.uv  = p[vi] * 0.5f + 0.5f;
+  return out;
 }
 
-// Signed distance from point p to segment (a,b)
-fn segDist(p: vec2f, a: vec2f, b: vec2f) -> f32 {
-  let ab = b - a;
-  let t  = clamp(dot(p - a, ab) / dot(ab, ab), 0f, 1f);
-  return length(p - (a + t * ab));
+fn is_solid(p: vec2<f32>, cx: f32, cy: f32, theta: f32, a: f32, b: f32) -> bool {
+    let ca = cos(theta);
+    let sa = sin(theta);
+    let half_len = a - b;
+    var dx = p.x - cx;
+    var dy = p.y - cy;
+    dx -= W * round(dx / W);
+    dy -= H * round(dy / H);
+    let lx = dx * ca + dy * sa;
+    let ly = -dx * sa + dy * ca;
+    let cap_dist = max(0.0, abs(lx) - half_len);
+    return (cap_dist * cap_dist + ly * ly) <= (b * b);
 }
 
 @fragment
-fn fs_main(in: VSOut) -> @location(0) vec4f {
-  let gxf = in.uv.x * Wf;
-  let gyf = (1f - in.uv.y) * Hf;
-  let gxi = u32(gxf);
-  let gyi = u32(gyf);
-
-  if (gxi >= W || gyi >= H) { return vec4f(0,0,0,1); }
-
-  // Card line: from -a to +a along major axis
-  let ca   = cos(params.theta);
-  let sa   = sin(params.theta);
-  let tip1 = vec2f(params.cx - params.a * ca, params.cy - params.a * sa);
-  let tip2 = vec2f(params.cx + params.a * ca, params.cy + params.a * sa);
-  let d    = segDist(vec2f(gxf, gyf), tip1, tip2);
-  if (d < 0.8f) { return vec4f(1, 1, 0.2, 1); }  // bright yellow line
-
-  // Vorticity
-  let vR   = getVel(gxi+1u, gyi);
-  let vL   = getVel(gxi-1u, gyi);
-  let vU   = getVel(gxi, gyi+1u);
-  let vD   = getVel(gxi, gyi-1u);
-  let vort = (vR.y - vL.y - vU.x + vD.x) * 0.5f;
-
-  let scale = 0.005f;
-  let t = clamp(vort / scale, -1f, 1f);
-  var col: vec3f;
-  if (t >= 0f) {
-    col = mix(vec3f(1,1,1), vec3f(1,0.15,0.1), t);
-  } else {
-    col = mix(vec3f(1,1,1), vec3f(0.1,0.3,1), -t);
+fn fs_main(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> {
+  let x = uv.x * W; let y = (1.0 - uv.y) * H;
+  let cell = u32(y) * u32(W) + u32(x);
+  
+  if (is_solid(vec2(x, y), state.cx, state.cy, state.theta, state.a, state.b)) {
+    return vec4(1.0, 0.8, 0.4, 1.0);
   }
-  return vec4f(col, 1);
+
+  let ux = vel[cell * 2u];
+  let uy = vel[cell * 2u + 1u];
+  let speed = sqrt(ux*ux + uy*uy);
+  
+  // Colormap: blue for slow, red for fast
+  let c = mix(vec3(0.1, 0.1, 0.4), vec3(0.9, 0.2, 0.1), clamp(speed * 10f, 0f, 1f));
+  return vec4(c, 1.0);
 }
