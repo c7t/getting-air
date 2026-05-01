@@ -23,7 +23,7 @@ struct CardState {
   th_old : f32,
   tau    : f32,
   y_total: f32,
-  _p1    : f32,
+  x_total: f32,
 }
 
 @group(0) @binding(0) var<storage, read_write> state  : CardState;
@@ -60,6 +60,7 @@ fn main() {
   state.cy    += state.vy;
   state.theta += state.omega;
   state.y_total += state.vy;
+  state.x_total += state.vx;
 
   // 5. Toroidal wrapping
   state.cx = (state.cx % W + W) % W;
