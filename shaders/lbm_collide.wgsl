@@ -68,15 +68,24 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   if (solid_now) { return; }
 
-  // Refilling: if was solid and is now fluid, initialize with card equilibrium
+  // Refilling: if was solid and is now fluid, initialize with LOCAL card velocity
   if (solid_old) {
+    // Local velocity at point p: v_cm + omega x (p - cx)
+    var rx = p.x - state.cx;
+    var ry = p.y - state.cy;
+    rx -= f32(W) * round(rx / f32(W));
+    ry -= f32(H) * round(ry / f32(H));
+    
+    let ulx = state.vx - state.omega * ry;
+    let uly = state.vy + state.omega * rx;
+    let u2  = ulx*ulx + uly*uly;
+
     for (var i = 0u; i < 9u; i++) {
       let exf = f32(ex[i]); let eyf = f32(ey[i]);
-      let eu  = exf * state.vx + eyf * state.vy;
-      let u2  = state.vx*state.vx + state.vy*state.vy;
+      let eu  = exf * ulx + eyf * uly;
       f_col[base + i] = wt[i] * 1.0f * (1f + eu/CS2 + eu*eu/(2f*CS2*CS2) - u2/(2f*CS2));
     }
-    vel[cell * 2u] = state.vx; vel[cell * 2u + 1u] = state.vy;
+    vel[cell * 2u] = ulx; vel[cell * 2u + 1u] = uly;
     return;
   }
 
