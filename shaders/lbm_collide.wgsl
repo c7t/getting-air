@@ -21,7 +21,7 @@ struct CardState {
   cx_old : f32,
   cy_old : f32,
   th_old : f32,
-  _p0    : f32,
+  tau    : f32,
 }
 
 @group(0) @binding(0) var<storage, read>       state : CardState;
@@ -117,7 +117,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     Pxy += f[i] * exf * eyf;
   }
 
-  let omgT = 1f - 1f / 0.52f; // Use fixed tau=0.52 for now
+  let omgT = 1f - 1f / state.tau;
   for (var i = 0u; i < 9u; i++) {
     let exf = f32(ex[i]); let eyf = f32(ey[i]);
     let eu  = exf*ux + eyf*uy;
