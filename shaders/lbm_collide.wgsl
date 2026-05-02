@@ -112,7 +112,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   vel[cell * 2u] = ux; vel[cell * 2u + 1u] = uy;
 
   // 4. Collide and Apply ALBC Sponge
-  let SPONGE_W = 64.0f;
+  let SPONGE_W = 4.0f;
   let dist_x = min(f32(x), f32(W - 1u - x));
   let dist_y = min(f32(y), f32(H - 1u - y));
   var sponge_weight = clamp(1.0f - min(dist_x, dist_y) / SPONGE_W, 0.0f, 1.0f);
