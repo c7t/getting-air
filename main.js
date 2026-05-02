@@ -122,7 +122,7 @@ async function init() {
   const adapter = await navigator.gpu.requestAdapter();
   if (!adapter) { statusEl.textContent = 'No adapter'; return; }
   
-  const hasTimestamp = adapter.features.has('timestamp-query');
+  const hasTimestamp = 0 && adapter.features.has('timestamp-query');
   const device = await adapter.requestDevice({
     requiredFeatures: hasTimestamp ? ['timestamp-query'] : []
   });
