@@ -23,6 +23,10 @@ struct CardState {
   tau    : f32,
   y_total: f32,
   x_total: f32,
+  off_x  : f32,
+  off_y  : f32,
+  off_x_old : f32,
+  off_y_old : f32,
 }
 
 @group(0) @binding(0) var<storage, read>       state : CardState;
