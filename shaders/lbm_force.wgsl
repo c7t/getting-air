@@ -35,7 +35,7 @@ struct CardState {
 
 const W      = 1024u;
 const H      = 1024u;
-const FSCALE = 1000f;
+const FSCALE = 10000f;
 
 const ex = array<i32,9>( 0, 1, 0,-1, 0, 1,-1,-1, 1);
 const ey = array<i32,9>( 0, 0, 1, 0,-1, 1, 1,-1,-1);

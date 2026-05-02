@@ -35,7 +35,7 @@ struct CardState {
 
 const W = 1024.0f;
 const H = 1024.0f;
-const FSCALE = 1000.0f;
+const FSCALE = 10000.0f;
 
 @compute @workgroup_size(1)
 fn main() {
