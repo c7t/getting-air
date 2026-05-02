@@ -25,7 +25,7 @@ const U_T     = 0.05;
 const G_LU    = U_T**2 / (Math.PI * B * (RHO_B - 1));
 const G_EFF   = G_LU * (1 - 1 / RHO_B);
 
-const FSCALE  = 1e3;
+const FSCALE  = 1e4;
 
 const EX = [0, 1, 0,-1, 0, 1,-1,-1, 1];
 const EY = [0, 0, 1, 0,-1, 1, 1,-1,-1];
