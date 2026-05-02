@@ -71,15 +71,19 @@ fn get_chi(phi: f32) -> f32 {
 }
 
 fn get_uy(x: i32, y: i32) -> f32 {
-    let ux = (u32(x) + u32(W)) % u32(W);
-    let uy = (u32(y) + u32(H)) % u32(H);
-    return vel[(uy * u32(W) + ux) * 2u + 1u];
+    let wx = (u32(x) + u32(W)) % u32(W);
+    let wy = (u32(y) + u32(H)) % u32(H);
+    let bx = (wx + u32(state.off_x)) % u32(W);
+    let by = (wy + u32(state.off_y)) % u32(H);
+    return vel[(by * u32(W) + bx) * 2u + 1u];
 }
 
 fn get_ux(x: i32, y: i32) -> f32 {
-    let ux = (u32(x) + u32(W)) % u32(W);
-    let uy = (u32(y) + u32(H)) % u32(H);
-    return vel[(uy * u32(W) + ux) * 2u];
+    let wx = (u32(x) + u32(W)) % u32(W);
+    let wy = (u32(y) + u32(H)) % u32(H);
+    let bx = (wx + u32(state.off_x)) % u32(W);
+    let by = (wy + u32(state.off_y)) % u32(H);
+    return vel[(by * u32(W) + bx) * 2u];
 }
 
 @fragment

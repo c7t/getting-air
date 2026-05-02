@@ -63,9 +63,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let x = gid.x; let y = gid.y;
   if (x >= W || y >= H) { return; }
 
-  let cell = y * W + x;
+  let bx   = (x + u32(state.off_x)) % W;
+  let by   = (y + u32(state.off_y)) % H;
+  let cell = by * W + bx;
   let base = cell * 9u;
-  let p = vec2<f32>(f32(x), f32(y));
+  let p    = vec2<f32>(f32(x), f32(y));
 
   let phi = get_phi(p, state);
   let chi = get_chi(phi);
@@ -87,7 +89,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   ry -= f32(H) * round(ry / f32(H));
   let usx = state.vx - state.omega * ry;
   let usy = state.vy + state.omega * rx;
-
+  
+...
   // Penalty Force F = rho * chi * (Us - u*)
   let Fx = rho * chi * (usx - ux_star);
   let Fy = rho * chi * (usy - uy_star);

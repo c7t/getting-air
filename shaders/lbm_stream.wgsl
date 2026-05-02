@@ -14,12 +14,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let x = gid.x; let y = gid.y;
   if (x >= W || y >= H) { return; }
 
-  let cell     = y * W + x;
+  let bx   = (x + u32(state.off_x)) % W;
+  let by   = (y + u32(state.off_y)) % H;
+  let cell = by * W + bx;
   let dst_base = cell * 9u;
 
   for (var i = 0u; i < 9u; i++) {
-    let sx = u32((i32(x) - ex[i] + i32(W)) % i32(W));
-    let sy = u32((i32(y) - ey[i] + i32(H)) % i32(H));
-    f_out[dst_base + i] = f_col[(sy * W + sx) * 9u + i];
+    // Window coordinates of source neighbor
+    let wx_src = (x + W - u32(ex[i])) % W;
+    let wy_src = (y + H - u32(ey[i])) % H;
+    
+    // Map window source to buffer source
+    let bx_src = (wx_src + u32(state.off_x)) % W;
+    let by_src = (wy_src + u32(state.off_y)) % H;
+    
+    f_out[dst_base + i] = f_col[(by_src * W + bx_src) * 9u + i];
   }
 }
