@@ -23,6 +23,10 @@ struct CardState {
   tau    : f32,
   y_total: f32,
   x_total: f32,
+  off_x  : f32,
+  off_y  : f32,
+  off_x_old : f32,
+  off_y_old : f32,
 }
 
 @group(0) @binding(0) var<storage, read>       state  : CardState;
@@ -30,8 +34,8 @@ struct CardState {
 @group(0) @binding(2) var<storage, read_write> forces : array<atomic<i32>, 4>;
 
 const W      = 512u;
-const H      = 1024u;
-const FSCALE = 1000f;
+const H      = 512u;
+const FSCALE = 10000f;
 
 const ex = array<i32,9>( 0, 1, 0,-1, 0, 1,-1,-1, 1);
 const ey = array<i32,9>( 0, 0, 1, 0,-1, 1, 1,-1,-1);
@@ -54,46 +58,78 @@ fn get_chi(phi: f32) -> f32 {
     return 0.5f * (1.0f - tanh(phi / epsilon));
 }
 
+var<workgroup> wg_fx : array<f32, 64>;
+var<workgroup> wg_fy : array<f32, 64>;
+var<workgroup> wg_tz : array<f32, 64>;
+
 @compute @workgroup_size(8, 8)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn main(
+  @builtin(global_invocation_id) gid: vec3<u32>,
+  @builtin(local_invocation_index) lid: u32
+) {
   let x = gid.x; let y = gid.y;
-  if (x >= W || y >= H) { return; }
+  
+  var fx_body = 0.0f;
+  var fy_body = 0.0f;
+  var tz_body = 0.0f;
 
-  let cell = y * W + x;
-  let base = cell * 9u;
-  let p = vec2<f32>(f32(x), f32(y));
+  if (x < W && y < H) {
+    let bx   = (x + u32(state.off_x)) % W;
+    let by   = (y + u32(state.off_y)) % H;
+    let cell = by * W + bx;
+    let base = cell * 9u;
+    let p    = vec2<f32>(f32(x), f32(y));
 
-  let phi = get_phi(p, state);
-  let chi = get_chi(phi);
-  if (chi < 1e-6) { return; }
+    let phi = get_phi(p, state);
+    let chi = get_chi(phi);
 
-  var rho = 0f; var ux_star = 0f; var uy_star = 0f;
-  for (var i = 0u; i < 9u; i++) {
-    let fi = f_in[base + i];
-    rho     += fi;
-    ux_star += fi * f32(ex[i]);
-    uy_star += fi * f32(ey[i]);
+    if (chi >= 1e-6) {
+      var rho = 0f; var ux_star = 0f; var uy_star = 0f;
+      for (var i = 0u; i < 9u; i++) {
+        let fi = f_in[base + i];
+        rho     += fi;
+        ux_star += fi * f32(ex[i]);
+        uy_star += fi * f32(ey[i]);
+      }
+      ux_star /= rho; uy_star /= rho;
+
+      // Local solid velocity Us
+      var rx = p.x - state.cx;
+      var ry = p.y - state.cy;
+      rx -= f32(W) * round(rx / f32(W));
+      ry -= f32(H) * round(ry / f32(H));
+      let usx = state.vx - state.omega * ry;
+      let usy = state.vy + state.omega * rx;
+
+      // Penalty Force F = rho * chi * (Us - u*)
+      let Fx = rho * chi * (usx - ux_star);
+      let Fy = rho * chi * (usy - uy_star);
+
+      // Integrate NEGATIVE of penalty force onto body
+      fx_body = -Fx;
+      fy_body = -Fy;
+      tz_body = rx * fy_body - ry * fx_body;
+    }
   }
-  ux_star /= rho; uy_star /= rho;
 
-  // Local solid velocity Us
-  var rx = p.x - state.cx;
-  var ry = p.y - state.cy;
-  rx -= f32(W) * round(rx / f32(W));
-  ry -= f32(H) * round(ry / f32(H));
-  let usx = state.vx - state.omega * ry;
-  let usy = state.vy + state.omega * rx;
+  // Workgroup reduction
+  wg_fx[lid] = fx_body;
+  wg_fy[lid] = fy_body;
+  wg_tz[lid] = tz_body;
+  workgroupBarrier();
 
-  // Penalty Force F = rho * chi * (Us - u*)
-  let Fx = rho * chi * (usx - ux_star);
-  let Fy = rho * chi * (usy - uy_star);
-
-  // Integrate NEGATIVE of penalty force onto body
-  let fx_body = -Fx;
-  let fy_body = -Fy;
-  let tz_body = rx * fy_body - ry * fx_body;
-
-  atomicAdd(&forces[0], i32(fx_body * FSCALE));
-  atomicAdd(&forces[1], i32(fy_body * FSCALE));
-  atomicAdd(&forces[2], i32(tz_body * FSCALE));
+  // Simple reduction tree or linear sum for 64 elements
+  if (lid == 0u) {
+    var sum_fx = 0.0f;
+    var sum_fy = 0.0f;
+    var sum_tz = 0.0f;
+    for (var i = 0u; i < 64u; i++) {
+      sum_fx += wg_fx[i];
+      sum_fy += wg_fy[i];
+      sum_tz += wg_tz[i];
+    }
+    atomicAdd(&forces[0], i32(sum_fx * FSCALE));
+    atomicAdd(&forces[1], i32(sum_fy * FSCALE));
+    atomicAdd(&forces[2], i32(sum_tz * FSCALE));
+  }
 }

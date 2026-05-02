@@ -24,21 +24,27 @@ struct CardState {
   tau    : f32,
   y_total: f32,
   x_total: f32,
+  off_x  : f32,
+  off_y  : f32,
+  off_x_old : f32,
+  off_y_old : f32,
 }
 
 @group(0) @binding(0) var<storage, read_write> state  : CardState;
 @group(0) @binding(1) var<storage, read_write> forces : array<atomic<i32>, 4>;
 
 const W = 512.0f;
-const H = 1024.0f;
-const FSCALE = 1000.0f;
+const H = 512.0f;
+const FSCALE = 10000.0f;
 
 @compute @workgroup_size(1)
 fn main() {
-  // 0. Save current as old for the next step's transition refill
+  // 0. Save current as old for the next step
   state.cx_old = state.cx;
   state.cy_old = state.cy;
   state.th_old = state.theta;
+  state.off_x_old = state.off_x;
+  state.off_y_old = state.off_y;
 
   // 1. Read accumulated impulse from atomic buffer
   let fx_fluid = f32(atomicExchange(&forces[0], 0)) / FSCALE;
@@ -55,17 +61,25 @@ fn main() {
   state.vy    = clamp(state.vy, -state.v_max, state.v_max);
   state.omega = clamp(state.omega, -state.o_max, state.o_max);
 
-  // 4. Position update
-  state.cx    += state.vx;
-  state.cy    += state.vy;
-  state.theta += state.omega;
+  // 4. Position update (absolute)
   state.y_total += state.vy;
   state.x_total += state.vx;
+  state.theta   += state.omega;
 
-  // 5. Toroidal wrapping
-  state.cx = (state.cx % W + W) % W;
-  state.cy = (state.cy % H + H) % H;
-  
+  // 5. Moving Window Panning
+  // We want to keep (cx, cy) near (W/2, H*2/3)
+  let initial_cx = W / 2.0f;
+  let initial_cy = H * 2.0f / 3.0f;
+
+  let shift_x = floor(state.x_total);
+  let shift_y = floor(state.y_total);
+
+  state.off_x = (shift_x % W + W) % W;
+  state.off_y = (shift_y % H + H) % H;
+
+  state.cx = initial_cx + (state.x_total - shift_x);
+  state.cy = initial_cy + (state.y_total - shift_y);
+
   state.fx = fx_fluid;
   state.fy = fy_fluid;
   state.tz = tz_fluid;

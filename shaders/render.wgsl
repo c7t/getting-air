@@ -23,13 +23,17 @@ struct CardState {
   tau    : f32,
   y_total: f32,
   x_total: f32,
+  off_x  : f32,
+  off_y  : f32,
+  off_x_old : f32,
+  off_y_old : f32,
 }
 
 @group(0) @binding(0) var<storage, read> vel   : array<f32>;
 @group(0) @binding(1) var<storage, read> state : CardState;
 
 const W = 512.0f;
-const H = 1024.0f;
+const H = 512.0f;
 
 struct VSOut {
   @builtin(position) pos : vec4<f32>,
@@ -67,15 +71,19 @@ fn get_chi(phi: f32) -> f32 {
 }
 
 fn get_uy(x: i32, y: i32) -> f32 {
-    let ux = (u32(x) + u32(W)) % u32(W);
-    let uy = (u32(y) + u32(H)) % u32(H);
-    return vel[(uy * u32(W) + ux) * 2u + 1u];
+    let wx = (u32(x) + u32(W)) % u32(W);
+    let wy = (u32(y) + u32(H)) % u32(H);
+    let bx = (wx + u32(state.off_x)) % u32(W);
+    let by = (wy + u32(state.off_y)) % u32(H);
+    return vel[(by * u32(W) + bx) * 2u + 1u];
 }
 
 fn get_ux(x: i32, y: i32) -> f32 {
-    let ux = (u32(x) + u32(W)) % u32(W);
-    let uy = (u32(y) + u32(H)) % u32(H);
-    return vel[(uy * u32(W) + ux) * 2u];
+    let wx = (u32(x) + u32(W)) % u32(W);
+    let wy = (u32(y) + u32(H)) % u32(H);
+    let bx = (wx + u32(state.off_x)) % u32(W);
+    let by = (wy + u32(state.off_y)) % u32(H);
+    return vel[(by * u32(W) + bx) * 2u];
 }
 
 @fragment
