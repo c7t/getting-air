@@ -1,10 +1,6 @@
 const canvas   = document.getElementById('c');
 const statusEl = document.getElementById('status');
 
-const dpr = window.devicePixelRatio || 1;
-canvas.width  = Math.round(canvas.clientWidth  * dpr);
-canvas.height = Math.round(canvas.clientHeight * dpr);
-
 const W = 512, H = 512, NCELLS = W * H;
 
 // ── Pesavento & Wang (2004) physical parameters ───────────────────────────────
@@ -110,7 +106,15 @@ async function init() {
 
   const ctx = canvas.getContext('webgpu');
   const fmt = navigator.gpu.getPreferredCanvasFormat();
-  ctx.configure({ device, format: fmt, alphaMode: 'opaque' });
+  
+  function resize() {
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width  = Math.round(canvas.clientWidth * dpr);
+    canvas.height = Math.round(canvas.clientHeight * dpr);
+    ctx.configure({ device, format: fmt, alphaMode: 'opaque' });
+  }
+  window.addEventListener('resize', resize);
+  resize();
 
   const U = GPUBufferUsage;
   const fSize   = NCELLS * 9 * 4;
