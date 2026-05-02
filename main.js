@@ -83,7 +83,7 @@ async function init() {
   const cardStateStage = device.createBuffer({ size: 104, usage: U.MAP_READ | U.COPY_DST });
 
   const cardInit = new Float32Array([
-    W/2, H/2, 0.2,   // cx, cy, theta
+    W/2, H * 2/3, 0.2,   // cx, cy, theta
     0, 0, 0,         // vx, vy, omega
     0, 0, 0,         // fx, fy, tz
     MASS, I_BODY, G_EFF,
