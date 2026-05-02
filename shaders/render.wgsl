@@ -32,8 +32,8 @@ struct CardState {
 @group(0) @binding(0) var<storage, read> vel   : array<f32>;
 @group(0) @binding(1) var<storage, read> state : CardState;
 
-const W = 1024.0f;
-const H = 1024.0f;
+const W = 512.0f;
+const H = 512.0f;
 
 struct VSOut {
   @builtin(position) pos : vec4<f32>,
