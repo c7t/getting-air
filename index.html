@@ -37,6 +37,13 @@
       font-size: 12px; color: #7f7; background: rgba(0,0,0,0.6);
       padding: 4px 8px; border-radius: 3px; pointer-events: none;
     }
+    #perf {
+      position: absolute; top: 40px; left: 8px;
+      font-size: 11px; color: #0cf; background: rgba(0,0,0,0.6);
+      padding: 4px 8px; border-radius: 3px; pointer-events: none;
+      display: flex; flex-direction: column; gap: 2px;
+    }
+    .perf-label { color: #888; margin-right: 4px; }
     #download {
       position: absolute; top: 8px; right: 8px;
       font-size: 12px; color: #eee; background: rgba(0,0,0,0.6);
@@ -63,6 +70,11 @@
   <div id="canvas-container">
     <canvas id="c"></canvas>
     <div id="status">initializing...</div>
+    <div id="perf">
+      <div><span class="perf-label">MLUPS:</span> <span id="val-mlups">0.0</span></div>
+      <div><span class="perf-label">GPU:</span> <span id="val-gpu-ms">0.0</span> ms</div>
+      <div><span class="perf-label">SYNC:</span> <span id="val-sync-ms">0.0</span> ms</div>
+    </div>
     <button id="download">Download CSV</button>
   </div>
 
