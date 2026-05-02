@@ -1,5 +1,35 @@
 // Simple periodic streaming for D2Q9.
 
+struct CardState {
+  cx     : f32,
+  cy     : f32,
+  theta  : f32,
+  vx     : f32,
+  vy     : f32,
+  omega  : f32,
+  fx     : f32,
+  fy     : f32,
+  tz     : f32,
+  mass   : f32,
+  i_body : f32,
+  g_eff  : f32,
+  a      : f32,
+  b      : f32,
+  v_max  : f32,
+  o_max  : f32,
+  cx_old : f32,
+  cy_old : f32,
+  th_old : f32,
+  tau    : f32,
+  y_total: f32,
+  x_total: f32,
+  off_x  : f32,
+  off_y  : f32,
+  off_x_old : f32,
+  off_y_old : f32,
+}
+
+@group(0) @binding(0) var<storage, read>       state : CardState;
 @group(0) @binding(1) var<storage, read>       f_col : array<f32>;
 @group(0) @binding(2) var<storage, read_write> f_out : array<f32>;
 
