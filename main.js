@@ -14,7 +14,7 @@ const A = 64, B = 8;
 
 // Dimensionless moment of inertia: I* = b(a²+b²)ρ_b / (2a³ρ_f)  = 0.17
 // → ρ_b/ρ_f = I* · 2a³ / (b·(a²+b²)) ≈ 2.678
-const I_STAR = 0.17;
+const I_STAR = 0.34;
 const RHO_B  = I_STAR * 2 * A**3 / (B * (A**2 + B**2));
 const MASS   = RHO_B * Math.PI * A * B;
 const I_BODY = RHO_B * Math.PI * A * B * (A**2 + B**2) / 4;
