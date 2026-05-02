@@ -130,7 +130,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let tau_total = tau0 + 0.5f * (sqrt(tau0*tau0 + 54.0f * Cs*Cs * Q) - tau0);
   let omg = 1.0f / tau_total;
 
-  // 4. Collide using tau_total
+  // 4. Collide and Apply ALBC Sponge
+  let SPONGE_W = 64.0f;
+  let dist_x = min(f32(x), f32(W - 1u - x));
+  let dist_y = min(f32(y), f32(H - 1u - y));
+  var sponge_weight = clamp(1.0f - min(dist_x, dist_y) / SPONGE_W, 0.0f, 1.0f);
+  // Smooth cubic ramp
+  sponge_weight = sponge_weight * sponge_weight * (3.0f - 2.0f * sponge_weight);
+
   for (var i = 0u; i < 9u; i++) {
     let exf = f32(ex[i]); let eyf = f32(ey[i]);
     
@@ -140,6 +147,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let term2  = (exf*ux + eyf*uy) * 9.0f;
     let Si = (1.0f - 0.5f * omg) * wt[i] * ( (term1x + term2*exf)*Fx + (term1y + term2*eyf)*Fy );
     
-    f_col[base + i] = f[i] - omg * (f[i] - feq[i]) + Si;
+    let f_collide = f[i] - omg * (f[i] - feq[i]) + Si;
+    let f_target  = wt[i] * 1.0f; // rho=1.0, u=0 equilibrium
+    
+    f_col[base + i] = mix(f_collide, f_target, sponge_weight);
   }
 }
