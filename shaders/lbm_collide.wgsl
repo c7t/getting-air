@@ -1,4 +1,4 @@
-// Volume Penalization IB-LBM (Direct Forcing) with Guo's scheme and Smagorinsky LES.
+// Volume Penalization IB-LBM (Direct Forcing) with Guo's scheme.
 
 struct CardState {
   cx     : f32,
@@ -23,6 +23,10 @@ struct CardState {
   tau    : f32,
   y_total: f32,
   x_total: f32,
+  off_x  : f32,
+  off_y  : f32,
+  off_x_old : f32,
+  off_y_old : f32,
 }
 
 @group(0) @binding(0) var<storage, read>       state : CardState;
@@ -31,7 +35,7 @@ struct CardState {
 @group(0) @binding(3) var<storage, read_write> vel   : array<f32>;
 
 const W   = 512u;
-const H   = 1024u;
+const H   = 512u;
 
 const ex = array<i32,9>( 0, 1, 0,-1, 0, 1,-1,-1, 1);
 const ey = array<i32,9>( 0, 0, 1, 0,-1, 1, 1,-1,-1);
@@ -50,6 +54,8 @@ fn get_phi(p: vec2<f32>, state: CardState) -> f32 {
     dy -= f32(H) * round(dy / f32(H));
     let lx = dx * ca + dy * sa;
     let ly = -dx * sa + dy * ca;
+    
+    // Algebraic distance approximation for ellipse
     let d = sqrt((lx*lx)/(state.a*state.a) + (ly*ly)/(state.b*state.b)) - 1.0;
     return d * state.b; 
 }
@@ -64,9 +70,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let x = gid.x; let y = gid.y;
   if (x >= W || y >= H) { return; }
 
-  let cell = y * W + x;
+  let bx   = (x + u32(state.off_x)) % W;
+  let by   = (y + u32(state.off_y)) % H;
+  let cell = by * W + bx;
   let base = cell * 9u;
-  let p = vec2<f32>(f32(x), f32(y));
+  let p    = vec2<f32>(f32(x), f32(y));
 
   var f: array<f32,9>;
   for (var i = 0u; i < 9u; i++) { f[i] = f_in[base + i]; }
@@ -82,6 +90,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   // Local solid velocity Us
   var rx = p.x - state.cx;
   var ry = p.y - state.cy;
+  // NOTE: In moving window mode, dx/dy are already window-local, 
+  // but we keep the wrap check for robustness during transition.
   rx -= f32(W) * round(rx / f32(W));
   ry -= f32(H) * round(ry / f32(H));
   let usx = state.vx - state.omega * ry;
@@ -101,41 +111,29 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   vel[cell * 2u] = ux; vel[cell * 2u + 1u] = uy;
 
-  // 1. Calculate equilibrium and non-equilibrium tensor
-  var feq: array<f32,9>;
-  var Pxx = 0.0f; var Pyy = 0.0f; var Pxy = 0.0f;
+  // 4. Collide and Apply ALBC Sponge
+  let SPONGE_W = 16.0f;
+  let dist_x = min(f32(x), f32(W - 1u - x));
+  let dist_y = min(f32(y), f32(H - 1u - y));
+  var sponge_weight = clamp(1.0f - min(dist_x, dist_y) / SPONGE_W, 0.0f, 1.0f);
+  // Smooth cubic ramp
+  sponge_weight = sponge_weight * sponge_weight * (3.0f - 2.0f * sponge_weight);
+
+  let omg = 1.0f / state.tau;
   for (var i = 0u; i < 9u; i++) {
     let exf = f32(ex[i]); let eyf = f32(ey[i]);
     let eu  = exf*ux + eyf*uy;
-    feq[i] = wt[i] * rho * (1f + 3f*eu + 4.5f*eu*eu - 1.5f*u_sq);
+    let feq = wt[i] * rho * (1f + 3f*eu + 4.5f*eu*eu - 1.5f*u_sq);
     
-    let fneq = f[i] - feq[i];
-    Pxx += fneq * exf * exf;
-    Pyy += fneq * eyf * eyf;
-    Pxy += fneq * exf * eyf;
-  }
 
-  // 2. Calculate local strain magnitude Q = sqrt(2 * sum(Pi_neq^2))
-  let Q = sqrt(2.0f * (Pxx*Pxx + Pyy*Pyy + 2.0f*Pxy*Pxy));
-
-  // 3. Calculate Eddy Relaxation Time (Smagorinsky model)
-  let Cs = 0.4f;
-  let tau0 = state.tau;
-  // tau_total = tau0 + 0.5 * (sqrt(tau0^2 + (18*Cs^2 / cs2) * Q) - tau0)
-  // With cs2 = 1/3, 18/cs2 = 54.
-  let tau_total = tau0 + 0.5f * (sqrt(tau0*tau0 + 54.0f * Cs*Cs * Q) - tau0);
-  let omg = 1.0f / tau_total;
-
-  // 4. Collide using tau_total
-  for (var i = 0u; i < 9u; i++) {
-    let exf = f32(ex[i]); let eyf = f32(ey[i]);
-    
-    // Guo's Source Term Si using locally varying tau_total
+    // Guo's Source Term Si = (1 - 1/(2tau)) * wi * [ (ei-u)/cs2 + (ei.u)/cs4 * ei ] . F
     let term1x = (exf - ux) * 3.0f;
     let term1y = (eyf - uy) * 3.0f;
     let term2  = (exf*ux + eyf*uy) * 9.0f;
     let Si = (1.0f - 0.5f * omg) * wt[i] * ( (term1x + term2*exf)*Fx + (term1y + term2*eyf)*Fy );
     
-    f_col[base + i] = f[i] - omg * (f[i] - feq[i]) + Si;
+    let f_collide = f[i] - omg * (f[i] - feq) + Si;
+    let f_target  = wt[i] * 1.0f; // rho=1.0, u=0 equilibrium
+    f_col[base + i] = mix(f_collide, f_target, sponge_weight);
   }
 }
