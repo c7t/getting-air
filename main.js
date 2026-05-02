@@ -78,9 +78,9 @@ async function init() {
   const velBuf  = device.createBuffer({ size: NCELLS * 2 * 4, usage: U.STORAGE });
   const forceBuf = device.createBuffer({ size: 16, usage: U.STORAGE | U.COPY_SRC | U.COPY_DST });
 
-  // CardState: 22 floats = 88 bytes
-  const cardStateBuf   = device.createBuffer({ size: 88, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
-  const cardStateStage = device.createBuffer({ size: 88, usage: U.MAP_READ | U.COPY_DST });
+  // CardState: 26 floats = 104 bytes
+  const cardStateBuf   = device.createBuffer({ size: 104, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
+  const cardStateStage = device.createBuffer({ size: 104, usage: U.MAP_READ | U.COPY_DST });
 
   const cardInit = new Float32Array([
     W/2, H/4, 0.2,   // cx, cy, theta
@@ -91,7 +91,8 @@ async function init() {
     0.3, 0.025,      // v_max, o_max
     W/2, H/4, 0.2,   // cx_old, cy_old, th_old
     TAU,             // tau
-    0, 0             // y_total, x_total
+    0, 0,            // y_total, x_total
+    0, 0, 0, 0       // off_x, off_y, off_x_old, off_y_old
   ]);
   device.queue.writeBuffer(cardStateBuf, 0, cardInit);
   device.queue.writeBuffer(f_a, 0, initF());
@@ -180,7 +181,7 @@ async function init() {
       const rp = enc.beginRenderPass({ colorAttachments: [{ view: ctx.getCurrentTexture().createView(), clearValue: { r:0.07, g:0.07, b:0.1, a:1 }, loadOp: 'clear', storeOp: 'store' }]});
       rp.setPipeline(renPL); rp.setBindGroup(0, renBG); rp.draw(6); rp.end();
       
-      enc.copyBufferToBuffer(cardStateBuf, 0, cardStateStage, 0, 88);
+      enc.copyBufferToBuffer(cardStateBuf, 0, cardStateStage, 0, 104);
       device.queue.submit([enc.finish()]);
 
       // Read back state every frame for trajectory
