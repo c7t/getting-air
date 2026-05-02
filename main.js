@@ -14,47 +14,54 @@ const W = 512, H = 512, NCELLS = W * H;
 // Semi-axes: a=32, b=4 [lu].  Aspect ratio e = b/a = 0.125.
 // Geometry: Semi-major (A) and semi-minor (B) axes of the ellipse in lattice units.
 // The card is 2*A long and 2*B thick.
-const A = 32, B = 4;
+let A = 64, B = 8;
 
 // Dimensionless moment of inertia: I* = b(a²+b²)ρ_b / (2a³ρ_f)  = 0.17
 // → ρ_b/ρ_f = I* · 2a³ / (b·(a²+b²)) ≈ 2.678
 // This characterizes the rotation dynamics. A value of 0.17 is typical for 
 // a card whose mass distribution allows for stable tumbling.
-const I_STAR = 0.34;
-
-// RHO_B: Solid-to-fluid density ratio (ρ_body / ρ_fluid).
-// Calculated to satisfy the I_STAR requirement. In LBM, fluid density is 1.0.
-// Higher RHO_B makes the card "heavier" and less affected by small fluid gusts.
-const RHO_B  = I_STAR * 2 * A**3 / (B * (A**2 + B**2));
-
-// MASS: Total mass of the 2D ellipse (Area * Density).
-const MASS   = RHO_B * Math.PI * A * B;
-
-// I_BODY: Moment of inertia for a 2D ellipse. 
-// Determines how much torque is needed to change the card's rotation speed.
-const I_BODY = RHO_B * Math.PI * A * B * (A**2 + B**2) / 4;
+let I_STAR = 0.34;
 
 // TAU: LBM Relaxation Time. 
 // Related to Kinematic Viscosity (ν) by: ν = (TAU - 0.5) / 3.
 // TAU = 0.5 corresponds to zero viscosity (unstable). 
 // TAU = 0.52 is "thin" fluid (high Reynolds number, e.g., Re ≈ 1100).
 // Target Re = 1100 requires τ ≈ 0.509; we start at 0.52 for stability.
-const TAU     = 0.502;
+let TAU = 0.509;
 
 // U_T: Target Terminal Velocity (in lattice units per step).
 // Target u_t small enough to keep Ma < 0.1 during free-fall transient.
 // We aim for 0.05 so that even during fast tumbles, the tip velocity
 // stays well below the Mach limit (Ma < 0.3) where LBM becomes inaccurate.
-const U_T     = 0.05;
+let U_T = 0.05;
 
-// G_LU: Raw Gravity. 
-// The gravitational constant needed to reach U_T against viscous drag.
-const G_LU    = U_T**2 / (Math.PI * B * (RHO_B - 1));
+let RHO_B, MASS, I_BODY, G_LU, G_EFF;
 
-// G_EFF: Effective Gravity (Buoyancy-corrected).
-// In a coupled simulation, the fluid pushes up on the card. 
-// G_EFF accounts for the weight of the card minus the weight of the displaced fluid.
-const G_EFF   = G_LU * (1 - 1 / RHO_B);
+function recalculate() {
+  // RHO_B: Solid-to-fluid density ratio (ρ_body / ρ_fluid).
+  // Calculated to satisfy the I_STAR requirement. In LBM, fluid density is 1.0.
+  // Higher RHO_B makes the card "heavier" and less affected by small fluid gusts.
+  RHO_B  = I_STAR * 2 * A**3 / (B * (A**2 + B**2));
+  RHO_B  = Math.max(1.05, RHO_B);
+
+  // MASS: Total mass of the 2D ellipse (Area * Density).
+  MASS   = RHO_B * Math.PI * A * B;
+
+  // I_BODY: Moment of inertia for a 2D ellipse. 
+  // Determines how much torque is needed to change the card's rotation speed.
+  I_BODY = RHO_B * Math.PI * A * B * (A**2 + B**2) / 4;
+
+  // G_LU: Raw Gravity. 
+  // The gravitational constant needed to reach U_T against viscous drag.
+  G_LU   = U_T**2 / (Math.PI * B * (RHO_B - 1));
+
+  // G_EFF: Effective Gravity (Buoyancy-corrected).
+  // In a coupled simulation, the fluid pushes up on the card. 
+  // G_EFF accounts for the weight of the card minus the weight of the displaced fluid.
+  G_EFF  = G_LU * (1 - 1 / RHO_B);
+}
+recalculate();
+
 
 // FSCALE: Atomic Scaling Factor.
 // Used to convert floating-point forces/torques to integers for the GPU atomics.
@@ -132,6 +139,31 @@ async function init() {
   device.queue.writeBuffer(cardStateBuf, 0, cardInit);
   device.queue.writeBuffer(f_a, 0, initF());
 
+  let paramsDirty = false;
+  const updateGPUParams = () => {
+    const data = new Float32Array([MASS, I_BODY, G_EFF, A, B]);
+    device.queue.writeBuffer(cardStateBuf, 9 * 4, data);
+    device.queue.writeBuffer(cardStateBuf, 19 * 4, new Float32Array([TAU]));
+  };
+
+  const sliders = [
+    { id: 'A', setter: v => A = v, dp: 0 },
+    { id: 'B', setter: v => B = v, dp: 0 },
+    { id: 'I_STAR', setter: v => I_STAR = v, dp: 2 },
+    { id: 'TAU', setter: v => TAU = v, dp: 3 },
+    { id: 'U_T', setter: v => U_T = v, dp: 3 },
+  ];
+  sliders.forEach(s => {
+    const el = document.getElementById(`slider-${s.id}`);
+    const valEl = document.getElementById(`val-${s.id}`);
+    el.oninput = () => {
+      s.setter(parseFloat(el.value));
+      valEl.textContent = el.value;
+      recalculate();
+      paramsDirty = true;
+    };
+  });
+
   const [colSM, strSM, frcSM, phySM, renSM] = await Promise.all([
     loadShader(device, 'shaders/lbm_collide.wgsl'),
     loadShader(device, 'shaders/lbm_stream.wgsl'),
@@ -204,6 +236,10 @@ async function init() {
 
   async function frame() {
     try {
+      if (paramsDirty) {
+        updateGPUParams();
+        paramsDirty = false;
+      }
       const enc = device.createCommandEncoder();
       for (let s = 0; s < STEPS_PER_FRAME; s++) {
         const col = enc.beginComputePass(); col.setPipeline(colPL); col.setBindGroup(0, colBG); col.dispatchWorkgroups(WGX, WGY); col.end();

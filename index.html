@@ -20,12 +20,51 @@
       cursor: pointer; font-family: monospace;
     }
     #download:hover { background: rgba(50,50,50,0.8); }
+    #controls {
+      position: absolute; bottom: 0; left: 0; width: 100%;
+      background: rgba(0,0,0,0.7); padding: 10px;
+      display: flex; flex-direction: column; gap: 4px;
+      border-top: 1px solid #444;
+    }
+    .control-row { display: flex; align-items: center; gap: 10px; }
+    .control-row label { width: 100px; font-size: 11px; color: #aaa; }
+    .control-row input { flex-grow: 1; cursor: pointer; }
+    .control-row span { width: 50px; text-align: right; font-size: 11px; color: #fff; }
   </style>
 </head>
 <body>
   <canvas id="c"></canvas>
   <div id="status">initializing...</div>
   <button id="download">Download CSV</button>
+
+  <div id="controls">
+    <div class="control-row">
+      <label>A (semi-major)</label>
+      <input type="range" id="slider-A" min="10" max="128" step="1" value="64">
+      <span id="val-A">64</span>
+    </div>
+    <div class="control-row">
+      <label>B (semi-minor)</label>
+      <input type="range" id="slider-B" min="2" max="32" step="1" value="8">
+      <span id="val-B">8</span>
+    </div>
+    <div class="control-row">
+      <label>I* (inertia)</label>
+      <input type="range" id="slider-I_STAR" min="0.05" max="1.0" step="0.01" value="0.34">
+      <span id="val-I_STAR">0.34</span>
+    </div>
+    <div class="control-row">
+      <label>τ (viscosity)</label>
+      <input type="range" id="slider-TAU" min="0.501" max="0.6" step="0.001" value="0.509">
+      <span id="val-TAU">0.509</span>
+    </div>
+    <div class="control-row">
+      <label>Ut (gravity)</label>
+      <input type="range" id="slider-U_T" min="0.01" max="0.15" step="0.005" value="0.05">
+      <span id="val-U_T">0.05</span>
+    </div>
+  </div>
+
   <script type="module" src="main.js"></script>
 </body>
 </html>
