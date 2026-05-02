@@ -68,9 +68,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let x = gid.x; let y = gid.y;
   if (x >= W || y >= H) { return; }
 
-  let cell = y * W + x;
+  let bx   = (x + u32(state.off_x)) % W;
+  let by   = (y + u32(state.off_y)) % H;
+  let cell = by * W + bx;
   let base = cell * 9u;
-  let p = vec2<f32>(f32(x), f32(y));
+  let p    = vec2<f32>(f32(x), f32(y));
 
   var f: array<f32,9>;
   for (var i = 0u; i < 9u; i++) { f[i] = f_in[base + i]; }
@@ -86,6 +88,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   // Local solid velocity Us
   var rx = p.x - state.cx;
   var ry = p.y - state.cy;
+  // NOTE: In moving window mode, dx/dy are already window-local, 
+  // but we keep the wrap check for robustness during transition.
   rx -= f32(W) * round(rx / f32(W));
   ry -= f32(H) * round(ry / f32(H));
   let usx = state.vx - state.omega * ry;
