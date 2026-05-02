@@ -77,8 +77,9 @@ function feq(rho, ux, uy, i) {
 function initF() {
   const f = new Float32Array(NCELLS * 9);
   for (let c = 0; c < NCELLS; c++) {
-    const base = c * 9;
-    for (let i = 0; i < 9; i++) f[base+i] = feq(1, 0, 0, i);
+    for (let i = 0; i < 9; i++) {
+      f[i * NCELLS + c] = feq(1, 0, 0, i);
+    }
   }
   return f;
 }

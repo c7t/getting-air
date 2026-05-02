@@ -86,7 +86,7 @@ fn main(
     if (chi >= 1e-6) {
       var rho = 0f; var ux_star = 0f; var uy_star = 0f;
       for (var i = 0u; i < 9u; i++) {
-        let fi = f_in[base + i];
+        let fi = f_in[i * (W * H) + cell];
         rho     += fi;
         ux_star += fi * f32(ex[i]);
         uy_star += fi * f32(ey[i]);
