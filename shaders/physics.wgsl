@@ -33,8 +33,8 @@ struct CardState {
 @group(0) @binding(0) var<storage, read_write> state  : CardState;
 @group(0) @binding(1) var<storage, read_write> forces : array<atomic<i32>, 4>;
 
-const W = 512.0f;
-const H = 512.0f;
+override W : u32;
+override H : u32;
 const FSCALE = 10000.0f;
 
 @compute @workgroup_size(1)
@@ -68,17 +68,17 @@ fn main() {
 
   // 5. Moving Window Panning
   // We want to keep (cx, cy) near (W/2, H*2/3)
-  let initial_cx = W / 2.0f;
-  let initial_cy = H / 2.0f;
+  let initial_cx = f32(W) / 2.0f;
+  let initial_cy = f32(H) / 2.0f;
 
-  let shift_x = floor(state.x_total);
-  let shift_y = floor(state.y_total);
+  let shift_x = i32(floor(state.x_total));
+  let shift_y = i32(floor(state.y_total));
 
-  state.off_x = (shift_x % W + W) % W;
-  state.off_y = (shift_y % H + H) % H;
+  state.off_x = f32((shift_x % i32(W) + i32(W)) % i32(W));
+  state.off_y = f32((shift_y % i32(H) + i32(H)) % i32(H));
 
-  state.cx = initial_cx + (state.x_total - shift_x);
-  state.cy = initial_cy + (state.y_total - shift_y);
+  state.cx = initial_cx + (state.x_total - f32(shift_x));
+  state.cy = initial_cy + (state.y_total - f32(shift_y));
 
   state.fx = fx_fluid;
   state.fy = fy_fluid;

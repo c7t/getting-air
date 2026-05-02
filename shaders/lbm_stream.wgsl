@@ -33,8 +33,8 @@ struct CardState {
 @group(0) @binding(1) var<storage, read>       f_col : array<f32>;
 @group(0) @binding(2) var<storage, read_write> f_out : array<f32>;
 
-const W   = 512u;
-const H   = 512u;
+override W : u32;
+override H : u32;
 
 const ex = array<i32,9>( 0, 1, 0,-1, 0, 1,-1,-1, 1);
 const ey = array<i32,9>( 0, 0, 1, 0,-1, 1, 1,-1,-1);

@@ -1,7 +1,27 @@
 const canvas   = document.getElementById('c');
 const statusEl = document.getElementById('status');
 
-const W = 512, H = 512, NCELLS = W * H;
+const urlParams = new URLSearchParams(window.location.search);
+let resLog2 = parseInt(urlParams.get('res')) || 6; 
+if (resLog2 < 6) resLog2 = 6;
+if (resLog2 > 11) resLog2 = 11;
+
+let W = 1 << resLog2;
+let H = W;
+let NCELLS = W * H;
+
+const resSlider = document.getElementById('slider-RES');
+const resVal    = document.getElementById('val-RES');
+resSlider.value = resLog2;
+resVal.textContent = W;
+resSlider.onchange = () => {
+  const url = new URL(window.location);
+  url.searchParams.set('res', resSlider.value);
+  window.location.href = url.href;
+};
+resSlider.oninput = () => {
+  resVal.textContent = 1 << parseInt(resSlider.value);
+};
 
 // ── Pesavento & Wang (2004) physical parameters ───────────────────────────────
 // These constants define the "regime" of the simulation (Falling Paper).
@@ -211,13 +231,24 @@ async function init() {
     { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } }
   ]});
 
-  const stepPL = device.createComputePipeline({ layout: device.createPipelineLayout({ bindGroupLayouts: [stepBGL] }), compute: { module: stepSM, entryPoint: 'main' } });
-  const frcPL = device.createComputePipeline({ layout: device.createPipelineLayout({ bindGroupLayouts: [frcBGL] }), compute: { module: frcSM, entryPoint: 'main' } });
-  const phyPL = device.createComputePipeline({ layout: device.createPipelineLayout({ bindGroupLayouts: [phyBGL] }), compute: { module: phySM, entryPoint: 'main' } });
+  const constants = { W, H };
+
+  const stepPL = device.createComputePipeline({ 
+    layout: device.createPipelineLayout({ bindGroupLayouts: [stepBGL] }), 
+    compute: { module: stepSM, entryPoint: 'main', constants } 
+  });
+  const frcPL = device.createComputePipeline({ 
+    layout: device.createPipelineLayout({ bindGroupLayouts: [frcBGL] }), 
+    compute: { module: frcSM, entryPoint: 'main', constants } 
+  });
+  const phyPL = device.createComputePipeline({ 
+    layout: device.createPipelineLayout({ bindGroupLayouts: [phyBGL] }), 
+    compute: { module: phySM, entryPoint: 'main', constants } 
+  });
   const renPL = device.createRenderPipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [renBGL] }),
-    vertex: { module: renSM, entryPoint: 'vs_main' },
-    fragment: { module: renSM, entryPoint: 'fs_main', targets: [{ format: fmt }] },
+    vertex: { module: renSM, entryPoint: 'vs_main', constants },
+    fragment: { module: renSM, entryPoint: 'fs_main', targets: [{ format: fmt }], constants },
     primitive: { topology: 'triangle-list' },
   });
 
