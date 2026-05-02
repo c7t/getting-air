@@ -32,8 +32,8 @@ struct CardState {
 @group(0) @binding(0) var<storage, read> vel   : array<f32>;
 @group(0) @binding(1) var<storage, read> state : CardState;
 
-const W = 512.0f;
-const H = 512.0f;
+override W : u32;
+override H : u32;
 
 struct VSOut {
   @builtin(position) pos : vec4<f32>,
@@ -57,8 +57,8 @@ fn get_phi(p: vec2<f32>, state: CardState) -> f32 {
     let sa = sin(state.theta);
     var dx = p.x - state.cx;
     var dy = p.y - state.cy;
-    dx -= W * round(dx / W);
-    dy -= H * round(dy / H);
+    dx -= f32(W) * round(dx / f32(W));
+    dy -= f32(H) * round(dy / f32(H));
     let lx = dx * ca + dy * sa;
     let ly = -dx * sa + dy * ca;
     let d = sqrt((lx*lx)/(state.a*state.a) + (ly*ly)/(state.b*state.b)) - 1.0;
@@ -71,24 +71,24 @@ fn get_chi(phi: f32) -> f32 {
 }
 
 fn get_uy(x: i32, y: i32) -> f32 {
-    let wx = (u32(x) + u32(W)) % u32(W);
-    let wy = (u32(y) + u32(H)) % u32(H);
-    let bx = (wx + u32(state.off_x)) % u32(W);
-    let by = (wy + u32(state.off_y)) % u32(H);
-    return vel[(by * u32(W) + bx) * 2u + 1u];
+    let wx = (u32(x) + W) % W;
+    let wy = (u32(y) + H) % H;
+    let bx = (wx + u32(state.off_x)) % W;
+    let by = (wy + u32(state.off_y)) % H;
+    return vel[(by * W + bx) * 2u + 1u];
 }
 
 fn get_ux(x: i32, y: i32) -> f32 {
-    let wx = (u32(x) + u32(W)) % u32(W);
-    let wy = (u32(y) + u32(H)) % u32(H);
-    let bx = (wx + u32(state.off_x)) % u32(W);
-    let by = (wy + u32(state.off_y)) % u32(H);
-    return vel[(by * u32(W) + bx) * 2u];
+    let wx = (u32(x) + W) % W;
+    let wy = (u32(y) + H) % H;
+    let bx = (wx + u32(state.off_x)) % W;
+    let by = (wy + u32(state.off_y)) % H;
+    return vel[(by * W + bx) * 2u];
 }
 
 @fragment
 fn fs_main(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> {
-  let fx = uv.x * W; let fy = (1.0 - uv.y) * H;
+  let fx = uv.x * f32(W); let fy = (1.0 - uv.y) * f32(H);
   let ix = i32(fx); let iy = i32(fy);
   
   let chi = get_chi(get_phi(vec2(fx, fy), state));
