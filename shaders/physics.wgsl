@@ -67,9 +67,9 @@ fn main() {
   state.theta   += state.omega;
 
   // 5. Moving Window Panning
-  // We want to keep (cx, cy) near (W/2, H/2)
+  // We want to keep (cx, cy) near (W/2, H*2/3)
   let initial_cx = W / 2.0f;
-  let initial_cy = H / 2.0f;
+  let initial_cy = H * 2.0f / 3.0f;
 
   let shift_x = floor(state.x_total);
   let shift_y = floor(state.y_total);
