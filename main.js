@@ -112,6 +112,7 @@ async function init() {
     { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }
   ]});
   const strBGL = device.createBindGroupLayout({ label: 'strBGL', entries: [
+    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }
   ]});
@@ -141,7 +142,7 @@ async function init() {
   });
 
   const colBG = device.createBindGroup({ layout: colBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_a } }, { binding: 2, resource: { buffer: f_b } }, { binding: 3, resource: { buffer: velBuf } }]});
-  const strBG = device.createBindGroup({ layout: strBGL, entries: [{ binding: 1, resource: { buffer: f_b } }, { binding: 2, resource: { buffer: f_c } }]});
+  const strBG = device.createBindGroup({ layout: strBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_b } }, { binding: 2, resource: { buffer: f_c } }]});
   const frcBG = device.createBindGroup({ layout: frcBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_a } }, { binding: 2, resource: { buffer: forceBuf } }]});
   const phyBG = device.createBindGroup({ layout: phyBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: forceBuf } }]});
   const renBG = device.createBindGroup({ layout: renBGL, entries: [{ binding: 0, resource: { buffer: velBuf } }, { binding: 1, resource: { buffer: cardStateBuf } }]});
