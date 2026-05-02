@@ -100,7 +100,24 @@ async function init() {
   if (!navigator.gpu) { statusEl.textContent = 'WebGPU not available'; return; }
   const adapter = await navigator.gpu.requestAdapter();
   if (!adapter) { statusEl.textContent = 'No adapter'; return; }
-  const device = await adapter.requestDevice();
+  
+  const hasTimestamp = adapter.features.has('timestamp-query');
+  const device = await adapter.requestDevice({
+    requiredFeatures: hasTimestamp ? ['timestamp-query'] : []
+  });
+
+  const querySet = hasTimestamp ? device.createQuerySet({
+    type: 'timestamp',
+    count: 2
+  }) : null;
+  const queryResolveBuffer = hasTimestamp ? device.createBuffer({
+    size: 16,
+    usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC
+  }) : null;
+  const queryReadBuffer = hasTimestamp ? device.createBuffer({
+    size: 16,
+    usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+  }) : null;
   
   device.pushErrorScope('validation');
 
@@ -238,6 +255,10 @@ async function init() {
     a.click();
   };
 
+  const mlupsEl = document.getElementById('val-mlups');
+  const gpuMsEl = document.getElementById('val-gpu-ms');
+  const syncMsEl = document.getElementById('val-sync-ms');
+
   async function frame() {
     try {
       if (paramsDirty) {
@@ -245,6 +266,11 @@ async function init() {
         paramsDirty = false;
       }
       const enc = device.createCommandEncoder();
+      
+      if (hasTimestamp) {
+        enc.writeTimestamp(querySet, 0);
+      }
+
       for (let s = 0; s < STEPS_PER_FRAME; s++) {
         const col = enc.beginComputePass(); col.setPipeline(colPL); col.setBindGroup(0, colBG); col.dispatchWorkgroups(WGX, WGY); col.end();
         const str = enc.beginComputePass(); str.setPipeline(strPL); str.setBindGroup(0, strBG); str.dispatchWorkgroups(WGX, WGY); str.end();
@@ -254,21 +280,48 @@ async function init() {
       }
       step += STEPS_PER_FRAME;
 
+      if (hasTimestamp) {
+        enc.writeTimestamp(querySet, 1);
+        enc.resolveQuerySet(querySet, 0, 2, queryResolveBuffer, 0);
+        enc.copyBufferToBuffer(queryResolveBuffer, 0, queryReadBuffer, 0, 16);
+      }
+
       const rp = enc.beginRenderPass({ colorAttachments: [{ view: ctx.getCurrentTexture().createView(), clearValue: { r:0.07, g:0.07, b:0.1, a:1 }, loadOp: 'clear', storeOp: 'store' }]});
       rp.setPipeline(renPL); rp.setBindGroup(0, renBG); rp.draw(6); rp.end();
       
       enc.copyBufferToBuffer(cardStateBuf, 0, cardStateStage, 0, 104);
+      
+      const tSubmit = performance.now();
       device.queue.submit([enc.finish()]);
 
       // Read back state every frame for trajectory
       await cardStateStage.mapAsync(GPUMapMode.READ);
+      const tRead = performance.now();
+      
       const d = new Float32Array(cardStateStage.getMappedRange());
-      // Stop pushing trajectory updates after a while so we don't eat all memory
+      
+      let gpuTime = 0;
+      if (hasTimestamp) {
+        await queryReadBuffer.mapAsync(GPUMapMode.READ);
+        const timestamps = new BigUint64Array(queryReadBuffer.getMappedRange());
+        gpuTime = Number(timestamps[1] - timestamps[0]) / 1e6;
+        queryReadBuffer.unmap();
+      } else {
+        // Fallback to CPU-side timing of the submission block
+        gpuTime = tRead - tSubmit;
+      }
+
+      // Update trajectory
       if (step < 100000) {
         // Record: step, cx, cy_total, cx_total, theta, vx, vy, omega, fx, fy, tz
         trajectory.push([step, d[0], d[20], d[21], d[2], d[3], d[4], d[5], d[6], d[7], d[8]]);
       }
-      if (performance.now() - lastT > 300) {
+      
+      if (performance.now() - lastT > 250) {
+        const mlups = (NCELLS * STEPS_PER_FRAME) / (gpuTime * 1e3);
+        mlupsEl.textContent = mlups.toFixed(1);
+        gpuMsEl.textContent = gpuTime.toFixed(2);
+        syncMsEl.textContent = (tRead - tSubmit).toFixed(2);
         statusEl.textContent = `step ${step}  y=${d[20].toFixed(1)}  x=${d[21].toFixed(1)}  vy=${d[4].toFixed(4)}  Fy=${d[7].toExponential(2)}  θ=${d[2].toFixed(2)}`;
         lastT = performance.now();
       }
