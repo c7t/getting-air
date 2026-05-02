@@ -5,27 +5,61 @@ const dpr = window.devicePixelRatio || 1;
 canvas.width  = Math.round(canvas.clientWidth  * dpr);
 canvas.height = Math.round(canvas.clientHeight * dpr);
 
-const W = 1024, H = 1024, NCELLS = W * H;
+const W = 512, H = 512, NCELLS = W * H;
 
 // ── Pesavento & Wang (2004) physical parameters ───────────────────────────────
+// These constants define the "regime" of the simulation (Falling Paper).
+
 // Paper: "Falling Paper: Navigating the Trade-Off between Density and Aspect Ratio"
 // Semi-axes: a=32, b=4 [lu].  Aspect ratio e = b/a = 0.125.
-const A = 64, B = 8;
+// Geometry: Semi-major (A) and semi-minor (B) axes of the ellipse in lattice units.
+// The card is 2*A long and 2*B thick.
+const A = 32, B = 4;
 
 // Dimensionless moment of inertia: I* = b(a²+b²)ρ_b / (2a³ρ_f)  = 0.17
 // → ρ_b/ρ_f = I* · 2a³ / (b·(a²+b²)) ≈ 2.678
+// This characterizes the rotation dynamics. A value of 0.17 is typical for 
+// a card whose mass distribution allows for stable tumbling.
 const I_STAR = 0.34;
+
+// RHO_B: Solid-to-fluid density ratio (ρ_body / ρ_fluid).
+// Calculated to satisfy the I_STAR requirement. In LBM, fluid density is 1.0.
+// Higher RHO_B makes the card "heavier" and less affected by small fluid gusts.
 const RHO_B  = I_STAR * 2 * A**3 / (B * (A**2 + B**2));
+
+// MASS: Total mass of the 2D ellipse (Area * Density).
 const MASS   = RHO_B * Math.PI * A * B;
+
+// I_BODY: Moment of inertia for a 2D ellipse. 
+// Determines how much torque is needed to change the card's rotation speed.
 const I_BODY = RHO_B * Math.PI * A * B * (A**2 + B**2) / 4;
 
-// Target u_t small enough to keep Ma < 0.1 during free-fall transient.
+// TAU: LBM Relaxation Time. 
+// Related to Kinematic Viscosity (ν) by: ν = (TAU - 0.5) / 3.
+// TAU = 0.5 corresponds to zero viscosity (unstable). 
+// TAU = 0.52 is "thin" fluid (high Reynolds number, e.g., Re ≈ 1100).
 // Target Re = 1100 requires τ ≈ 0.509; we start at 0.52 for stability.
-const TAU     = 0.52;
-const U_T     = 0.05;
+const TAU     = 0.508;
+
+// U_T: Target Terminal Velocity (in lattice units per step).
+// Target u_t small enough to keep Ma < 0.1 during free-fall transient.
+// We aim for 0.05 so that even during fast tumbles, the tip velocity
+// stays well below the Mach limit (Ma < 0.3) where LBM becomes inaccurate.
+const U_T     = 0.08;
+
+// G_LU: Raw Gravity. 
+// The gravitational constant needed to reach U_T against viscous drag.
 const G_LU    = U_T**2 / (Math.PI * B * (RHO_B - 1));
+
+// G_EFF: Effective Gravity (Buoyancy-corrected).
+// In a coupled simulation, the fluid pushes up on the card. 
+// G_EFF accounts for the weight of the card minus the weight of the displaced fluid.
 const G_EFF   = G_LU * (1 - 1 / RHO_B);
 
+// FSCALE: Atomic Scaling Factor.
+// Used to convert floating-point forces/torques to integers for the GPU atomics.
+// Must be large enough for precision (1e4 = 0.0001 precision) but small enough
+// to avoid 32-bit integer overflow when summing 1000s of cells.
 const FSCALE  = 1e4;
 
 const EX = [0, 1, 0,-1, 0, 1,-1,-1, 1];
