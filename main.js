@@ -335,6 +335,7 @@ async function init() {
 
         // Update trajectory from this specific completed step
         if (st.step < 100000) {
+          // Record: step, cx, cy_total, cx_total, theta, vx, vy, omega, fx, fy, tz
           trajectory.push([st.step, d[0], d[20], d[21], d[2], d[3], d[4], d[5], d[6], d[7], d[8]]);
         }
         
