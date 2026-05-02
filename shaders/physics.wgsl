@@ -33,7 +33,7 @@ struct CardState {
 @group(0) @binding(0) var<storage, read_write> state  : CardState;
 @group(0) @binding(1) var<storage, read_write> forces : array<atomic<i32>, 4>;
 
-const W = 512.0f;
+const W = 1024.0f;
 const H = 1024.0f;
 const FSCALE = 1000.0f;
 
