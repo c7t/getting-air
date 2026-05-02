@@ -152,7 +152,7 @@ async function init() {
   if (error) { handleErr(error); return; }
 
   const WGX = Math.ceil(W / 8), WGY = Math.ceil(H / 8);
-  const STEPS_PER_FRAME = 16;
+  const STEPS_PER_FRAME = 32;
   let step = 0, lastT = performance.now();
 
   const trajectory = [];
