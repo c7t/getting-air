@@ -4,7 +4,7 @@ const dpr = window.devicePixelRatio || 1;
 canvas.width  = Math.round(canvas.clientWidth  * dpr);
 canvas.height = Math.round(canvas.clientHeight * dpr);
 
-const W = 512, H = 1024, NCELLS = W * H;
+const W = 1024, H = 1024, NCELLS = W * H;
 
 // ── Pesavento & Wang (2004) physical parameters ───────────────────────────────
 // Paper: "Falling Paper: Navigating the Trade-Off between Density and Aspect Ratio"

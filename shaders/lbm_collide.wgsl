@@ -34,7 +34,7 @@ struct CardState {
 @group(0) @binding(2) var<storage, read_write> f_col : array<f32>;
 @group(0) @binding(3) var<storage, read_write> vel   : array<f32>;
 
-const W   = 512u;
+const W   = 1024u;
 const H   = 1024u;
 
 const ex = array<i32,9>( 0, 1, 0,-1, 0, 1,-1,-1, 1);
