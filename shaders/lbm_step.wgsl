@@ -82,7 +82,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let bx_src = (wx_src + u32(state.off_x)) % W;
     let by_src = (wy_src + u32(state.off_y)) % H;
     
-    f[i] = f_in[(by_src * W + bx_src) * 9u + i];
+    f[i] = f_in[i * (W * H) + (by_src * W + bx_src)];
   }
 
   // 2. Local Macroscopic Variables
@@ -144,6 +144,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let f_collide = f[i] - omg * (f[i] - feq) + Si;
     let f_target  = wt[i] * 1.0f; // rho=1.0, u=0 equilibrium
     
-    f_out[cell * 9u + i] = mix(f_collide, f_target, sponge_weight);
+    f_out[i * (W * H) + cell] = mix(f_collide, f_target, sponge_weight);
   }
 }
