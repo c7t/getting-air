@@ -89,8 +89,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   ry -= f32(H) * round(ry / f32(H));
   let usx = state.vx - state.omega * ry;
   let usy = state.vy + state.omega * rx;
-  
-...
+
   // Penalty Force F = rho * chi * (Us - u*)
   let Fx = rho * chi * (usx - ux_star);
   let Fy = rho * chi * (usy - uy_star);
