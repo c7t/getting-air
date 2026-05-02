@@ -137,7 +137,6 @@ async function init() {
   const fSize   = NCELLS * 9 * 4;
   const f_a     = device.createBuffer({ size: fSize, usage: U.STORAGE | U.COPY_DST });
   const f_b     = device.createBuffer({ size: fSize, usage: U.STORAGE });
-  const f_c     = device.createBuffer({ size: fSize, usage: U.STORAGE | U.COPY_SRC });
   const velBuf  = device.createBuffer({ size: NCELLS * 2 * 4, usage: U.STORAGE });
   const forceBuf = device.createBuffer({ size: 16, usage: U.STORAGE | U.COPY_SRC | U.COPY_DST });
 
@@ -185,24 +184,18 @@ async function init() {
     };
   });
 
-  const [colSM, strSM, frcSM, phySM, renSM] = await Promise.all([
-    loadShader(device, 'shaders/lbm_collide.wgsl'),
-    loadShader(device, 'shaders/lbm_stream.wgsl'),
+  const [stepSM, frcSM, phySM, renSM] = await Promise.all([
+    loadShader(device, 'shaders/lbm_step.wgsl'),
     loadShader(device, 'shaders/lbm_force.wgsl'),
     loadShader(device, 'shaders/physics.wgsl'),
     loadShader(device, 'shaders/render.wgsl'),
   ]);
 
-  const colBGL = device.createBindGroupLayout({ label: 'colBGL', entries: [
+  const stepBGL = device.createBindGroupLayout({ label: 'stepBGL', entries: [
     { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
     { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }
-  ]});
-  const strBGL = device.createBindGroupLayout({ label: 'strBGL', entries: [
-    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }
   ]});
   const frcBGL = device.createBindGroupLayout({ label: 'frcBGL', entries: [
     { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
@@ -218,8 +211,7 @@ async function init() {
     { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } }
   ]});
 
-  const colPL = device.createComputePipeline({ layout: device.createPipelineLayout({ bindGroupLayouts: [colBGL] }), compute: { module: colSM, entryPoint: 'main' } });
-  const strPL = device.createComputePipeline({ layout: device.createPipelineLayout({ bindGroupLayouts: [strBGL] }), compute: { module: strSM, entryPoint: 'main' } });
+  const stepPL = device.createComputePipeline({ layout: device.createPipelineLayout({ bindGroupLayouts: [stepBGL] }), compute: { module: stepSM, entryPoint: 'main' } });
   const frcPL = device.createComputePipeline({ layout: device.createPipelineLayout({ bindGroupLayouts: [frcBGL] }), compute: { module: frcSM, entryPoint: 'main' } });
   const phyPL = device.createComputePipeline({ layout: device.createPipelineLayout({ bindGroupLayouts: [phyBGL] }), compute: { module: phySM, entryPoint: 'main' } });
   const renPL = device.createRenderPipeline({
@@ -229,9 +221,12 @@ async function init() {
     primitive: { topology: 'triangle-list' },
   });
 
-  const colBG = device.createBindGroup({ layout: colBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_a } }, { binding: 2, resource: { buffer: f_b } }, { binding: 3, resource: { buffer: velBuf } }]});
-  const strBG = device.createBindGroup({ layout: strBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_b } }, { binding: 2, resource: { buffer: f_c } }]});
-  const frcBG = device.createBindGroup({ layout: frcBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_a } }, { binding: 2, resource: { buffer: forceBuf } }]});
+  const stepBG_ab = device.createBindGroup({ layout: stepBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_a } }, { binding: 2, resource: { buffer: f_b } }, { binding: 3, resource: { buffer: velBuf } }]});
+  const stepBG_ba = device.createBindGroup({ layout: stepBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_b } }, { binding: 2, resource: { buffer: f_a } }, { binding: 3, resource: { buffer: velBuf } }]});
+  
+  const frcBG_a = device.createBindGroup({ layout: frcBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_a } }, { binding: 2, resource: { buffer: forceBuf } }]});
+  const frcBG_b = device.createBindGroup({ layout: frcBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_b } }, { binding: 2, resource: { buffer: forceBuf } }]});
+  
   const phyBG = device.createBindGroup({ layout: phyBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: forceBuf } }]});
   const renBG = device.createBindGroup({ layout: renBGL, entries: [{ binding: 0, resource: { buffer: velBuf } }, { binding: 1, resource: { buffer: cardStateBuf } }]});
 
@@ -241,6 +236,7 @@ async function init() {
   const WGX = Math.ceil(W / 8), WGY = Math.ceil(H / 8);
   const STEPS_PER_FRAME = 64;
   let step = 0, lastT = performance.now();
+  let useB = false;
 
   const trajectory = [];
 
@@ -272,11 +268,14 @@ async function init() {
       }
 
       for (let s = 0; s < STEPS_PER_FRAME; s++) {
-        const col = enc.beginComputePass(); col.setPipeline(colPL); col.setBindGroup(0, colBG); col.dispatchWorkgroups(WGX, WGY); col.end();
-        const str = enc.beginComputePass(); str.setPipeline(strPL); str.setBindGroup(0, strBG); str.dispatchWorkgroups(WGX, WGY); str.end();
-        enc.copyBufferToBuffer(f_c, 0, f_a, 0, fSize);
+        const stepBG = useB ? stepBG_ba : stepBG_ab;
+        const frcBG  = useB ? frcBG_b  : frcBG_a;
+        
         const frc = enc.beginComputePass(); frc.setPipeline(frcPL); frc.setBindGroup(0, frcBG); frc.dispatchWorkgroups(WGX, WGY); frc.end();
         const phy = enc.beginComputePass(); phy.setPipeline(phyPL); phy.setBindGroup(0, phyBG); phy.dispatchWorkgroups(1); phy.end();
+        const stp = enc.beginComputePass(); stp.setPipeline(stepPL); stp.setBindGroup(0, stepBG); stp.dispatchWorkgroups(WGX, WGY); stp.end();
+        
+        useB = !useB;
       }
       step += STEPS_PER_FRAME;
 
