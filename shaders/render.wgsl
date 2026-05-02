@@ -98,12 +98,12 @@ fn fs_main(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> {
             - (get_ux(ix, iy + 1) - get_ux(ix, iy - 1)) * 0.5f;
 
   // Blue for clockwise (negative), red for counter-clockwise (positive)
-  let val = clamp(omega * 20.0f, -1.0f, 1.0f);
+  let val = clamp(omega * 80.0f, -1.0f, 1.0f);
   var c: vec3<f32>;
   if (val > 0.0) {
-    c = mix(vec3(0.05, 0.05, 0.1), vec3(0.9, 0.2, 0.1), val);
+    c = mix(vec3(0.05, 0.05, 0.1), vec3(1.0, 0.3, 0.2), val);
   } else {
-    c = mix(vec3(0.05, 0.05, 0.1), vec3(0.1, 0.4, 0.9), -val);
+    c = mix(vec3(0.05, 0.05, 0.1), vec3(0.2, 0.5, 1.0), -val);
   }
   
   // Blend with solid color
