@@ -190,7 +190,7 @@ async function init() {
       await cardStateStage.mapAsync(GPUMapMode.READ);
       const d = new Float32Array(cardStateStage.getMappedRange());
       // Stop pushing trajectory updates after a while so we don't eat all memory
-      if (d[20] < 100000) {
+      if (step < 100000) {
         // Record: step, cx, cy_total, cx_total, theta, vx, vy, omega, fx, fy, tz
         trajectory.push([step, d[0], d[20], d[21], d[2], d[3], d[4], d[5], d[6], d[7], d[8]]);
       }
