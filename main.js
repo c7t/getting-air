@@ -143,7 +143,6 @@ async function init() {
 
   // CardState: 26 floats = 104 bytes
   const cardStateBuf   = device.createBuffer({ size: 104, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
-  const cardStateStage = device.createBuffer({ size: 104, usage: U.MAP_READ | U.COPY_DST });
 
   const cardInit = new Float32Array([
     W/2, H/2, 0.2,   // cx, cy, theta
@@ -252,6 +251,16 @@ async function init() {
     a.click();
   };
 
+  // Triple-buffering for readbacks to avoid CPU-GPU stalls
+  const STAGES = 3;
+  const stages = Array.from({ length: STAGES }, () => ({
+    card: device.createBuffer({ size: 104, usage: U.MAP_READ | U.COPY_DST }),
+    query: hasTimestamp ? device.createBuffer({ size: 16, usage: U.MAP_READ | U.COPY_DST }) : null,
+    inFlight: false,
+    step: 0
+  }));
+  let currentStageIdx = 0;
+
   const mlupsEl = document.getElementById('val-mlups');
   const gpuMsEl = document.getElementById('val-gpu-ms');
   const syncMsEl = document.getElementById('val-sync-ms');
@@ -262,6 +271,15 @@ async function init() {
         updateGPUParams();
         paramsDirty = false;
       }
+      
+      const stage = stages[currentStageIdx];
+      // Backpressure: if the oldest stage is still in flight, we must wait.
+      // With 3 buffers and STEPS_PER_FRAME=64, this should be rare.
+      if (stage.inFlight) {
+        requestAnimationFrame(() => frame().catch(handleErr));
+        return;
+      }
+
       const enc = device.createCommandEncoder();
       
       if (hasTimestamp) {
@@ -283,50 +301,59 @@ async function init() {
       if (hasTimestamp) {
         enc.writeTimestamp(querySet, 1);
         enc.resolveQuerySet(querySet, 0, 2, queryResolveBuffer, 0);
-        enc.copyBufferToBuffer(queryResolveBuffer, 0, queryReadBuffer, 0, 16);
+        enc.copyBufferToBuffer(queryResolveBuffer, 0, stage.query, 0, 16);
       }
 
       const rp = enc.beginRenderPass({ colorAttachments: [{ view: ctx.getCurrentTexture().createView(), clearValue: { r:0.07, g:0.07, b:0.1, a:1 }, loadOp: 'clear', storeOp: 'store' }]});
       rp.setPipeline(renPL); rp.setBindGroup(0, renBG); rp.draw(6); rp.end();
       
-      enc.copyBufferToBuffer(cardStateBuf, 0, cardStateStage, 0, 104);
+      enc.copyBufferToBuffer(cardStateBuf, 0, stage.card, 0, 104);
       
       const tSubmit = performance.now();
       device.queue.submit([enc.finish()]);
 
-      // Read back state every frame for trajectory
-      await cardStateStage.mapAsync(GPUMapMode.READ);
-      const tRead = performance.now();
+      // Start asynchronous readback
+      stage.inFlight = true;
+      stage.step = step;
       
-      const d = new Float32Array(cardStateStage.getMappedRange());
-      
-      let gpuTime = 0;
-      if (hasTimestamp) {
-        await queryReadBuffer.mapAsync(GPUMapMode.READ);
-        const timestamps = new BigUint64Array(queryReadBuffer.getMappedRange());
-        gpuTime = Number(timestamps[1] - timestamps[0]) / 1e6;
-        queryReadBuffer.unmap();
-      } else {
-        // Fallback to CPU-side timing of the submission block
-        gpuTime = tRead - tSubmit;
-      }
+      const processReadback = async (st) => {
+        const pCard = st.card.mapAsync(GPUMapMode.READ);
+        const pQuery = hasTimestamp ? st.query.mapAsync(GPUMapMode.READ) : Promise.resolve();
+        
+        await Promise.all([pCard, pQuery]);
+        
+        const d = new Float32Array(st.card.getMappedRange());
+        let gpuTime = 0;
+        if (hasTimestamp) {
+          const timestamps = new BigUint64Array(st.query.getMappedRange());
+          gpuTime = Number(timestamps[1] - timestamps[0]) / 1e6;
+          st.query.unmap();
+        } else {
+          // Without native timestamps, we measure CPU submission-to-read completion
+          gpuTime = performance.now() - tSubmit;
+        }
 
-      // Update trajectory
-      if (step < 100000) {
-        // Record: step, cx, cy_total, cx_total, theta, vx, vy, omega, fx, fy, tz
-        trajectory.push([step, d[0], d[20], d[21], d[2], d[3], d[4], d[5], d[6], d[7], d[8]]);
-      }
-      
-      if (performance.now() - lastT > 250) {
-        const mlups = (NCELLS * STEPS_PER_FRAME) / (gpuTime * 1e3);
-        mlupsEl.textContent = mlups.toFixed(1);
-        gpuMsEl.textContent = gpuTime.toFixed(2);
-        syncMsEl.textContent = (tRead - tSubmit).toFixed(2);
-        statusEl.textContent = `step ${step}  y=${d[20].toFixed(1)}  x=${d[21].toFixed(1)}  vy=${d[4].toFixed(4)}  Fy=${d[7].toExponential(2)}  θ=${d[2].toFixed(2)}`;
-        lastT = performance.now();
-      }
-      cardStateStage.unmap();
+        // Update trajectory from this specific completed step
+        if (st.step < 100000) {
+          trajectory.push([st.step, d[0], d[20], d[21], d[2], d[3], d[4], d[5], d[6], d[7], d[8]]);
+        }
+        
+        if (performance.now() - lastT > 250) {
+          const mlups = (NCELLS * STEPS_PER_FRAME) / (gpuTime * 1e3);
+          mlupsEl.textContent = mlups.toFixed(1);
+          gpuMsEl.textContent = gpuTime.toFixed(2);
+          syncMsEl.textContent = (performance.now() - tSubmit).toFixed(2);
+          statusEl.textContent = `step ${st.step}  y=${d[20].toFixed(1)}  x=${d[21].toFixed(1)}  vy=${d[4].toFixed(4)}  Fy=${d[7].toExponential(2)}  θ=${d[2].toFixed(2)}`;
+          lastT = performance.now();
+        }
+        
+        st.card.unmap();
+        st.inFlight = false;
+      };
 
+      processReadback(stage);
+      
+      currentStageIdx = (currentStageIdx + 1) % STAGES;
       requestAnimationFrame(() => frame().catch(handleErr));
     } catch (e) {
       handleErr(e);
