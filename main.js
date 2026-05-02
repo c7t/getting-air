@@ -39,13 +39,13 @@ const I_BODY = RHO_B * Math.PI * A * B * (A**2 + B**2) / 4;
 // TAU = 0.5 corresponds to zero viscosity (unstable). 
 // TAU = 0.52 is "thin" fluid (high Reynolds number, e.g., Re ≈ 1100).
 // Target Re = 1100 requires τ ≈ 0.509; we start at 0.52 for stability.
-const TAU     = 0.508;
+const TAU     = 0.502;
 
 // U_T: Target Terminal Velocity (in lattice units per step).
 // Target u_t small enough to keep Ma < 0.1 during free-fall transient.
 // We aim for 0.05 so that even during fast tumbles, the tip velocity
 // stays well below the Mach limit (Ma < 0.3) where LBM becomes inaccurate.
-const U_T     = 0.08;
+const U_T     = 0.05;
 
 // G_LU: Raw Gravity. 
 // The gravitational constant needed to reach U_T against viscous drag.
@@ -118,7 +118,7 @@ async function init() {
   const cardStateStage = device.createBuffer({ size: 104, usage: U.MAP_READ | U.COPY_DST });
 
   const cardInit = new Float32Array([
-    W/2, H * 2/3, 0.2,   // cx, cy, theta
+    W/2, H/2, 0.2,   // cx, cy, theta
     0, 0, 0,         // vx, vy, omega
     0, 0, 0,         // fx, fy, tz
     MASS, I_BODY, G_EFF,
@@ -186,7 +186,7 @@ async function init() {
   if (error) { handleErr(error); return; }
 
   const WGX = Math.ceil(W / 8), WGY = Math.ceil(H / 8);
-  const STEPS_PER_FRAME = 32;
+  const STEPS_PER_FRAME = 64;
   let step = 0, lastT = performance.now();
 
   const trajectory = [];
