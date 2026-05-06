@@ -40,12 +40,13 @@ struct VSOut {
   @location(0) uv : vec2<f32>,
 }
 
+const p = array<vec2<f32>,6>(
+  vec2(-1f,-1f), vec2( 1f,-1f), vec2(-1f, 1f),
+  vec2(-1f, 1f), vec2( 1f,-1f), vec2( 1f, 1f)
+);
+
 @vertex
 fn vs_main(@builtin(vertex_index) vi : u32) -> VSOut {
-  let p = array<vec2<f32>,6>(
-    vec2(-1f,-1f), vec2( 1f,-1f), vec2(-1f, 1f),
-    vec2(-1f, 1f), vec2( 1f,-1f), vec2( 1f, 1f)
-  );
   var out: VSOut;
   out.pos = vec4(p[vi], 0f, 1f);
   out.uv  = p[vi] * 0.5f + 0.5f;
