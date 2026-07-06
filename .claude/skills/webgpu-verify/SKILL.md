@@ -118,9 +118,23 @@ canvas is a failure to render, not success.
   `#vpm-r-circ` (VPM) — the VPM panel's measured-vs-analytic numbers are a real
   correctness check, not just telemetry.
 
+- **Kill every previous instance before launching a new one, not just the last
+  PID.** `$! > /tmp/vpm-chrome.pid` overwrites the pid file each time, so if you
+  launch several times across a session without cleaning up first, earlier
+  Chrome processes become orphaned and keep running in the background,
+  invisibly competing for the GPU with whichever instance you're currently
+  testing against. Symptom: numbers that were rock-solid in an earlier run
+  (e.g. an analytic-vs-measured match) suddenly show a large, unexplained
+  error — looks exactly like a code regression but is really just GPU
+  contention slowing/jittering the simulation. Before trusting a surprising
+  result, check `ps aux | grep "[c]hrome.*vpm-chrome-profile"` (or whatever
+  profile-dir prefix you're using) and `pkill -f` any stragglers, then rerun
+  on a clean GPU before concluding there's a real bug.
+
 ## Cleanup
 
 ```bash
 kill $(cat /tmp/vpm-chrome.pid) $(cat /tmp/vpm-https.pid) 2>/dev/null
-rm -rf /tmp/vpm-chrome-profile
+pkill -f "vpm-chrome-profile" 2>/dev/null   # catches any orphaned instances too
+rm -rf /tmp/vpm-chrome-profile*
 ```
