@@ -2,7 +2,7 @@ const canvas   = document.getElementById('c');
 const statusEl = document.getElementById('status');
 
 const urlParams = new URLSearchParams(window.location.search);
-let resLog2 = parseInt(urlParams.get('res')) || 6; 
+let resLog2 = parseInt(urlParams.get('res')) || 8;
 if (resLog2 < 6) resLog2 = 6;
 if (resLog2 > 11) resLog2 = 11;
 
