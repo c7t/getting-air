@@ -34,13 +34,14 @@ its own profile dir and a remote-debugging port, with WebGPU explicitly enabled:
 
 ```bash
 mkdir -p /tmp/vpm-chrome-profile
+profile_dir=$(mktemp -d -p /tmp/vpm-chrome-profile)
 DISPLAY=:0 nohup /opt/google/chrome/chrome \
   --remote-debugging-port=9333 \
   --enable-features=Vulkan,WebGPUService \
   --enable-unsafe-webgpu \
   --ignore-certificate-errors \
   --no-first-run --no-default-browser-check \
-  --user-data-dir=/tmp/vpm-chrome-profile \
+  --user-data-dir=$profile_dir \
   --window-size=1400,900 \
   "https://localhost:4444/index.html" > /tmp/vpm-chrome.log 2>&1 &
 echo $! > /tmp/vpm-chrome.pid
