@@ -158,8 +158,34 @@ async function init() {
   // dev build from the start (main.js keeps it off with `0 &&` -- don't
   // touch that file, this is deliberately different here).
   const hasTimestamp = adapter.features.has('timestamp-query');
+
+  // WebGPU devices default to the spec MINIMUM limits (128 MiB storage
+  // buffer bindings, 256 MiB total buffer size) regardless of what the
+  // adapter can actually do -- f_a/f_b (NCELLS*9*4 bytes) exceeds the
+  // default storage-binding limit at any resolution >= ~1536^2 (144 MiB at
+  // 2048^2). This is the "WebGPU allocation limit" this project has hit
+  // before; it's a device-limit *request* that was never made, unrelated
+  // to AMR block size (the coarse grid is still one dense NCELLS-sized
+  // buffer through Milestone 2 -- AMR's actual memory-footprint payoff
+  // doesn't land until Milestone 4's block pool). Request exactly what the
+  // current resolution needs, capped at the adapter's real capability, and
+  // fail with a clear message rather than a cryptic validation error if
+  // the requested resolution genuinely exceeds this GPU.
+  const DEFAULT_MAX_STORAGE_BINDING = 128 * 1024 * 1024;
+  const DEFAULT_MAX_BUFFER_SIZE = 256 * 1024 * 1024;
+  const neededBufferBytes = NCELLS * 9 * 4; // f_a/f_b: the largest storage-bound buffers
+  if (neededBufferBytes > adapter.limits.maxStorageBufferBindingSize) {
+    const mib = (b) => (b / 1048576).toFixed(0);
+    statusEl.textContent = `error: ${W}x${H} needs a ${mib(neededBufferBytes)} MiB buffer binding, this GPU's max is ${mib(adapter.limits.maxStorageBufferBindingSize)} MiB`;
+    return;
+  }
+  const requiredLimits = {
+    maxStorageBufferBindingSize: Math.min(Math.max(neededBufferBytes, DEFAULT_MAX_STORAGE_BINDING), adapter.limits.maxStorageBufferBindingSize),
+    maxBufferSize: Math.min(Math.max(neededBufferBytes, DEFAULT_MAX_BUFFER_SIZE), adapter.limits.maxBufferSize),
+  };
   const device = await adapter.requestDevice({
-    requiredFeatures: hasTimestamp ? ['timestamp-query'] : []
+    requiredFeatures: hasTimestamp ? ['timestamp-query'] : [],
+    requiredLimits,
   });
 
   const querySet = hasTimestamp ? device.createQuerySet({
