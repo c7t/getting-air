@@ -21,6 +21,21 @@ let W = 1 << resLog2;
 let H = W;
 let NCELLS = W * H;
 
+// ── Milestone 2 (plans/AMR.md): static 2-level refinement ─────────────────
+// Fixed fine region, window-space-anchored (not buffer-space -- see the
+// plan's design note). GHOST=2 fine-cell layers matches the paper's own
+// reasoning (2 fine substeps need 2 ghost layers to stay correctly fed).
+const GHOST = 2;
+const FINE_COARSE_W = 16, FINE_COARSE_H = 16; // fine region size, in COARSE cells
+const FW = FINE_COARSE_W * 2, FH = FINE_COARSE_H * 2; // fine "real" interior cells
+const FBW = FW + 2 * GHOST, FBH = FH + 2 * GHOST; // fine buffer incl. ghosts
+const NCELLS1 = FBW * FBH;
+// Defaults to card-centered; overridable via URL for the silence test (see
+// plans/AMR.md's Milestone 2 validation section), which wants the fine
+// region placed somewhere the card ISN'T.
+const FINE_ORIGIN_X = urlParams.has('fineOriginX') ? parseInt(urlParams.get('fineOriginX')) : Math.floor(W / 2 - FINE_COARSE_W / 2);
+const FINE_ORIGIN_Y = urlParams.has('fineOriginY') ? parseInt(urlParams.get('fineOriginY')) : Math.floor(H / 2 - FINE_COARSE_H / 2);
+
 const resSlider = document.getElementById('slider-RES');
 const resVal    = document.getElementById('val-RES');
 resSlider.value = resLog2;
@@ -70,6 +85,20 @@ function initF() {
   for (let c = 0; c < NCELLS; c++) {
     for (let i = 0; i < 9; i++) {
       f[i * NCELLS + c] = feq(1, 0, 0, i);
+    }
+  }
+  return f;
+}
+
+// The IC is spatially uniform (rho=1, u=0 everywhere), so the fine grid's
+// t=0 state is trivially also uniform equilibrium -- interpolating a
+// uniform coarse field gives back the same uniform field. No need for a
+// real GPU interpolation dispatch at init.
+function initF1() {
+  const f = new Float32Array(NCELLS1 * 9);
+  for (let c = 0; c < NCELLS1; c++) {
+    for (let i = 0; i < 9; i++) {
+      f[i * NCELLS1 + c] = feq(1, 0, 0, i);
     }
   }
   return f;
@@ -175,8 +204,17 @@ async function init() {
   // CardState: 26 floats = 104 bytes
   const cardStateBuf = device.createBuffer({ size: 104, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
 
+  // Fine grid (Milestone 2): plain flat buffer, no block-major layout and no
+  // moving-window circular addressing -- see plans/AMR.md's Milestone 2
+  // scope notes for why.
+  const fSize1  = NCELLS1 * 9 * 4;
+  const f1_a    = device.createBuffer({ size: fSize1, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
+  const f1_b    = device.createBuffer({ size: fSize1, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
+  const vel1Buf = device.createBuffer({ size: NCELLS1 * 2 * 4, usage: U.STORAGE | U.COPY_SRC });
+
   device.queue.writeBuffer(cardStateBuf, 0, initCardState());
   device.queue.writeBuffer(f_a, 0, initF());
+  device.queue.writeBuffer(f1_a, 0, initF1());
 
   let paramsDirty = false;
   const updateGPUParams = () => {
@@ -203,11 +241,14 @@ async function init() {
     };
   });
 
-  const [stepSM, frcSM, phySM, renSM] = await Promise.all([
+  const [stepSM, frcSM, phySM, renSM, interpSM, step1SM, avgSM] = await Promise.all([
     loadShader(device, 'shaders/amr_step.wgsl'),
     loadShader(device, 'shaders/amr_force.wgsl'),
     loadShader(device, 'shaders/amr_physics.wgsl'),
     loadShader(device, 'shaders/amr_render.wgsl'),
+    loadShader(device, 'shaders/amr_interp_c2f.wgsl'),
+    loadShader(device, 'shaders/amr_step1.wgsl'),
+    loadShader(device, 'shaders/amr_average_f2c.wgsl'),
   ]);
 
   const stepBGL = device.createBindGroupLayout({ label: 'stepBGL', entries: [
@@ -227,10 +268,31 @@ async function init() {
   ]});
   const renBGL = device.createBindGroupLayout({ label: 'renBGL', entries: [
     { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
-    { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } }
+    { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
+    { binding: 2, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } }
+  ]});
+
+  // Milestone 2: interp (coarse->fine ghosts), fine step, average (fine->coarse).
+  const interpBGL = device.createBindGroupLayout({ label: 'interpBGL', entries: [
+    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }
+  ]});
+  const step1BGL = device.createBindGroupLayout({ label: 'step1BGL', entries: [
+    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }
+  ]});
+  const avgBGL = device.createBindGroupLayout({ label: 'avgBGL', entries: [
+    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }
   ]});
 
   const constants = { W, H };
+  const fineConstants = { W, H, FW, FH, FINE_ORIGIN_X, FINE_ORIGIN_Y };
+  const step1Constants = { FW, FH, FINE_ORIGIN_X, FINE_ORIGIN_Y };
 
   const stepPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [stepBGL] }),
@@ -247,8 +309,20 @@ async function init() {
   const renPL = device.createRenderPipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [renBGL] }),
     vertex: { module: renSM, entryPoint: 'vs_main', constants },
-    fragment: { module: renSM, entryPoint: 'fs_main', targets: [{ format: fmt }], constants },
+    fragment: { module: renSM, entryPoint: 'fs_main', targets: [{ format: fmt }], constants: fineConstants },
     primitive: { topology: 'triangle-list' },
+  });
+  const interpPL = device.createComputePipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [interpBGL] }),
+    compute: { module: interpSM, entryPoint: 'main', constants: fineConstants }
+  });
+  const step1PL = device.createComputePipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [step1BGL] }),
+    compute: { module: step1SM, entryPoint: 'main', constants: step1Constants }
+  });
+  const avgPL = device.createComputePipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [avgBGL] }),
+    compute: { module: avgSM, entryPoint: 'main', constants: fineConstants }
   });
 
   const stepBG_ab = device.createBindGroup({ layout: stepBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_a } }, { binding: 2, resource: { buffer: f_b } }, { binding: 3, resource: { buffer: velBuf } }]});
@@ -258,12 +332,35 @@ async function init() {
   const frcBG_b = device.createBindGroup({ layout: frcBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_b } }, { binding: 2, resource: { buffer: forceBuf } }]});
 
   const phyBG = device.createBindGroup({ layout: phyBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: forceBuf } }]});
-  const renBG = device.createBindGroup({ layout: renBGL, entries: [{ binding: 0, resource: { buffer: velBuf } }, { binding: 1, resource: { buffer: cardStateBuf } }]});
+  const renBG = device.createBindGroup({ layout: renBGL, entries: [{ binding: 0, resource: { buffer: velBuf } }, { binding: 1, resource: { buffer: cardStateBuf } }, { binding: 2, resource: { buffer: vel1Buf } }]});
+
+  // Milestone 2 bind groups.
+  // interp always WRITES f1_a (the fine grid's current-at-macro-step-
+  // boundary buffer, mirroring f_a's own invariant -- 2 fine substeps per
+  // macro-step is even), but READS whichever coarse buffer is "current"
+  // this macro-step (same source the force pass reads).
+  const interpBG_readA = device.createBindGroup({ layout: interpBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_a } }, { binding: 2, resource: { buffer: f1_a } }]});
+  const interpBG_readB = device.createBindGroup({ layout: interpBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_b } }, { binding: 2, resource: { buffer: f1_a } }]});
+  // Fine ping-pong within a macro-step is a fixed 2-call sequence (ab then
+  // ba), not a persistent toggle like the coarse useB -- always call both,
+  // in order, every macro-step.
+  const step1BG_ab = device.createBindGroup({ layout: step1BGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f1_a } }, { binding: 2, resource: { buffer: f1_b } }, { binding: 3, resource: { buffer: vel1Buf } }]});
+  const step1BG_ba = device.createBindGroup({ layout: step1BGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f1_b } }, { binding: 2, resource: { buffer: f1_a } }, { binding: 3, resource: { buffer: vel1Buf } }]});
+  // average always READS f1_a (fine grid is current again after 2 substeps)
+  // but WRITES whichever coarse buffer the coarse step just wrote this
+  // macro-step -- named by target, matching stepBG_ba being the one that
+  // writes f_a.
+  const avgBG_targetA = device.createBindGroup({ layout: avgBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f1_a } }, { binding: 2, resource: { buffer: f_a } }]});
+  const avgBG_targetB = device.createBindGroup({ layout: avgBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f1_a } }, { binding: 2, resource: { buffer: f_b } }]});
 
   const error = await device.popErrorScope();
   if (error) { handleErr(error); return; }
 
   const WGX = Math.ceil(W / 8), WGY = Math.ceil(H / 8);
+  // Milestone 2: fine buffer dispatch (interp + fine step, full FBWxFBH),
+  // and average dispatch (one thread per coarse cell in the fine region).
+  const WGX1 = Math.ceil(FBW / 8), WGY1 = Math.ceil(FBH / 8);
+  const WGX_avg = Math.ceil((FW / 2) / 8), WGY_avg = Math.ceil((FH / 2) / 8);
   const STEPS_PER_FRAME = 64;
   let step = 0, lastT = performance.now();
   let useB = false;
@@ -302,6 +399,8 @@ async function init() {
   const stagingF     = device.createBuffer({ size: fSize, usage: U.MAP_READ | U.COPY_DST });
   const stagingVel   = device.createBuffer({ size: NCELLS * 2 * 4, usage: U.MAP_READ | U.COPY_DST });
   const stagingCard  = device.createBuffer({ size: 104, usage: U.MAP_READ | U.COPY_DST });
+  const stagingF1    = device.createBuffer({ size: fSize1, usage: U.MAP_READ | U.COPY_DST });
+  const stagingVel1  = device.createBuffer({ size: NCELLS1 * 2 * 4, usage: U.MAP_READ | U.COPY_DST });
 
   // Invariant this relies on: STEPS_PER_FRAME is even, so useB always
   // returns to its initial value (false) at a frame boundary, meaning f_a
@@ -312,21 +411,29 @@ async function init() {
     enc.copyBufferToBuffer(f_a, 0, stagingF, 0, fSize);
     enc.copyBufferToBuffer(velBuf, 0, stagingVel, 0, NCELLS * 2 * 4);
     enc.copyBufferToBuffer(cardStateBuf, 0, stagingCard, 0, 104);
+    enc.copyBufferToBuffer(f1_a, 0, stagingF1, 0, fSize1);
+    enc.copyBufferToBuffer(vel1Buf, 0, stagingVel1, 0, NCELLS1 * 2 * 4);
     device.queue.submit([enc.finish()]);
     await Promise.all([
       stagingF.mapAsync(GPUMapMode.READ),
       stagingVel.mapAsync(GPUMapMode.READ),
       stagingCard.mapAsync(GPUMapMode.READ),
+      stagingF1.mapAsync(GPUMapMode.READ),
+      stagingVel1.mapAsync(GPUMapMode.READ),
     ]);
     const f = new Float32Array(stagingF.getMappedRange()).slice();
     const vel = new Float32Array(stagingVel.getMappedRange()).slice();
     const card = Array.from(new Float32Array(stagingCard.getMappedRange()).slice());
+    const f1 = new Float32Array(stagingF1.getMappedRange()).slice();
+    const vel1 = new Float32Array(stagingVel1.getMappedRange()).slice();
     stagingF.unmap();
     stagingVel.unmap();
     stagingCard.unmap();
+    stagingF1.unmap();
+    stagingVel1.unmap();
 
     const snapshot = {
-      formatVersion: 2,
+      formatVersion: 3,
       // 'block8': f/vel are laid out in fixed 8x8 buffer-space cell-blocks
       // (see shaders/amr_step.wgsl's cellIndex, Milestone 1 of
       // plans/AMR.md), not flat row-major -- tools/amr-diff.js needs this
@@ -337,6 +444,14 @@ async function init() {
       fB64: bytesToB64(new Uint8Array(f.buffer, f.byteOffset, f.byteLength)),
       velB64: bytesToB64(new Uint8Array(vel.buffer, vel.byteOffset, vel.byteLength)),
       params: { A, B, I_STAR, TAU, U_T, resLog2 },
+      // Milestone 2: fine grid, plain flat layout (no block-major, no
+      // circular buffer -- see plans/AMR.md). fine.f/vel are indexed
+      // fy*FBW+fx directly.
+      fine: {
+        FW, FH, FBW, FBH, GHOST, FINE_ORIGIN_X, FINE_ORIGIN_Y,
+        fB64: bytesToB64(new Uint8Array(f1.buffer, f1.byteOffset, f1.byteLength)),
+        velB64: bytesToB64(new Uint8Array(vel1.buffer, vel1.byteOffset, vel1.byteLength)),
+      },
     };
     console.log('[AMR snapshot] saved', { W, H, step });
     return snapshot;
@@ -366,6 +481,16 @@ async function init() {
     // (read from velBuf) didn't -- the asymmetry was the tell.
     device.queue.writeBuffer(velBuf, 0, vel.buffer, vel.byteOffset, NCELLS * 2 * 4);
     device.queue.writeBuffer(cardStateBuf, 0, new Float32Array(snapshot.cardState));
+    if (snapshot.fine) {
+      if (snapshot.fine.FW !== FW || snapshot.fine.FH !== FH ||
+          snapshot.fine.FINE_ORIGIN_X !== FINE_ORIGIN_X || snapshot.fine.FINE_ORIGIN_Y !== FINE_ORIGIN_Y) {
+        throw new Error(`snapshot fine region (FW=${snapshot.fine.FW},FH=${snapshot.fine.FH},origin=${snapshot.fine.FINE_ORIGIN_X},${snapshot.fine.FINE_ORIGIN_Y}) doesn't match this page's (FW=${FW},FH=${FH},origin=${FINE_ORIGIN_X},${FINE_ORIGIN_Y})`);
+      }
+      const f1 = b64ToFloat32(snapshot.fine.fB64, NCELLS1 * 9);
+      const vel1 = b64ToFloat32(snapshot.fine.velB64, NCELLS1 * 2);
+      device.queue.writeBuffer(f1_a, 0, f1.buffer, f1.byteOffset, fSize1);
+      device.queue.writeBuffer(vel1Buf, 0, vel1.buffer, vel1.byteOffset, NCELLS1 * 2 * 4);
+    }
     useB = false;
     step = snapshot.step;
     console.log('[AMR snapshot] loaded', { W, H, step });
@@ -374,6 +499,7 @@ async function init() {
 
   function resetSim() {
     device.queue.writeBuffer(f_a, 0, initF());
+    device.queue.writeBuffer(f1_a, 0, initF1());
     device.queue.writeBuffer(cardStateBuf, 0, initCardState());
     device.queue.writeBuffer(forceBuf, 0, new Int32Array([0, 0, 0, 0]));
     useB = false;
@@ -416,13 +542,26 @@ async function init() {
         enc.writeTimestamp(querySet, 0);
       }
 
+      // Milestone 2 macro-step (plans/AMR.md): each iteration is 1 coarse
+      // step + 2 fine substeps, ordered per AGAL's Fig. 13 recursive
+      // routine -- interpolate ghosts from the CURRENT (pre-step) coarse
+      // state, then coarse-step and fine-step-x2 independently (both read
+      // only pre-step data, so their relative order doesn't matter), then
+      // average the now-twice-advanced fine interior back onto the coarse
+      // cells the coarse step just (less accurately) computed.
       for (let s = 0; s < STEPS_PER_FRAME; s++) {
-        const stepBG = useB ? stepBG_ba : stepBG_ab;
-        const frcBG  = useB ? frcBG_b  : frcBG_a;
+        const stepBG   = useB ? stepBG_ba      : stepBG_ab;
+        const frcBG    = useB ? frcBG_b        : frcBG_a;
+        const interpBG = useB ? interpBG_readB : interpBG_readA;
+        const avgBG    = useB ? avgBG_targetA  : avgBG_targetB;
 
         const frc = enc.beginComputePass(); frc.setPipeline(frcPL); frc.setBindGroup(0, frcBG); frc.dispatchWorkgroups(WGX, WGY); frc.end();
         const phy = enc.beginComputePass(); phy.setPipeline(phyPL); phy.setBindGroup(0, phyBG); phy.dispatchWorkgroups(1); phy.end();
+        const ipl = enc.beginComputePass(); ipl.setPipeline(interpPL); ipl.setBindGroup(0, interpBG); ipl.dispatchWorkgroups(WGX1, WGY1); ipl.end();
         const stp = enc.beginComputePass(); stp.setPipeline(stepPL); stp.setBindGroup(0, stepBG); stp.dispatchWorkgroups(WGX, WGY); stp.end();
+        const f1a = enc.beginComputePass(); f1a.setPipeline(step1PL); f1a.setBindGroup(0, step1BG_ab); f1a.dispatchWorkgroups(WGX1, WGY1); f1a.end();
+        const f1b = enc.beginComputePass(); f1b.setPipeline(step1PL); f1b.setBindGroup(0, step1BG_ba); f1b.dispatchWorkgroups(WGX1, WGY1); f1b.end();
+        const avg = enc.beginComputePass(); avg.setPipeline(avgPL); avg.setBindGroup(0, avgBG); avg.dispatchWorkgroups(WGX_avg, WGY_avg); avg.end();
 
         useB = !useB;
       }
