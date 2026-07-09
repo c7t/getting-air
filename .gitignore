@@ -1,0 +1,11 @@
+*.png
+*.pdf
+AGAL/
+notes.txt
+plans/
+transcripts/
+snapshots/
+https.py
+*.pem
+*~
+*.mp4
