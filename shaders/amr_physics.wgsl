@@ -1,0 +1,86 @@
+// Rigid body integration and state management.
+// Runs once per LBM step to move the card smoothly.
+
+struct CardState {
+  cx     : f32,
+  cy     : f32,
+  theta  : f32,
+  vx     : f32,
+  vy     : f32,
+  omega  : f32,
+  fx     : f32,
+  fy     : f32,
+  tz     : f32,
+  mass   : f32,
+  i_body : f32,
+  g_eff  : f32,
+  a      : f32,  // semi-major axis
+  b      : f32,  // semi-minor axis
+  v_max  : f32,
+  o_max  : f32,
+  cx_old : f32,
+  cy_old : f32,
+  th_old : f32,
+  tau    : f32,
+  y_total: f32,
+  x_total: f32,
+  off_x  : f32,
+  off_y  : f32,
+  off_x_old : f32,
+  off_y_old : f32,
+}
+
+@group(0) @binding(0) var<storage, read_write> state  : CardState;
+@group(0) @binding(1) var<storage, read_write> forces : array<atomic<i32>, 4>;
+
+override W : u32;
+override H : u32;
+const FSCALE = 10000.0f;
+
+@compute @workgroup_size(1)
+fn main() {
+  // 0. Save current as old for the next step
+  state.cx_old = state.cx;
+  state.cy_old = state.cy;
+  state.th_old = state.theta;
+  state.off_x_old = state.off_x;
+  state.off_y_old = state.off_y;
+
+  // 1. Read accumulated impulse from atomic buffer
+  let fx_fluid = f32(atomicExchange(&forces[0], 0)) / FSCALE;
+  let fy_fluid = f32(atomicExchange(&forces[1], 0)) / FSCALE;
+  let tz_fluid = f32(atomicExchange(&forces[2], 0)) / FSCALE;
+
+  // 2. Newton integration
+  state.vx    += fx_fluid / state.mass;
+  state.vy    += (fy_fluid + state.mass * state.g_eff) / state.mass;
+  state.omega += tz_fluid / state.i_body;
+
+  // 3. Clamping
+  state.vx    = clamp(state.vx, -state.v_max, state.v_max);
+  state.vy    = clamp(state.vy, -state.v_max, state.v_max);
+  state.omega = clamp(state.omega, -state.o_max, state.o_max);
+
+  // 4. Position update (absolute)
+  state.y_total += state.vy;
+  state.x_total += state.vx;
+  state.theta   += state.omega;
+
+  // 5. Moving Window Panning
+  // We want to keep (cx, cy) near (W/2, H*2/3)
+  let initial_cx = f32(W) / 2.0f;
+  let initial_cy = f32(H) / 2.0f;
+
+  let shift_x = i32(floor(state.x_total));
+  let shift_y = i32(floor(state.y_total));
+
+  state.off_x = f32((shift_x % i32(W) + i32(W)) % i32(W));
+  state.off_y = f32((shift_y % i32(H) + i32(H)) % i32(H));
+
+  state.cx = initial_cx + (state.x_total - f32(shift_x));
+  state.cy = initial_cy + (state.y_total - f32(shift_y));
+
+  state.fx = fx_fluid;
+  state.fy = fy_fluid;
+  state.tz = tz_fluid;
+}
