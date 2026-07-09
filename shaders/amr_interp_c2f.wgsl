@@ -52,9 +52,15 @@ struct CardState {
 }
 
 @group(0) @binding(0) var<storage, read>       state       : CardState;
-@group(0) @binding(1) var<storage, read>       f_coarse    : array<f32>;
-@group(0) @binding(2) var<storage, read_write> f_pool      : array<f32>;
-@group(0) @binding(3) var<storage, read>       slotToBlock : array<i32>;
+@group(0) @binding(1) var<storage, read>       f_coarse       : array<f32>;
+@group(0) @binding(2) var<storage, read_write> f_pool         : array<f32>;
+@group(0) @binding(3) var<storage, read>       slotToBlock    : array<i32>;
+// Milestone 4b: which slots were JUST assigned this refine/coarsen round --
+// only read when GHOST_ONLY=0 (the one-time full-slot-fill pipeline), to
+// avoid re-filling an already-active slot's evolved interior with a fresh
+// (and by now stale) coarse interpolation. The steady-state GHOST_ONLY=1
+// pipeline shares this bind group layout but never reads this binding.
+@group(0) @binding(4) var<storage, read>       newlyActivated : array<u32>;
 
 override W : u32;   // coarse grid dims
 override H : u32;
@@ -143,6 +149,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   let isInterior = fx >= GHOST && fx < GHOST + RB * 2u && fy >= GHOST && fy < GHOST + RB * 2u;
   if (isInterior && GHOST_ONLY != 0u) { return; }
+  // Milestone 4b: init mode only fills genuinely-new slots (see binding 4's
+  // comment above) -- an already-active slot reaching this pipeline (only
+  // possible if callers dispatch it too broadly) must not be touched.
+  if (GHOST_ONLY == 0u && newlyActivated[slot] == 0u) { return; }
 
   let nbx = W / BLOCK;
   let originX = (u32(blockID) % nbx) * RB;

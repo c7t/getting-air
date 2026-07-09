@@ -37,6 +37,21 @@ const NCELLS1 = FB * FB; // cells per pool slot
 const MAX_FINE_BLOCKS = urlParams.has('maxFineBlocks') ? parseInt(urlParams.get('maxFineBlocks')) : 64;
 const NBX = W / BLOCK, NBY = H / BLOCK, NBLOCKS = NBX * NBY; // coarse block grid
 
+// ── Milestone 4b (plans/AMR.md): automatic vorticity-driven refinement ────
+// Simplified AGAL Algorithm 3 for our 2-level case (see amr_criterion.wgsl/
+// amr_manage.wgsl headers): a single refine threshold plus a lower coarsen
+// threshold for hysteresis, both in log2|omega| units. Calibrated against
+// an actual live run, not guessed: at step ~4096 (default IC, card still
+// accelerating from rest) the true domain-wide max|omega| was only 0.0202
+// (log2 ~= -5.63), measured directly from a debugSnapshotSave readback --
+// the original guess of -5 never triggered any refinement at that stage.
+// -6/-7 reliably triggers refinement tracking the wake. Still expect to
+// retune as later milestones (larger domains, different A/B/tau) shift the
+// sim's operating range.
+const REFINE_EVERY = urlParams.has('refineEvery') ? parseInt(urlParams.get('refineEvery')) : 16;
+const REFINE_THRESH = urlParams.has('refineThresh') ? parseFloat(urlParams.get('refineThresh')) : -6;
+const COARSEN_THRESH = urlParams.has('coarsenThresh') ? parseFloat(urlParams.get('coarsenThresh')) : -7;
+
 const resSlider = document.getElementById('slider-RES');
 const resVal    = document.getElementById('val-RES');
 resSlider.value = resLog2;
@@ -253,11 +268,22 @@ async function init() {
   const blockSlotBuf   = device.createBuffer({ size: NBLOCKS * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
   const slotToBlockBuf = device.createBuffer({ size: MAX_FINE_BLOCKS * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
 
+  // Milestone 4b: automatic refinement bookkeeping.
+  const blockCriterionBuf  = device.createBuffer({ size: NBLOCKS * 4, usage: U.STORAGE | U.COPY_DST });
+  const freeListBuf        = device.createBuffer({ size: MAX_FINE_BLOCKS * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
+  // Single atomic<i32> counter -- how many slots are free (top-of-stack
+  // index into freeList). Separate 4-byte buffer since WGSL atomics need
+  // their own binding, matching shaders/lbm_force.wgsl's forces buffer.
+  const freeCountBuf       = device.createBuffer({ size: 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
+  const newlyActivatedBuf  = device.createBuffer({ size: MAX_FINE_BLOCKS * 4, usage: U.STORAGE | U.COPY_DST });
+
   device.queue.writeBuffer(cardStateBuf, 0, initCardState());
   device.queue.writeBuffer(f_a, 0, initF());
   device.queue.writeBuffer(finePoolF_a, 0, initFPool());
   device.queue.writeBuffer(blockSlotBuf, 0, new Int32Array(NBLOCKS).fill(-1));
   device.queue.writeBuffer(slotToBlockBuf, 0, new Int32Array(MAX_FINE_BLOCKS).fill(-1));
+  device.queue.writeBuffer(freeListBuf, 0, new Int32Array(MAX_FINE_BLOCKS).map((_, i) => i));
+  device.queue.writeBuffer(freeCountBuf, 0, new Int32Array([MAX_FINE_BLOCKS]));
 
   let paramsDirty = false;
   const updateGPUParams = () => {
@@ -284,7 +310,7 @@ async function init() {
     };
   });
 
-  const [stepSM, frcSM, phySM, renSM, interpSM, step1SM, avgSM] = await Promise.all([
+  const [stepSM, frcSM, phySM, renSM, interpSM, step1SM, avgSM, criterionSM, manageSM] = await Promise.all([
     loadShader(device, 'shaders/amr_step.wgsl'),
     loadShader(device, 'shaders/amr_force.wgsl'),
     loadShader(device, 'shaders/amr_physics.wgsl'),
@@ -292,6 +318,8 @@ async function init() {
     loadShader(device, 'shaders/amr_interp_c2f.wgsl'),
     loadShader(device, 'shaders/amr_step1.wgsl'),
     loadShader(device, 'shaders/amr_average_f2c.wgsl'),
+    loadShader(device, 'shaders/amr_criterion.wgsl'),
+    loadShader(device, 'shaders/amr_manage.wgsl'),
   ]);
 
   const stepBGL = device.createBindGroupLayout({ label: 'stepBGL', entries: [
@@ -318,11 +346,27 @@ async function init() {
 
   // Milestone 4: interp (coarse->fine ghosts), fine step, average (fine->coarse),
   // all pool-aware (an extra read-only slotToBlock/blockSlot binding vs. M2).
+  // Binding 4 (newlyActivated) is Milestone 4b: only read by the GHOST_ONLY=0
+  // init pipeline, but must still be present in the layout both pipelines share.
   const interpBGL = device.createBindGroupLayout({ label: 'interpBGL', entries: [
     { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-    { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }
+    { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }
+  ]});
+  // Milestone 4b: criterion (per-block vorticity max) and manage (refine/coarsen decision).
+  const criterionBGL = device.createBindGroupLayout({ label: 'criterionBGL', entries: [
+    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }
+  ]});
+  const manageBGL = device.createBindGroupLayout({ label: 'manageBGL', entries: [
+    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }
   ]});
   const step1BGL = device.createBindGroupLayout({ label: 'step1BGL', entries: [
     { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
@@ -345,6 +389,8 @@ async function init() {
   const interpConstants = { W, H, RB, GHOST_ONLY: 1 };
   const interpInitConstants = { W, H, RB, GHOST_ONLY: 0 };
   const step1Constants = { W, H, RB };
+  const criterionConstants = { W, H };
+  const manageConstants = { W, H, REFINE_THRESH, COARSEN_THRESH };
 
   const stepPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [stepBGL] }),
@@ -384,6 +430,22 @@ async function init() {
     layout: device.createPipelineLayout({ bindGroupLayouts: [avgBGL] }),
     compute: { module: avgSM, entryPoint: 'main', constants: fineConstants }
   });
+  const criterionPL = device.createComputePipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [criterionBGL] }),
+    compute: { module: criterionSM, entryPoint: 'main', constants: criterionConstants }
+  });
+  // Two pipelines, same module, different entry points -- dispatched as two
+  // SEPARATE passes (coarsen fully completing before refine starts) to
+  // avoid a same-dispatch free-list race. See amr_manage.wgsl's header for
+  // the bug this fixes (found by this milestone's own validation).
+  const manageCoarsenPL = device.createComputePipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [manageBGL] }),
+    compute: { module: manageSM, entryPoint: 'coarsen', constants: manageConstants }
+  });
+  const manageRefinePL = device.createComputePipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [manageBGL] }),
+    compute: { module: manageSM, entryPoint: 'refine', constants: manageConstants }
+  });
 
   const stepBG_ab = device.createBindGroup({ layout: stepBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_a } }, { binding: 2, resource: { buffer: f_b } }, { binding: 3, resource: { buffer: velBuf } }]});
   const stepBG_ba = device.createBindGroup({ layout: stepBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_b } }, { binding: 2, resource: { buffer: f_a } }, { binding: 3, resource: { buffer: velBuf } }]});
@@ -399,8 +461,8 @@ async function init() {
   // boundary buffer, mirroring f_a's own invariant -- 2 fine substeps per
   // macro-step is even), but READS whichever coarse buffer is "current"
   // this macro-step (same source the force pass reads).
-  const interpBG_readA = device.createBindGroup({ layout: interpBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_a } }, { binding: 2, resource: { buffer: finePoolF_a } }, { binding: 3, resource: { buffer: slotToBlockBuf } }]});
-  const interpBG_readB = device.createBindGroup({ layout: interpBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_b } }, { binding: 2, resource: { buffer: finePoolF_a } }, { binding: 3, resource: { buffer: slotToBlockBuf } }]});
+  const interpBG_readA = device.createBindGroup({ layout: interpBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_a } }, { binding: 2, resource: { buffer: finePoolF_a } }, { binding: 3, resource: { buffer: slotToBlockBuf } }, { binding: 4, resource: { buffer: newlyActivatedBuf } }]});
+  const interpBG_readB = device.createBindGroup({ layout: interpBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_b } }, { binding: 2, resource: { buffer: finePoolF_a } }, { binding: 3, resource: { buffer: slotToBlockBuf } }, { binding: 4, resource: { buffer: newlyActivatedBuf } }]});
   // Fine ping-pong within a macro-step is a fixed 2-call sequence (ab then
   // ba), not a persistent toggle like the coarse useB -- always call both,
   // in order, every macro-step.
@@ -416,8 +478,12 @@ async function init() {
   // a just-activated slot immediately after coarse->fine interpolation
   // logically depends on the CURRENT coarse state, i.e. same source
   // selection as the steady-state interp bind groups above.
-  const interpInitBG_readA = device.createBindGroup({ layout: interpBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_a } }, { binding: 2, resource: { buffer: finePoolF_a } }, { binding: 3, resource: { buffer: slotToBlockBuf } }]});
-  const interpInitBG_readB = device.createBindGroup({ layout: interpBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_b } }, { binding: 2, resource: { buffer: finePoolF_a } }, { binding: 3, resource: { buffer: slotToBlockBuf } }]});
+  const interpInitBG_readA = device.createBindGroup({ layout: interpBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_a } }, { binding: 2, resource: { buffer: finePoolF_a } }, { binding: 3, resource: { buffer: slotToBlockBuf } }, { binding: 4, resource: { buffer: newlyActivatedBuf } }]});
+  const interpInitBG_readB = device.createBindGroup({ layout: interpBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_b } }, { binding: 2, resource: { buffer: finePoolF_a } }, { binding: 3, resource: { buffer: slotToBlockBuf } }, { binding: 4, resource: { buffer: newlyActivatedBuf } }]});
+
+  // Milestone 4b bind groups.
+  const criterionBG = device.createBindGroup({ layout: criterionBGL, entries: [{ binding: 0, resource: { buffer: velBuf } }, { binding: 1, resource: { buffer: blockCriterionBuf } }]});
+  const manageBG = device.createBindGroup({ layout: manageBGL, entries: [{ binding: 0, resource: { buffer: blockCriterionBuf } }, { binding: 1, resource: { buffer: blockSlotBuf } }, { binding: 2, resource: { buffer: slotToBlockBuf } }, { binding: 3, resource: { buffer: freeListBuf } }, { binding: 4, resource: { buffer: freeCountBuf } }, { binding: 5, resource: { buffer: newlyActivatedBuf } }]});
 
   const error = await device.popErrorScope();
   if (error) { handleErr(error); return; }
@@ -428,10 +494,14 @@ async function init() {
   // Milestone 4 design note). average dispatches one workgroup per slot
   // exactly (RB*RB=8*8=64 cells = 1 workgroup, see amr_average_f2c.wgsl).
   const WGX1 = Math.ceil(FB / 8), WGY1 = Math.ceil(FB / 8);
+  // Milestone 4b: manage dispatches one thread per coarse block.
+  const WG_MANAGE = Math.ceil(NBLOCKS / 64);
   const STEPS_PER_FRAME = 64;
   let step = 0, lastT = performance.now();
   let useB = false;
   let liveMode = true;
+  let autoRefine = false; // Milestone 4b: off by default -- see debugActivateBlock's guard
+  let macroStepCounter = 0;
 
   const trajectory = [];
 
@@ -579,6 +649,15 @@ async function init() {
       for (let slot = 0; slot < MAX_FINE_BLOCKS; slot++) {
         if (slotToBlockCPU[slot] === -1) freeSlots.push(slot);
       }
+      // Milestone 4b: the GPU-side freeList/freeCount (which the automatic
+      // management pass owns) aren't part of the snapshot -- rebuild them
+      // from the loaded slotToBlock instead of restoring a captured copy.
+      // Free-list ORDER doesn't affect correctness (any permutation of the
+      // free slots works equally as a stack), so this is exact, not an
+      // approximation, and avoids growing the snapshot format for state
+      // that's fully redundant with slotToBlock.
+      device.queue.writeBuffer(freeListBuf, 0, new Int32Array(freeSlots));
+      device.queue.writeBuffer(freeCountBuf, 0, new Int32Array([freeSlots.length]));
     }
     useB = false;
     step = snapshot.step;
@@ -596,10 +675,31 @@ async function init() {
   // duplicating this 7-pass sequence would risk the two silently drifting
   // apart.
   function dispatchMacroStep(enc) {
-    const stepBG   = useB ? stepBG_ba      : stepBG_ab;
-    const frcBG    = useB ? frcBG_b        : frcBG_a;
-    const interpBG = useB ? interpBG_readB : interpBG_readA;
-    const avgBG    = useB ? avgBG_targetA  : avgBG_targetB;
+    const stepBG       = useB ? stepBG_ba          : stepBG_ab;
+    const frcBG        = useB ? frcBG_b            : frcBG_a;
+    const interpBG     = useB ? interpBG_readB     : interpBG_readA;
+    const interpInitBG = useB ? interpInitBG_readB : interpInitBG_readA;
+    const avgBG        = useB ? avgBG_targetA      : avgBG_targetB;
+
+    // Milestone 4b: re-evaluate refinement every REFINE_EVERY macro-steps.
+    // Runs BEFORE the steady-state interp pass below so a block refined
+    // this round gets its one-time full-slot fill (interpInitPL, gated on
+    // newlyActivated -- see amr_interp_c2f.wgsl) before anything else this
+    // macro-step reads its pool slot. Reads velBuf as populated by the
+    // PREVIOUS macro-step's coarse step, i.e. the same "current, pre-step"
+    // data the force pass also reads.
+    if (autoRefine && macroStepCounter % REFINE_EVERY === 0) {
+      enc.clearBuffer(newlyActivatedBuf); // GPU-recorded, not queue.writeBuffer --
+      // see plans/AMR.md's Milestone 4b note on why a JS-side writeBuffer
+      // wouldn't interleave correctly with commands already recorded into
+      // this same not-yet-submitted encoder.
+      const crit = enc.beginComputePass(); crit.setPipeline(criterionPL); crit.setBindGroup(0, criterionBG); crit.dispatchWorkgroups(WGX, WGY); crit.end();
+      // Coarsen MUST fully complete before refine starts -- see amr_manage.wgsl's header.
+      const coarsenP = enc.beginComputePass(); coarsenP.setPipeline(manageCoarsenPL); coarsenP.setBindGroup(0, manageBG); coarsenP.dispatchWorkgroups(WG_MANAGE); coarsenP.end();
+      const refineP = enc.beginComputePass(); refineP.setPipeline(manageRefinePL); refineP.setBindGroup(0, manageBG); refineP.dispatchWorkgroups(WG_MANAGE); refineP.end();
+      const init = enc.beginComputePass(); init.setPipeline(interpInitPL); init.setBindGroup(0, interpInitBG); init.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); init.end();
+    }
+    macroStepCounter++;
 
     const frc = enc.beginComputePass(); frc.setPipeline(frcPL); frc.setBindGroup(0, frcBG); frc.dispatchWorkgroups(WGX, WGY); frc.end();
     const phy = enc.beginComputePass(); phy.setPipeline(phyPL); phy.setBindGroup(0, phyBG); phy.dispatchWorkgroups(1); phy.end();
@@ -633,6 +733,10 @@ async function init() {
     device.queue.writeBuffer(blockSlotBuf, 0, blockSlotCPU);
     device.queue.writeBuffer(slotToBlockBuf, 0, slotToBlockCPU);
     freeSlots = Array.from({ length: MAX_FINE_BLOCKS }, (_, i) => i);
+    device.queue.writeBuffer(freeListBuf, 0, new Int32Array(MAX_FINE_BLOCKS).map((_, i) => i));
+    device.queue.writeBuffer(freeCountBuf, 0, new Int32Array([MAX_FINE_BLOCKS]));
+    autoRefine = false;
+    macroStepCounter = 0;
     useB = false;
     step = 0;
     trajectory.length = 0;
@@ -646,7 +750,51 @@ async function init() {
   // liveMode is false, matching the debugSnapshotSave/Load convention --
   // dispatchMacroStep's useB toggling and this function's direct queue
   // writes would otherwise race the frame() loop's own encoder.
+  // Reads blockSlot/slotToBlock directly from GPU -- the authoritative
+  // source once Milestone 4b's automatic management can mutate pool state
+  // without going through the CPU mirror at all. Reuses the same staging
+  // buffers debugSnapshotSave uses; not safe to call concurrently with
+  // another in-flight readback through those buffers, which is fine for an
+  // interactive debug tool but worth noting if this ever needs to run on a
+  // hot path.
+  async function readPoolIndirection() {
+    const enc = device.createCommandEncoder();
+    enc.copyBufferToBuffer(blockSlotBuf, 0, stagingBlockSlot, 0, NBLOCKS * 4);
+    enc.copyBufferToBuffer(slotToBlockBuf, 0, stagingSlotToBlock, 0, MAX_FINE_BLOCKS * 4);
+    device.queue.submit([enc.finish()]);
+    await Promise.all([
+      stagingBlockSlot.mapAsync(GPUMapMode.READ),
+      stagingSlotToBlock.mapAsync(GPUMapMode.READ),
+    ]);
+    const blockSlot = new Int32Array(stagingBlockSlot.getMappedRange()).slice();
+    const slotToBlock = new Int32Array(stagingSlotToBlock.getMappedRange()).slice();
+    stagingBlockSlot.unmap();
+    stagingSlotToBlock.unmap();
+    return { blockSlot, slotToBlock };
+  }
+
+  // Milestone 4b: toggles automatic vorticity-driven refinement. Manual
+  // debugActivateBlock/debugDeactivateBlock are guarded against running
+  // while this is on (see below) -- both mutate blockSlotCPU/slotToBlockCPU/
+  // freeSlots directly, which would race the GPU-side free-list the
+  // automatic management pass owns while enabled. Turning it off resyncs
+  // those CPU mirrors from a fresh GPU readback, since automatic management
+  // may have changed pool state the CPU mirror never saw.
+  async function setAutoRefine(v) {
+    autoRefine = !!v;
+    if (!autoRefine) {
+      const { blockSlot, slotToBlock } = await readPoolIndirection();
+      blockSlotCPU.set(blockSlot);
+      slotToBlockCPU.set(slotToBlock);
+      freeSlots = [];
+      for (let slot = 0; slot < MAX_FINE_BLOCKS; slot++) {
+        if (slotToBlockCPU[slot] === -1) freeSlots.push(slot);
+      }
+    }
+  }
+
   async function debugActivateBlock(bx, by) {
+    if (autoRefine) throw new Error('debugActivateBlock: disable autoRefine first (setAutoRefine(false)) -- manual activation would race the GPU-side free-list');
     if (bx < 0 || bx >= NBX || by < 0 || by >= NBY) {
       throw new Error(`block (${bx},${by}) out of range [0,${NBX})x[0,${NBY})`);
     }
@@ -677,6 +825,7 @@ async function init() {
   // state as of the most recent macro-step -- deactivation just stops
   // future fine-level evolution and frees the slot for reuse.
   function debugDeactivateBlock(bx, by) {
+    if (autoRefine) throw new Error('debugDeactivateBlock: disable autoRefine first (setAutoRefine(false)) -- manual deactivation would race the GPU-side free-list');
     if (bx < 0 || bx >= NBX || by < 0 || by >= NBY) {
       throw new Error(`block (${bx},${by}) out of range [0,${NBX})x[0,${NBY})`);
     }
@@ -691,11 +840,15 @@ async function init() {
     return { wasActive: true, slot };
   }
 
-  function debugListActiveBlocks() {
+  // Always reads GPU state directly (not the CPU mirror, which goes stale
+  // the instant autoRefine's automatic management mutates pool state
+  // without the CPU ever seeing it) -- see readPoolIndirection.
+  async function debugListActiveBlocks() {
+    const { blockSlot } = await readPoolIndirection();
     const active = [];
     for (let blockID = 0; blockID < NBLOCKS; blockID++) {
-      if (blockSlotCPU[blockID] !== -1) {
-        active.push({ bx: blockID % NBX, by: Math.floor(blockID / NBX), slot: blockSlotCPU[blockID] });
+      if (blockSlot[blockID] !== -1) {
+        active.push({ bx: blockID % NBX, by: Math.floor(blockID / NBX), slot: blockSlot[blockID] });
       }
     }
     return active;
@@ -731,7 +884,10 @@ async function init() {
     debugActivateBlock,
     debugDeactivateBlock,
     debugListActiveBlocks,
+    setAutoRefine,
+    isAutoRefine: () => autoRefine,
     getBlockGridDims: () => ({ NBX, NBY, RB, MAX_FINE_BLOCKS }),
+    getRefineParams: () => ({ REFINE_EVERY, REFINE_THRESH, COARSEN_THRESH }),
   };
 
   async function frame() {
