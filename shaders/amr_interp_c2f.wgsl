@@ -1,19 +1,26 @@
-// Milestone 2 (plans/AMR.md): coarse -> fine ghost-cell interpolation.
+// Milestone 4 (plans/AMR.md): coarse -> fine ghost-cell interpolation,
+// POOL-AWARE. Supersedes Milestone 2's single-fixed-region version:
+// instead of one hardcoded window-anchored fine region, this operates on
+// whichever of MAX_FINE_BLOCKS pool slots are currently assigned to a
+// coarse block (slotToBlock[slot] != -1).
 //
-// Runs once per macro-step, before the coarse step overwrites f_coarse, so
-// it always reads the coarse state at the START of the macro-step (matching
-// AGAL's Fig. 13 step 1: "interpolation of data from the coarse grid to
-// ghost cells on the fine grid" happens before step 2's coarse advance).
-// Only writes the fine grid's 2-cell ghost border -- the "real" interior
-// cells evolve via their own fine-level physics (amr_step1.wgsl) and are
-// left untouched here.
+// Dispatched over (tileX, tileY, slot) -- the Z dimension selects pool
+// slot, so cost scales with pool CAPACITY, not domain size (see
+// plans/AMR.md's Milestone 4 design note on why this dispatch shape is the
+// one part not worth simplifying away).
 //
-// Dupuis-Chopard rescaling (cited in the paper's section 3.4): bilinearly
-// interpolate rho/u from the 4 surrounding coarse cells, evaluate f_eq
-// fresh at the fine target point from that interpolated rho/u, and
-// separately bilinearly interpolate the non-equilibrium part
-// f_neq = f - f_eq from the same 4 corners, rescaled by tau_fine/tau_coarse
-// (see plans/AMR.md's Milestone 2 section for the tau_fine derivation).
+// Buffer-space native (unlike M2): M1's coarse blocks are already defined
+// in buffer space (fixed in memory regardless of the moving window's
+// off_x/off_y), so a pool slot's coarse-cell lookups need no window
+// conversion at all -- only the (separate, in amr_step1.wgsl) card SDF
+// physics needs window coordinates.
+//
+// GHOST_ONLY selects between two compiled pipelines from this one module:
+// GHOST_ONLY=1 (steady-state, every macro-step) only re-interpolates the
+// ghost border, matching M2's behavior. GHOST_ONLY=0 (one-time, on
+// activation) fills the WHOLE slot including the "real" interior, needed
+// because a freshly-activated slot has no prior fine-level state to
+// evolve from.
 
 struct CardState {
   cx     : f32,
@@ -44,16 +51,15 @@ struct CardState {
   off_y_old : f32,
 }
 
-@group(0) @binding(0) var<storage, read>       state    : CardState;
-@group(0) @binding(1) var<storage, read>       f_coarse : array<f32>;
-@group(0) @binding(2) var<storage, read_write> f_fine   : array<f32>;
+@group(0) @binding(0) var<storage, read>       state       : CardState;
+@group(0) @binding(1) var<storage, read>       f_coarse    : array<f32>;
+@group(0) @binding(2) var<storage, read_write> f_pool      : array<f32>;
+@group(0) @binding(3) var<storage, read>       slotToBlock : array<i32>;
 
-override W : u32;  // coarse grid dims
+override W : u32;   // coarse grid dims
 override H : u32;
-override FW : u32; // fine grid "real" interior dims
-override FH : u32;
-override FINE_ORIGIN_X : i32; // fine region's lower-left corner, coarse window units
-override FINE_ORIGIN_Y : i32;
+override RB : u32;  // refine block size in coarse cells (matches M1's BLOCK)
+override GHOST_ONLY : u32;
 
 const BLOCK = 8u;
 const GHOST = 2u;
@@ -72,7 +78,6 @@ fn feq(rho: f32, ux: f32, uy: f32, i: u32) -> f32 {
 }
 
 // Block-major linear index for a cell at COARSE buffer coordinates (cx, cy).
-// See amr_step.wgsl for the full derivation.
 fn cellIndex(cx: u32, cy: u32) -> u32 {
   let nbx = W / BLOCK;
   let bx = cx / BLOCK; let by = cy / BLOCK;
@@ -81,34 +86,31 @@ fn cellIndex(cx: u32, cy: u32) -> u32 {
   return blockID * (BLOCK * BLOCK) + ly * BLOCK + lx;
 }
 
+// Fine ghost-local coordinate -> position in BUFFER-space coarse units.
+// origin is the coarse block's own buffer-space lower-left corner
+// (blockBX*RB, blockBY*RB). No window conversion: coarse-cell lookups
+// stay in buffer space throughout, matching M1's own addressing.
+fn fineToCoarseUnit(fCoord: u32, origin: u32) -> f32 {
+  let j = f32(i32(fCoord) - i32(GHOST));
+  return f32(origin) - 0.25 + 0.5 * j;
+}
+
 fn wrapCoord(v: i32, n: u32) -> u32 {
   let m = i32(n);
   return u32(((v % m) + m) % m);
 }
 
-// Fine ghost-local coordinate -> position in COARSE window units. GHOST is
-// the fine cell at the region's edge; each coarse cell splits into 2 fine
-// cells of half-width, centered at +-0.25 coarse units from the coarse
-// cell's own center.
-fn fineToCoarseUnit(fCoord: u32, origin: i32) -> f32 {
-  let j = f32(i32(fCoord) - i32(GHOST));
-  return f32(origin) - 0.25 + 0.5 * j;
-}
-
-// Reads macroscopic (rho, ux, uy) and all 9 f_neq components at a single
-// COARSE window-space integer coordinate (wrapping/off_x-mapping handled
-// internally, matching amr_step.wgsl's coarse addressing).
 struct CoarseSample {
   rho: f32,
   ux: f32,
   uy: f32,
   fneq: array<f32, 9>,
 }
-fn sampleCoarse(wx: i32, wy: i32) -> CoarseSample {
-  let wxu = wrapCoord(wx, W);
-  let wyu = wrapCoord(wy, H);
-  let bx = (wxu + u32(state.off_x)) % W;
-  let by = (wyu + u32(state.off_y)) % H;
+// wx, wy here are BUFFER-space integer coordinates (periodic, no off_x
+// mapping needed -- see file header).
+fn sampleCoarse(bx_in: i32, by_in: i32) -> CoarseSample {
+  let bx = wrapCoord(bx_in, W);
+  let by = wrapCoord(by_in, H);
   let cell = cellIndex(bx, by);
 
   var f: array<f32, 9>;
@@ -132,17 +134,22 @@ fn sampleCoarse(wx: i32, wy: i32) -> CoarseSample {
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let fx = gid.x; let fy = gid.y;
-  let FBW = FW + 2u * GHOST;
-  let FBH = FH + 2u * GHOST;
-  if (fx >= FBW || fy >= FBH) { return; }
+  let slot = gid.z;
+  let FB = RB * 2u + 2u * GHOST;
+  if (fx >= FB || fy >= FB) { return; }
 
-  // Only the ghost border is (re-)interpolated; interior cells evolve via
-  // their own fine-level physics in amr_step1.wgsl.
-  let isInterior = fx >= GHOST && fx < GHOST + FW && fy >= GHOST && fy < GHOST + FH;
-  if (isInterior) { return; }
+  let blockID = slotToBlock[slot];
+  if (blockID < 0) { return; } // slot not currently assigned
 
-  let px = fineToCoarseUnit(fx, FINE_ORIGIN_X);
-  let py = fineToCoarseUnit(fy, FINE_ORIGIN_Y);
+  let isInterior = fx >= GHOST && fx < GHOST + RB * 2u && fy >= GHOST && fy < GHOST + RB * 2u;
+  if (isInterior && GHOST_ONLY != 0u) { return; }
+
+  let nbx = W / BLOCK;
+  let originX = (u32(blockID) % nbx) * RB;
+  let originY = (u32(blockID) / nbx) * RB;
+
+  let px = fineToCoarseUnit(fx, originX);
+  let py = fineToCoarseUnit(fy, originY);
 
   let x0 = i32(floor(px)); let x1 = x0 + 1;
   let y0 = i32(floor(py)); let y1 = y0 + 1;
@@ -167,9 +174,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let tau_fine = 2.0f * tau_coarse - 0.5f;
   let rescale = tau_fine / tau_coarse;
 
-  let fineCell = fy * FBW + fx;
+  // f_pool is direction-major across the WHOLE pool (matching the coarse
+  // f_coarse convention): plane stride = MAX_FINE_BLOCKS*FB*FB, derived via
+  // arrayLength instead of a separate override (the buffer's actual size
+  // already encodes it).
+  let poolPlaneStride = arrayLength(&f_pool) / 9u;
+  let poolCellBase = slot * (FB * FB) + fy * FB + fx;
   for (var i = 0u; i < 9u; i++) {
     let fneq = w00*s00.fneq[i] + w10*s10.fneq[i] + w01*s01.fneq[i] + w11*s11.fneq[i];
-    f_fine[i * (FBW * FBH) + fineCell] = feq(rho, ux, uy, i) + rescale * fneq;
+    f_pool[i * poolPlaneStride + poolCellBase] = feq(rho, ux, uy, i) + rescale * fneq;
   }
 }
