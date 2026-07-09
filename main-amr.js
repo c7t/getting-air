@@ -500,7 +500,7 @@ async function init() {
   let step = 0, lastT = performance.now();
   let useB = false;
   let liveMode = true;
-  let autoRefine = false; // Milestone 4b: off by default -- see debugActivateBlock's guard
+  let autoRefine = true; // Milestone 4b: on by default so refinement (and its coverage overlay) is visible without a console command; setAutoRefine(false) to disable for manual debugActivateBlock/debugDeactivateBlock testing
   let macroStepCounter = 0;
 
   const trajectory = [];
@@ -735,7 +735,7 @@ async function init() {
     freeSlots = Array.from({ length: MAX_FINE_BLOCKS }, (_, i) => i);
     device.queue.writeBuffer(freeListBuf, 0, new Int32Array(MAX_FINE_BLOCKS).map((_, i) => i));
     device.queue.writeBuffer(freeCountBuf, 0, new Int32Array([MAX_FINE_BLOCKS]));
-    autoRefine = false;
+    autoRefine = true; // matches the on-by-default initial state -- reset shouldn't silently disable it
     macroStepCounter = 0;
     useB = false;
     step = 0;
