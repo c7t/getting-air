@@ -123,8 +123,13 @@ fn windowToPool(wx: f32, wy: f32) -> vec3<i32> {
     let bufX = wrapf(wx + state.off_x, f32(W));
     let bufY = wrapf(wy + state.off_y, f32(H));
     let nbx = W / BLOCK;
-    let blockBX = u32(bufX) / RB;
-    let blockBY = u32(bufY) / RB;
+    // Resolve the containing block by NEAREST coarse-cell center (+0.5 before
+    // truncation): coarse cells are integer-centered (see amr_step1.wgsl's
+    // fineToCoarseUnit -- the two fine cells straddling coarse cell c sit at
+    // c-0.25 and c+0.25), so a plain u32(bufX)/RB mis-assigns the outer half of
+    // each boundary coarse cell to the wrong block.
+    let blockBX = u32(wrapf(bufX + 0.5, f32(W))) / RB;
+    let blockBY = u32(wrapf(bufY + 0.5, f32(H))) / RB;
     let blockID = i32(blockBY * nbx + blockBX);
     let slot = blockSlot[blockID];
     if (slot < 0) { return vec3<i32>(0, 0, -1); }
@@ -135,28 +140,37 @@ fn windowToPool(wx: f32, wy: f32) -> vec3<i32> {
     return vec3<i32>(i32(round(fxc)), i32(round(fyc)), slot);
 }
 
-// True only when the full 4-point vorticity stencil around the pool
-// coordinate lands in the slot's "real" interior (not its ghost border,
-// which holds approximate/stale data by design -- see amr_interp_c2f.wgsl).
-fn inPoolInterior(fx: i32, fy: i32) -> bool {
-    return fx > i32(GHOST) && fx < i32(GHOST + RB * 2u) - 1 &&
-           fy > i32(GHOST) && fy < i32(GHOST + RB * 2u) - 1;
-}
-
-fn get_uy1(fx: i32, fy: i32, slot: i32) -> f32 {
+// Fine-pool velocity at a WINDOW position, resolving which block actually
+// contains that position (buffer-space, same off_x/off_y inversion as
+// windowToPool). Returns (ux, uy, valid); valid=0 if that position isn't in
+// a currently-refined block. Because each lookup is resolved independently,
+// a vorticity stencil tap that crosses a seam lands in the NEIGHBOR block's
+// REAL interior rather than this block's stale ghost ring -- so a chain of
+// refined blocks samples as one contiguous fine region.
+fn fineVelAt(wx: f32, wy: f32) -> vec3<f32> {
+    let bufX = wrapf(wx + state.off_x, f32(W));
+    let bufY = wrapf(wy + state.off_y, f32(H));
+    let nbx = W / BLOCK;
+    // Nearest coarse-cell-center block resolution (+0.5 before truncation) --
+    // see windowToPool. Without it the outer half-coarse-cell ring of a block
+    // resolves to the wrong block and samples its own stale ghost cell instead
+    // of the neighbor's real interior, leaving a residual half-cell seam and
+    // defeating the coarse fallback at a true fine/coarse perimeter. With it,
+    // every position (and each +/-0.5 stencil tap) maps to a REAL cell [2,17]
+    // of the correct block.
+    let bBX = u32(wrapf(bufX + 0.5, f32(W))) / RB;
+    let bBY = u32(wrapf(bufY + 0.5, f32(H))) / RB;
+    let slot = blockSlot[i32(bBY * nbx + bBX)];
+    if (slot < 0) { return vec3<f32>(0.0, 0.0, 0.0); }
+    let originX = bBX * RB;
+    let originY = bBY * RB;
+    let fxc = f32(GHOST) + 2.0 * (bufX - f32(originX)) + 0.5;
+    let fyc = f32(GHOST) + 2.0 * (bufY - f32(originY)) + 0.5;
     let FB = RB * 2u + 2u * GHOST;
-    let cx = u32(clamp(fx, 0, i32(FB) - 1));
-    let cy = u32(clamp(fy, 0, i32(FB) - 1));
+    let cx = u32(clamp(i32(round(fxc)), 0, i32(FB) - 1));
+    let cy = u32(clamp(i32(round(fyc)), 0, i32(FB) - 1));
     let cell = u32(slot) * (FB * FB) + cy * FB + cx;
-    return vel_pool[cell * 2u + 1u];
-}
-
-fn get_ux1(fx: i32, fy: i32, slot: i32) -> f32 {
-    let FB = RB * 2u + 2u * GHOST;
-    let cx = u32(clamp(fx, 0, i32(FB) - 1));
-    let cy = u32(clamp(fy, 0, i32(FB) - 1));
-    let cell = u32(slot) * (FB * FB) + cy * FB + cx;
-    return vel_pool[cell * 2u];
+    return vec3<f32>(vel_pool[cell * 2u], vel_pool[cell * 2u + 1u], 1.0);
 }
 
 @fragment
@@ -172,17 +186,27 @@ fn fs_main(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> {
             - (get_ux(ix, iy + 1) - get_ux(ix, iy - 1)) * 0.5f;
 
   // Milestone 4 (plans/AMR.md): sample the fine pool instead of the coarse
-  // grid wherever this window position falls in a currently-refined block
-  // and away from its ghost border -- a seam here would mean a real
-  // interpolation/averaging bug, not just a small numerical diff.
+  // grid wherever this window position falls in a currently-refined block.
+  // Each vorticity stencil tap is resolved to whichever block contains it
+  // (see fineVelAt), so a tap at a seam crosses into the neighbor's REAL
+  // interior and a chain of refined blocks renders as one contiguous fine
+  // region -- no coarse-sampled stripe (periodic block-pitch seam) at every
+  // internal block edge. Only where a tap lands in a genuinely COARSE
+  // neighbor (the true fine/coarse perimeter) is any tap invalid, in which
+  // case we keep the coarse omega computed above.
   let pool = windowToPool(fx, fy);
-  if (pool.z >= 0 && inPoolInterior(pool.x, pool.y)) {
-    // Central difference df/dx ~= (f(x+dx)-f(x-dx))/(2*dx). Fine cells are
-    // spaced dx=0.5 coarse units apart (not the coarse grid's dx=1), so the
-    // factor is 1/(2*0.5)=1, not the coarse path's 0.5 -- no separate scale
-    // needed here.
-    omega = (get_uy1(pool.x + 1, pool.y, pool.z) - get_uy1(pool.x - 1, pool.y, pool.z))
-          - (get_ux1(pool.x, pool.y + 1, pool.z) - get_ux1(pool.x, pool.y - 1, pool.z));
+  let c0 = fineVelAt(fx, fy);
+  if (c0.z > 0.5) {
+    // Fine cells are 0.5 coarse units apart, so a +/-0.5 window step is
+    // exactly one fine cell; central difference over +/-1 fine cell (factor
+    // 1/(2*0.5)=1, matching the pre-existing fine path).
+    let xp = fineVelAt(fx + 0.5, fy);
+    let xm = fineVelAt(fx - 0.5, fy);
+    let yp = fineVelAt(fx, fy + 0.5);
+    let ym = fineVelAt(fx, fy - 0.5);
+    if (xp.z > 0.5 && xm.z > 0.5 && yp.z > 0.5 && ym.z > 0.5) {
+      omega = (xp.y - xm.y) - (yp.x - ym.x);
+    }
   }
 
   // Blue for clockwise (negative), red for counter-clockwise (positive)
