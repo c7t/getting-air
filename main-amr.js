@@ -497,6 +497,32 @@ async function init() {
     return { step };
   }
 
+  // Milestone 2 macro-step (plans/AMR.md): 1 coarse step + 2 fine substeps,
+  // ordered per AGAL's Fig. 13 recursive routine -- interpolate ghosts from
+  // the CURRENT (pre-step) coarse state, then coarse-step and fine-step-x2
+  // independently (both read only pre-step data, so their relative order
+  // doesn't matter), then average the now-twice-advanced fine interior back
+  // onto the coarse cells the coarse step just (less accurately) computed.
+  // Factored out of frame()'s loop so debugStepSync can reuse it exactly --
+  // duplicating this 7-pass sequence would risk the two silently drifting
+  // apart.
+  function dispatchMacroStep(enc) {
+    const stepBG   = useB ? stepBG_ba      : stepBG_ab;
+    const frcBG    = useB ? frcBG_b        : frcBG_a;
+    const interpBG = useB ? interpBG_readB : interpBG_readA;
+    const avgBG    = useB ? avgBG_targetA  : avgBG_targetB;
+
+    const frc = enc.beginComputePass(); frc.setPipeline(frcPL); frc.setBindGroup(0, frcBG); frc.dispatchWorkgroups(WGX, WGY); frc.end();
+    const phy = enc.beginComputePass(); phy.setPipeline(phyPL); phy.setBindGroup(0, phyBG); phy.dispatchWorkgroups(1); phy.end();
+    const ipl = enc.beginComputePass(); ipl.setPipeline(interpPL); ipl.setBindGroup(0, interpBG); ipl.dispatchWorkgroups(WGX1, WGY1); ipl.end();
+    const stp = enc.beginComputePass(); stp.setPipeline(stepPL); stp.setBindGroup(0, stepBG); stp.dispatchWorkgroups(WGX, WGY); stp.end();
+    const f1a = enc.beginComputePass(); f1a.setPipeline(step1PL); f1a.setBindGroup(0, step1BG_ab); f1a.dispatchWorkgroups(WGX1, WGY1); f1a.end();
+    const f1b = enc.beginComputePass(); f1b.setPipeline(step1PL); f1b.setBindGroup(0, step1BG_ba); f1b.dispatchWorkgroups(WGX1, WGY1); f1b.end();
+    const avg = enc.beginComputePass(); avg.setPipeline(avgPL); avg.setBindGroup(0, avgBG); avg.dispatchWorkgroups(WGX_avg, WGY_avg); avg.end();
+
+    useB = !useB;
+  }
+
   function resetSim() {
     device.queue.writeBuffer(f_a, 0, initF());
     device.queue.writeBuffer(f1_a, 0, initF1());
@@ -507,6 +533,24 @@ async function init() {
     trajectory.length = 0;
   }
 
+  // Deterministic synchronous stepping, bypassing rAF entirely -- lets two
+  // separate builds be driven to an EXACT matching step count for a fair
+  // diff. Wall-clock polling of the normal rAF-driven `liveMode` loop can't
+  // guarantee this: STEPS_PER_FRAME-sized jumps land unpredictably relative
+  // to any external poll interval (confirmed directly while re-validating
+  // Milestones 1 and 2 at 256x256 -- see plans/AMR.md).
+  async function debugStepSync(n) {
+    liveMode = false;
+    for (let k = 0; k < n; k += STEPS_PER_FRAME) {
+      const enc = device.createCommandEncoder();
+      for (let s = 0; s < STEPS_PER_FRAME; s++) dispatchMacroStep(enc);
+      device.queue.submit([enc.finish()]);
+      await device.queue.onSubmittedWorkDone();
+      step += STEPS_PER_FRAME;
+    }
+    return { step };
+  }
+
   window.__AMR = {
     setLive: (v) => { liveMode = !!v; },
     isLive: () => liveMode,
@@ -515,6 +559,7 @@ async function init() {
     getDims: () => ({ W, H }),
     debugSnapshotSave,
     debugSnapshotLoad,
+    debugStepSync,
   };
 
   async function frame() {
@@ -542,29 +587,7 @@ async function init() {
         enc.writeTimestamp(querySet, 0);
       }
 
-      // Milestone 2 macro-step (plans/AMR.md): each iteration is 1 coarse
-      // step + 2 fine substeps, ordered per AGAL's Fig. 13 recursive
-      // routine -- interpolate ghosts from the CURRENT (pre-step) coarse
-      // state, then coarse-step and fine-step-x2 independently (both read
-      // only pre-step data, so their relative order doesn't matter), then
-      // average the now-twice-advanced fine interior back onto the coarse
-      // cells the coarse step just (less accurately) computed.
-      for (let s = 0; s < STEPS_PER_FRAME; s++) {
-        const stepBG   = useB ? stepBG_ba      : stepBG_ab;
-        const frcBG    = useB ? frcBG_b        : frcBG_a;
-        const interpBG = useB ? interpBG_readB : interpBG_readA;
-        const avgBG    = useB ? avgBG_targetA  : avgBG_targetB;
-
-        const frc = enc.beginComputePass(); frc.setPipeline(frcPL); frc.setBindGroup(0, frcBG); frc.dispatchWorkgroups(WGX, WGY); frc.end();
-        const phy = enc.beginComputePass(); phy.setPipeline(phyPL); phy.setBindGroup(0, phyBG); phy.dispatchWorkgroups(1); phy.end();
-        const ipl = enc.beginComputePass(); ipl.setPipeline(interpPL); ipl.setBindGroup(0, interpBG); ipl.dispatchWorkgroups(WGX1, WGY1); ipl.end();
-        const stp = enc.beginComputePass(); stp.setPipeline(stepPL); stp.setBindGroup(0, stepBG); stp.dispatchWorkgroups(WGX, WGY); stp.end();
-        const f1a = enc.beginComputePass(); f1a.setPipeline(step1PL); f1a.setBindGroup(0, step1BG_ab); f1a.dispatchWorkgroups(WGX1, WGY1); f1a.end();
-        const f1b = enc.beginComputePass(); f1b.setPipeline(step1PL); f1b.setBindGroup(0, step1BG_ba); f1b.dispatchWorkgroups(WGX1, WGY1); f1b.end();
-        const avg = enc.beginComputePass(); avg.setPipeline(avgPL); avg.setBindGroup(0, avgBG); avg.dispatchWorkgroups(WGX_avg, WGY_avg); avg.end();
-
-        useB = !useB;
-      }
+      for (let s = 0; s < STEPS_PER_FRAME; s++) dispatchMacroStep(enc);
       step += STEPS_PER_FRAME;
 
       if (hasTimestamp) {
