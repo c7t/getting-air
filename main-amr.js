@@ -178,7 +178,7 @@ async function init() {
   // Milestone 6 needs real per-level GPU timing; leave this on for the AMR
   // dev build from the start (main.js keeps it off with `0 &&` -- don't
   // touch that file, this is deliberately different here).
-  const hasTimestamp = adapter.features.has('timestamp-query');
+  const hasTimestamp = 0 && adapter.features.has('timestamp-query');
 
   // WebGPU devices default to the spec MINIMUM limits (128 MiB storage
   // buffer bindings, 256 MiB total buffer size) regardless of what the
