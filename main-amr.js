@@ -912,14 +912,14 @@ async function init() {
       const enc = device.createCommandEncoder();
 
       if (hasTimestamp) {
-        enc.writeTimestamp(querySet, 0);
+        // enc.writeTimestamp(querySet, 0);
       }
 
       for (let s = 0; s < STEPS_PER_FRAME; s++) dispatchMacroStep(enc);
       step += STEPS_PER_FRAME;
 
       if (hasTimestamp) {
-        enc.writeTimestamp(querySet, 1);
+        // enc.writeTimestamp(querySet, 1);
         enc.resolveQuerySet(querySet, 0, 2, queryResolveBuffer, 0);
         enc.copyBufferToBuffer(queryResolveBuffer, 0, stage.query, 0, 16);
       }
