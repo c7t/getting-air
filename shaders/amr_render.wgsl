@@ -123,8 +123,13 @@ fn windowToPool(wx: f32, wy: f32) -> vec3<i32> {
     let bufX = wrapf(wx + state.off_x, f32(W));
     let bufY = wrapf(wy + state.off_y, f32(H));
     let nbx = W / BLOCK;
-    let blockBX = u32(bufX) / RB;
-    let blockBY = u32(bufY) / RB;
+    // Resolve the containing block by NEAREST coarse-cell center (+0.5 before
+    // truncation): coarse cells are integer-centered (see amr_step1.wgsl's
+    // fineToCoarseUnit -- the two fine cells straddling coarse cell c sit at
+    // c-0.25 and c+0.25), so a plain u32(bufX)/RB mis-assigns the outer half of
+    // each boundary coarse cell to the wrong block.
+    let blockBX = u32(wrapf(bufX + 0.5, f32(W))) / RB;
+    let blockBY = u32(wrapf(bufY + 0.5, f32(H))) / RB;
     let blockID = i32(blockBY * nbx + blockBX);
     let slot = blockSlot[blockID];
     if (slot < 0) { return vec3<i32>(0, 0, -1); }
@@ -146,8 +151,15 @@ fn fineVelAt(wx: f32, wy: f32) -> vec3<f32> {
     let bufX = wrapf(wx + state.off_x, f32(W));
     let bufY = wrapf(wy + state.off_y, f32(H));
     let nbx = W / BLOCK;
-    let bBX = u32(bufX) / RB;
-    let bBY = u32(bufY) / RB;
+    // Nearest coarse-cell-center block resolution (+0.5 before truncation) --
+    // see windowToPool. Without it the outer half-coarse-cell ring of a block
+    // resolves to the wrong block and samples its own stale ghost cell instead
+    // of the neighbor's real interior, leaving a residual half-cell seam and
+    // defeating the coarse fallback at a true fine/coarse perimeter. With it,
+    // every position (and each +/-0.5 stencil tap) maps to a REAL cell [2,17]
+    // of the correct block.
+    let bBX = u32(wrapf(bufX + 0.5, f32(W))) / RB;
+    let bBY = u32(wrapf(bufY + 0.5, f32(H))) / RB;
     let slot = blockSlot[i32(bBY * nbx + bBX)];
     if (slot < 0) { return vec3<f32>(0.0, 0.0, 0.0); }
     let originX = bBX * RB;
