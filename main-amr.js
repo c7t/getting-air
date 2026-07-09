@@ -348,12 +348,16 @@ async function init() {
   // all pool-aware (an extra read-only slotToBlock/blockSlot binding vs. M2).
   // Binding 4 (newlyActivated) is Milestone 4b: only read by the GHOST_ONLY=0
   // init pipeline, but must still be present in the layout both pipelines share.
+  // Milestone 4c: binding 5 (blockSlot) added so a ghost cell can check
+  // whether its edge-adjacent neighbor block is also currently refined (see
+  // amr_interp_c2f.wgsl's file header on fine-fine ghost consultation).
   const interpBGL = device.createBindGroupLayout({ label: 'interpBGL', entries: [
     { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
     { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }
+    { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }
   ]});
   // Milestone 4b: criterion (per-block vorticity max) and manage (refine/coarsen decision).
   const criterionBGL = device.createBindGroupLayout({ label: 'criterionBGL', entries: [
@@ -461,8 +465,8 @@ async function init() {
   // boundary buffer, mirroring f_a's own invariant -- 2 fine substeps per
   // macro-step is even), but READS whichever coarse buffer is "current"
   // this macro-step (same source the force pass reads).
-  const interpBG_readA = device.createBindGroup({ layout: interpBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_a } }, { binding: 2, resource: { buffer: finePoolF_a } }, { binding: 3, resource: { buffer: slotToBlockBuf } }, { binding: 4, resource: { buffer: newlyActivatedBuf } }]});
-  const interpBG_readB = device.createBindGroup({ layout: interpBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_b } }, { binding: 2, resource: { buffer: finePoolF_a } }, { binding: 3, resource: { buffer: slotToBlockBuf } }, { binding: 4, resource: { buffer: newlyActivatedBuf } }]});
+  const interpBG_readA = device.createBindGroup({ layout: interpBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_a } }, { binding: 2, resource: { buffer: finePoolF_a } }, { binding: 3, resource: { buffer: slotToBlockBuf } }, { binding: 4, resource: { buffer: newlyActivatedBuf } }, { binding: 5, resource: { buffer: blockSlotBuf } }]});
+  const interpBG_readB = device.createBindGroup({ layout: interpBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_b } }, { binding: 2, resource: { buffer: finePoolF_a } }, { binding: 3, resource: { buffer: slotToBlockBuf } }, { binding: 4, resource: { buffer: newlyActivatedBuf } }, { binding: 5, resource: { buffer: blockSlotBuf } }]});
   // Fine ping-pong within a macro-step is a fixed 2-call sequence (ab then
   // ba), not a persistent toggle like the coarse useB -- always call both,
   // in order, every macro-step.
@@ -478,8 +482,8 @@ async function init() {
   // a just-activated slot immediately after coarse->fine interpolation
   // logically depends on the CURRENT coarse state, i.e. same source
   // selection as the steady-state interp bind groups above.
-  const interpInitBG_readA = device.createBindGroup({ layout: interpBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_a } }, { binding: 2, resource: { buffer: finePoolF_a } }, { binding: 3, resource: { buffer: slotToBlockBuf } }, { binding: 4, resource: { buffer: newlyActivatedBuf } }]});
-  const interpInitBG_readB = device.createBindGroup({ layout: interpBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_b } }, { binding: 2, resource: { buffer: finePoolF_a } }, { binding: 3, resource: { buffer: slotToBlockBuf } }, { binding: 4, resource: { buffer: newlyActivatedBuf } }]});
+  const interpInitBG_readA = device.createBindGroup({ layout: interpBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_a } }, { binding: 2, resource: { buffer: finePoolF_a } }, { binding: 3, resource: { buffer: slotToBlockBuf } }, { binding: 4, resource: { buffer: newlyActivatedBuf } }, { binding: 5, resource: { buffer: blockSlotBuf } }]});
+  const interpInitBG_readB = device.createBindGroup({ layout: interpBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_b } }, { binding: 2, resource: { buffer: finePoolF_a } }, { binding: 3, resource: { buffer: slotToBlockBuf } }, { binding: 4, resource: { buffer: newlyActivatedBuf } }, { binding: 5, resource: { buffer: blockSlotBuf } }]});
 
   // Milestone 4b bind groups.
   const criterionBG = device.createBindGroup({ layout: criterionBGL, entries: [{ binding: 0, resource: { buffer: velBuf } }, { binding: 1, resource: { buffer: blockCriterionBuf } }]});
@@ -806,6 +810,17 @@ async function init() {
     slotToBlockCPU[slot] = blockID;
     device.queue.writeBuffer(blockSlotBuf, blockID * 4, new Int32Array([slot]));
     device.queue.writeBuffer(slotToBlockBuf, slot * 4, new Int32Array([blockID]));
+    // BUGFIX: the GHOST_ONLY=0 pipeline's own guard (see amr_interp_c2f.wgsl)
+    // is `if (GHOST_ONLY==0u && newlyActivated[slot]==0u) { return; }` --
+    // without this write, every thread hits that guard and the dispatch
+    // below silently does nothing, leaving the slot's fine pool at whatever
+    // uniform-rest state initFPool() set it to. The automatic refine() path
+    // in amr_manage.wgsl sets this correctly; this manual CPU-driven path
+    // had never set it, meaning this debug function has been silently
+    // non-functional (activating a slot without ever actually initializing
+    // its fine data) since it was written. Reset back to 0 after dispatch,
+    // matching the automatic path's per-round clearBuffer lifecycle.
+    device.queue.writeBuffer(newlyActivatedBuf, slot * 4, new Uint32Array([1]));
 
     const interpInitBG = useB ? interpInitBG_readB : interpInitBG_readA;
     const enc = device.createCommandEncoder();
@@ -816,6 +831,7 @@ async function init() {
     ipl.end();
     device.queue.submit([enc.finish()]);
     await device.queue.onSubmittedWorkDone();
+    device.queue.writeBuffer(newlyActivatedBuf, slot * 4, new Uint32Array([0]));
     return { slot, alreadyActive: false };
   }
 
@@ -840,6 +856,95 @@ async function init() {
     return { wasActive: true, slot };
   }
 
+  // TEMPORARY diagnostic (Milestone 4c investigation): writes a synthetic
+  // f[0]=fx*100+fy marker into every pool cell, dispatches ONLY the
+  // steady-state ghost-fill pass once (bypassing coarse step / fine step1 /
+  // average entirely), and returns the resulting f[0] plane. Since the
+  // marker survives untouched in every INTERIOR cell (this pass never
+  // writes interior cells) and ghost cells get overwritten by whatever the
+  // shader's neighbor-consultation logic picks, this directly reveals which
+  // cell a ghost cell actually read from, with zero confounding from
+  // streaming/collision. Remove once the fine-fine indexing bug is found.
+  async function debugProbeGhostFill() {
+    const NPOOL = MAX_FINE_BLOCKS * NCELLS1;
+    const marker = new Float32Array(NPOOL * 9);
+    for (let s = 0; s < MAX_FINE_BLOCKS; s++) {
+      for (let fy = 0; fy < FB; fy++) {
+        for (let fx = 0; fx < FB; fx++) {
+          const cell = s * (FB * FB) + fy * FB + fx;
+          marker[0 * NPOOL + cell] = fx * 100 + fy;
+        }
+      }
+    }
+    device.queue.writeBuffer(finePoolF_a, 0, marker);
+
+    const enc = device.createCommandEncoder();
+    const ipl = enc.beginComputePass();
+    ipl.setPipeline(interpPL);
+    ipl.setBindGroup(0, interpBG_readA);
+    ipl.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS);
+    ipl.end();
+    device.queue.submit([enc.finish()]);
+    await device.queue.onSubmittedWorkDone();
+
+    const enc2 = device.createCommandEncoder();
+    enc2.copyBufferToBuffer(finePoolF_a, 0, stagingFPool, 0, fSizePool);
+    device.queue.submit([enc2.finish()]);
+    await stagingFPool.mapAsync(GPUMapMode.READ);
+    const result = new Float32Array(stagingFPool.getMappedRange()).slice();
+    stagingFPool.unmap();
+    return Array.from(result.subarray(0, NPOOL));
+  }
+
+  // TEMPORARY diagnostic: dispatches ONLY the steady-state (GHOST_ONLY=1)
+  // ghost-fill pass, in isolation, WITHOUT first overwriting finePoolF_a --
+  // unlike debugProbeGhostFill (which stomps the pool with a marker
+  // pattern), this preserves whatever real interior data debugActivateBlock
+  // already seeded, so it can be used to test the fine-fine consultation
+  // path (which only runs in GHOST_ONLY=1, never in debugActivateBlock's own
+  // GHOST_ONLY=0 init dispatch) against a known synthetic field's already-
+  // correctly-interpolated interior, isolating exactly the mechanism the
+  // Phase 4c ghost-consultation code exercises in real macro-steps.
+  async function debugRunSteadyGhostFill() {
+    const enc = device.createCommandEncoder();
+    const ipl = enc.beginComputePass();
+    ipl.setPipeline(interpPL);
+    ipl.setBindGroup(0, useB ? interpBG_readB : interpBG_readA);
+    ipl.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS);
+    ipl.end();
+    device.queue.submit([enc.finish()]);
+    await device.queue.onSubmittedWorkDone();
+  }
+
+  // TEMPORARY diagnostic (root-cause investigation of the pre-existing
+  // coarse<->fine interface artifact): overwrites f_a with a Taylor-Green-
+  // like analytic vortex field (ux=-A*sin(2*pi*y/L), uy=A*sin(2*pi*x/L),
+  // rho=1) instead of the usual uniform rest state. Unlike a linear ramp,
+  // this has genuine curvature AND nonzero, smoothly-varying vorticity
+  // (omega = A*(2*pi/L)*(cos(2*pi*x/L)+cos(2*pi*y/L))), so any error the
+  // coarse->fine interpolation introduces at a block boundary shows up
+  // against a known analytic ground truth, not against chaotic real flow
+  // structure that's hard to reason about. Buffer-space coordinates (no
+  // window conversion -- off_x/off_y are 0 right after reset() anyway).
+  function debugInjectSyntheticField(A, L) {
+    const f = new Float32Array(NCELLS * 9);
+    for (let by = 0; by < NBY; by++) {
+      for (let bx = 0; bx < NBX; bx++) {
+        for (let ly = 0; ly < BLOCK; ly++) {
+          for (let lx = 0; lx < BLOCK; lx++) {
+            const x = bx * BLOCK + lx, y = by * BLOCK + ly;
+            const blockID = by * NBX + bx;
+            const cell = blockID * (BLOCK * BLOCK) + ly * BLOCK + lx;
+            const ux = -A * Math.sin(2 * Math.PI * y / L);
+            const uy = A * Math.sin(2 * Math.PI * x / L);
+            for (let i = 0; i < 9; i++) f[i * NCELLS + cell] = feq(1, ux, uy, i);
+          }
+        }
+      }
+    }
+    device.queue.writeBuffer(f_a, 0, f);
+  }
+
   // Always reads GPU state directly (not the CPU mirror, which goes stale
   // the instant autoRefine's automatic management mutates pool state
   // without the CPU ever seeing it) -- see readPoolIndirection.
@@ -860,6 +965,19 @@ async function init() {
   // guarantee this: STEPS_PER_FRAME-sized jumps land unpredictably relative
   // to any external poll interval (confirmed directly while re-validating
   // Milestones 1 and 2 at 256x256 -- see plans/AMR.md).
+  // TEMPORARY diagnostic: single-macro-step granularity (debugStepSync is
+  // locked to STEPS_PER_FRAME=64-step batches), for bisecting exactly which
+  // macro-step a divergence first appears on.
+  async function debugStepOne() {
+    liveMode = false;
+    const enc = device.createCommandEncoder();
+    dispatchMacroStep(enc);
+    device.queue.submit([enc.finish()]);
+    await device.queue.onSubmittedWorkDone();
+    step += 1;
+    return { step };
+  }
+
   async function debugStepSync(n) {
     liveMode = false;
     for (let k = 0; k < n; k += STEPS_PER_FRAME) {
@@ -881,9 +999,13 @@ async function init() {
     debugSnapshotSave,
     debugSnapshotLoad,
     debugStepSync,
+    debugStepOne,
     debugActivateBlock,
     debugDeactivateBlock,
     debugListActiveBlocks,
+    debugProbeGhostFill,
+    debugRunSteadyGhostFill,
+    debugInjectSyntheticField,
     setAutoRefine,
     isAutoRefine: () => autoRefine,
     getBlockGridDims: () => ({ NBX, NBY, RB, MAX_FINE_BLOCKS }),
