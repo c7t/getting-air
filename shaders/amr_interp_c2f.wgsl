@@ -61,6 +61,12 @@ struct CardState {
 // (and by now stale) coarse interpolation. The steady-state GHOST_ONLY=1
 // pipeline shares this bind group layout but never reads this binding.
 @group(0) @binding(4) var<storage, read>       newlyActivated : array<u32>;
+// Milestone 4c: coarse-block -> pool-slot map (inverse of slotToBlock), so a
+// ghost cell can check whether its EDGE-adjacent neighbor block is also
+// currently refined, and if so pull directly from that neighbor's fine
+// interior instead of round-tripping through the coarse level. Read-write
+// elsewhere (main.js owns writes); read-only here.
+@group(0) @binding(5) var<storage, read>       blockSlot      : array<i32>;
 
 override W : u32;   // coarse grid dims
 override H : u32;
@@ -155,8 +161,83 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (GHOST_ONLY == 0u && newlyActivated[slot] == 0u) { return; }
 
   let nbx = W / BLOCK;
-  let originX = (u32(blockID) % nbx) * RB;
-  let originY = (u32(blockID) / nbx) * RB;
+  let nby = H / BLOCK;
+  let bx = u32(blockID) % nbx;
+  let by = u32(blockID) / nbx;
+  let originX = bx * RB;
+  let originY = by * RB;
+
+  // Milestone 4c: fine-fine ghost consultation. Only in the steady-state
+  // pass (GHOST_ONLY=1) -- in the init pass (GHOST_ONLY=0) two edge-adjacent
+  // blocks can both be newly-activated in the SAME dispatch, and this pass
+  // also fills their interiors (see the isInterior/GHOST_ONLY skip above),
+  // so reading a neighbor's interior there would race its own write.
+  // Steady-state has no such race: interior cells are only ever written by
+  // the PREVIOUS macro-step's step1PL (this pass returns early on interior
+  // cells, see above), so a neighbor's interior is always stable data
+  // regardless of dispatch order across slots/workgroups.
+  //
+  // A ghost cell lies along exactly one edge (not a diagonal corner) when
+  // exactly one of fx/fy is out of the interior range. Diagonal corners
+  // (both out of range) consult the diagonal neighbor block the same way --
+  // found to matter in practice, not just a completeness nicety: a corner
+  // still on the old coarse-interpolated path, sitting between two edges
+  // now made exact by the fine-fine consultation below, goes measurably
+  // inconsistent with its (now-precise) edge neighbors. Since the D2Q9
+  // stencil streams diagonally too, that inconsistency feeds directly into
+  // the interior cell nearest the corner every fine substep and grows
+  // there until it diverges -- confirmed directly: a controlled 3x3
+  // refined cluster seeded with a smooth analytic (Taylor-Green) field and
+  // no card/turbulence involved still blew up within ~2800 macro-steps,
+  // bisected to a single corner cell (the one corner of a cluster-corner
+  // block that happens to have an active diagonal neighbor) climbing from
+  // ~0.55 to over 1 before cascading to NaN.
+  let RB2 = RB * 2u;
+  let inXRange = fx >= GHOST && fx < GHOST + RB2;
+  let inYRange = fy >= GHOST && fy < GHOST + RB2;
+  if (GHOST_ONLY != 0u) {
+    var neighborSlot = -1;
+    var nfx = fx; var nfy = fy;
+    if (inYRange && fx < GHOST) {
+      neighborSlot = blockSlot[by * nbx + ((bx + nbx - 1u) % nbx)];
+      nfx = fx + RB2;
+    } else if (inYRange && fx >= GHOST + RB2) {
+      neighborSlot = blockSlot[by * nbx + ((bx + 1u) % nbx)];
+      nfx = fx - RB2;
+    } else if (inXRange && fy < GHOST) {
+      neighborSlot = blockSlot[((by + nby - 1u) % nby) * nbx + bx];
+      nfy = fy + RB2;
+    } else if (inXRange && fy >= GHOST + RB2) {
+      neighborSlot = blockSlot[((by + 1u) % nby) * nbx + bx];
+      nfy = fy - RB2;
+    } else if (fx < GHOST && fy < GHOST) {
+      // NW diagonal corner.
+      neighborSlot = blockSlot[((by + nby - 1u) % nby) * nbx + ((bx + nbx - 1u) % nbx)];
+      nfx = fx + RB2; nfy = fy + RB2;
+    } else if (fx >= GHOST + RB2 && fy < GHOST) {
+      // NE diagonal corner.
+      neighborSlot = blockSlot[((by + nby - 1u) % nby) * nbx + ((bx + 1u) % nbx)];
+      nfx = fx - RB2; nfy = fy + RB2;
+    } else if (fx < GHOST && fy >= GHOST + RB2) {
+      // SW diagonal corner.
+      neighborSlot = blockSlot[((by + 1u) % nby) * nbx + ((bx + nbx - 1u) % nbx)];
+      nfx = fx + RB2; nfy = fy - RB2;
+    } else if (fx >= GHOST + RB2 && fy >= GHOST + RB2) {
+      // SE diagonal corner.
+      neighborSlot = blockSlot[((by + 1u) % nby) * nbx + ((bx + 1u) % nbx)];
+      nfx = fx - RB2; nfy = fy - RB2;
+    }
+
+    if (neighborSlot >= 0) {
+      let poolPlaneStride = arrayLength(&f_pool) / 9u;
+      let poolCellBase = slot * (FB * FB) + fy * FB + fx;
+      let neighborCellBase = u32(neighborSlot) * (FB * FB) + nfy * FB + nfx;
+      for (var i = 0u; i < 9u; i++) {
+        f_pool[i * poolPlaneStride + poolCellBase] = f_pool[i * poolPlaneStride + neighborCellBase];
+      }
+      return;
+    }
+  }
 
   let px = fineToCoarseUnit(fx, originX);
   let py = fineToCoarseUnit(fy, originY);
