@@ -1,19 +1,17 @@
-// Milestone 2 (plans/AMR.md): fine -> coarse averaging (restriction).
+// Milestone 4 (plans/AMR.md): fine -> coarse averaging (restriction),
+// POOL-AWARE. Supersedes Milestone 2's single-fixed-region version -- see
+// amr_interp_c2f.wgsl's file header for the shared pool addressing scheme.
 //
-// Runs once per macro-step, after both fine substeps complete, overwriting
-// every coarse cell within the fine region's footprint with the average of
-// its 4 fine children (AGAL Fig. 13 step 4). Simplification recorded in
-// plans/AMR.md: this averages the WHOLE fine region back to its coarse
-// parents, not just AGAL's narrower "interface layer" -- a correctness-
-// neutral simplification at our scale, not a numerically different choice.
+// Dispatched as (1, 1, MAX_FINE_BLOCKS) with workgroup_size(8,8): a coarse
+// block is exactly RB*RB=8*8=64 cells, i.e. exactly one workgroup, so each
+// thread handles exactly one coarse cell's 4 fine children -- no separate
+// tile-index dimension needed here (unlike interp/step1, which iterate
+// over the larger FBxFB slot buffer).
 //
-// rho is a simple arithmetic mean of the 4 children (exactly mass-
-// conservative: each fine cell has 1/4 the coarse cell's area, so total
-// mass over the 4 children equals mean(rho)*coarse_area). Velocity is a
-// mass-weighted average of the children (momentum-conservative: coarse
-// momentum = mean(rho_i * u_i), not a naive mean of u_i). The non-
-// equilibrium part is inverse-Dupuis-Chopard-rescaled by tau_coarse/tau_fine
-// (see amr_interp_c2f.wgsl for the forward direction).
+// rho: simple arithmetic mean of the 4 children (exactly mass-
+// conservative). Velocity: mass-weighted average (momentum-conservative).
+// Non-equilibrium part: inverse-Dupuis-Chopard-rescaled by
+// tau_coarse/tau_fine (see amr_interp_c2f.wgsl for the forward direction).
 
 struct CardState {
   cx     : f32,
@@ -44,17 +42,14 @@ struct CardState {
   off_y_old : f32,
 }
 
-@group(0) @binding(0) var<storage, read>       state    : CardState;
-@group(0) @binding(1) var<storage, read>       f_fine   : array<f32>;
-@group(0) @binding(2) var<storage, read_write> f_coarse : array<f32>;
+@group(0) @binding(0) var<storage, read>       state       : CardState;
+@group(0) @binding(1) var<storage, read>       f_pool      : array<f32>;
+@group(0) @binding(2) var<storage, read_write> f_coarse    : array<f32>;
+@group(0) @binding(3) var<storage, read>       slotToBlock : array<i32>;
 
-override W : u32;  // coarse grid dims
+override W : u32;
 override H : u32;
-override FW : u32; // fine grid "real" interior dims
-override FH : u32;
-override FINE_ORIGIN_X : i32;
-override FINE_ORIGIN_Y : i32;
-
+override RB : u32;
 const BLOCK = 8u;
 const GHOST = 2u;
 
@@ -80,20 +75,22 @@ fn cellIndex(cx: u32, cy: u32) -> u32 {
 }
 
 @compute @workgroup_size(8, 8)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let lcx = gid.x; let lcy = gid.y; // coarse-cell-local coords within the fine region
-  let CW = FW / 2u; let CH = FH / 2u;
-  if (lcx >= CW || lcy >= CH) { return; }
+fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wgid: vec3<u32>) {
+  let lcx = lid.x; let lcy = lid.y; // coarse-cell-local coords within the block
+  let slot = wgid.z;
 
-  let FBW = FW + 2u * GHOST;
-  let FBH = FH + 2u * GHOST;
+  let blockID = slotToBlock[slot];
+  if (blockID < 0) { return; }
 
-  // The 4 fine children of this coarse cell, in fine-local (ghost-inclusive) coords.
+  let FB = RB * 2u + 2u * GHOST;
+  let poolPlaneStride = arrayLength(&f_pool) / 9u;
+
+  // The 4 fine children of this coarse cell, in slot-local (ghost-inclusive) coords.
   let fx0 = GHOST + 2u * lcx; let fx1 = fx0 + 1u;
   let fy0 = GHOST + 2u * lcy; let fy1 = fy0 + 1u;
   let children = array<u32, 4>(
-    fy0 * FBW + fx0, fy0 * FBW + fx1,
-    fy1 * FBW + fx0, fy1 * FBW + fx1
+    slot * (FB * FB) + fy0 * FB + fx0, slot * (FB * FB) + fy0 * FB + fx1,
+    slot * (FB * FB) + fy1 * FB + fx0, slot * (FB * FB) + fy1 * FB + fx1
   );
 
   var rho_sum = 0f;
@@ -108,7 +105,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var rho = 0f; var ux = 0f; var uy = 0f;
     var f: array<f32, 9>;
     for (var i = 0u; i < 9u; i++) {
-      f[i] = f_fine[i * (FBW * FBH) + cell];
+      f[i] = f_pool[i * poolPlaneStride + cell];
       rho += f[i];
       ux  += f[i] * f32(ex[i]);
       uy  += f[i] * f32(ey[i]);
@@ -126,7 +123,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let uy_avg = rhou_y_sum / rho_sum;
 
   let tau_fine = 2.0f * state.tau - 0.5f;
-  let rescale = state.tau / tau_fine; // inverse of amr_interp_c2f.wgsl's rescale
+  let rescale = state.tau / tau_fine;
 
   var fneq_avg: array<f32, 9>;
   for (var i = 0u; i < 9u; i++) {
@@ -137,11 +134,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     fneq_avg[i] = s * 0.25f;
   }
 
-  // Destination: coarse WINDOW coords -> buffer coords -> block-major index.
-  let cwx = u32(FINE_ORIGIN_X) + lcx;
-  let cwy = u32(FINE_ORIGIN_Y) + lcy;
-  let cbx = (cwx + u32(state.off_x)) % W;
-  let cby = (cwy + u32(state.off_y)) % H;
+  // Destination: coarse BUFFER coords (no window conversion -- see file header).
+  let nbx = W / BLOCK;
+  let cbx = (u32(blockID) % nbx) * RB + lcx;
+  let cby = (u32(blockID) / nbx) * RB + lcy;
   let coarseCell = cellIndex(cbx, cby);
 
   for (var i = 0u; i < 9u; i++) {
