@@ -392,6 +392,9 @@ async function init() {
   // GHOST_ONLY=0: full-slot fill, used once on block activation (see debugActivateBlock).
   const interpConstants = { W, H, RB, GHOST_ONLY: 1 };
   const interpInitConstants = { W, H, RB, GHOST_ONLY: 0 };
+  // Between-substep fine-fine-only ghost re-exchange (see amr_interp_c2f.wgsl's
+  // FINE_FINE_ONLY note and the dispatch between f1a/f1b below).
+  const interpFFConstants = { W, H, RB, GHOST_ONLY: 1, FINE_FINE_ONLY: 1 };
   const step1Constants = { W, H, RB };
   const criterionConstants = { W, H };
   const manageConstants = { W, H, REFINE_THRESH, COARSEN_THRESH };
@@ -425,6 +428,11 @@ async function init() {
   const interpInitPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [interpBGL] }),
     compute: { module: interpSM, entryPoint: 'main', constants: interpInitConstants }
+  });
+  // Fine-fine-only ghost re-exchange pipeline (same module, FINE_FINE_ONLY=1).
+  const interpFFPL = device.createComputePipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [interpBGL] }),
+    compute: { module: interpSM, entryPoint: 'main', constants: interpFFConstants }
   });
   const step1PL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [step1BGL] }),
@@ -472,6 +480,12 @@ async function init() {
   // in order, every macro-step.
   const step1BG_ab = device.createBindGroup({ layout: step1BGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: finePoolF_a } }, { binding: 2, resource: { buffer: finePoolF_b } }, { binding: 3, resource: { buffer: finePoolVel } }, { binding: 4, resource: { buffer: slotToBlockBuf } }]});
   const step1BG_ba = device.createBindGroup({ layout: step1BGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: finePoolF_b } }, { binding: 2, resource: { buffer: finePoolF_a } }, { binding: 3, resource: { buffer: finePoolVel } }, { binding: 4, resource: { buffer: slotToBlockBuf } }]});
+  // Fine-fine-only ghost re-exchange, run BETWEEN f1a and f1b. f1a writes the
+  // post-substep-1 pool into finePoolF_b (the buffer f1b then reads), so this
+  // refreshes each block's fine-fine seam ghosts IN PLACE in finePoolF_b from
+  // the neighbor's just-updated interior. binding 1 (f_coarse) is unused in
+  // FINE_FINE_ONLY mode; f_a is bound only to satisfy the shared layout.
+  const interpFFBG_b = device.createBindGroup({ layout: interpBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_a } }, { binding: 2, resource: { buffer: finePoolF_b } }, { binding: 3, resource: { buffer: slotToBlockBuf } }, { binding: 4, resource: { buffer: newlyActivatedBuf } }, { binding: 5, resource: { buffer: blockSlotBuf } }]});
   // average always READS finePoolF_a (pool is current again after 2
   // substeps) but WRITES whichever coarse buffer the coarse step just
   // wrote this macro-step -- named by target, matching stepBG_ba being the
@@ -711,6 +725,11 @@ async function init() {
     const ipl = enc.beginComputePass(); ipl.setPipeline(interpPL); ipl.setBindGroup(0, interpBG); ipl.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); ipl.end();
     const stp = enc.beginComputePass(); stp.setPipeline(stepPL); stp.setBindGroup(0, stepBG); stp.dispatchWorkgroups(WGX, WGY); stp.end();
     const f1a = enc.beginComputePass(); f1a.setPipeline(step1PL); f1a.setBindGroup(0, step1BG_ab); f1a.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); f1a.end();
+    // Refresh fine-fine seam ghosts from neighbors' post-substep-1 interiors so
+    // the second fine substep couples to CURRENT neighbor state (a chain of
+    // fine blocks then behaves like one contiguous fine region). Separate pass
+    // => WebGPU barrier after f1a's writes, before f1b reads finePoolF_b.
+    const ff = enc.beginComputePass(); ff.setPipeline(interpFFPL); ff.setBindGroup(0, interpFFBG_b); ff.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); ff.end();
     const f1b = enc.beginComputePass(); f1b.setPipeline(step1PL); f1b.setBindGroup(0, step1BG_ba); f1b.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); f1b.end();
     // Exactly one workgroup per slot (RB*RB=64 cells = 1 workgroup, see amr_average_f2c.wgsl).
     const avg = enc.beginComputePass(); avg.setPipeline(avgPL); avg.setBindGroup(0, avgBG); avg.dispatchWorkgroups(1, 1, MAX_FINE_BLOCKS); avg.end();

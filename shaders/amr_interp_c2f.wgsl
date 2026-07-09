@@ -72,6 +72,18 @@ override W : u32;   // coarse grid dims
 override H : u32;
 override RB : u32;  // refine block size in coarse cells (matches M1's BLOCK)
 override GHOST_ONLY : u32;
+// When set, this pass does ONLY the fine-fine (edge + diagonal-corner) ghost
+// copy below and returns -- it never falls through to coarse interpolation and
+// never touches coarse-adjacent ghosts. Used for the between-substep fine-fine
+// re-exchange (see main-amr.js): the once-per-macro-step interp fills fine-fine
+// seams exactly for the FIRST fine substep only; without a refresh, the SECOND
+// substep streams a stale/edge-clamped neighbor halo, injecting a periodic
+// error at every fine-fine seam once per macro-step (the block-pitch artifact).
+// Coarse-adjacent ghosts intentionally keep their "degrade over 2 substeps"
+// behavior (correct multi-rate coupling; coarse is quasi-static), so this mode
+// leaves them alone. Default 0u so the existing interp/interpInit pipelines,
+// which don't set it, still compile.
+override FINE_FINE_ONLY : u32 = 0u;
 
 const BLOCK = 8u;
 const GHOST = 2u;
@@ -238,6 +250,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       return;
     }
   }
+
+  // Fine-fine-only mode: this ghost cell has no active fine neighbor (the copy
+  // above didn't fire), so there is nothing to refresh -- leave it exactly as
+  // the previous fine substep produced it (coarse-adjacent ghosts keep their
+  // intended multi-rate "degrade over 2 substeps" behavior) and do NOT run the
+  // coarse interpolation below.
+  if (FINE_FINE_ONLY != 0u) { return; }
 
   let px = fineToCoarseUnit(fx, originX);
   let py = fineToCoarseUnit(fy, originY);
