@@ -194,6 +194,15 @@ fn fs_main(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> {
     c = mix(vec3(0.05, 0.05, 0.1), vec3(0.2, 0.5, 1.0), -val);
   }
 
+  // Refined-block coverage overlay: flat gray tint over the whole coarse
+  // block footprint currently holding a pool slot (pool.z>=0), not just its
+  // sampled interior -- a cheap visual sanity check for M3's own question
+  // ("do we see artifacts / is coverage where we'd expect"), reusing pool.z
+  // already computed above at no extra cost.
+  if (pool.z >= 0) {
+    c = mix(c, vec3(0.5, 0.5, 0.5), 0.18f);
+  }
+
   // Blend with solid color
   let solid_color = vec3(1.0, 0.8, 0.4);
   c = mix(c, solid_color, chi);
