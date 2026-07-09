@@ -153,7 +153,23 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   vel_pool[cell * 2u] = ux; vel_pool[cell * 2u + 1u] = uy;
 
-  // 4. Collision (no sponge -- fine region is interior to the coarse domain)
+  // 4. Collision and ALBC sponge. Milestone 4b fix: this used to skip the
+  // sponge entirely on the (then-true) assumption that the fine region
+  // never reaches the window edge -- valid when M2 hand-placed a single
+  // static box, but false once refinement is criterion-driven and can
+  // trigger anywhere, including near the sponge band where the coarse step
+  // (amr_step.wgsl) DOES damp toward equilibrium. A refined block there
+  // with no sponge of its own diverges from its damped coarse neighbors,
+  // and the average pass then writes that undamped state back onto them --
+  // exactly the boundary artifact this was fixed in response to. Same
+  // formula as amr_step.wgsl's sponge, reusing the wx/wy already computed
+  // above for the card SDF.
+  let SPONGE_W = 4.0f;
+  let dist_x = min(wx, f32(W) - 1.0f - wx);
+  let dist_y = min(wy, f32(H) - 1.0f - wy);
+  var sponge_weight = clamp(1.0f - min(dist_x, dist_y) / SPONGE_W, 0.0f, 1.0f);
+  sponge_weight = sponge_weight * sponge_weight * (3.0f - 2.0f * sponge_weight);
+
   let tau_fine = 2.0f * state.tau - 0.5f;
   let omg = 1.0f / tau_fine;
   for (var i = 0u; i < 9u; i++) {
@@ -166,6 +182,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let term2  = (exf*ux + eyf*uy) * 9.0f;
     let Si = (1.0f - 0.5f * omg) * wt[i] * ( (term1x + term2*exf)*Fx + (term1y + term2*eyf)*Fy );
 
-    f_out[i * poolPlaneStride + cell] = f[i] - omg * (f[i] - feq) + Si;
+    let f_collide = f[i] - omg * (f[i] - feq) + Si;
+    let f_target  = wt[i] * 1.0f;
+    f_out[i * poolPlaneStride + cell] = mix(f_collide, f_target, sponge_weight);
   }
 }
