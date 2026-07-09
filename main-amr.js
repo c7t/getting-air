@@ -326,7 +326,12 @@ async function init() {
     stagingCard.unmap();
 
     const snapshot = {
-      formatVersion: 1,
+      formatVersion: 2,
+      // 'block8': f/vel are laid out in fixed 8x8 buffer-space cell-blocks
+      // (see shaders/amr_step.wgsl's cellIndex, Milestone 1 of
+      // plans/AMR.md), not flat row-major -- tools/amr-diff.js needs this
+      // tag to decode snapshots correctly.
+      layout: 'block8',
       W, H, step,
       cardState: card,
       fB64: bytesToB64(new Uint8Array(f.buffer, f.byteOffset, f.byteLength)),
@@ -340,6 +345,15 @@ async function init() {
   async function debugSnapshotLoad(snapshot) {
     if (snapshot.W !== W || snapshot.H !== H) {
       throw new Error(`snapshot is ${snapshot.W}x${snapshot.H}, page is ${W}x${H} -- reload with ?res=${Math.log2(snapshot.W)}`);
+    }
+    // Raw f_a/velBuf bytes are only meaningful under the layout they were
+    // captured with (see debugSnapshotSave's 'layout' field) -- loading a
+    // pre-Milestone-1 flat-row-major snapshot here would silently
+    // reinterpret it as block-major and corrupt state with no thrown error,
+    // exactly the class of silent-failure this project has learned to
+    // guard against explicitly rather than discover from wrong output.
+    if (snapshot.layout !== 'block8') {
+      throw new Error(`snapshot layout is '${snapshot.layout}', this build expects 'block8'`);
     }
     const f = b64ToFloat32(snapshot.fB64, NCELLS * 9);
     const vel = b64ToFloat32(snapshot.velB64, NCELLS * 2);

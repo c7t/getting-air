@@ -1,5 +1,22 @@
 // Fused LBM Kernel: Pull-Streaming + Collision + Source Term
-// This kernel performs a full LBM step in one pass over memory.
+//
+// Milestone 1 (plans/AMR.md): block-major buffer layout. Buffer cells are
+// grouped into fixed BLOCK x BLOCK tiles laid out contiguously per tile --
+// this is the addressable "cell-block" unit later milestones pool/refine/
+// coarsen (AGAL section 3.2's cell-block decomposition), though at this
+// milestone the block <-> position mapping is still a straight identity (no
+// pool indirection yet -- that's Milestone 4).
+//
+// Dispatch is now over BUFFER coordinates (not window coordinates): gid.x/
+// gid.y address a fixed memory location that never moves as the moving
+// window (off_x/off_y) pans. Window/physical coordinates (needed only for
+// the card SDF and the ALBC sponge, both physically anchored, not buffer-
+// anchored) are derived per-thread by inverting the moving-window mapping.
+// Streaming between buffer-adjacent cells is equivalent to streaming
+// between window-adjacent cells because off_x/off_y is a single shift
+// applied uniformly to every cell: if bx = (wx + off_x) % W for every
+// cell, then the neighbor at window offset -ex lands at buffer offset -ex
+// too, regardless of off_x's actual value.
 
 struct CardState {
   cx     : f32,
@@ -37,6 +54,7 @@ struct CardState {
 
 override W : u32;
 override H : u32;
+const BLOCK = 8u;
 
 const ex = array<i32,9>( 0, 1, 0,-1, 0, 1,-1,-1, 1);
 const ey = array<i32,9>( 0, 0, 1, 0,-1, 1, 1,-1,-1);
@@ -45,6 +63,17 @@ const wt = array<f32,9>(
   0.11111111f, 0.11111111f, 0.11111111f, 0.11111111f,
   0.02777778f, 0.02777778f, 0.02777778f, 0.02777778f
 );
+
+// Block-major linear index for a cell at BUFFER coordinates (cx, cy).
+// W and H are always exact multiples of BLOCK (resLog2 clamps W,H to
+// powers of two >= 64), so this partitions the buffer exactly.
+fn cellIndex(cx: u32, cy: u32) -> u32 {
+  let nbx = W / BLOCK;
+  let bx = cx / BLOCK; let by = cy / BLOCK;
+  let lx = cx % BLOCK; let ly = cy % BLOCK;
+  let blockID = by * nbx + bx;
+  return blockID * (BLOCK * BLOCK) + ly * BLOCK + lx;
+}
 
 fn get_phi(p: vec2<f32>, state: CardState) -> f32 {
     let ca = cos(state.theta);
@@ -55,10 +84,10 @@ fn get_phi(p: vec2<f32>, state: CardState) -> f32 {
     dy -= f32(H) * round(dy / f32(H));
     let lx = dx * ca + dy * sa;
     let ly = -dx * sa + dy * ca;
-    
+
     // Algebraic distance approximation for ellipse
     let d = sqrt((lx*lx)/(state.a*state.a) + (ly*ly)/(state.b*state.b)) - 1.0;
-    return d * state.b; 
+    return d * state.b;
 }
 
 fn get_chi(phi: f32) -> f32 {
@@ -68,21 +97,19 @@ fn get_chi(phi: f32) -> f32 {
 
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let x = gid.x; let y = gid.y;
-  if (x >= W || y >= H) { return; }
+  let cx = gid.x; let cy = gid.y;
+  if (cx >= W || cy >= H) { return; }
 
-  // 1. Pull Streaming: Read populations from neighbors that will arrive at (x,y)
+  // Window/physical coordinates: invert the moving-window shift.
+  let wx = (cx + W - u32(state.off_x)) % W;
+  let wy = (cy + H - u32(state.off_y)) % H;
+
+  // 1. Pull Streaming: buffer-space neighbor (see file header derivation).
   var f: array<f32,9>;
   for (var i = 0u; i < 9u; i++) {
-    // Window coordinates of source neighbor
-    let wx_src = (x + W - u32(ex[i])) % W;
-    let wy_src = (y + H - u32(ey[i])) % H;
-    
-    // Map window source to buffer source
-    let bx_src = (wx_src + u32(state.off_x)) % W;
-    let by_src = (wy_src + u32(state.off_y)) % H;
-    
-    f[i] = f_in[i * (W * H) + (by_src * W + bx_src)];
+    let bx_src = (cx + W - u32(ex[i])) % W;
+    let by_src = (cy + H - u32(ey[i])) % H;
+    f[i] = f_in[i * (W * H) + cellIndex(bx_src, by_src)];
   }
 
   // 2. Local Macroscopic Variables
@@ -93,39 +120,37 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     uy_star += f[i] * f32(ey[i]);
   }
   ux_star /= rho; uy_star /= rho;
-  
-  // 3. Penalty Force and Solid Coupling
-  let p = vec2<f32>(f32(x), f32(y));
+
+  // 3. Penalty Force and Solid Coupling (window-space)
+  let p = vec2<f32>(f32(wx), f32(wy));
   var rx = p.x - state.cx;
   var ry = p.y - state.cy;
   rx -= f32(W) * round(rx / f32(W));
   ry -= f32(H) * round(ry / f32(H));
-  
+
   let usx = state.vx - state.omega * ry;
   let usy = state.vy + state.omega * rx;
-  
+
   let phi = get_phi(p, state);
   let chi = get_chi(phi);
-  
+
   // Penalty Force F = rho * chi * (Us - u*)
   let Fx = rho * chi * (usx - ux_star);
   let Fy = rho * chi * (usy - uy_star);
-  
+
   // Actual fluid velocity u = u* + F/(2rho)
   let ux = ux_star + Fx / (2.0f * rho);
   let uy = uy_star + Fy / (2.0f * rho);
   let u_sq = ux*ux + uy*uy;
 
-  // Store velocity for rendering (buffer cell index)
-  let bx = (x + u32(state.off_x)) % W;
-  let by = (y + u32(state.off_y)) % H;
-  let cell = by * W + bx;
+  // Store velocity for rendering (block-major buffer cell index)
+  let cell = cellIndex(cx, cy);
   vel[cell * 2u] = ux; vel[cell * 2u + 1u] = uy;
 
-  // 4. Collision and ALBC Sponge
+  // 4. Collision and ALBC Sponge (window-space distance to window edges)
   let SPONGE_W = 4.0f;
-  let dist_x = min(f32(x), f32(W - 1u - x));
-  let dist_y = min(f32(y), f32(H - 1u - y));
+  let dist_x = min(f32(wx), f32(W - 1u - wx));
+  let dist_y = min(f32(wy), f32(H - 1u - wy));
   var sponge_weight = clamp(1.0f - min(dist_x, dist_y) / SPONGE_W, 0.0f, 1.0f);
   sponge_weight = sponge_weight * sponge_weight * (3.0f - 2.0f * sponge_weight);
 
@@ -134,16 +159,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let exf = f32(ex[i]); let eyf = f32(ey[i]);
     let eu  = exf*ux + eyf*uy;
     let feq = wt[i] * rho * (1f + 3f*eu + 4.5f*eu*eu - 1.5f*u_sq);
-    
+
     // Guo's Source Term Si = (1 - 1/(2tau)) * wi * [ (ei-u)/cs2 + (ei.u)/cs4 * ei ] . F
     let term1x = (exf - ux) * 3.0f;
     let term1y = (eyf - uy) * 3.0f;
     let term2  = (exf*ux + eyf*uy) * 9.0f;
     let Si = (1.0f - 0.5f * omg) * wt[i] * ( (term1x + term2*exf)*Fx + (term1y + term2*eyf)*Fy );
-    
+
     let f_collide = f[i] - omg * (f[i] - feq) + Si;
     let f_target  = wt[i] * 1.0f; // rho=1.0, u=0 equilibrium
-    
+
     f_out[i * (W * H) + cell] = mix(f_collide, f_target, sponge_weight);
   }
 }

@@ -21,18 +21,37 @@ function b64ToFloat32(b64, floatCount) {
   return new Float32Array(binary.buffer, binary.byteOffset, floatCount);
 }
 
+// Raw array index for a cell at BUFFER coordinates (cx, cy), given the raw
+// GPU buffer's layout. 'flat' is main.js's plain row-major (pre-Milestone-1
+// snapshots, formatVersion 1, no 'layout' field). 'block8' is main-amr.js's
+// Milestone-1 layout (see shaders/amr_step.wgsl's cellIndex) -- fixed 8x8
+// buffer-space blocks, block-major, laid out row-major by block.
+const BLOCK = 8;
+function rawIndex(cx, cy, W, H, layout) {
+  if (layout === 'flat') return cy * W + cx;
+  if (layout === 'block8') {
+    const nbx = W / BLOCK;
+    const bx = Math.floor(cx / BLOCK), by = Math.floor(cy / BLOCK);
+    const lx = cx % BLOCK, ly = cy % BLOCK;
+    const blockID = by * nbx + bx;
+    return blockID * (BLOCK * BLOCK) + ly * BLOCK + lx;
+  }
+  throw new Error(`unknown snapshot layout '${layout}'`);
+}
+
 // Buffer storage is a circular window (main-amr.js's moving-window
 // off_x/off_y, see .plan-albc-moving-window.md): window coordinate wx maps
 // to buffer coordinate bx = (wx + off_x) % W. Unshift so field comparisons
-// are in physically meaningful window coordinates, not raw (and
-// step-dependent) buffer layout.
-function unshiftField(buf, W, H, comps, offX, offY) {
+// are in physically meaningful window coordinates (and a canonical flat
+// row-major layout, regardless of the source snapshot's raw layout), not
+// raw (and step-dependent, and layout-dependent) buffer storage.
+function unshiftField(buf, W, H, comps, offX, offY, layout) {
   const out = new Float32Array(W * H * comps);
   for (let wy = 0; wy < H; wy++) {
     const by = (wy + offY) % H;
     for (let wx = 0; wx < W; wx++) {
       const bx = (wx + offX) % W;
-      const srcCell = by * W + bx;
+      const srcCell = rawIndex(bx, by, W, H, layout);
       const dstCell = wy * W + wx;
       for (let c = 0; c < comps; c++) out[dstCell * comps + c] = buf[srcCell * comps + c];
     }
@@ -88,9 +107,12 @@ function loadFields(snapshot) {
   const { W, H } = snapshot;
   const NCELLS = W * H;
   const offX = snapshot.cardState[22], offY = snapshot.cardState[23];
+  // formatVersion 1 snapshots (pre-Milestone-1) predate the 'layout' field
+  // and are always flat row-major.
+  const layout = snapshot.layout || 'flat';
 
   const velRaw = b64ToFloat32(snapshot.velB64, NCELLS * 2);
-  const vel = unshiftField(velRaw, W, H, 2, offX, offY);
+  const vel = unshiftField(velRaw, W, H, 2, offX, offY, layout);
   const ux = new Float32Array(NCELLS), uy = new Float32Array(NCELLS);
   for (let c = 0; c < NCELLS; c++) { ux[c] = vel[c * 2]; uy[c] = vel[c * 2 + 1]; }
 
@@ -101,13 +123,13 @@ function loadFields(snapshot) {
   const fUnshifted = new Float32Array(NCELLS * 9);
   for (let i = 0; i < 9; i++) {
     const plane = fRaw.subarray(i * NCELLS, (i + 1) * NCELLS);
-    const planeVec = unshiftField(plane, W, H, 1, offX, offY);
+    const planeVec = unshiftField(plane, W, H, 1, offX, offY, layout);
     fUnshifted.set(planeVec, i * NCELLS);
   }
   const rho = rhoFromF(fUnshifted, W, H);
   const omega = vorticityField(ux, uy, W, H);
 
-  return { W, H, step: snapshot.step, ux, uy, rho, omega };
+  return { W, H, step: snapshot.step, layout, ux, uy, rho, omega };
 }
 
 function main() {
@@ -127,7 +149,7 @@ function main() {
   }
 
   const fa = loadFields(a), fb = loadFields(b);
-  console.log(`Comparing ${aFile} (step ${fa.step}) vs ${bFile} (step ${fb.step}), ${fa.W}x${fa.H}`);
+  console.log(`Comparing ${aFile} (step ${fa.step}, layout ${fa.layout}) vs ${bFile} (step ${fb.step}, layout ${fb.layout}), ${fa.W}x${fa.H}`);
   const results = {
     ux: diffStats(fa.ux, fb.ux, 'ux   '),
     uy: diffStats(fa.uy, fb.uy, 'uy   '),
