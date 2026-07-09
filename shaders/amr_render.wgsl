@@ -34,6 +34,18 @@ struct CardState {
 
 override W : u32;
 override H : u32;
+const BLOCK = 8u;
+
+// Block-major linear index for a cell at BUFFER coordinates (cx, cy).
+// See amr_step.wgsl for the full derivation; vel is laid out this way
+// (Milestone 1, plans/AMR.md) instead of flat row-major.
+fn cellIndex(cx: u32, cy: u32) -> u32 {
+  let nbx = W / BLOCK;
+  let bx = cx / BLOCK; let by = cy / BLOCK;
+  let lx = cx % BLOCK; let ly = cy % BLOCK;
+  let blockID = by * nbx + bx;
+  return blockID * (BLOCK * BLOCK) + ly * BLOCK + lx;
+}
 
 struct VSOut {
   @builtin(position) pos : vec4<f32>,
@@ -76,7 +88,7 @@ fn get_uy(x: i32, y: i32) -> f32 {
     let wy = (u32(y) + H) % H;
     let bx = (wx + u32(state.off_x)) % W;
     let by = (wy + u32(state.off_y)) % H;
-    return vel[(by * W + bx) * 2u + 1u];
+    return vel[cellIndex(bx, by) * 2u + 1u];
 }
 
 fn get_ux(x: i32, y: i32) -> f32 {
@@ -84,7 +96,7 @@ fn get_ux(x: i32, y: i32) -> f32 {
     let wy = (u32(y) + H) % H;
     let bx = (wx + u32(state.off_x)) % W;
     let by = (wy + u32(state.off_y)) % H;
-    return vel[(by * W + bx) * 2u];
+    return vel[cellIndex(bx, by) * 2u];
 }
 
 @fragment

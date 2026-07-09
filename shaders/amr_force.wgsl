@@ -1,4 +1,8 @@
 // Force and torque on the solid body via integration of the penalty force.
+//
+// Milestone 1 (plans/AMR.md): block-major buffer layout, same rationale and
+// derivation as amr_step.wgsl's file header -- dispatch over buffer-space
+// coordinates, derive window coordinates per-thread for the card SDF.
 
 struct CardState {
   cx     : f32,
@@ -36,9 +40,20 @@ struct CardState {
 override W : u32;
 override H : u32;
 const FSCALE = 10000f;
+const BLOCK = 8u;
 
 const ex = array<i32,9>( 0, 1, 0,-1, 0, 1,-1,-1, 1);
 const ey = array<i32,9>( 0, 0, 1, 0,-1, 1, 1,-1,-1);
+
+// Block-major linear index for a cell at BUFFER coordinates (cx, cy).
+// See amr_step.wgsl for the full derivation.
+fn cellIndex(cx: u32, cy: u32) -> u32 {
+  let nbx = W / BLOCK;
+  let bx = cx / BLOCK; let by = cy / BLOCK;
+  let lx = cx % BLOCK; let ly = cy % BLOCK;
+  let blockID = by * nbx + bx;
+  return blockID * (BLOCK * BLOCK) + ly * BLOCK + lx;
+}
 
 fn get_phi(p: vec2<f32>, state: CardState) -> f32 {
     let ca = cos(state.theta);
@@ -67,18 +82,17 @@ fn main(
   @builtin(global_invocation_id) gid: vec3<u32>,
   @builtin(local_invocation_index) lid: u32
 ) {
-  let x = gid.x; let y = gid.y;
-  
+  let cx = gid.x; let cy = gid.y;
+
   var fx_body = 0.0f;
   var fy_body = 0.0f;
   var tz_body = 0.0f;
 
-  if (x < W && y < H) {
-    let bx   = (x + u32(state.off_x)) % W;
-    let by   = (y + u32(state.off_y)) % H;
-    let cell = by * W + bx;
-    let base = cell * 9u;
-    let p    = vec2<f32>(f32(x), f32(y));
+  if (cx < W && cy < H) {
+    let wx   = (cx + W - u32(state.off_x)) % W;
+    let wy   = (cy + H - u32(state.off_y)) % H;
+    let cell = cellIndex(cx, cy);
+    let p    = vec2<f32>(f32(wx), f32(wy));
 
     let phi = get_phi(p, state);
     let chi = get_chi(phi);
