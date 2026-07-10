@@ -94,8 +94,18 @@ fn get_phi(p: vec2<f32>, state: CardState) -> f32 {
     return d * state.b;
 }
 
+// Milestone 8 (plans/AMR-multilevel.md): epsilon = K_EPS * dx_L1, not the
+// bare physical constant amr_step.wgsl (L0) still uses -- L1's own dx is a
+// fixed 0.5 (in L0-buffer-space units, matching amr_interp_dense_parent.
+// wgsl's 0.5 factor; L1 is a single dedicated file/level, so this is a
+// literal here, not a runtime lookup the way amr_step1_pool.wgsl's shared,
+// multi-level pipeline needs). K_EPS=1.5 matches L0's own hardcoded value
+// (dx_L0=1 there), so this is the SAME constant, just no longer coincident
+// with dx=1 -- a genuine behavior change (0.75, not 1.5), fixing the
+// under-resolved diffuse-boundary sampling this milestone targets.
+const K_EPS = 1.5f;
 fn get_chi(phi: f32) -> f32 {
-    let epsilon = 1.5f;
+    let epsilon = K_EPS * 0.5f;
     // Clamp tanh arg: large |arg| overflows to NaN on some GPUs (e.g. Intel Gen12LP); saturated regime is unchanged. See PR.
     return 0.5f * (1.0f - tanh(clamp(phi / epsilon, -20.0f, 20.0f)));
 }

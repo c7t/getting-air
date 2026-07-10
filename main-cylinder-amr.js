@@ -7,6 +7,17 @@
 // uniform freestream sponge target via amr_step.wgsl/amr_step1.wgsl's
 // SPONGE_UX/UY overrides instead of the falling card's quiescent far field.
 //
+// Milestone 8 (plans/AMR-multilevel.md): this is still a fixed 2-level
+// build (never got main-amr.js's Milestone 5-7 pools[]/N_LEVELS/S_Advance
+// forward-ported -- that's Milestone 10's job, not this one), but it DOES
+// need level 1's own force pass (amr_force1.wgsl, HAS_CHILD=0 since there's
+// no level 2 here) and amr_force.wgsl's finest-wins masking, since both
+// shader files are shared verbatim with main-amr.js and this harness is
+// exactly the "coarse L0 + refined L1" scenario M8 exists to fix (the
+// force/torque driving Cd/Cl was aliased at coarse-only integration).
+// amr_step1.wgsl's epsilon scaling (1.5 -> 0.75 for L1) comes along for
+// free from the shared shader file, no JS-side change needed for that part.
+//
 // window.__CYL matches main-cylinder.js's shape exactly (setRe, reset,
 // getParams, getForceHistory, debugRunAndCollect) so tools/validate-
 // cylinder.js drives this page unmodified -- only --url differs. That's
@@ -237,6 +248,11 @@ async function init() {
   const f_b      = device.createBuffer({ size: fSize, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
   const velBuf   = device.createBuffer({ size: NCELLS * 2 * 4, usage: U.STORAGE | U.COPY_SRC });
   const forceBuf = device.createBuffer({ size: 16, usage: U.STORAGE | U.COPY_SRC | U.COPY_DST });
+  // Milestone 8: harmless placeholder for force1PL's "child level's
+  // blockSlot" binding -- this harness has no level>=2 (HAS_CHILD=0 always
+  // masks it out), see main-amr.js's identical dummyBlockSlotBuf comment.
+  const dummyBlockSlotBuf = device.createBuffer({ size: 4, usage: U.STORAGE | U.COPY_DST });
+  device.queue.writeBuffer(dummyBlockSlotBuf, 0, new Int32Array([-1]));
 
   const cardStateBuf = device.createBuffer({ size: 104, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
 
@@ -280,16 +296,21 @@ async function init() {
     reVal.textContent = RE.toFixed(0);
   };
 
-  const [stepSM, frcSM, phySM, renSM, interpSM, step1SM, avgSM, criterionSM, manageSM] = await Promise.all([
+  const [stepSM, frcSM, phySM, renSM, interpSM, step1SM, avgSM, criterionSM, manageSM, force1SM] = await Promise.all([
     loadShader(device, 'shaders/amr_step.wgsl'),
     loadShader(device, 'shaders/amr_force.wgsl'),
     loadShader(device, 'shaders/amr_physics.wgsl'),
     loadShader(device, 'shaders/amr_render.wgsl'),
-    loadShader(device, 'shaders/amr_interp_c2f.wgsl'),
+    // Milestone 6 renamed this file (dense/pool-parent addressing split);
+    // this harness has no level>=2, so it only ever needs the dense-parent
+    // case (main-amr.js's own L0->L1 shader).
+    loadShader(device, 'shaders/amr_interp_dense_parent.wgsl'),
     loadShader(device, 'shaders/amr_step1.wgsl'),
     loadShader(device, 'shaders/amr_average_f2c.wgsl'),
     loadShader(device, 'shaders/amr_criterion.wgsl'),
     loadShader(device, 'shaders/amr_manage.wgsl'),
+    // Milestone 8: level 1's own force pass -- see amr_force1.wgsl's header.
+    loadShader(device, 'shaders/amr_force1.wgsl'),
   ]);
 
   const stepBGL = device.createBindGroupLayout({ label: 'stepBGL', entries: [
@@ -298,10 +319,23 @@ async function init() {
     { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
     { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }
   ]});
+  // Milestone 8: binding 3 (blockSlot1) is the finest-wins masking check --
+  // see amr_force.wgsl's header.
   const frcBGL = device.createBindGroupLayout({ label: 'frcBGL', entries: [
     { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }
+    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }
+  ]});
+  // Milestone 8: level 1's own force pass. This harness has no level>=2, so
+  // HAS_CHILD is always 0 and binding 4 is a harmless dummy -- see
+  // amr_force1.wgsl's header.
+  const force1BGL = device.createBindGroupLayout({ label: 'force1BGL', entries: [
+    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }
   ]});
   const phyBGL = device.createBindGroupLayout({ label: 'phyBGL', entries: [
     { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
@@ -377,6 +411,11 @@ async function init() {
     layout: device.createPipelineLayout({ bindGroupLayouts: [frcBGL] }),
     compute: { module: frcSM, entryPoint: 'main', constants }
   });
+  // Milestone 8: HAS_CHILD=0 -- this harness has no level>=2.
+  const force1PL = device.createComputePipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [force1BGL] }),
+    compute: { module: force1SM, entryPoint: 'main', constants: { W, H, RB, HAS_CHILD: 0 } }
+  });
   const phyPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [phyBGL] }),
     compute: { module: phySM, entryPoint: 'main', constants }
@@ -423,8 +462,12 @@ async function init() {
   const stepBG_ab = device.createBindGroup({ layout: stepBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_a } }, { binding: 2, resource: { buffer: f_b } }, { binding: 3, resource: { buffer: velBuf } }]});
   const stepBG_ba = device.createBindGroup({ layout: stepBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_b } }, { binding: 2, resource: { buffer: f_a } }, { binding: 3, resource: { buffer: velBuf } }]});
 
-  const frcBG_a = device.createBindGroup({ layout: frcBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_a } }, { binding: 2, resource: { buffer: forceBuf } }]});
-  const frcBG_b = device.createBindGroup({ layout: frcBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_b } }, { binding: 2, resource: { buffer: forceBuf } }]});
+  const frcBG_a = device.createBindGroup({ layout: frcBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_a } }, { binding: 2, resource: { buffer: forceBuf } }, { binding: 3, resource: { buffer: blockSlotBuf } }]});
+  const frcBG_b = device.createBindGroup({ layout: frcBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_b } }, { binding: 2, resource: { buffer: forceBuf } }, { binding: 3, resource: { buffer: blockSlotBuf } }]});
+  // Milestone 8: level 1's own force pass. Always reads finePoolF_a --
+  // level 1's own buffer is always "current" at a macro-step boundary
+  // (same invariant as main-amr.js's own force1BG).
+  const force1BG = device.createBindGroup({ layout: force1BGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: finePoolF_a } }, { binding: 2, resource: { buffer: forceBuf } }, { binding: 3, resource: { buffer: slotToBlockBuf } }, { binding: 4, resource: { buffer: dummyBlockSlotBuf } }]});
 
   const phyBG = device.createBindGroup({ layout: phyBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: forceBuf } }]});
   const overlayOpacityBuf = device.createBuffer({ size: 4, usage: U.UNIFORM | U.COPY_DST });
@@ -528,6 +571,10 @@ async function init() {
     macroStepCounter++;
 
     const frc = enc.beginComputePass(); frc.setPipeline(frcPL); frc.setBindGroup(0, frcBG); frc.dispatchWorkgroups(WGX, WGY); frc.end();
+    // Milestone 8: level 1's own force contribution, before `phy` drains
+    // the shared atomic forces[] buffer -- see main-amr.js's identical
+    // comment on ordering/commutativity.
+    const f1frc = enc.beginComputePass(); f1frc.setPipeline(force1PL); f1frc.setBindGroup(0, force1BG); f1frc.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); f1frc.end();
     const phy = enc.beginComputePass(); phy.setPipeline(phyPL); phy.setBindGroup(0, phyBG); phy.dispatchWorkgroups(1); phy.end();
     const ipl = enc.beginComputePass(); ipl.setPipeline(interpPL); ipl.setBindGroup(0, interpBG); ipl.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); ipl.end();
     const stp = enc.beginComputePass(); stp.setPipeline(stepPL); stp.setBindGroup(0, stepBG); stp.dispatchWorkgroups(WGX, WGY); stp.end();

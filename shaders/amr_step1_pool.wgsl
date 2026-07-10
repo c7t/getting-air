@@ -64,7 +64,8 @@ struct LevelParams {
   nbx: u32,        // unused here (no cellIndex()/blockID-derived origin at this level -- see header) -- kept so this level's ONE uniform buffer is shared verbatim with amr_interp_pool_parent.wgsl/amr_average_pool_parent.wgsl, not a third near-duplicate.
   nby: u32,        // unused here, same reason.
   parentTau: f32,
-  _pad: f32,
+  dxL: f32,        // Milestone 8: this level's own grid spacing in L0-buffer-
+                   // space units, used below to scale epsilon (get_chi).
 }
 
 @group(0) @binding(0) var<storage, read>       state       : CardState;
@@ -83,6 +84,16 @@ const GHOST = 2u;
 
 override SPONGE_UX : f32 = 0.0f;
 override SPONGE_UY : f32 = 0.0f;
+
+// Milestone 8 (plans/AMR-multilevel.md): epsilon = K_EPS * dx_L, not a fixed
+// physical constant -- a fixed epsilon means refinement only ever improves
+// *sampling* of an unchanging diffuse-boundary width, never the boundary's
+// own sharpness. K_EPS=1.5 matches today's L0/L1 value exactly (dx_L0=1,
+// dx_L1=0.5 are hardcoded literals in amr_step.wgsl/amr_step1.wgsl, which
+// is why THEIR epsilon values don't change); this shared pipeline's dx_L
+// genuinely varies per level (levelParams.dxL, runtime -- see header), so
+// epsilon must be computed here, not hardcoded.
+const K_EPS = 1.5f;
 
 const ex = array<i32,9>( 0, 1, 0,-1, 0, 1,-1,-1, 1);
 const ey = array<i32,9>( 0, 0, 1, 0,-1, 1, 1,-1,-1);
@@ -117,7 +128,7 @@ fn get_phi(p: vec2<f32>, state: CardState) -> f32 {
 }
 
 fn get_chi(phi: f32) -> f32 {
-    let epsilon = 1.5f;
+    let epsilon = K_EPS * levelParams.dxL;
     return 0.5f * (1.0f - tanh(clamp(phi / epsilon, -20.0f, 20.0f)));
 }
 
