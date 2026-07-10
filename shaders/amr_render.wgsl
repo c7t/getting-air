@@ -89,7 +89,8 @@ fn get_phi(p: vec2<f32>, state: CardState) -> f32 {
 
 fn get_chi(phi: f32) -> f32 {
     let epsilon = 1.5f;
-    return 0.5f * (1.0f - tanh(phi / epsilon));
+    // Clamp tanh arg: large |arg| overflows to NaN on some GPUs (e.g. Intel Gen12LP); saturated regime is unchanged. See PR.
+    return 0.5f * (1.0f - tanh(clamp(phi / epsilon, -20.0f, 20.0f)));
 }
 
 fn get_uy(x: i32, y: i32) -> f32 {
