@@ -33,6 +33,7 @@ struct CardState {
 @group(0) @binding(1) var<storage, read> state       : CardState;
 @group(0) @binding(2) var<storage, read> vel_pool    : array<f32>; // Milestone 4: fine pool
 @group(0) @binding(3) var<storage, read> blockSlot   : array<i32>; // Milestone 4: coarse block -> pool slot
+@group(0) @binding(4) var<uniform>       overlayOpacity : f32;     // refinement-coverage overlay opacity [0,1]
 
 override W : u32;
 override H : u32;
@@ -115,99 +116,93 @@ fn wrapf(v: f32, n: f32) -> f32 {
     return r;
 }
 
-// Continuous window coords -> (fine-local x, fine-local y, pool slot).
-// slot = -1 if the coarse block this window position falls in isn't
-// currently refined. Buffer-space-native lookup (adds off_x/off_y once,
-// same inversion amr_step1.wgsl's kernel uses), matching Milestone 4's
-// pool addressing scheme -- see amr_interp_c2f.wgsl's file header.
-fn windowToPool(wx: f32, wy: f32) -> vec3<i32> {
-    let bufX = wrapf(wx + state.off_x, f32(W));
-    let bufY = wrapf(wy + state.off_y, f32(H));
-    let nbx = W / BLOCK;
-    // Resolve the containing block by NEAREST coarse-cell center (+0.5 before
-    // truncation): coarse cells are integer-centered (see amr_step1.wgsl's
-    // fineToCoarseUnit -- the two fine cells straddling coarse cell c sit at
-    // c-0.25 and c+0.25), so a plain u32(bufX)/RB mis-assigns the outer half of
-    // each boundary coarse cell to the wrong block.
-    let blockBX = u32(wrapf(bufX + 0.5, f32(W))) / RB;
-    let blockBY = u32(wrapf(bufY + 0.5, f32(H))) / RB;
-    let blockID = i32(blockBY * nbx + blockBX);
-    let slot = blockSlot[blockID];
-    if (slot < 0) { return vec3<i32>(0, 0, -1); }
-    let originX = blockBX * RB;
-    let originY = blockBY * RB;
-    let fxc = f32(GHOST) + 2.0 * (bufX - f32(originX)) + 0.5;
-    let fyc = f32(GHOST) + 2.0 * (bufY - f32(originY)) + 0.5;
-    return vec3<i32>(i32(round(fxc)), i32(round(fyc)), slot);
+// Coarse-grid vorticity at integer-centred cell (cx, cy) in WINDOW coords
+// (get_ux/get_uy add the window offset and wrap). Central difference, per
+// coarse cell (dx=1) => the 0.5 factor.
+fn coarseOmegaCell(cx: i32, cy: i32) -> f32 {
+  return (get_uy(cx + 1, cy) - get_uy(cx - 1, cy)) * 0.5f
+       - (get_ux(cx, cy + 1) - get_ux(cx, cy - 1)) * 0.5f;
 }
 
-// Fine-pool velocity at a WINDOW position, resolving which block actually
-// contains that position (buffer-space, same off_x/off_y inversion as
-// windowToPool). Returns (ux, uy, valid); valid=0 if that position isn't in
-// a currently-refined block. Because each lookup is resolved independently,
-// a vorticity stencil tap that crosses a seam lands in the NEIGHBOR block's
-// REAL interior rather than this block's stale ghost ring -- so a chain of
-// refined blocks samples as one contiguous fine region.
-fn fineVelAt(wx: f32, wy: f32) -> vec3<f32> {
-    let bufX = wrapf(wx + state.off_x, f32(W));
-    let bufY = wrapf(wy + state.off_y, f32(H));
-    let nbx = W / BLOCK;
-    // Nearest coarse-cell-center block resolution (+0.5 before truncation) --
-    // see windowToPool. Without it the outer half-coarse-cell ring of a block
-    // resolves to the wrong block and samples its own stale ghost cell instead
-    // of the neighbor's real interior, leaving a residual half-cell seam and
-    // defeating the coarse fallback at a true fine/coarse perimeter. With it,
-    // every position (and each +/-0.5 stencil tap) maps to a REAL cell [2,17]
-    // of the correct block.
-    let bBX = u32(wrapf(bufX + 0.5, f32(W))) / RB;
-    let bBY = u32(wrapf(bufY + 0.5, f32(H))) / RB;
-    let slot = blockSlot[i32(bBY * nbx + bBX)];
-    if (slot < 0) { return vec3<f32>(0.0, 0.0, 0.0); }
-    let originX = bBX * RB;
-    let originY = bBY * RB;
-    let fxc = f32(GHOST) + 2.0 * (bufX - f32(originX)) + 0.5;
-    let fyc = f32(GHOST) + 2.0 * (bufY - f32(originY)) + 0.5;
-    let FB = RB * 2u + 2u * GHOST;
-    let cx = u32(clamp(i32(round(fxc)), 0, i32(FB) - 1));
-    let cy = u32(clamp(i32(round(fyc)), 0, i32(FB) - 1));
-    let cell = u32(slot) * (FB * FB) + cy * FB + cx;
-    return vec3<f32>(vel_pool[cell * 2u], vel_pool[cell * 2u + 1u], 1.0);
+// Fine-pool velocity at a fine-cell INDEX (cx, cy) within a slot. The ghost
+// ring (cells [0,1] and [FB-2,FB-1]) is c2f-filled from the coarse field, so a
+// fine stencil that reaches into the ring stays consistent with the coarse
+// level -- this is what lets the perimeter fine curl match the coarse curl
+// without a hard operator switch. Clamp keeps out-of-range taps in the ring.
+fn poolVelCell(slot: u32, cx: i32, cy: i32) -> vec2<f32> {
+  let FBl = RB * 2u + 2u * GHOST;
+  let ix = u32(clamp(cx, 0, i32(FBl) - 1));
+  let iy = u32(clamp(cy, 0, i32(FBl) - 1));
+  let cell = slot * (FBl * FBl) + iy * FBl + ix;
+  return vec2<f32>(vel_pool[cell * 2u], vel_pool[cell * 2u + 1u]);
+}
+
+// Fine-grid vorticity at fine cell (cx, cy) of a slot. Fine spacing is 0.5
+// coarse units and the central difference spans +/-1 fine cell, so the factor
+// is 1/(2*0.5) = 1 -- the SAME per-coarse-unit normalization as
+// coarseOmegaCell, so the two levels are directly comparable at interfaces.
+fn fineOmegaCell(slot: u32, cx: i32, cy: i32) -> f32 {
+  let uyp = poolVelCell(slot, cx + 1, cy).y;
+  let uym = poolVelCell(slot, cx - 1, cy).y;
+  let uxp = poolVelCell(slot, cx, cy + 1).x;
+  let uxm = poolVelCell(slot, cx, cy - 1).x;
+  return (uyp - uym) - (uxp - uxm);
 }
 
 @fragment
 fn fs_main(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> {
   let fx = uv.x * f32(W); let fy = (1.0 - uv.y) * f32(H);
-  let ix = i32(fx); let iy = i32(fy);
 
   let chi = get_chi(get_phi(vec2(fx, fy), state));
 
-  // Discrete vorticity: du_y/dx - du_x/dy, coarse (always computed as the
-  // fallback -- see below).
-  var omega = (get_uy(ix + 1, iy) - get_uy(ix - 1, iy)) * 0.5f
-            - (get_ux(ix, iy + 1) - get_ux(ix, iy - 1)) * 0.5f;
+  // Level-consistent vorticity RECONSTRUCTION. Compute the discrete curl as a
+  // cell-centred scalar FIELD (per coarse cell, and per fine cell in refined
+  // blocks) and bilinearly interpolate that field. This replaces the old
+  // approach of differencing NEAREST-sampled velocity per pixel, which made
+  // omega piecewise-constant per cell (visible stair-steps) and hard-switched
+  // between a coarse (+/-1 coarse cell) and fine (+/-1 fine cell) operator at
+  // perimeters (a 1-band seam). The velocity field is smooth and continuous
+  // (verified), so interpolating the curl field is a FAITHFUL reconstruction,
+  // not a blur/mask.
 
-  // Milestone 4 (plans/AMR.md): sample the fine pool instead of the coarse
-  // grid wherever this window position falls in a currently-refined block.
-  // Each vorticity stencil tap is resolved to whichever block contains it
-  // (see fineVelAt), so a tap at a seam crosses into the neighbor's REAL
-  // interior and a chain of refined blocks renders as one contiguous fine
-  // region -- no coarse-sampled stripe (periodic block-pitch seam) at every
-  // internal block edge. Only where a tap lands in a genuinely COARSE
-  // neighbor (the true fine/coarse perimeter) is any tap invalid, in which
-  // case we keep the coarse omega computed above.
-  let pool = windowToPool(fx, fy);
-  let c0 = fineVelAt(fx, fy);
-  if (c0.z > 0.5) {
-    // Fine cells are 0.5 coarse units apart, so a +/-0.5 window step is
-    // exactly one fine cell; central difference over +/-1 fine cell (factor
-    // 1/(2*0.5)=1, matching the pre-existing fine path).
-    let xp = fineVelAt(fx + 0.5, fy);
-    let xm = fineVelAt(fx - 0.5, fy);
-    let yp = fineVelAt(fx, fy + 0.5);
-    let ym = fineVelAt(fx, fy - 0.5);
-    if (xp.z > 0.5 && xm.z > 0.5 && yp.z > 0.5 && ym.z > 0.5) {
-      omega = (xp.y - xm.y) - (yp.x - ym.x);
-    }
+  // Coarse field: bilinear over the 4 surrounding integer-centred coarse cells.
+  let cx0 = i32(floor(fx)); let cy0 = i32(floor(fy));
+  let ctx = fx - f32(cx0);  let cty = fy - f32(cy0);
+  var omega = mix(
+      mix(coarseOmegaCell(cx0, cy0),     coarseOmegaCell(cx0 + 1, cy0),     ctx),
+      mix(coarseOmegaCell(cx0, cy0 + 1), coarseOmegaCell(cx0 + 1, cy0 + 1), ctx),
+      cty);
+
+  // If this pixel falls in a refined block, override with the fine field
+  // (bilinear over the 4 surrounding fine cells). Block resolution uses the
+  // same nearest-coarse-cell-centre (+0.5) rule as the sim. The fine-local
+  // offset uses PERIODIC distance (bufX-originX wrapped): without it, a
+  // position in the top half-cell of the buffer wrap resolves its block to the
+  // opposite side and maps to a bogus ghost cell -- a real moving-wrap seam.
+  // Fine-edge cells read the ghost ring via poolVelCell. Internal fine-fine
+  // block edges are exactly C0 (ghosts copy the neighbour's real interior). At
+  // a TRUE fine/coarse perimeter the coarse-adjacent ghosts are c2f-derived and
+  // evolve across the 2 fine substeps (multi-rate), so the fine curl there is
+  // close-but-not-bit-identical to the coarse curl -- a small bounded residual,
+  // far smaller than the old hard-fallback stencil-width seam (no hard switch).
+  let bufX = wrapf(fx + state.off_x, f32(W));
+  let bufY = wrapf(fy + state.off_y, f32(H));
+  let nbx = W / BLOCK;
+  let bBX = u32(wrapf(bufX + 0.5, f32(W))) / RB;
+  let bBY = u32(wrapf(bufY + 0.5, f32(H))) / RB;
+  let slot = blockSlot[i32(bBY * nbx + bBX)];
+  if (slot >= 0) {
+    let s = u32(slot);
+    var dxr = bufX - f32(bBX * RB); dxr -= f32(W) * round(dxr / f32(W));
+    var dyr = bufY - f32(bBY * RB); dyr -= f32(H) * round(dyr / f32(H));
+    let fxc = f32(GHOST) + 2.0 * dxr + 0.5;
+    let fyc = f32(GHOST) + 2.0 * dyr + 0.5;
+    let fx0 = i32(floor(fxc)); let fy0 = i32(floor(fyc));
+    let ftx = fxc - f32(fx0);  let fty = fyc - f32(fy0);
+    omega = mix(
+        mix(fineOmegaCell(s, fx0, fy0),     fineOmegaCell(s, fx0 + 1, fy0),     ftx),
+        mix(fineOmegaCell(s, fx0, fy0 + 1), fineOmegaCell(s, fx0 + 1, fy0 + 1), ftx),
+        fty);
   }
 
   // Blue for clockwise (negative), red for counter-clockwise (positive)
@@ -222,12 +217,12 @@ fn fs_main(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> {
   // Refined-block coverage overlay: additive green (not a mix toward gray --
   // a mix is barely visible against the near-black low-vorticity
   // background where coverage most needs to be legible) over the whole
-  // coarse block footprint currently holding a pool slot (pool.z>=0), not
-  // just its sampled interior. Reuses pool.z already computed above at no
+  // coarse block footprint currently holding a pool slot (slot>=0), not
+  // just its sampled interior. Reuses slot already computed above at no
   // extra cost. Canvas output is unorm, so this saturates harmlessly in
   // already-bright (high-vorticity or solid-body) regions.
-  if (pool.z >= 0) {
-    c += vec3(0.0, 0.22, 0.0);
+  if (slot >= 0) {
+    c += vec3(0.0, 0.22, 0.0) * overlayOpacity;
   }
 
   // Blend with solid color
