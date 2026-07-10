@@ -86,8 +86,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     ux_star += f[i] * f32(ex[i]);
     uy_star += f[i] * f32(ey[i]);
   }
-  ux_star /= rho; uy_star /= rho;
-  
+  let rhoDen = max(rho, 1e-6f); // NaN-containment floor (parity with amr_step)
+  ux_star /= rhoDen; uy_star /= rhoDen;
+
   // Local solid velocity Us
   var rx = p.x - state.cx;
   var ry = p.y - state.cy;
@@ -106,8 +107,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let Fy = rho * chi * (usy - uy_star);
   
   // Actual fluid velocity u = u* + F/(2rho)
-  let ux = ux_star + Fx / (2.0f * rho);
-  let uy = uy_star + Fy / (2.0f * rho);
+  let ux = ux_star + Fx / (2.0f * rhoDen);
+  let uy = uy_star + Fy / (2.0f * rhoDen);
   let u_sq = ux*ux + uy*uy;
 
   vel[cell * 2u] = ux; vel[cell * 2u + 1u] = uy;
