@@ -127,7 +127,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     ux_star += f[i] * f32(ex[i]);
     uy_star += f[i] * f32(ey[i]);
   }
-  ux_star /= rho; uy_star /= rho;
+  // NaN-containment floor (see amr_step.wgsl): finite velocity even if rho<=0.
+  let rhoDen = max(rho, 1e-6f);
+  ux_star /= rhoDen; uy_star /= rhoDen;
 
   // 3. Penalty Force and Solid Coupling. Buffer-space fine position ->
   // window position by inverting off_x/off_y (see file header).
@@ -136,8 +138,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let wx = wrapf(bufX - state.off_x, f32(W));
   let wy = wrapf(bufY - state.off_y, f32(H));
   let p = vec2<f32>(wx, wy);
-  let rx = p.x - state.cx;
-  let ry = p.y - state.cy;
+  // Periodic minimum-image lever arm, matching amr_step.wgsl / amr_force.wgsl
+  // (the coarse step and force pass wrap rx/ry; the fine step previously did
+  // not, so a cell reached across a seam got the wrong rotational velocity).
+  var rx = p.x - state.cx;
+  var ry = p.y - state.cy;
+  rx -= f32(W) * round(rx / f32(W));
+  ry -= f32(H) * round(ry / f32(H));
 
   let usx = state.vx - state.omega * ry;
   let usy = state.vy + state.omega * rx;
@@ -148,8 +155,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let Fx = rho * chi * (usx - ux_star);
   let Fy = rho * chi * (usy - uy_star);
 
-  let ux = ux_star + Fx / (2.0f * rho);
-  let uy = uy_star + Fy / (2.0f * rho);
+  let ux = ux_star + Fx / (2.0f * rhoDen);
+  let uy = uy_star + Fy / (2.0f * rhoDen);
   let u_sq = ux*ux + uy*uy;
 
   vel_pool[cell * 2u] = ux; vel_pool[cell * 2u + 1u] = uy;

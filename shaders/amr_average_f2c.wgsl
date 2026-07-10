@@ -110,7 +110,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wgi
       ux  += f[i] * f32(ex[i]);
       uy  += f[i] * f32(ey[i]);
     }
-    ux /= rho; uy /= rho;
+    ux /= max(rho, 1e-6f); uy /= max(rho, 1e-6f); // NaN-containment floor
     f_children[c] = f;
     rho_children[c] = rho; ux_children[c] = ux; uy_children[c] = uy;
     rho_sum += rho;
@@ -119,8 +119,9 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wgi
   }
 
   let rho_avg = rho_sum * 0.25f;
-  let ux_avg = rhou_x_sum / rho_sum;
-  let uy_avg = rhou_y_sum / rho_sum;
+  let rho_sum_den = max(rho_sum, 1e-6f); // NaN-containment floor
+  let ux_avg = rhou_x_sum / rho_sum_den;
+  let uy_avg = rhou_y_sum / rho_sum_den;
 
   let tau_fine = 2.0f * state.tau - 0.5f;
   let rescale = state.tau / tau_fine;
