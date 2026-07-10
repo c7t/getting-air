@@ -124,7 +124,11 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wgi
   let uy_avg = rhou_y_sum / rho_sum_den;
 
   let tau_fine = 2.0f * state.tau - 0.5f;
-  let rescale = state.tau / tau_fine;
+  // Inverse of the coarse->fine rescale (see amr_interp_c2f.wgsl): the
+  // fine->coarse factor is (tau_coarse/tau_fine) * (dx_coarse/dx_fine) =
+  // (tau_coarse/tau_fine) * n, with refinement ratio n=2. The per-cell velocity
+  // gradient doubles going to the coarser grid, so fneq must be scaled up by n.
+  let rescale = 2.0f * state.tau / tau_fine;
 
   var fneq_avg: array<f32, 9>;
   for (var i = 0u; i < 9u; i++) {

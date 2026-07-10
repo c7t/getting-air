@@ -282,7 +282,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   let tau_coarse = state.tau;
   let tau_fine = 2.0f * tau_coarse - 0.5f;
-  let rescale = tau_fine / tau_coarse;
+  // Dupuis-Chopard non-equilibrium rescale, coarse->fine. The factor is
+  // (tau_fine/tau_coarse) * (dx_fine/dx_coarse) = (tau_fine/tau_coarse) * (1/n),
+  // with refinement ratio n=2. fneq scales as tau * (velocity gradient per
+  // lattice cell); the same physical shear spans 2x as many fine cells, so the
+  // per-cell gradient (and hence fneq) is halved on the fine grid. Omitting the
+  // 1/n factor leaves an O(1) (2x) non-equilibrium stress discontinuity at every
+  // fine<->coarse interface, injecting spurious vorticity there.
+  let rescale = 0.5f * tau_fine / tau_coarse;
 
   // f_pool is direction-major across the WHOLE pool (matching the coarse
   // f_coarse convention): plane stride = MAX_FINE_BLOCKS*FB*FB, derived via
