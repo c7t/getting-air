@@ -311,7 +311,12 @@ async function init() {
     { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
     { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
     { binding: 2, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
-    { binding: 3, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } }
+    { binding: 3, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
+    // overlayOpacity (binding 4): refinement-coverage overlay opacity [0,1],
+    // added to amr_render.wgsl by the pulled overlay-toggle change. No UI
+    // slider in this harness (headless/CDP-driven) -- just bind a fixed
+    // value so the render pipeline matches the shader's binding layout.
+    { binding: 4, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } }
   ]});
   const interpBGL = device.createBindGroupLayout({ label: 'interpBGL', entries: [
     { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
@@ -422,7 +427,9 @@ async function init() {
   const frcBG_b = device.createBindGroup({ layout: frcBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_b } }, { binding: 2, resource: { buffer: forceBuf } }]});
 
   const phyBG = device.createBindGroup({ layout: phyBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: forceBuf } }]});
-  const renBG = device.createBindGroup({ layout: renBGL, entries: [{ binding: 0, resource: { buffer: velBuf } }, { binding: 1, resource: { buffer: cardStateBuf } }, { binding: 2, resource: { buffer: finePoolVel } }, { binding: 3, resource: { buffer: blockSlotBuf } }]});
+  const overlayOpacityBuf = device.createBuffer({ size: 4, usage: U.UNIFORM | U.COPY_DST });
+  device.queue.writeBuffer(overlayOpacityBuf, 0, new Float32Array([1.0]));
+  const renBG = device.createBindGroup({ layout: renBGL, entries: [{ binding: 0, resource: { buffer: velBuf } }, { binding: 1, resource: { buffer: cardStateBuf } }, { binding: 2, resource: { buffer: finePoolVel } }, { binding: 3, resource: { buffer: blockSlotBuf } }, { binding: 4, resource: { buffer: overlayOpacityBuf } }]});
 
   const interpBG_readA = device.createBindGroup({ layout: interpBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_a } }, { binding: 2, resource: { buffer: finePoolF_a } }, { binding: 3, resource: { buffer: slotToBlockBuf } }, { binding: 4, resource: { buffer: newlyActivatedBuf } }, { binding: 5, resource: { buffer: blockSlotBuf } }]});
   const interpBG_readB = device.createBindGroup({ layout: interpBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_b } }, { binding: 2, resource: { buffer: finePoolF_a } }, { binding: 3, resource: { buffer: slotToBlockBuf } }, { binding: 4, resource: { buffer: newlyActivatedBuf } }, { binding: 5, resource: { buffer: blockSlotBuf } }]});
