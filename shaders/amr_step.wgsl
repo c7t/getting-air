@@ -56,6 +56,13 @@ override W : u32;
 override H : u32;
 const BLOCK = 8u;
 
+// Sponge relaxation target velocity. Default (0,0) reproduces the original
+// quiescent far-field exactly; a validation scenario (e.g. cylinder in
+// crossflow) sets these to a uniform freestream instead. Mirrors
+// lbm_step.wgsl's SPONGE_UX/UY -- see that file for the rationale.
+override SPONGE_UX : f32 = 0.0f;
+override SPONGE_UY : f32 = 0.0f;
+
 const ex = array<i32,9>( 0, 1, 0,-1, 0, 1,-1,-1, 1);
 const ey = array<i32,9>( 0, 0, 1, 0,-1, 1, 1,-1,-1);
 const wt = array<f32,9>(
@@ -173,7 +180,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let Si = (1.0f - 0.5f * omg) * wt[i] * ( (term1x + term2*exf)*Fx + (term1y + term2*eyf)*Fy );
 
     let f_collide = f[i] - omg * (f[i] - feq) + Si;
-    let f_target  = wt[i] * 1.0f; // rho=1.0, u=0 equilibrium
+    let eu_far = exf*SPONGE_UX + eyf*SPONGE_UY;
+    let f_target = wt[i] * (1.0f + 3.0f*eu_far + 4.5f*eu_far*eu_far - 1.5f*(SPONGE_UX*SPONGE_UX + SPONGE_UY*SPONGE_UY)); // rho=1.0, u=(SPONGE_UX,SPONGE_UY) equilibrium
 
     f_out[i * (W * H) + cell] = mix(f_collide, f_target, sponge_weight);
   }

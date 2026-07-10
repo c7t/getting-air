@@ -56,6 +56,12 @@ override RB : u32;
 const BLOCK = 8u;
 const GHOST = 2u;
 
+// Sponge relaxation target velocity -- mirrors amr_step.wgsl's SPONGE_UX/UY
+// exactly (same formula, see this file's sponge comment below for why the
+// fine level needs its own copy of the sponge at all).
+override SPONGE_UX : f32 = 0.0f;
+override SPONGE_UY : f32 = 0.0f;
+
 const ex = array<i32,9>( 0, 1, 0,-1, 0, 1,-1,-1, 1);
 const ey = array<i32,9>( 0, 0, 1, 0,-1, 1, 1,-1,-1);
 const wt = array<f32,9>(
@@ -191,7 +197,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let Si = (1.0f - 0.5f * omg) * wt[i] * ( (term1x + term2*exf)*Fx + (term1y + term2*eyf)*Fy );
 
     let f_collide = f[i] - omg * (f[i] - feq) + Si;
-    let f_target  = wt[i] * 1.0f;
+    let eu_far = exf*SPONGE_UX + eyf*SPONGE_UY;
+    let f_target = wt[i] * (1.0f + 3.0f*eu_far + 4.5f*eu_far*eu_far - 1.5f*(SPONGE_UX*SPONGE_UX + SPONGE_UY*SPONGE_UY));
     f_out[i * poolPlaneStride + cell] = mix(f_collide, f_target, sponge_weight);
   }
 }
