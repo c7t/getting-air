@@ -34,7 +34,20 @@ const BLOCK = 8;       // coarse block size (matches M1's cellIndex)
 const RB = BLOCK;      // refine block size in coarse cells -- refine at block granularity
 const FB = RB * 2 + 2 * GHOST; // per-slot fine buffer side length (20 for RB=8,GHOST=2)
 const NCELLS1 = FB * FB; // cells per pool slot
-const MAX_FINE_BLOCKS = urlParams.has('maxFineBlocks') ? parseInt(urlParams.get('maxFineBlocks')) : 64;
+// 64 was sized before geometry-forced refinement (see amr_manage.wgsl's
+// isNearBody) existed, and was measured to permanently saturate: at the
+// halved A=32,B=4 scale (see the A/B comment above), the card's own halo
+// alone needs ~57-68 slots (down from ~100-115 pre-halving), and combined
+// body+wake demand at the current, not-yet-recalibrated REFINE_THRESH/
+// COARSEN_THRESH measures ~67-79 (debugListActiveBlocks() via
+// ?refineThresh=999 isolates the body-only number, ?maxFineBlocks=<big>
+// removes the cap so the count reflects real demand, not pool exhaustion).
+// 128 gives headroom above that measured combined figure -- expected to
+// matter once those thresholds are retuned for the new scale (smaller body
+// means sharper vorticity gradients per unit length, so wake demand should
+// go up, not down) -- while still costing less fine-pool memory (~4.0 MiB)
+// than the coarse grid's own buffers (~5.24 MiB at the default W=256).
+const MAX_FINE_BLOCKS = urlParams.has('maxFineBlocks') ? parseInt(urlParams.get('maxFineBlocks')) : 128;
 const NBX = W / BLOCK, NBY = H / BLOCK, NBLOCKS = NBX * NBY; // coarse block grid
 
 // ── Milestone 4b (plans/AMR.md): automatic vorticity-driven refinement ────
@@ -52,6 +65,19 @@ const REFINE_EVERY = urlParams.has('refineEvery') ? parseInt(urlParams.get('refi
 const REFINE_THRESH = urlParams.has('refineThresh') ? parseFloat(urlParams.get('refineThresh')) : -6;
 const COARSEN_THRESH = urlParams.has('coarsenThresh') ? parseFloat(urlParams.get('coarsenThresh')) : -7;
 
+// Geometry-forced refinement (see amr_manage.wgsl's isNearBody): blocks near
+// the card's SDF -- now or FORCE_REFINE_LOOKAHEAD macro-steps from now, by
+// linear extrapolation of vx/vy/omega -- are always refined and never
+// coarsened, independent of the vorticity criterion above. Fixes the
+// "blunting" gap where a lagging vorticity signal leaves the card's own
+// sharp geometry on the coarse grid (e.g. the whole startup transient,
+// before any wake vorticity exists). Margin default (8 = one BLOCK) and
+// lookahead default (matches REFINE_EVERY, the re-evaluation cadence it's
+// meant to bridge) are starting points, not measured -- retune alongside
+// REFINE_THRESH/COARSEN_THRESH once exercised against a live run.
+const FORCE_REFINE_MARGIN = urlParams.has('forceRefineMargin') ? parseFloat(urlParams.get('forceRefineMargin')) : 8;
+const FORCE_REFINE_LOOKAHEAD = urlParams.has('forceRefineLookahead') ? parseFloat(urlParams.get('forceRefineLookahead')) : REFINE_EVERY;
+
 const resSlider = document.getElementById('slider-RES');
 const resVal    = document.getElementById('val-RES');
 resSlider.value = resLog2;
@@ -67,8 +93,15 @@ resSlider.oninput = () => {
 
 // ── Pesavento & Wang (2004) physical parameters ───────────────────────────────
 // These constants define the "regime" of the simulation (Falling Paper).
-
-let A = 64, B = 8;
+//
+// A/B are in COARSE-grid units, and are deliberately HALF of main.js's dense-
+// reference values (64,8) -- this is the AMR resource-savings fix: the card
+// is defined as a fine-level body (64,8-equivalent), and only appears at
+// that size where the refinement halo (see amr_manage.wgsl's isNearBody)
+// actually resolves it at 2x. Everywhere else, the same W x H coarse buffer
+// now spans a domain 2x wider (4x the area) in body-lengths for identical
+// coarse-grid memory, vs. always running the card at dense-equivalent size.
+let A = 32, B = 4;
 let I_STAR = 0.34;
 let TAU = 0.509;
 let U_T = 0.05;
@@ -370,7 +403,9 @@ async function init() {
     { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
     { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
     { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-    { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }
+    { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    // Milestone 4c: geometry-forced refinement needs the card's pose/velocity.
+    { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }
   ]});
   const step1BGL = device.createBindGroupLayout({ label: 'step1BGL', entries: [
     { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
@@ -397,7 +432,7 @@ async function init() {
   const interpFFConstants = { W, H, RB, GHOST_ONLY: 1, FINE_FINE_ONLY: 1 };
   const step1Constants = { W, H, RB };
   const criterionConstants = { W, H };
-  const manageConstants = { W, H, REFINE_THRESH, COARSEN_THRESH };
+  const manageConstants = { W, H, REFINE_THRESH, COARSEN_THRESH, FORCE_REFINE_MARGIN, FORCE_REFINE_LOOKAHEAD };
 
   const stepPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [stepBGL] }),
@@ -501,7 +536,7 @@ async function init() {
 
   // Milestone 4b bind groups.
   const criterionBG = device.createBindGroup({ layout: criterionBGL, entries: [{ binding: 0, resource: { buffer: velBuf } }, { binding: 1, resource: { buffer: blockCriterionBuf } }]});
-  const manageBG = device.createBindGroup({ layout: manageBGL, entries: [{ binding: 0, resource: { buffer: blockCriterionBuf } }, { binding: 1, resource: { buffer: blockSlotBuf } }, { binding: 2, resource: { buffer: slotToBlockBuf } }, { binding: 3, resource: { buffer: freeListBuf } }, { binding: 4, resource: { buffer: freeCountBuf } }, { binding: 5, resource: { buffer: newlyActivatedBuf } }]});
+  const manageBG = device.createBindGroup({ layout: manageBGL, entries: [{ binding: 0, resource: { buffer: blockCriterionBuf } }, { binding: 1, resource: { buffer: blockSlotBuf } }, { binding: 2, resource: { buffer: slotToBlockBuf } }, { binding: 3, resource: { buffer: freeListBuf } }, { binding: 4, resource: { buffer: freeCountBuf } }, { binding: 5, resource: { buffer: newlyActivatedBuf } }, { binding: 6, resource: { buffer: cardStateBuf } }]});
 
   const error = await device.popErrorScope();
   if (error) { handleErr(error); return; }
