@@ -108,9 +108,19 @@ fn main(
     let chi = get_chi(phi);
 
     if (chi >= 1e-6) {
+      // Pull-gather from buffer-space neighbors, matching amr_step.wgsl's
+      // streaming step exactly (see that file's header for the buffer-space
+      // vs window-space derivation). Reading f_in[cell] directly here (as
+      // this used to) computes rho/u* from the RAW pre-streaming buffer,
+      // a different macroscopic field from what amr_step.wgsl uses for the
+      // Guo forcing term it actually injects into the fluid, anywhere
+      // there's a spatial gradient -- i.e. exactly the boundary layer/wake
+      // region where chi > 0 (see the equivalent lbm_force.wgsl fix).
       var rho = 0f; var ux_star = 0f; var uy_star = 0f;
       for (var i = 0u; i < 9u; i++) {
-        let fi = f_in[i * (W * H) + cell];
+        let bx_src = (cx + W - u32(ex[i])) % W;
+        let by_src = (cy + H - u32(ey[i])) % H;
+        let fi = f_in[i * (W * H) + cellIndex(bx_src, by_src)];
         rho     += fi;
         ux_star += fi * f32(ex[i]);
         uy_star += fi * f32(ey[i]);
