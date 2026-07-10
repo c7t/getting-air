@@ -120,7 +120,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     ux_star += f[i] * f32(ex[i]);
     uy_star += f[i] * f32(ey[i]);
   }
-  ux_star /= rho; uy_star /= rho;
+  // NaN-containment floor: divide by a positive rho so a pathological cell
+  // (rho <= 0 during an incipient instability) yields a large-but-finite
+  // velocity rather than Inf/NaN that streams and corrupts the whole field.
+  // No-op in the valid regime (rho ~ 1). See also the tanh clamp in get_chi.
+  let rhoDen = max(rho, 1e-6f);
+  ux_star /= rhoDen; uy_star /= rhoDen;
 
   // 3. Penalty Force and Solid Coupling (window-space)
   let p = vec2<f32>(f32(wx), f32(wy));
@@ -140,8 +145,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let Fy = rho * chi * (usy - uy_star);
 
   // Actual fluid velocity u = u* + F/(2rho)
-  let ux = ux_star + Fx / (2.0f * rho);
-  let uy = uy_star + Fy / (2.0f * rho);
+  let ux = ux_star + Fx / (2.0f * rhoDen);
+  let uy = uy_star + Fy / (2.0f * rhoDen);
   let u_sq = ux*ux + uy*uy;
 
   // Store velocity for rendering (block-major buffer cell index)
