@@ -1,0 +1,50 @@
+{
+  "geometry": "circular cylinder, 2D, unconfined uniform crossflow",
+  "note": "These are consensus ranges for an OPEN/unconfined domain (low blockage ratio, uniform far-field velocity) -- not the DFG/Schafer-Turek 'flow around a cylinder' benchmark, whose Cd/Cl/St numbers come from a narrow channel with a parabolic inlet profile and a different Re definition. Don't cross-compare the two. Tolerances are generous because the literature itself spans a range depending on domain size/discretization, not because of a single 'authoritative' number.",
+  "measurement": {
+    "transient": "Discard at least the first ~40 D/U0 time units (impulsive/seeded-flow startup transient) before sampling -- shedding needs several cycles to reach a stable limit cycle.",
+    "cd_definition": "Cd = 2*Fx / (rho0 * U0^2 * D), time-averaged over an integer number of shedding periods (rho0 = 1 in lattice units).",
+    "cl_definition": "Cl = 2*Fy / (rho0 * U0^2 * D).",
+    "st_definition": "St = fs * D / U0, where fs is the vortex-shedding frequency (estimate via zero-crossing period of Cl(t), or an FFT peak, over the same measurement window)."
+  },
+  "cases": [
+    {
+      "re": 20,
+      "regime": "steady, no shedding",
+      "cd": 2.05,
+      "cd_tol": 0.15,
+      "st": null,
+      "st_tol": null,
+      "wake_length_over_D": 0.94,
+      "source": "Dennis & Chang (1970), J. Fluid Mech. 42(3):471-489; recirculation length corroborated experimentally by Coutanceau & Bouard (1977), J. Fluid Mech. 79(2)."
+    },
+    {
+      "re": 40,
+      "regime": "steady, no shedding",
+      "cd": 1.52,
+      "cd_tol": 0.12,
+      "st": null,
+      "st_tol": null,
+      "wake_length_over_D": 2.35,
+      "source": "Dennis & Chang (1970), J. Fluid Mech. 42(3):471-489."
+    },
+    {
+      "re": 100,
+      "regime": "periodic vortex shedding (Karman street)",
+      "cd": 1.35,
+      "cd_tol": 0.15,
+      "st": 0.165,
+      "st_tol": 0.015,
+      "source": "Braza, Chassaing & Ha Minh (1986), J. Fluid Mech. 165:79-130; He & Doolen (1997), J. Comput. Phys. 134(2) (LBM-specific); Williamson (1996), Annu. Rev. Fluid Mech. 28, St-Re correlation for the laminar shedding regime."
+    },
+    {
+      "re": 200,
+      "regime": "periodic vortex shedding (Karman street)",
+      "cd": 1.34,
+      "cd_tol": 0.15,
+      "st": 0.197,
+      "st_tol": 0.015,
+      "source": "Henderson (1995), Phys. Fluids 7(9):2102-2104."
+    }
+  ]
+}
