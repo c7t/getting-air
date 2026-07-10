@@ -362,9 +362,25 @@ async function init() {
     statusEl.textContent = `error: ${W}x${H} needs a ${mib(neededBufferBytes)} MiB buffer binding, this GPU's max is ${mib(adapter.limits.maxStorageBufferBindingSize)} MiB`;
     return;
   }
+  // Milestone 9: shaders/amr_manage_pool.wgsl needs 15 storage bindings in
+  // one bind group (childCriterion/blockSlot/slotToBlock/freeList/
+  // freeCount/newlyActivated/state/parentSlot/quadrant/originX/originY,
+  // plus 4 parent-level read-only mirrors for the 2:1-balance neighbor
+  // checks) -- past the WebGPU spec-MINIMUM maxStorageBuffersPerShaderStage
+  // of 8 (already the exact ceiling several existing 8-binding layouts sit
+  // at, e.g. step1PoolBGL), same "spec minimum, not a real GPU limit"
+  // situation as maxStorageBufferBindingSize above. Same treatment: request
+  // what's needed, capped at the adapter's real capability, fail loud
+  // (not a cryptic validation error) if this GPU genuinely can't do it.
+  const NEEDED_STORAGE_BUFFERS_PER_STAGE = 16;
+  if (NEEDED_STORAGE_BUFFERS_PER_STAGE > adapter.limits.maxStorageBuffersPerShaderStage) {
+    statusEl.textContent = `error: needs ${NEEDED_STORAGE_BUFFERS_PER_STAGE} storage buffers per shader stage, this GPU's max is ${adapter.limits.maxStorageBuffersPerShaderStage}`;
+    return;
+  }
   const requiredLimits = {
     maxStorageBufferBindingSize: Math.min(Math.max(neededBufferBytes, DEFAULT_MAX_STORAGE_BINDING), adapter.limits.maxStorageBufferBindingSize),
     maxBufferSize: Math.min(Math.max(neededBufferBytes, DEFAULT_MAX_BUFFER_SIZE), adapter.limits.maxBufferSize),
+    maxStorageBuffersPerShaderStage: NEEDED_STORAGE_BUFFERS_PER_STAGE,
   };
   const device = await adapter.requestDevice({
     requiredFeatures: hasTimestamp ? ['timestamp-query'] : [],
@@ -417,6 +433,11 @@ async function init() {
   // hasChild is true, which is never the case for whoever binds this.
   const dummyBlockSlotBuf = device.createBuffer({ size: 4, usage: U.STORAGE | U.COPY_DST });
   device.queue.writeBuffer(dummyBlockSlotBuf, 0, new Int32Array([-1]));
+  // Milestone 9: same idea, for a "child level's blockCriterion" binding
+  // when HAS_LEVEL2=0 (N_LEVELS==2) -- amr_manage.wgsl's cascade/coarsen-
+  // block checks are compiled out in that case, so this is never read.
+  const dummyCriterionBuf = device.createBuffer({ size: 4, usage: U.STORAGE | U.COPY_DST });
+  device.queue.writeBuffer(dummyCriterionBuf, 0, new Float32Array([0]));
 
   // CardState: 26 floats = 104 bytes
   const cardStateBuf = device.createBuffer({ size: 104, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
@@ -525,7 +546,7 @@ async function init() {
     };
   }
 
-  const [stepSM, frcSM, phySM, renSM, interpDenseSM, interpPoolSM, step1SM, step1PoolSM, avgSM, avgPoolSM, criterionSM, manageSM, force1SM, force1PoolSM] = await Promise.all([
+  const [stepSM, frcSM, phySM, renSM, interpDenseSM, interpPoolSM, step1SM, step1PoolSM, avgSM, avgPoolSM, criterionSM, manageSM, force1SM, force1PoolSM, criterionPoolSM, managePoolSM] = await Promise.all([
     loadShader(device, 'shaders/amr_step.wgsl'),
     loadShader(device, 'shaders/amr_force.wgsl'),
     loadShader(device, 'shaders/amr_physics.wgsl'),
@@ -548,6 +569,10 @@ async function init() {
     // addressing split as everything else -- see amr_force1.wgsl's header.
     loadShader(device, 'shaders/amr_force1.wgsl'),
     loadShader(device, 'shaders/amr_force1_pool.wgsl'),
+    // Milestone 9: per-level criterion + quad allocator/2:1-balance,
+    // parent=level>=1 -- see amr_criterion_pool.wgsl/amr_manage_pool.wgsl.
+    loadShader(device, 'shaders/amr_criterion_pool.wgsl'),
+    loadShader(device, 'shaders/amr_manage_pool.wgsl'),
   ]);
 
   const stepBGL = device.createBindGroupLayout({ label: 'stepBGL', entries: [
@@ -623,7 +648,38 @@ async function init() {
     { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
     { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
     // Milestone 4c: geometry-forced refinement needs the card's pose/velocity.
-    { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }
+    { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    // Milestone 9: level 2's own blockCriterion/blockSlot, for the cascade/
+    // coarsen-block checks (harmless dummies when HAS_LEVEL2=0).
+    { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 8, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }
+  ]});
+  // Milestone 9: per-quadrant criterion for any level-(m+1) decision,
+  // parent=level m -- see amr_criterion_pool.wgsl's header (one pipeline
+  // per parent level, not shared, unlike the M6-M8 pool-parent shaders).
+  const criterionPoolBGL = device.createBindGroupLayout({ label: 'criterionPoolBGL', entries: [
+    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }
+  ]});
+  // Milestone 9: quad allocator + 2:1 balance for any level-(m+1) decision,
+  // parent=level m>=1 -- see amr_manage_pool.wgsl's header.
+  const managePoolBGL = device.createBindGroupLayout({ label: 'managePoolBGL', entries: [
+    { binding: 0,  visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 1,  visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    { binding: 2,  visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    { binding: 3,  visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    { binding: 4,  visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    { binding: 5,  visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    { binding: 6,  visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 7,  visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    { binding: 8,  visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    { binding: 9,  visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    { binding: 10, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    { binding: 11, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 12, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 13, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 14, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }
   ]});
   const step1BGL = device.createBindGroupLayout({ label: 'step1BGL', entries: [
     { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
@@ -699,7 +755,7 @@ async function init() {
   const interpFFConstants = { W, H, RB, GHOST_ONLY: 1, FINE_FINE_ONLY: 1 };
   const step1Constants = { W, H, RB };
   const criterionConstants = { W, H };
-  const manageConstants = { W, H, REFINE_THRESH, COARSEN_THRESH, FORCE_REFINE_MARGIN, FORCE_REFINE_LOOKAHEAD };
+  const manageConstants = { W, H, REFINE_THRESH, COARSEN_THRESH, FORCE_REFINE_MARGIN, FORCE_REFINE_LOOKAHEAD, HAS_LEVEL2: N_LEVELS > 2 ? 1 : 0 };
 
   const stepPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [stepBGL] }),
@@ -811,6 +867,40 @@ async function init() {
     compute: { module: manageSM, entryPoint: 'refine', constants: manageConstants }
   });
 
+  // Milestone 9: one criterion/manage pipeline PAIR per PARENT level
+  // (1..N_LEVELS-2, i.e. every level that can itself have a child) --
+  // NBX_PARENT/NBY_PARENT/PARENT_CELL_SIZE_L0/PARENT_HAS_CACHED_ORIGIN are
+  // compile-time overrides, one pipeline object per parent level, not
+  // shared the way M6-M8's pool-parent pipelines are (see
+  // amr_manage_pool.wgsl's header for why that's the right tradeoff here).
+  // Keyed by PARENT level m, deciding child level m+1.
+  const criterionPoolPLs = {};
+  const managePoolCoarsenPLs = {};
+  const managePoolRefinePLs = {};
+  for (let m = 1; m < N_LEVELS - 1; m++) {
+    const parentPool = pools[m];
+    const parentIsDense = m === 1; // level 1's parent is L0 -- see amr_step1.wgsl's header
+    const poolConstants = {
+      W, H, RB,
+      NBX_PARENT: parentPool.NBX, NBY_PARENT: parentPool.NBY,
+      PARENT_CELL_SIZE_L0: cellSizeL0AtLevel(m),
+      PARENT_HAS_CACHED_ORIGIN: parentIsDense ? 0 : 1,
+      REFINE_THRESH, COARSEN_THRESH, FORCE_REFINE_MARGIN, FORCE_REFINE_LOOKAHEAD,
+    };
+    criterionPoolPLs[m] = device.createComputePipeline({
+      layout: device.createPipelineLayout({ bindGroupLayouts: [criterionPoolBGL] }),
+      compute: { module: criterionPoolSM, entryPoint: 'main', constants: { RB, NBX_PARENT: parentPool.NBX } }
+    });
+    managePoolCoarsenPLs[m] = device.createComputePipeline({
+      layout: device.createPipelineLayout({ bindGroupLayouts: [managePoolBGL] }),
+      compute: { module: managePoolSM, entryPoint: 'coarsen', constants: poolConstants }
+    });
+    managePoolRefinePLs[m] = device.createComputePipeline({
+      layout: device.createPipelineLayout({ bindGroupLayouts: [managePoolBGL] }),
+      compute: { module: managePoolSM, entryPoint: 'refine', constants: poolConstants }
+    });
+  }
+
   const stepBG_ab = device.createBindGroup({ layout: stepBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_a } }, { binding: 2, resource: { buffer: f_b } }, { binding: 3, resource: { buffer: velBuf } }]});
   const stepBG_ba = device.createBindGroup({ layout: stepBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_b } }, { binding: 2, resource: { buffer: f_a } }, { binding: 3, resource: { buffer: velBuf } }]});
 
@@ -855,7 +945,48 @@ async function init() {
 
   // Milestone 4b bind groups.
   const criterionBG = device.createBindGroup({ layout: criterionBGL, entries: [{ binding: 0, resource: { buffer: velBuf } }, { binding: 1, resource: { buffer: pools[1].blockCriterionBuf } }]});
-  const manageBG = device.createBindGroup({ layout: manageBGL, entries: [{ binding: 0, resource: { buffer: pools[1].blockCriterionBuf } }, { binding: 1, resource: { buffer: pools[1].blockSlotBuf } }, { binding: 2, resource: { buffer: pools[1].slotToBlockBuf } }, { binding: 3, resource: { buffer: pools[1].freeListBuf } }, { binding: 4, resource: { buffer: pools[1].freeCountBuf } }, { binding: 5, resource: { buffer: pools[1].newlyActivatedBuf } }, { binding: 6, resource: { buffer: cardStateBuf } }]});
+  const manageBG = device.createBindGroup({ layout: manageBGL, entries: [{ binding: 0, resource: { buffer: pools[1].blockCriterionBuf } }, { binding: 1, resource: { buffer: pools[1].blockSlotBuf } }, { binding: 2, resource: { buffer: pools[1].slotToBlockBuf } }, { binding: 3, resource: { buffer: pools[1].freeListBuf } }, { binding: 4, resource: { buffer: pools[1].freeCountBuf } }, { binding: 5, resource: { buffer: pools[1].newlyActivatedBuf } }, { binding: 6, resource: { buffer: cardStateBuf } }, { binding: 7, resource: { buffer: N_LEVELS > 2 ? pools[2].blockCriterionBuf : dummyCriterionBuf } }, { binding: 8, resource: { buffer: N_LEVELS > 2 ? pools[2].blockSlotBuf : dummyBlockSlotBuf } }]});
+
+  // Milestone 9: one criterion/manage bind group per PARENT level
+  // (1..N_LEVELS-2), deciding child level m+1. Parent=level 1 sources from
+  // the flat globals (velBuf/pools[1].*), parent=level>=2 from pools[m]
+  // (both are equally valid "parent pool" shapes for this purpose -- the
+  // dense-vs-cached-origin distinction is handled entirely by
+  // PARENT_HAS_CACHED_ORIGIN, already baked into the pipeline above).
+  const criterionPoolBGs = {};
+  const managePoolBGs = {};
+  for (let m = 1; m < N_LEVELS - 1; m++) {
+    const parentPool = pools[m];
+    const childPool = pools[m + 1];
+    const parentVel = m === 1 ? velBuf : parentPool.finePoolVel;
+    const parentSlotToBlockBuf = m === 1 ? pools[1].slotToBlockBuf : parentPool.slotToBlockBuf;
+    const parentBlockSlotBuf = m === 1 ? pools[1].blockSlotBuf : parentPool.blockSlotBuf;
+    const parentOriginXBuf = m === 1 ? dummyBlockSlotBuf : parentPool.originXBuf; // dummy: level-1 parent has no cached origin (PARENT_HAS_CACHED_ORIGIN=0 gates it out)
+    const parentOriginYBuf = m === 1 ? dummyBlockSlotBuf : parentPool.originYBuf;
+
+    criterionPoolBGs[m] = device.createBindGroup({ layout: criterionPoolBGL, entries: [
+      { binding: 0, resource: { buffer: parentVel } },
+      { binding: 1, resource: { buffer: parentSlotToBlockBuf } },
+      { binding: 2, resource: { buffer: childPool.blockCriterionBuf } },
+    ]});
+    managePoolBGs[m] = device.createBindGroup({ layout: managePoolBGL, entries: [
+      { binding: 0, resource: { buffer: childPool.blockCriterionBuf } },
+      { binding: 1, resource: { buffer: childPool.blockSlotBuf } },
+      { binding: 2, resource: { buffer: childPool.slotToBlockBuf } },
+      { binding: 3, resource: { buffer: childPool.freeListBuf } },
+      { binding: 4, resource: { buffer: childPool.freeCountBuf } },
+      { binding: 5, resource: { buffer: childPool.newlyActivatedBuf } },
+      { binding: 6, resource: { buffer: cardStateBuf } },
+      { binding: 7, resource: { buffer: childPool.parentSlotBuf } },
+      { binding: 8, resource: { buffer: childPool.quadrantBuf } },
+      { binding: 9, resource: { buffer: childPool.originXBuf } },
+      { binding: 10, resource: { buffer: childPool.originYBuf } },
+      { binding: 11, resource: { buffer: parentBlockSlotBuf } },
+      { binding: 12, resource: { buffer: parentSlotToBlockBuf } },
+      { binding: 13, resource: { buffer: parentOriginXBuf } },
+      { binding: 14, resource: { buffer: parentOriginYBuf } },
+    ]});
+  }
 
   // Bind groups for every level-pair (child level c=2..N_LEVELS-1, parent
   // c-1): interpolate (both parent-buffer variants -- Milestone 7 needs
@@ -1264,25 +1395,74 @@ async function init() {
     const frcBG        = useB ? frcBG_b            : frcBG_a;
     const interpInitBG = useB ? interpInitBG_readB : interpInitBG_readA;
 
-    // Milestone 4b: re-evaluate refinement every REFINE_EVERY macro-steps.
-    // Level 1 only -- Milestone 9 generalizes automatic refine/coarsen to
-    // level>=2; manual debugActivateBlock(level>=2,...) is the only way to
-    // populate those levels until then (Milestone 6). Runs BEFORE
-    // S_Advance below so a block refined this round gets its one-time
-    // full-slot fill (interpInitPL, gated on newlyActivated) before
-    // anything else this macro-step reads its pool slot. Reads velBuf as
-    // populated by the PREVIOUS macro-step's coarse step, i.e. the same
-    // "current, pre-step" data the force pass also reads.
+    // Milestone 4b/9: re-evaluate refinement every REFINE_EVERY macro-steps,
+    // now generalized across every configured level. Runs BEFORE S_Advance
+    // below so anything refined this round gets its one-time full-slot
+    // fill before anything else this macro-step reads its pool slot. Reads
+    // each level's own velocity field as populated by the PREVIOUS macro-
+    // step (level 1's finePoolVel, level>=2's own), i.e. the same
+    // "current, pre-step" data the force passes also read.
     if (autoRefine && macroStepCounter % REFINE_EVERY === 0) {
-      enc.clearBuffer(pools[1].newlyActivatedBuf); // GPU-recorded, not queue.writeBuffer --
-      // see plans/AMR.md's Milestone 4b note on why a JS-side writeBuffer
-      // wouldn't interleave correctly with commands already recorded into
-      // this same not-yet-submitted encoder.
+      for (let m = 1; m < N_LEVELS; m++) {
+        enc.clearBuffer(pools[m].newlyActivatedBuf); // GPU-recorded, not queue.writeBuffer --
+        // see plans/AMR.md's Milestone 4b note on why a JS-side writeBuffer
+        // wouldn't interleave correctly with commands already recorded into
+        // this same not-yet-submitted encoder.
+      }
+
+      // Criterion: level 1's own (dense, from velBuf, unchanged) plus every
+      // parent level's own pool criterion (deciding levels 2..N_LEVELS-1).
+      // Evaluated ONCE, before the fixed-point loop below -- a block's own
+      // vorticity doesn't change just because a neighbor gets (de)activated
+      // this round, so re-evaluating per iteration would be wasted work.
       const crit = enc.beginComputePass(); crit.setPipeline(criterionPL); crit.setBindGroup(0, criterionBG); crit.dispatchWorkgroups(WGX, WGY); crit.end();
-      // Coarsen MUST fully complete before refine starts -- see amr_manage.wgsl's header.
-      const coarsenP = enc.beginComputePass(); coarsenP.setPipeline(manageCoarsenPL); coarsenP.setBindGroup(0, manageBG); coarsenP.dispatchWorkgroups(WG_MANAGE); coarsenP.end();
-      const refineP = enc.beginComputePass(); refineP.setPipeline(manageRefinePL); refineP.setBindGroup(0, manageBG); refineP.dispatchWorkgroups(WG_MANAGE); refineP.end();
+      for (let m = 1; m < N_LEVELS - 1; m++) {
+        const c = enc.beginComputePass(); c.setPipeline(criterionPoolPLs[m]); c.setBindGroup(0, criterionPoolBGs[m]); c.dispatchWorkgroups(2, 2, pools[m].MAX_FINE_BLOCKS); c.end();
+      }
+
+      // Milestone 9: 2:1-balance fixed-point loop -- coarsen finest-to-
+      // coarsest (a level can't release while it's still a parent, or
+      // while releasing would strand a neighbor's deeper child -- see
+      // amr_manage.wgsl's header), then refine coarsest-to-finest (so a
+      // neighbor cascade-forced active THIS iteration, at a shallower
+      // level, is already reflected in blockSlot before a deeper level's
+      // refine pass checks for it THIS SAME iteration). A handful of
+      // iterations is enough to converge at this plan's validated depth
+      // (N<=3, plans/AMR-multilevel.md's Milestone 9 text) -- see
+      // amr_manage_pool.wgsl's header for why cascades don't chain deeper
+      // than one hop there.
+      const FIXED_POINT_ITERS = Math.max(1, N_LEVELS - 1);
+      for (let iter = 0; iter < FIXED_POINT_ITERS; iter++) {
+        for (let m = N_LEVELS - 1; m >= 1; m--) {
+          if (m === 1) {
+            const p = enc.beginComputePass(); p.setPipeline(manageCoarsenPL); p.setBindGroup(0, manageBG); p.dispatchWorkgroups(WG_MANAGE); p.end();
+          } else {
+            const parentLevel = m - 1;
+            const wg = Math.ceil(pools[m].MAX_FINE_BLOCKS / 64);
+            const p = enc.beginComputePass(); p.setPipeline(managePoolCoarsenPLs[parentLevel]); p.setBindGroup(0, managePoolBGs[parentLevel]); p.dispatchWorkgroups(wg); p.end();
+          }
+        }
+        for (let m = 1; m < N_LEVELS; m++) {
+          if (m === 1) {
+            const p = enc.beginComputePass(); p.setPipeline(manageRefinePL); p.setBindGroup(0, manageBG); p.dispatchWorkgroups(WG_MANAGE); p.end();
+          } else {
+            const parentLevel = m - 1;
+            const wg = Math.ceil(pools[parentLevel].MAX_FINE_BLOCKS / 64);
+            const p = enc.beginComputePass(); p.setPipeline(managePoolRefinePLs[parentLevel]); p.setBindGroup(0, managePoolBGs[parentLevel]); p.dispatchWorkgroups(wg); p.end();
+          }
+        }
+      }
+
+      // One-time full-slot fill for everything newly activated this round,
+      // every level (level 1: dense-parent init pipeline, unchanged;
+      // level>=2: pool-parent init pipeline, reading readA since a
+      // level's own buffer is always "current" at a macro-step boundary --
+      // same invariant debugActivateBlock already relies on).
       const init = enc.beginComputePass(); init.setPipeline(interpInitPL); init.setBindGroup(0, interpInitBG); init.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); init.end();
+      for (let m = 2; m < N_LEVELS; m++) {
+        const pool = pools[m];
+        const p = enc.beginComputePass(); p.setPipeline(interpPoolParentInitPL); p.setBindGroup(0, pool.interpPoolParentBG_readA); p.dispatchWorkgroups(WGX1, WGY1, pool.MAX_FINE_BLOCKS); p.end();
+      }
     }
     macroStepCounter++;
 
@@ -1755,6 +1935,43 @@ async function init() {
     return active;
   }
 
+  // Milestone 9's own validation ask: walk all active tiles, confirm no
+  // same-level-neighbor pair differs by more than 1 level -- cheap enough
+  // to call periodically during development/validation, not wired into
+  // the live per-macro-step path (that would need a GPU-side assertion
+  // mechanism this project doesn't have; a readback-based debug function
+  // is enough to catch a real violation during testing).
+  async function debugCheck21Balance() {
+    const level1 = await debugListActiveBlocks(1);
+    const level1Set = new Set(level1.map(b => `${b.bx},${b.by}`));
+    const level2Set = new Set();
+    let level2Count = 0;
+    if (N_LEVELS > 2) {
+      const level2 = await debugListActiveBlocks(2);
+      level2Count = level2.length;
+      for (const b of level2) level2Set.add(`${Math.floor(b.bx / 2)},${Math.floor(b.by / 2)}`);
+    }
+    const { NBX, NBY } = pools[1];
+    function levelOf(bx, by) {
+      const key = `${bx},${by}`;
+      if (!level1Set.has(key)) return 0;
+      return level2Set.has(key) ? 2 : 1;
+    }
+    const violations = [];
+    for (const b of level1) {
+      const l = levelOf(b.bx, b.by);
+      const neighbors = [
+        [b.bx, (b.by + NBY - 1) % NBY], [b.bx, (b.by + 1) % NBY],
+        [(b.bx + 1) % NBX, b.by], [(b.bx + NBX - 1) % NBX, b.by],
+      ];
+      for (const [nbx, nby] of neighbors) {
+        const nl = levelOf(nbx, nby);
+        if (Math.abs(l - nl) > 1) violations.push({ bx: b.bx, by: b.by, level: l, neighbor: [nbx, nby], neighborLevel: nl });
+      }
+    }
+    return { ok: violations.length === 0, violations, level1Count: level1.length, level2Count };
+  }
+
   // Deterministic synchronous stepping, bypassing rAF entirely -- lets two
   // separate builds be driven to an EXACT matching step count for a fair
   // diff. Wall-clock polling of the normal rAF-driven `liveMode` loop can't
@@ -1827,6 +2044,7 @@ async function init() {
     debugActivateBlock,
     debugDeactivateBlock,
     debugListActiveBlocks,
+    debugCheck21Balance,
     debugProbeGhostFill,
     debugRunSteadyGhostFill,
     debugReadPool,
