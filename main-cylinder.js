@@ -27,14 +27,26 @@ let W = 1 << resLog2;
 let H = W;
 let NCELLS = W * H;
 
-// R: cylinder radius in lattice units (D = 2R). U0: freestream speed in
-// lattice units/step (kept small so Ma = U0/cs stays well under 0.3). Re:
-// Reynolds number, used only to derive TAU = 0.5 + 3*nu, nu = U0*D/Re.
-// R and U0 are baked into the compute pipelines (R into CardState at init,
-// U0 into the SPONGE_UX override), so changing them takes a page reload,
-// same convention as the RES slider. TAU is dynamic (like main.js) so
-// Re can be explored live without recompiling pipelines.
-let R  = parseFloat(urlParams.get('r'))  || 12;
+// BLOCKAGE: domain height / D (D = cylinder diameter). UPSTREAM: distance
+// from the left edge to the cylinder center, in diameters. R is *derived*
+// from W and BLOCKAGE rather than taken directly in lattice units -- if R
+// were an independent lattice-unit parameter, bumping it at fixed domain
+// resolution silently changes both the blockage ratio and the upstream/
+// downstream fetch (in diameters), confounding any attempt at a grid-
+// convergence study (see the R=12->24 experiment that made Cd move the
+// wrong way). Deriving R this way means bumping only `res` in the URL is
+// a valid resolution sweep: blockage and fetch length in D-units stay
+// fixed, only the diffuse-interface width relative to D shrinks.
+let BLOCKAGE = parseFloat(urlParams.get('blockage')) || 24;
+let UPSTREAM = parseFloat(urlParams.get('upstream')) || 8;
+let R = W / (2 * BLOCKAGE);
+
+// U0: freestream speed in lattice units/step (kept small so Ma = U0/cs
+// stays well under 0.3). Re: Reynolds number, used only to derive
+// TAU = 0.5 + 3*nu, nu = U0*D/Re. U0 is baked into the SPONGE_UX pipeline
+// override, so changing it takes a page reload, same convention as the
+// RES slider. TAU is dynamic (like main.js) so Re can be explored live
+// without recompiling pipelines.
 let U0 = parseFloat(urlParams.get('u0')) || 0.04;
 let RE = parseFloat(urlParams.get('re')) || 100;
 
@@ -80,14 +92,43 @@ function feq(rho, ux, uy, i) {
   return WT[i] * rho * (1 + eu*3 + eu*eu*4.5 - (ux*ux+uy*uy)*1.5);
 }
 
+// PERTURB: amplitude (as a fraction of U0) of a small transverse-velocity
+// perturbation seeded into the initial condition. Both the analytic circle
+// and a pure freestream initial condition are exactly top/bottom symmetric,
+// so without this, vortex shedding onset has to grow from whatever
+// asymmetry floating-point round-off happens to provide -- which is a
+// *smaller and slower-growing* seed at higher grid resolution (finer grids
+// have less discretization error to seed from), making Cd/shedding-strength
+// look like they're shrinking with resolution when really the higher-
+// resolution runs just haven't finished saturating within the same step
+// budget (this is what the res=8/9/10 sweep showed: Cd fell monotonically
+// with resolution, and the Cl oscillation got visibly weaker each time).
+// SEED is a fixed PRNG seed so runs stay reproducible for regression use.
+const PERTURB = parseFloat(urlParams.get('perturb')) || 0.02;
+const SEED    = parseInt(urlParams.get('seed'))      || 12345;
+
+function mulberry32(seed) {
+  let s = seed | 0;
+  return function () {
+    s = (s + 0x6D2B79F5) | 0;
+    let t = Math.imul(s ^ (s >>> 15), 1 | s);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
 // Seed the whole domain at the freestream velocity (rather than quiescent)
 // -- this is standard practice for these benchmarks and shortens the
-// startup transient that has to be discarded before measuring Cd/St.
+// startup transient that has to be discarded before measuring Cd/St -- plus
+// a small per-cell random transverse perturbation (see PERTURB above) so
+// shedding onset doesn't depend on grid-resolution-dependent round-off.
 function initF() {
+  const rng = mulberry32(SEED);
   const f = new Float32Array(NCELLS * 9);
   for (let c = 0; c < NCELLS; c++) {
+    const uy = (rng() * 2 - 1) * PERTURB * U0;
     for (let i = 0; i < 9; i++) {
-      f[i * NCELLS + c] = feq(1, U0, 0, i);
+      f[i * NCELLS + c] = feq(1, U0, uy, i);
     }
   }
   return f;
@@ -133,19 +174,22 @@ async function init() {
   const velBuf   = device.createBuffer({ size: NCELLS * 2 * 4, usage: U.STORAGE });
   const forceBuf = device.createBuffer({ size: 16, usage: U.STORAGE | U.COPY_SRC | U.COPY_DST });
 
-  // CardState: 26 floats = 104 bytes. Cylinder placed a quarter of the
-  // domain downstream of the inlet edge, centered transversely, matching
-  // the "cylinder N diameters downstream" convention of the FPSC benchmark
-  // this mirrors (amr-lbm.pdf S5.3).
+  // CardState: 26 floats = 104 bytes. Cylinder placed UPSTREAM diameters
+  // downstream of the inlet edge, centered transversely, matching the
+  // "cylinder N diameters downstream" convention of the FPSC benchmark this
+  // mirrors (amr-lbm.pdf S5.3) -- in diameters, not a fixed W/4, so it scales
+  // correctly with R (see the BLOCKAGE/UPSTREAM comment above).
+  const CX0 = UPSTREAM * 2 * R;
+  const CY0 = H / 2;
   function cardInit() {
     return new Float32Array([
-      W/4, H/2, 0,     // cx, cy, theta
+      CX0, CY0, 0,     // cx, cy, theta
       0, 0, 0,         // vx, vy, omega -- pinned (v_max/o_max = 0 below)
       0, 0, 0,         // fx, fy, tz
       1, 1, 0,         // mass, i_body, g_eff (no gravity, body is fixed)
       R, R,            // a, b (circle)
       0, 0,            // v_max, o_max -- 0 freezes the body exactly
-      W/4, H/2, 0,     // cx_old, cy_old, th_old
+      CX0, CY0, 0,     // cx_old, cy_old, th_old
       TAU,             // tau
       0, 0,            // y_total, x_total
       0, 0, 0, 0        // off_x, off_y, off_x_old, off_y_old
@@ -322,7 +366,7 @@ async function init() {
     setRe,
     getStep: () => step,
     getDims: () => ({ W, H }),
-    getParams: () => ({ R, D: 2 * R, U0, Re: RE, TAU }),
+    getParams: () => ({ R, D: 2 * R, U0, Re: RE, TAU, blockage: BLOCKAGE, upstream: UPSTREAM, perturb: PERTURB, seed: SEED, W, H }),
     getForceHistory: () => trajectory.slice(),
     debugRunAndCollect,
   };
