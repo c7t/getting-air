@@ -74,6 +74,15 @@ fn get_chi(phi: f32) -> f32 {
     return 0.5f * (1.0f - tanh(clamp(phi / epsilon, -20.0f, 20.0f)));
 }
 
+// Sanitize NaN to 0 and clamp to the representable fixed-point range so the
+// float->i32 conversion feeding the force atomics is always well-defined
+// (WGSL leaves out-of-range and NaN float->i32 conversion implementation-
+// defined). FSCALE=10000 and i32 max ~2.1e9, so +/-2e9 bounds |force| < 2e5.
+fn safeFixed(x: f32) -> i32 {
+    let s = select(x, 0.0f, x != x);
+    return i32(clamp(s, -2.0e9f, 2.0e9f));
+}
+
 var<workgroup> wg_fx : array<f32, 64>;
 var<workgroup> wg_fy : array<f32, 64>;
 var<workgroup> wg_tz : array<f32, 64>;
@@ -106,7 +115,7 @@ fn main(
         ux_star += fi * f32(ex[i]);
         uy_star += fi * f32(ey[i]);
       }
-      ux_star /= rho; uy_star /= rho;
+      ux_star /= max(rho, 1e-6f); uy_star /= max(rho, 1e-6f); // NaN-containment floor
 
       // Local solid velocity Us
       var rx = p.x - state.cx;
@@ -143,8 +152,12 @@ fn main(
       sum_fy += wg_fy[i];
       sum_tz += wg_tz[i];
     }
-    atomicAdd(&forces[0], i32(sum_fx * FSCALE));
-    atomicAdd(&forces[1], i32(sum_fy * FSCALE));
-    atomicAdd(&forces[2], i32(sum_tz * FSCALE));
+    // Clamp + NaN-sanitize before float->i32: WGSL leaves out-of-range/NaN
+    // float->i32 conversion implementation-defined (Intel and NVIDIA differ),
+    // so an unbounded or NaN reduction here would corrupt the body force/torque
+    // backend-specifically. See safeFixed().
+    atomicAdd(&forces[0], safeFixed(sum_fx * FSCALE));
+    atomicAdd(&forces[1], safeFixed(sum_fy * FSCALE));
+    atomicAdd(&forces[2], safeFixed(sum_tz * FSCALE));
   }
 }

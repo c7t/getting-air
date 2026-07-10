@@ -145,7 +145,7 @@ fn sampleCoarse(bx_in: i32, by_in: i32) -> CoarseSample {
     ux  += f[i] * f32(ex[i]);
     uy  += f[i] * f32(ey[i]);
   }
-  ux /= rho; uy /= rho;
+  ux /= max(rho, 1e-6f); uy /= max(rho, 1e-6f); // NaN-containment floor
 
   var out: CoarseSample;
   out.rho = rho; out.ux = ux; out.uy = uy;
