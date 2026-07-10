@@ -33,6 +33,7 @@ struct CardState {
 @group(0) @binding(1) var<storage, read> state       : CardState;
 @group(0) @binding(2) var<storage, read> vel_pool    : array<f32>; // Milestone 4: fine pool
 @group(0) @binding(3) var<storage, read> blockSlot   : array<i32>; // Milestone 4: coarse block -> pool slot
+@group(0) @binding(4) var<uniform>       overlayOpacity : f32;     // refinement-coverage overlay opacity [0,1]
 
 override W : u32;
 override H : u32;
@@ -221,7 +222,7 @@ fn fs_main(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> {
   // extra cost. Canvas output is unorm, so this saturates harmlessly in
   // already-bright (high-vorticity or solid-body) regions.
   if (slot >= 0) {
-    c += vec3(0.0, 0.22, 0.0);
+    c += vec3(0.0, 0.22, 0.0) * overlayOpacity;
   }
 
   // Blend with solid color

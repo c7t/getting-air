@@ -343,6 +343,18 @@ async function init() {
     };
   });
 
+  // Refinement-coverage (green) overlay opacity. Render-only; does not affect
+  // the simulation. Writing the uniform takes effect on the next frame.
+  const overlaySlider = document.getElementById('slider-overlay');
+  const overlayValEl = document.getElementById('val-overlay');
+  if (overlaySlider) {
+    overlaySlider.oninput = () => {
+      const v = parseFloat(overlaySlider.value);
+      overlayValEl.textContent = v.toFixed(2);
+      device.queue.writeBuffer(overlayOpacityBuf, 0, new Float32Array([v]));
+    };
+  }
+
   const [stepSM, frcSM, phySM, renSM, interpSM, step1SM, avgSM, criterionSM, manageSM] = await Promise.all([
     loadShader(device, 'shaders/amr_step.wgsl'),
     loadShader(device, 'shaders/amr_force.wgsl'),
@@ -374,7 +386,8 @@ async function init() {
     { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
     { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
     { binding: 2, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
-    { binding: 3, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } }
+    { binding: 3, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
+    { binding: 4, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } }
   ]});
 
   // Milestone 4: interp (coarse->fine ghosts), fine step, average (fine->coarse),
@@ -501,7 +514,9 @@ async function init() {
   const frcBG_b = device.createBindGroup({ layout: frcBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_b } }, { binding: 2, resource: { buffer: forceBuf } }]});
 
   const phyBG = device.createBindGroup({ layout: phyBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: forceBuf } }]});
-  const renBG = device.createBindGroup({ layout: renBGL, entries: [{ binding: 0, resource: { buffer: velBuf } }, { binding: 1, resource: { buffer: cardStateBuf } }, { binding: 2, resource: { buffer: finePoolVel } }, { binding: 3, resource: { buffer: blockSlotBuf } }]});
+  const overlayOpacityBuf = device.createBuffer({ size: 4, usage: U.UNIFORM | U.COPY_DST });
+  device.queue.writeBuffer(overlayOpacityBuf, 0, new Float32Array([1.0])); // overlay fully on by default
+  const renBG = device.createBindGroup({ layout: renBGL, entries: [{ binding: 0, resource: { buffer: velBuf } }, { binding: 1, resource: { buffer: cardStateBuf } }, { binding: 2, resource: { buffer: finePoolVel } }, { binding: 3, resource: { buffer: blockSlotBuf } }, { binding: 4, resource: { buffer: overlayOpacityBuf } }]});
 
   // Milestone 4 bind groups (pool-aware, superseding M2's single-region ones).
   // interp always WRITES finePoolF_a (the pool's current-at-macro-step-
