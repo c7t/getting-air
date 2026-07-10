@@ -142,14 +142,20 @@ async function main() {
   }
   await client.close();
 
-  console.log('\n%-6s %-24s %-22s %-22s', 'Re', 'regime', 'Cd (target ± tol)', 'St (target ± tol)');
+  // Node's console.log %s doesn't support printf-style width modifiers
+  // (%-6s prints literally, it doesn't left-pad) -- pad manually instead.
+  // padEnd(n) with a trailing space guarantees a separator even when a
+  // field (e.g. the "periodic vortex shedding..." regime string) overflows
+  // its target column width.
+  const pad = (s, n) => (String(s) + ' '.repeat(n)).slice(0, Math.max(String(s).length, n)) + ' ';
+  console.log('\n' + pad('Re', 6) + pad('regime', 24) + pad('Cd (target ± tol)', 22) + pad('St (target ± tol)', 22));
   let allPass = true;
   for (const r of results) {
     const cdStr = `${r.cd.measured.toFixed(3)} (${r.cd.target?.toFixed(3) ?? '-'} ± ${r.cd.tol ?? '-'}) ${r.cd.pass ? 'PASS' : 'FAIL'}`;
     const stStr = r.st.target == null
       ? 'n/a'
       : `${r.st.measured?.toFixed(4) ?? 'NONE'} (${r.st.target.toFixed(3)} ± ${r.st.tol}) ${r.st.pass ? 'PASS' : 'FAIL'}`;
-    console.log('%-6s %-24s %-22s %-22s', r.re, r.regime, cdStr, stStr);
+    console.log(pad(r.re, 6) + pad(r.regime, 24) + pad(cdStr, 22) + pad(stStr, 22));
     if (!r.cd.pass || !r.st.pass) allPass = false;
   }
   console.log(allPass ? '\nAll cases within tolerance.' : '\nSome cases OUT OF TOLERANCE -- see above.');
