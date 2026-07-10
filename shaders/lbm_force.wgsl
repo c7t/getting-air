@@ -92,9 +92,22 @@ fn main(
     let chi = get_chi(phi);
 
     if (chi >= 1e-6) {
+      // Pull-gather from upstream neighbors, matching lbm_step.wgsl's
+      // streaming step exactly. Reading f_in[cell] directly here (as this
+      // used to) computes rho/u* from the RAW pre-streaming buffer, which
+      // is a different macroscopic field from what lbm_step.wgsl uses for
+      // the Guo forcing term it actually injects into the fluid, anywhere
+      // there's a spatial gradient (i.e. exactly the boundary layer/wake
+      // region where chi > 0) -- so the force read back here for Cd/Cl (and
+      // fed to the rigid-body integration) wasn't the force actually being
+      // applied to the fluid.
       var rho = 0f; var ux_star = 0f; var uy_star = 0f;
       for (var i = 0u; i < 9u; i++) {
-        let fi = f_in[i * (W * H) + cell];
+        let wx_src = (x + W - u32(ex[i])) % W;
+        let wy_src = (y + H - u32(ey[i])) % H;
+        let bx_src = (wx_src + u32(state.off_x)) % W;
+        let by_src = (wy_src + u32(state.off_y)) % H;
+        let fi = f_in[i * (W * H) + (by_src * W + bx_src)];
         rho     += fi;
         ux_star += fi * f32(ex[i]);
         uy_star += fi * f32(ey[i]);
