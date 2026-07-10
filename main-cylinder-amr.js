@@ -36,9 +36,31 @@ const NCELLS1 = FB * FB;
 const MAX_FINE_BLOCKS = urlParams.has('maxFineBlocks') ? parseInt(urlParams.get('maxFineBlocks')) : 128;
 const NBX = W / BLOCK, NBY = H / BLOCK, NBLOCKS = NBX * NBY;
 
+// REFINE_THRESH/COARSEN_THRESH default to -6/-7 in main-amr.js (calibrated
+// for the falling-card scenario's vorticity scale). Retuned to -8/-9 here:
+// swept -6/-7 (18 active blocks, clustered on the body, Cd~1.60 at Re=100
+// vs a 1.35 literature target), -7/-8 (24-31 blocks, Cd~1.58), -8/-9 (62-75
+// blocks, Cd~1.48) with maxFineBlocks temporarily uncapped to see true
+// demand at each threshold before picking a default -- -8/-9 extends
+// refinement into the near wake (not just the body halo) and measurably
+// improves Cd, while peaking at ~75/128 pool slots (59% utilization), real
+// headroom below MAX_FINE_BLOCKS so amr_manage.wgsl's refine() shouldn't
+// hit its silent "pool exhausted this round -- stay coarse" fallback
+// (which would otherwise produce patchy, dispatch-order-dependent
+// refinement instead of a clean wake, with no error to signal it).
+//
+// Full validate-cylinder.js result at -8/-9: Re=100 Cd 1.590->1.482 (now
+// PASSES), Re=200 Cd 1.728->1.805 (WORSE, moved further from the 1.34
+// target), St unchanged at both Re (~0.13 vs 0.165 target at Re=100, ~0.15
+// vs 0.197 at Re=200) despite active blocks going from 18 to ~70 -- so
+// more wake refinement isn't the fix for St, and isn't a uniform win for
+// Cd either. Kept as the default anyway (net improvement, and the
+// regression is real information, not a reason to hide it) but the Re=200
+// regression needs its own investigation before assuming lower thresholds
+// are strictly better.
 const REFINE_EVERY = urlParams.has('refineEvery') ? parseInt(urlParams.get('refineEvery')) : 16;
-const REFINE_THRESH = urlParams.has('refineThresh') ? parseFloat(urlParams.get('refineThresh')) : -6;
-const COARSEN_THRESH = urlParams.has('coarsenThresh') ? parseFloat(urlParams.get('coarsenThresh')) : -7;
+const REFINE_THRESH = urlParams.has('refineThresh') ? parseFloat(urlParams.get('refineThresh')) : -8;
+const COARSEN_THRESH = urlParams.has('coarsenThresh') ? parseFloat(urlParams.get('coarsenThresh')) : -9;
 const FORCE_REFINE_MARGIN = urlParams.has('forceRefineMargin') ? parseFloat(urlParams.get('forceRefineMargin')) : 8;
 const FORCE_REFINE_LOOKAHEAD = urlParams.has('forceRefineLookahead') ? parseFloat(urlParams.get('forceRefineLookahead')) : REFINE_EVERY;
 
