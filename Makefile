@@ -29,7 +29,7 @@ JS      := $(wildcard *.js)
 .PHONY: help
 help: ## list targets
 	@grep -hE '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) \
-	  | awk 'BEGIN{FS=":.*## "}{printf "  make %-8s %s\n", $$1, $$2}'
+	  | awk 'BEGIN{FS=":.*## "}{printf "  make %-10s %s\n", $$1, $$2}'
 
 .PHONY: check
 check: js ## run all static checks (JS always; WGSL if naga is available)
@@ -66,3 +66,74 @@ js: ## syntax-check every JS module with `node --check`
 tools: ## install validation tools (naga-cli via cargo; needs Rust)
 	@command -v cargo >/dev/null 2>&1 || { echo "need Rust/cargo to install naga-cli -- see https://rustup.rs"; exit 1; }
 	cargo install naga-cli --version '^$(NAGA_VERSION)' --locked
+
+# --- Publishing / release --------------------------------------------------
+# These targets talk to GitHub via `gh` and ALWAYS act on your own `origin`
+# remote -- derived from the remote URL, NOT `gh repo view` (which resolves a
+# fork to its PARENT and would make you operate on the wrong repo). So `make
+# publish` publishes whichever repo you cloned from: run by the maintainer it
+# publishes the canonical site; run by a fork owner it publishes their fork.
+# The validation targets above need no network and no gh; only these do.
+
+# Minimum major version of gh we rely on (Pages API + `gh auth status`).
+MIN_GH_MAJOR := 2
+
+# origin owner/repo from the remote URL (handles https and ssh forms).
+ORIGIN_SLUG := $(shell git remote get-url origin 2>/dev/null | sed -E 's#(git@|https://)([^/:]+)[/:]##; s#\.git$$##')
+
+.PHONY: require-gh
+require-gh: ## check GitHub CLI (gh) is installed, current, and authenticated
+	@command -v gh >/dev/null 2>&1 || { \
+	  echo "gh (GitHub CLI) is not installed -- needed for 'make publish'/'make status'."; \
+	  echo "  install: https://github.com/cli/cli#installation"; \
+	  echo "           (e.g. 'brew install gh', 'sudo apt install gh', 'sudo dnf install gh')"; \
+	  exit 1; }
+	@have=$$(gh --version | sed -n 's/^gh version \([0-9]*\).*/\1/p'); \
+	  if [ "$${have:-0}" -lt $(MIN_GH_MAJOR) ]; then \
+	    echo "gh is too old (found v$$have, need v$(MIN_GH_MAJOR)+) -- please update it."; \
+	    echo "  update: https://github.com/cli/cli#installation"; \
+	    exit 1; fi
+	@gh auth status >/dev/null 2>&1 || { \
+	  echo "gh is installed but not signed in."; \
+	  echo "  run: gh auth login"; \
+	  exit 1; }
+
+.PHONY: status
+status: ## show origin repo, current branch, and what is published (Pages)
+	@echo "origin:  $(ORIGIN_SLUG)"
+	@echo "branch:  $$(git rev-parse --abbrev-ref HEAD)"
+	@echo "HEAD:    $$(git rev-parse --short HEAD)  $$(git log -1 --format=%s)"
+	@if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then \
+	  pb=$$(gh api "repos/$(ORIGIN_SLUG)/pages" --jq .source.branch 2>/dev/null); \
+	  pu=$$(gh api "repos/$(ORIGIN_SLUG)/pages" --jq .html_url 2>/dev/null); \
+	  if [ -n "$$pb" ]; then echo "pages:   branch '$$pb'  ->  $$pu"; \
+	  else echo "pages:   not configured for $(ORIGIN_SLUG)"; fi; \
+	else \
+	  echo "pages:   (install & sign in to gh to show what's published -- 'make require-gh')"; \
+	fi
+
+.PHONY: publish
+publish: require-gh check ## publish current branch to origin's Pages branch (release)
+	@slug="$(ORIGIN_SLUG)"; \
+	pb=$$(gh api "repos/$$slug/pages" --jq .source.branch 2>/dev/null); \
+	pu=$$(gh api "repos/$$slug/pages" --jq .html_url 2>/dev/null); \
+	cur=$$(git rev-parse --abbrev-ref HEAD); \
+	if [ -z "$$pb" ]; then echo "no GitHub Pages configured for $$slug -- set Settings > Pages first"; exit 1; fi; \
+	if [ "$$pb" = "$$cur" ]; then \
+	  echo "Pages serves the current branch ('$$pb') directly -- every push is already live; nothing to publish."; exit 0; fi; \
+	if [ -n "$$(git status --porcelain)" ]; then echo "working tree not clean -- commit or stash first"; exit 1; fi; \
+	src=$$(git rev-parse HEAD); short=$$(git rev-parse --short HEAD); \
+	remote_pb=$$(git ls-remote origin "refs/heads/$$pb" 2>/dev/null | cut -f1); \
+	if [ "$$remote_pb" = "$$src" ]; then echo "already published: $$slug@$$pb is at $$short"; exit 0; fi; \
+	force=""; \
+	if [ -n "$$remote_pb" ] && ! git merge-base --is-ancestor "$$remote_pb" "$$src" 2>/dev/null; then \
+	  if [ "$$FORCE" != "1" ]; then \
+	    echo "'$$pb' has commits not contained in $$cur (diverged)."; \
+	    echo "  reconcile, or re-run with FORCE=1 to overwrite."; exit 1; fi; \
+	  force="--force"; fi; \
+	echo "publish $$short ($$(git log -1 --format=%s))  ->  $$slug@$$pb"; \
+	echo "        live at: $$pu"; \
+	if [ "$$DRYRUN" = "1" ]; then echo "DRYRUN: would run 'git push $$force origin HEAD:refs/heads/$$pb'"; exit 0; fi; \
+	if [ "$$CONFIRM" != "1" ]; then printf "proceed? [y/N] "; read -r ans; case "$$ans" in y|Y) ;; *) echo "aborted."; exit 1;; esac; fi; \
+	git push $$force origin "HEAD:refs/heads/$$pb"; \
+	echo "published $$short -> $$slug@$$pb ; Pages rebuilds in ~1 min: $$pu"
