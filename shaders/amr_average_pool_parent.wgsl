@@ -20,7 +20,9 @@ struct LevelParams {
   nby: u32,        // cellIndex() lookup) -- shared verbatim with the interp/
                    // step1 pool-parent shaders' uniform, not a near-duplicate.
   parentTau: f32,
-  _pad: f32,
+  dxL: f32,        // also unused here -- see amr_interp_pool_parent.wgsl's
+                   // comment; real field, not padding (amr_force1_pool.wgsl
+                   // reads it from this same per-level buffer).
 }
 
 @group(0) @binding(0) var<uniform>             levelParams   : LevelParams;

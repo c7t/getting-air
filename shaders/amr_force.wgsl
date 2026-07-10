@@ -3,6 +3,17 @@
 // Milestone 1 (plans/AMR.md): block-major buffer layout, same rationale and
 // derivation as amr_step.wgsl's file header -- dispatch over buffer-space
 // coordinates, derive window coordinates per-thread for the card SDF.
+//
+// Milestone 8 (plans/AMR-multilevel.md): finest-wins masking. `average`
+// keeps a parent's cells populated (if coarser) under an active child, so
+// summing every level's force pass unconditionally would double-count the
+// same physical drag -- once crudely here at L0, once accurately at L1's
+// own force pass (amr_force1.wgsl). Refinement is always whole-block
+// (never partial -- decision 3's quad granularity, and L0->L1's own
+// footprint-preserving 1:1 relationship), so the skip is a per-BLOCK
+// check, not per-cell: if blockSlot1[this cell's block] is active, an L1
+// tile already covers this block's ENTIRE footprint more accurately, so
+// this pass contributes nothing for any cell in it.
 
 struct CardState {
   cx     : f32,
@@ -33,9 +44,10 @@ struct CardState {
   off_y_old : f32,
 }
 
-@group(0) @binding(0) var<storage, read>       state  : CardState;
-@group(0) @binding(1) var<storage, read>       f_in   : array<f32>;
-@group(0) @binding(2) var<storage, read_write> forces : array<atomic<i32>, 4>;
+@group(0) @binding(0) var<storage, read>       state      : CardState;
+@group(0) @binding(1) var<storage, read>       f_in       : array<f32>;
+@group(0) @binding(2) var<storage, read_write> forces     : array<atomic<i32>, 4>;
+@group(0) @binding(3) var<storage, read>       blockSlot1 : array<i32>; // level 1's own blockSlot -- see header
 
 override W : u32;
 override H : u32;
@@ -99,50 +111,58 @@ fn main(
   var tz_body = 0.0f;
 
   if (cx < W && cy < H) {
-    let wx   = (cx + W - u32(state.off_x)) % W;
-    let wy   = (cy + H - u32(state.off_y)) % H;
-    let cell = cellIndex(cx, cy);
-    let p    = vec2<f32>(f32(wx), f32(wy));
+    // Finest-wins masking (see header): skip this cell's whole block if L1
+    // already covers it.
+    let nbx1 = W / BLOCK;
+    let blockID1 = (cy / BLOCK) * nbx1 + (cx / BLOCK);
+    let coveredByFiner = blockSlot1[blockID1] >= 0;
 
-    let phi = get_phi(p, state);
-    let chi = get_chi(phi);
+    if (!coveredByFiner) {
+      let wx   = (cx + W - u32(state.off_x)) % W;
+      let wy   = (cy + H - u32(state.off_y)) % H;
+      let cell = cellIndex(cx, cy);
+      let p    = vec2<f32>(f32(wx), f32(wy));
 
-    if (chi >= 1e-6) {
-      // Pull-gather from buffer-space neighbors, matching amr_step.wgsl's
-      // streaming step exactly (see that file's header for the buffer-space
-      // vs window-space derivation). Reading f_in[cell] directly here (as
-      // this used to) computes rho/u* from the RAW pre-streaming buffer,
-      // a different macroscopic field from what amr_step.wgsl uses for the
-      // Guo forcing term it actually injects into the fluid, anywhere
-      // there's a spatial gradient -- i.e. exactly the boundary layer/wake
-      // region where chi > 0 (see the equivalent lbm_force.wgsl fix).
-      var rho = 0f; var ux_star = 0f; var uy_star = 0f;
-      for (var i = 0u; i < 9u; i++) {
-        let bx_src = (cx + W - u32(ex[i])) % W;
-        let by_src = (cy + H - u32(ey[i])) % H;
-        let fi = f_in[i * (W * H) + cellIndex(bx_src, by_src)];
-        rho     += fi;
-        ux_star += fi * f32(ex[i]);
-        uy_star += fi * f32(ey[i]);
+      let phi = get_phi(p, state);
+      let chi = get_chi(phi);
+
+      if (chi >= 1e-6) {
+        // Pull-gather from buffer-space neighbors, matching amr_step.wgsl's
+        // streaming step exactly (see that file's header for the buffer-space
+        // vs window-space derivation). Reading f_in[cell] directly here (as
+        // this used to) computes rho/u* from the RAW pre-streaming buffer,
+        // a different macroscopic field from what amr_step.wgsl uses for the
+        // Guo forcing term it actually injects into the fluid, anywhere
+        // there's a spatial gradient -- i.e. exactly the boundary layer/wake
+        // region where chi > 0 (see the equivalent lbm_force.wgsl fix).
+        var rho = 0f; var ux_star = 0f; var uy_star = 0f;
+        for (var i = 0u; i < 9u; i++) {
+          let bx_src = (cx + W - u32(ex[i])) % W;
+          let by_src = (cy + H - u32(ey[i])) % H;
+          let fi = f_in[i * (W * H) + cellIndex(bx_src, by_src)];
+          rho     += fi;
+          ux_star += fi * f32(ex[i]);
+          uy_star += fi * f32(ey[i]);
+        }
+        ux_star /= max(rho, 1e-6f); uy_star /= max(rho, 1e-6f); // NaN-containment floor
+
+        // Local solid velocity Us
+        var rx = p.x - state.cx;
+        var ry = p.y - state.cy;
+        rx -= f32(W) * round(rx / f32(W));
+        ry -= f32(H) * round(ry / f32(H));
+        let usx = state.vx - state.omega * ry;
+        let usy = state.vy + state.omega * rx;
+
+        // Penalty Force F = rho * chi * (Us - u*)
+        let Fx = rho * chi * (usx - ux_star);
+        let Fy = rho * chi * (usy - uy_star);
+
+        // Integrate NEGATIVE of penalty force onto body
+        fx_body = -Fx;
+        fy_body = -Fy;
+        tz_body = rx * fy_body - ry * fx_body;
       }
-      ux_star /= max(rho, 1e-6f); uy_star /= max(rho, 1e-6f); // NaN-containment floor
-
-      // Local solid velocity Us
-      var rx = p.x - state.cx;
-      var ry = p.y - state.cy;
-      rx -= f32(W) * round(rx / f32(W));
-      ry -= f32(H) * round(ry / f32(H));
-      let usx = state.vx - state.omega * ry;
-      let usy = state.vy + state.omega * rx;
-
-      // Penalty Force F = rho * chi * (Us - u*)
-      let Fx = rho * chi * (usx - ux_star);
-      let Fy = rho * chi * (usy - uy_star);
-
-      // Integrate NEGATIVE of penalty force onto body
-      fx_body = -Fx;
-      fy_body = -Fy;
-      tz_body = rx * fy_body - ry * fx_body;
     }
   }
 

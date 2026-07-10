@@ -49,7 +49,10 @@ struct LevelParams {
   nbx: u32,
   nby: u32,
   parentTau: f32,
-  _pad: f32,
+  dxL: f32, // this level's own grid spacing in L0-buffer-space units --
+            // unused here (no epsilon/geometry math in this shader), but
+            // real (not padding): Milestone 8's amr_force1_pool.wgsl reads
+            // it from this SAME per-level buffer, hence the shared name.
 }
 
 @group(0) @binding(0) var<uniform>             levelParams    : LevelParams;

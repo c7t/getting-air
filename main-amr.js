@@ -301,7 +301,27 @@ function allocLevelPool(device, U, m, NBX_m, NBY_m, maxFineBlocks) {
     // shaders/amr_step1_pool.wgsl's header.
     pool.originXBuf = device.createBuffer({ size: maxFineBlocks * 4, usage: U.STORAGE | U.COPY_DST });
     pool.originYBuf = device.createBuffer({ size: maxFineBlocks * 4, usage: U.STORAGE | U.COPY_DST });
+    // parentSlot has no meaningful "unset" value read anywhere unless
+    // slotToBlock already says active (initialized below) -- 0 is harmless
+    // filler, not a correctness requirement, so left at WebGPU's own
+    // zero-initialized default.
   }
+  // BUGFIX: WebGPU zero-initializes new buffers by default -- 0 is a VALID
+  // slot/blockID, not "unassigned" (that's -1, this pool's own convention
+  // throughout). Every debug/reset path (resetSim, debugSnapshotLoad) was
+  // careful to explicitly (re)write -1 before this milestone, but nothing
+  // wrote it at bare ALLOCATION time for levels >=2 -- level 1 got it from
+  // an explicit caller-side write (main-amr.js's init(), right after the
+  // pools loop), but that was never generalized to every level. Exposed by
+  // Milestone 8: with N_LEVELS>=3, a fresh page load (no explicit
+  // AMR.reset() call) left level 2's entire pool looking "active, slot 0"
+  // from frame 1 -- every slot's own force/step/average pass then ran for
+  // real, all racing to write the SAME parent location (parentSlot also
+  // defaulted to 0). Fixed at the source (every level, not just level 1)
+  // rather than special-cased, so this can't recur if a future level's
+  // caller-side init is ever forgotten again.
+  device.queue.writeBuffer(pool.blockSlotBuf, 0, new Int32Array(NBLOCKS_m).fill(-1));
+  device.queue.writeBuffer(pool.slotToBlockBuf, 0, new Int32Array(maxFineBlocks).fill(-1));
   return pool;
 }
 
@@ -389,6 +409,14 @@ async function init() {
   const f_b     = device.createBuffer({ size: fSize, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
   const velBuf  = device.createBuffer({ size: NCELLS * 2 * 4, usage: U.STORAGE | U.COPY_SRC });
   const forceBuf = device.createBuffer({ size: 16, usage: U.STORAGE | U.COPY_SRC | U.COPY_DST });
+  // Milestone 8: harmless placeholder for a "child level's blockSlot"
+  // binding when no such level actually exists in this configuration (the
+  // deepest configured level's own force pass still needs SOMETHING bound
+  // there, even though its hasChild/HAS_CHILD gate means it's never read).
+  // A single -1 entry is enough -- masking logic only ever indexes it when
+  // hasChild is true, which is never the case for whoever binds this.
+  const dummyBlockSlotBuf = device.createBuffer({ size: 4, usage: U.STORAGE | U.COPY_DST });
+  device.queue.writeBuffer(dummyBlockSlotBuf, 0, new Int32Array([-1]));
 
   // CardState: 26 floats = 104 bytes
   const cardStateBuf = device.createBuffer({ size: 104, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
@@ -419,28 +447,42 @@ async function init() {
 
   device.queue.writeBuffer(cardStateBuf, 0, initCardState());
   device.queue.writeBuffer(f_a, 0, initF());
-  // pools[1].finePoolF_a's equilibrium pre-fill already happened above, in
-  // the allocation loop (uniformly for every level, not just level 1).
-  device.queue.writeBuffer(pools[1].blockSlotBuf, 0, new Int32Array(NBLOCKS).fill(-1));
-  device.queue.writeBuffer(pools[1].slotToBlockBuf, 0, new Int32Array(MAX_FINE_BLOCKS).fill(-1));
+  // pools[1].finePoolF_a's equilibrium pre-fill, and blockSlotBuf/
+  // slotToBlockBuf's -1 fill, already happened above in allocLevelPool
+  // (uniformly for every level, not just level 1 -- see its own comment).
   device.queue.writeBuffer(pools[1].freeListBuf, 0, new Int32Array(MAX_FINE_BLOCKS).map((_, i) => i));
   device.queue.writeBuffer(pools[1].freeCountBuf, 0, new Int32Array([MAX_FINE_BLOCKS]));
 
-  // Milestone 6: per-child-level uniform for amr_interp_pool_parent.wgsl's
-  // LevelParams (this level's own NBX/NBY + its parent's tau). Only levels
-  // >=2 need one -- level 1's parent is the dense L0 grid, addressed via
-  // the dense shader's own CardState.tau read, not this uniform.
+  // Milestone 6/8: per-level uniform (LevelParams) for every level>=2's
+  // pool-parent interp/average/step1/force shaders. Layout: {nbx:u32,
+  // nby:u32, parentTau:f32, dxL:f32, hasChild:u32, _pad1:u32, _pad2:u32,
+  // _pad3:u32} = 32 bytes -- interp/average/step1_pool only declare the
+  // first 4 fields (16 bytes) in their own WGSL struct, which is a valid
+  // prefix of this same buffer; amr_force1_pool.wgsl (Milestone 8) is the
+  // only reader of hasChild, so it declares the full 8-field struct. Only
+  // levels >=2 need one -- level 1's parent is the dense L0 grid, addressed
+  // via the dense shader's own CardState.tau read, not this uniform (its
+  // OWN force pass, amr_force1.wgsl, gets a much smaller dedicated buffer --
+  // see below).
+  //
+  // Split into a one-time static write (nbx/nby/dxL/hasChild -- fixed for
+  // the whole session, geometric/topological, never change) and
+  // updateLevelParams() below (parentTau only -- the one field that
+  // actually moves, when the TAU slider changes).
   for (let c = 2; c < N_LEVELS; c++) {
-    pools[c].levelParamsBuf = device.createBuffer({ size: 16, usage: U.UNIFORM | U.COPY_DST });
+    const pool = pools[c];
+    pool.levelParamsBuf = device.createBuffer({ size: 32, usage: U.UNIFORM | U.COPY_DST });
+    const staticBuf = new ArrayBuffer(32);
+    const staticDv = new DataView(staticBuf);
+    staticDv.setUint32(0, pool.NBX, true);
+    staticDv.setUint32(4, pool.NBY, true);
+    staticDv.setFloat32(12, cellSizeL0AtLevel(c), true);
+    staticDv.setUint32(16, (c + 1) < N_LEVELS ? 1 : 0, true); // does LEVEL c itself have a child?
+    device.queue.writeBuffer(pool.levelParamsBuf, 0, staticBuf);
   }
   function updateLevelParams() {
     for (let c = 2; c < N_LEVELS; c++) {
-      const buf = new ArrayBuffer(16);
-      const dv = new DataView(buf);
-      dv.setUint32(0, pools[c].NBX, true);
-      dv.setUint32(4, pools[c].NBY, true);
-      dv.setFloat32(8, tauAtLevel(c - 1), true); // level c's parent is level c-1
-      device.queue.writeBuffer(pools[c].levelParamsBuf, 0, buf);
+      device.queue.writeBuffer(pools[c].levelParamsBuf, 8, new Float32Array([tauAtLevel(c - 1)])); // level c's parent is level c-1
     }
   }
   updateLevelParams();
@@ -483,7 +525,7 @@ async function init() {
     };
   }
 
-  const [stepSM, frcSM, phySM, renSM, interpDenseSM, interpPoolSM, step1SM, step1PoolSM, avgSM, avgPoolSM, criterionSM, manageSM] = await Promise.all([
+  const [stepSM, frcSM, phySM, renSM, interpDenseSM, interpPoolSM, step1SM, step1PoolSM, avgSM, avgPoolSM, criterionSM, manageSM, force1SM, force1PoolSM] = await Promise.all([
     loadShader(device, 'shaders/amr_step.wgsl'),
     loadShader(device, 'shaders/amr_force.wgsl'),
     loadShader(device, 'shaders/amr_physics.wgsl'),
@@ -502,6 +544,10 @@ async function init() {
     loadShader(device, 'shaders/amr_average_pool_parent.wgsl'),
     loadShader(device, 'shaders/amr_criterion.wgsl'),
     loadShader(device, 'shaders/amr_manage.wgsl'),
+    // Milestone 8: per-level force/torque integration, same dense/pool
+    // addressing split as everything else -- see amr_force1.wgsl's header.
+    loadShader(device, 'shaders/amr_force1.wgsl'),
+    loadShader(device, 'shaders/amr_force1_pool.wgsl'),
   ]);
 
   const stepBGL = device.createBindGroupLayout({ label: 'stepBGL', entries: [
@@ -510,10 +556,13 @@ async function init() {
     { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
     { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }
   ]});
+  // Milestone 8: binding 3 (blockSlot1) is the finest-wins masking check --
+  // see amr_force.wgsl's header.
   const frcBGL = device.createBindGroupLayout({ label: 'frcBGL', entries: [
     { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }
+    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }
   ]});
   const phyBGL = device.createBindGroupLayout({ label: 'phyBGL', entries: [
     { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
@@ -615,6 +664,29 @@ async function init() {
     { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }
   ]});
+  // Milestone 8: level 1's own force pass. Binding 4 (childBlockSlot) is
+  // level 2's blockSlot when HAS_CHILD=1, or a harmless dummy buffer when
+  // HAS_CHILD=0 (N_LEVELS==2) -- see amr_force1.wgsl's header.
+  const force1BGL = device.createBindGroupLayout({ label: 'force1BGL', entries: [
+    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }
+  ]});
+  // Milestone 8: level>=2's own force pass, one pipeline shared across every
+  // such level (hasChild is a runtime LevelParams field here, not a
+  // compile-time override -- see amr_force1_pool.wgsl's header).
+  const force1PoolBGL = device.createBindGroupLayout({ label: 'force1PoolBGL', entries: [
+    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+    { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }
+  ]});
 
   const constants = { W, H };
   const fineConstants = { W, H, RB };
@@ -707,6 +779,21 @@ async function init() {
     layout: device.createPipelineLayout({ bindGroupLayouts: [avgPoolBGL] }),
     compute: { module: avgPoolSM, entryPoint: 'main', constants: { RB } }
   });
+  // Milestone 8: level 1's own force pass. HAS_CHILD is baked in at
+  // pipeline-creation time -- level 1 has exactly one dedicated pipeline
+  // (not shared across levels), so whether level 2 exists is fixed for the
+  // whole session (see amr_force1.wgsl's header).
+  const force1PL = device.createComputePipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [force1BGL] }),
+    compute: { module: force1SM, entryPoint: 'main', constants: { W, H, RB, HAS_CHILD: N_LEVELS > 2 ? 1 : 0 } }
+  });
+  // Milestone 8: level>=2's own force pass, one pipeline reused across
+  // every such level (no per-level overrides -- hasChild/dxL are runtime
+  // LevelParams reads, see amr_force1_pool.wgsl's header).
+  const force1PoolPL = device.createComputePipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [force1PoolBGL] }),
+    compute: { module: force1PoolSM, entryPoint: 'main', constants: { W, H, RB } }
+  });
   const criterionPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [criterionBGL] }),
     compute: { module: criterionSM, entryPoint: 'main', constants: criterionConstants }
@@ -727,8 +814,8 @@ async function init() {
   const stepBG_ab = device.createBindGroup({ layout: stepBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_a } }, { binding: 2, resource: { buffer: f_b } }, { binding: 3, resource: { buffer: velBuf } }]});
   const stepBG_ba = device.createBindGroup({ layout: stepBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_b } }, { binding: 2, resource: { buffer: f_a } }, { binding: 3, resource: { buffer: velBuf } }]});
 
-  const frcBG_a = device.createBindGroup({ layout: frcBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_a } }, { binding: 2, resource: { buffer: forceBuf } }]});
-  const frcBG_b = device.createBindGroup({ layout: frcBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_b } }, { binding: 2, resource: { buffer: forceBuf } }]});
+  const frcBG_a = device.createBindGroup({ layout: frcBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_a } }, { binding: 2, resource: { buffer: forceBuf } }, { binding: 3, resource: { buffer: pools[1].blockSlotBuf } }]});
+  const frcBG_b = device.createBindGroup({ layout: frcBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_b } }, { binding: 2, resource: { buffer: forceBuf } }, { binding: 3, resource: { buffer: pools[1].blockSlotBuf } }]});
 
   const phyBG = device.createBindGroup({ layout: phyBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: forceBuf } }]});
   const overlayOpacityBuf = device.createBuffer({ size: 4, usage: U.UNIFORM | U.COPY_DST });
@@ -832,7 +919,36 @@ async function init() {
     ];
     childPool.avgPoolBG_targetA = device.createBindGroup({ layout: avgPoolBGL, entries: avgEntries(parentPool.finePoolF_a) });
     childPool.avgPoolBG_targetB = device.createBindGroup({ layout: avgPoolBGL, entries: avgEntries(parentPool.finePoolF_b) });
+
+    // Milestone 8: level c's own force pass. childBlockSlot is level c+1's
+    // blockSlot if it exists in this configuration, else the dummy --
+    // matches this level's own levelParams.hasChild value written above.
+    const childBlockSlotBuf = (c + 1 < N_LEVELS) ? pools[c + 1].blockSlotBuf : dummyBlockSlotBuf;
+    childPool.force1PoolBG = device.createBindGroup({ layout: force1PoolBGL, entries: [
+      { binding: 0, resource: { buffer: cardStateBuf } },
+      { binding: 1, resource: { buffer: childPool.finePoolF_a } },
+      { binding: 2, resource: { buffer: forceBuf } },
+      { binding: 3, resource: { buffer: childPool.slotToBlockBuf } },
+      { binding: 4, resource: { buffer: childPool.originXBuf } },
+      { binding: 5, resource: { buffer: childPool.originYBuf } },
+      { binding: 6, resource: { buffer: childPool.levelParamsBuf } },
+      { binding: 7, resource: { buffer: childBlockSlotBuf } },
+    ]});
   }
+
+  // Milestone 8: level 1's own force pass. Always reads pools[1].finePoolF_a
+  // -- level 1's own buffer is always "current" (_a) at a macro-step
+  // boundary, before S_Advance runs (see Milestone 7's own invariant), so
+  // no ping-pong variant is needed here (unlike frcBG_a/frcBG_b, which DOES
+  // depend on the persistent, cross-macro-step `useB` flag for L0's OWN
+  // buffer choice).
+  const force1BG = device.createBindGroup({ layout: force1BGL, entries: [
+    { binding: 0, resource: { buffer: cardStateBuf } },
+    { binding: 1, resource: { buffer: pools[1].finePoolF_a } },
+    { binding: 2, resource: { buffer: forceBuf } },
+    { binding: 3, resource: { buffer: pools[1].slotToBlockBuf } },
+    { binding: 4, resource: { buffer: N_LEVELS > 2 ? pools[2].blockSlotBuf : dummyBlockSlotBuf } },
+  ]});
 
   const error = await device.popErrorScope();
   if (error) { handleErr(error); return; }
@@ -1176,6 +1292,17 @@ async function init() {
     // AGAL's own S_ComputeForces* calls, handled alongside S_Advance, not
     // inside it).
     const frc = enc.beginComputePass(); frc.setPipeline(frcPL); frc.setBindGroup(0, frcBG); frc.dispatchWorkgroups(WGX, WGY); frc.end();
+    // Milestone 8: every level's own force contribution, all before `phy`
+    // drains+resets the shared atomic forces[] buffer. Order among these
+    // (and vs. frc above) doesn't matter -- each reads only its own
+    // level's "current, pre-macro-step" state and independently atomicAdds
+    // into forces[], the same commutativity argument as interp-vs-step at
+    // the root of S_Advance.
+    const f1frc = enc.beginComputePass(); f1frc.setPipeline(force1PL); f1frc.setBindGroup(0, force1BG); f1frc.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); f1frc.end();
+    for (let c = 2; c < N_LEVELS; c++) {
+      const pool = pools[c];
+      const p = enc.beginComputePass(); p.setPipeline(force1PoolPL); p.setBindGroup(0, pool.force1PoolBG); p.dispatchWorkgroups(WGX1, WGY1, pool.MAX_FINE_BLOCKS); p.end();
+    }
     const phy = enc.beginComputePass(); phy.setPipeline(phyPL); phy.setBindGroup(0, phyBG); phy.dispatchWorkgroups(1); phy.end();
 
     S_Advance(0, enc);
