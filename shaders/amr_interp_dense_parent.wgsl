@@ -4,6 +4,15 @@
 // whichever of MAX_FINE_BLOCKS pool slots are currently assigned to a
 // coarse block (slotToBlock[slot] != -1).
 //
+// Milestone 6 (plans/AMR-multilevel.md/-M5.md): renamed from
+// amr_interp_c2f.wgsl, logic UNCHANGED -- this is now specifically the
+// L0->L1 case (the "dense parent" side of the two-shader addressing
+// split), since the parent here is the dense, cellIndex()-addressed L0
+// buffer. Every deeper hop (L(m)->L(m+1), m>=1, parent is itself a pool
+// tile) uses the sibling shader shaders/amr_interp_pool_parent.wgsl
+// instead, which shares this file's interpolation math but sources the
+// "coarse" sample from a parent pool slot instead of a coarse buffer cell.
+//
 // Dispatched over (tileX, tileY, slot) -- the Z dimension selects pool
 // slot, so cost scales with pool CAPACITY, not domain size (see
 // plans/AMR.md's Milestone 4 design note on why this dispatch shape is the
