@@ -127,6 +127,12 @@ override COARSEN_THRESH : f32;
 override FORCE_REFINE_MARGIN : f32;
 override FORCE_REFINE_LOOKAHEAD : f32;
 override HAS_LEVEL2 : u32 = 0u;
+// L0 window-space edge band (coarse cells) excluded from vorticity-driven
+// refinement -- keeps fine blocks out of the ALBC sponge (amr_step.wgsl
+// SPONGE_W=4). Default 0 disables it; the JS default is 8. Preserves
+// isNearBody (the body is window-centered, never in the edge band) and the
+// 2:1-balance cascade, gating only the vorticity (epsFor) term.
+override SPONGE_EXCLUDE_W : f32 = 0.0f;
 const BLOCK = 8u;
 const EPS_FLOOR = 1e-6f;
 
@@ -186,6 +192,23 @@ fn isNearBody(blockID: u32) -> bool {
   return min(phi_now, phi_future) < FORCE_REFINE_MARGIN;
 }
 
+// True if blockID's center lies within SPONGE_EXCLUDE_W (coarse cells) of any
+// window edge, i.e. inside/near the ALBC sponge band (amr_step.wgsl SPONGE_W).
+// Window-space conversion mirrors isNearBody exactly. Gated off when
+// SPONGE_EXCLUDE_W <= 0 (the JS default is 8, ?spongeExclude=0 disables it).
+fn inSpongeBand(blockID: u32) -> bool {
+  if (SPONGE_EXCLUDE_W <= 0.0f) { return false; }
+  let nbx = W / BLOCK;
+  let bx = blockID % nbx; let by = blockID / nbx;
+  let cx_buf = bx * BLOCK + BLOCK / 2u;
+  let cy_buf = by * BLOCK + BLOCK / 2u;
+  let wx = (cx_buf + W - u32(state.off_x)) % W;
+  let wy = (cy_buf + H - u32(state.off_y)) % H;
+  let distX = min(f32(wx), f32(W - wx));
+  let distY = min(f32(wy), f32(H - wy));
+  return min(distX, distY) < SPONGE_EXCLUDE_W;
+}
+
 // True if the L1 tile at `blockID1` currently has an active level-2 child
 // (quadrant 0 stands for all 4 -- decision 3's all-or-nothing invariant).
 fn hasLevel2Child(blockID1: u32) -> bool {
@@ -217,7 +240,7 @@ fn coarsen(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (blockID >= nblocks) { return; }
 
   let currentSlot = blockSlot[blockID];
-  if (epsFor(blockID) < COARSEN_THRESH && currentSlot >= 0 && !isNearBody(blockID)) {
+  if ((epsFor(blockID) < COARSEN_THRESH || inSpongeBand(blockID)) && currentSlot >= 0 && !isNearBody(blockID)) {
     // Milestone 9: can't release a tile that's still a parent, or whose
     // release would leave a neighbor's level-2 child directly adjacent to
     // a level-0-only region -- see this file's header.
@@ -257,7 +280,7 @@ fn refine(@builtin(global_invocation_id) gid: vec3<u32>) {
       if (blockSlot[neighbors[i]] >= 0 && hasLevel2Child(neighbors[i])) { cascadeWanted = true; }
     }
   }
-  if ((epsFor(blockID) >= REFINE_THRESH || isNearBody(blockID) || cascadeWanted) && currentSlot < 0) {
+  if (((epsFor(blockID) >= REFINE_THRESH && !inSpongeBand(blockID)) || isNearBody(blockID) || cascadeWanted) && currentSlot < 0) {
     let oldCount = atomicSub(&freeCount, 1);
     if (oldCount > 0) {
       let slot = freeList[u32(oldCount - 1)];
