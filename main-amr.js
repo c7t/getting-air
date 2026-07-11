@@ -406,16 +406,18 @@ async function init() {
     statusEl.textContent = `error: ${W}x${H} needs a ${mib(neededBufferBytes)} MiB buffer binding, this GPU's max is ${mib(adapter.limits.maxStorageBufferBindingSize)} MiB`;
     return;
   }
-  // Milestone 9: shaders/amr_manage_pool.wgsl needs 15 storage bindings in
+  // Milestone 9: shaders/amr_manage_pool.wgsl needs 16 storage bindings in
   // one bind group (childCriterion/blockSlot/slotToBlock/freeList/
   // freeCount/newlyActivated/state/parentSlot/quadrant/originX/originY,
-  // plus 4 parent-level read-only mirrors for the 2:1-balance neighbor
-  // checks) -- past the WebGPU spec-MINIMUM maxStorageBuffersPerShaderStage
+  // 4 parent-level read-only mirrors for the 2:1-balance neighbor checks,
+  // plus 1 grandchild-level read-only mirror (grandchildBlockSlot) added
+  // for the N>=4 2:1-balance cascade fix -- see managePoolBGL's own
+  // comment) -- past the WebGPU spec-MINIMUM maxStorageBuffersPerShaderStage
   // of 8 (already the exact ceiling several existing 8-binding layouts sit
   // at, e.g. step1PoolBGL), same "spec minimum, not a real GPU limit"
   // situation as maxStorageBufferBindingSize above. Same treatment: request
-  // what's needed, capped at the adapter's real capability, fail loud
-  // (not a cryptic validation error) if this GPU genuinely can't do it.
+  // what's needed, capped at the adapter's real capability, fail loud (not
+  // a cryptic validation error) if this GPU genuinely can't do it.
   const NEEDED_STORAGE_BUFFERS_PER_STAGE = 16;
   if (NEEDED_STORAGE_BUFFERS_PER_STAGE > adapter.limits.maxStorageBuffersPerShaderStage) {
     statusEl.textContent = `error: needs ${NEEDED_STORAGE_BUFFERS_PER_STAGE} storage buffers per shader stage, this GPU's max is ${adapter.limits.maxStorageBuffersPerShaderStage}`;
@@ -726,7 +728,12 @@ async function init() {
     { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }
   ]});
   // Milestone 9: quad allocator + 2:1 balance for any level-(m+1) decision,
-  // parent=level m>=1 -- see amr_manage_pool.wgsl's header.
+  // parent=level m>=1 -- see amr_manage_pool.wgsl's header. 16 bindings
+  // (15 original + grandchildBlockSlot, added for the N>=4 2:1-balance
+  // cascade fix -- both refine() and coarsen() only ever need EXISTENCE,
+  // never level (m+2)'s criterion, so one shared buffer/layout covers
+  // both) -- exactly this adapter's real maxStorageBuffersPerShaderStage,
+  // not just the WebGPU spec minimum other buffer limits in this file hit.
   const managePoolBGL = device.createBindGroupLayout({ label: 'managePoolBGL', entries: [
     { binding: 0,  visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 1,  visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
@@ -742,7 +749,8 @@ async function init() {
     { binding: 11, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 12, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 13, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    { binding: 14, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }
+    { binding: 14, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 15, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // grandchildBlockSlot
   ]});
   const step1BGL = device.createBindGroupLayout({ label: 'step1BGL', entries: [
     { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
@@ -947,12 +955,18 @@ async function init() {
     // so it always picks up that child's own override (or falls back to
     // the base L0->L1 values if unset). See paramsForChildLevel's header.
     const childParams = paramsForChildLevel(m + 1);
+    // HAS_GRANDCHILD (level m+2) for the 2:1-balance cascade -- see
+    // amr_manage_pool.wgsl's header. Existence-based (hasGrandchild), not
+    // criterion-based, so no separate grandchild-level threshold overrides
+    // are needed here -- just whether that level exists at all.
+    const hasGrandchild = (m + 2) < N_LEVELS;
     const poolConstants = {
       W, H, RB,
       NBX_PARENT: parentPool.NBX, NBY_PARENT: parentPool.NBY,
       PARENT_CELL_SIZE_L0: cellSizeL0AtLevel(m),
       PARENT_HAS_CACHED_ORIGIN: parentIsDense ? 0 : 1,
       ...childParams,
+      HAS_GRANDCHILD: hasGrandchild ? 1 : 0,
     };
     criterionPoolPLs[m] = device.createComputePipeline({
       layout: device.createPipelineLayout({ bindGroupLayouts: [criterionPoolBGL] }),
@@ -1035,6 +1049,11 @@ async function init() {
     const parentBlockSlotBuf = m === 1 ? pools[1].blockSlotBuf : parentPool.blockSlotBuf;
     const parentOriginXBuf = m === 1 ? dummyBlockSlotBuf : parentPool.originXBuf; // dummy: level-1 parent has no cached origin (PARENT_HAS_CACHED_ORIGIN=0 gates it out)
     const parentOriginYBuf = m === 1 ? dummyBlockSlotBuf : parentPool.originYBuf;
+    // Grandchild (level m+2) blockSlot for the 2:1-balance cascade -- dummy
+    // when there's no such level (HAS_GRANDCHILD=0 gates it out of ever
+    // being read, matching every other dummy-buffer fallback in this file).
+    const grandchildPool = (m + 2) < N_LEVELS ? pools[m + 2] : null;
+    const grandchildBlockSlotBuf = grandchildPool ? grandchildPool.blockSlotBuf : dummyBlockSlotBuf;
 
     criterionPoolBGs[m] = device.createBindGroup({ layout: criterionPoolBGL, entries: [
       { binding: 0, resource: { buffer: parentVel } },
@@ -1057,6 +1076,7 @@ async function init() {
       { binding: 12, resource: { buffer: parentSlotToBlockBuf } },
       { binding: 13, resource: { buffer: parentOriginXBuf } },
       { binding: 14, resource: { buffer: parentOriginYBuf } },
+      { binding: 15, resource: { buffer: grandchildBlockSlotBuf } },
     ]});
   }
 
@@ -2112,16 +2132,21 @@ async function init() {
   // is enough to catch a real violation during testing).
   //
   // Generalized to N_LEVELS>=2 (was hardcoded to compare level 1 against
-  // level 2 only, silently ignoring level 3+ -- fine at this plan's
-  // original N<=3 validated depth, but a real blind spot once N_LEVELS=4
-  // is exercised). Checks EVERY level m=1..N_LEVELS-1 against its own
-  // same-level neighbors, where "effective depth" at a given level-m
-  // position walks DOWN through active children (if this position is
-  // itself active at m) to find the deepest actual coverage, or UP
-  // through active ancestors (if not active at m) to find the shallowest
-  // level that actually covers this position -- exactly what the old
-  // 2-level-only levelOf() did, just recursive instead of one hardcoded
-  // hop.
+  // level 2 only, silently ignoring level 3+). Border-aware, not whole-
+  // tile-max: a first version of this compared each tile's DEEPEST
+  // descendant ANYWHERE in its footprint against its neighbor's deepest
+  // descendant anywhere in ITS footprint -- wrong, and produced false-
+  // positive "violations" live (e.g. a level-1 tile A next to a level-1
+  // tile B where B's level-3 descendant sat on B's FAR side, away from A
+  // -- the actual A/B shared edge only ever touched B's level-2 quadrants,
+  // which IS balanced; B's unrelated far-side depth doesn't matter to
+  // that boundary). True 2:1 balance is a property of ADJACENT CELLS, not
+  // adjacent TILES-as-a-whole: only check LEAF tiles (active, no children
+  // -- a non-leaf tile's own boundary correctness is already checked one
+  // level deeper, at its children's own same-level neighbor checks, so
+  // checking it again here would be redundant AND use the wrong
+  // granularity), and for each neighbor, walk toward the SHARED edge
+  // specifically (borderMaxDepth), not the neighbor's tile as a whole.
   async function debugCheck21Balance() {
     const activeSets = {}, NBX_ = {}, NBY_ = {}, counts = {};
     for (let m = 1; m < N_LEVELS; m++) {
@@ -2129,6 +2154,9 @@ async function init() {
       activeSets[m] = new Set(active.map(b => `${b.bx},${b.by}`));
       NBX_[m] = pools[m].NBX; NBY_[m] = pools[m].NBY;
       counts[m] = active.length;
+    }
+    function hasChild(m, bx, by) {
+      return m + 1 < N_LEVELS && activeSets[m + 1].has(`${bx * 2},${by * 2}`);
     }
     function ancestorDepth(m, bx, by) {
       let level = m, x = bx, y = by;
@@ -2139,33 +2167,33 @@ async function init() {
       }
       return 0;
     }
-    // Quad-atomic allocation (decision 3) means all 4 children of an
-    // active parent exist together, so checking one quadrant is enough to
-    // detect "has a child at all"; still recurse into all 4 to find the
-    // true MAX depth, since siblings can independently refine further.
-    function descendantDepth(m, bx, by) {
-      if (m + 1 >= N_LEVELS || !activeSets[m + 1].has(`${bx * 2},${by * 2}`)) return m;
+    // The 2 (of 4) quadrant children that lie along a given edge of their
+    // parent -- e.g. a parent's SOUTH edge is covered by its qy=1 children
+    // (both qx). Recursing with the SAME edge picks the correct
+    // ever-deeper sliver along that edge, not the tile's max depth.
+    const EDGE_CHILDREN = { N: [[0, 0], [1, 0]], S: [[0, 1], [1, 1]], E: [[1, 0], [1, 1]], W: [[0, 0], [0, 1]] };
+    const OPPOSITE = { N: 'S', S: 'N', E: 'W', W: 'E' };
+    function borderMaxDepth(m, bx, by, edge) {
+      if (!hasChild(m, bx, by)) return m;
       let maxD = m;
-      for (const [dx, dy] of [[0, 0], [1, 0], [0, 1], [1, 1]]) {
-        maxD = Math.max(maxD, descendantDepth(m + 1, bx * 2 + dx, by * 2 + dy));
+      for (const [dx, dy] of EDGE_CHILDREN[edge]) {
+        maxD = Math.max(maxD, borderMaxDepth(m + 1, bx * 2 + dx, by * 2 + dy, edge));
       }
       return maxD;
     }
-    function trueDepth(m, bx, by) {
-      return activeSets[m].has(`${bx},${by}`) ? descendantDepth(m, bx, by) : ancestorDepth(m, bx, by);
-    }
     const violations = [];
+    const NEIGHBOR_OFFSETS = [['N', 0, -1], ['S', 0, 1], ['E', 1, 0], ['W', -1, 0]];
     for (let m = 1; m < N_LEVELS; m++) {
       for (const key of activeSets[m]) {
         const [bx, by] = key.split(',').map(Number);
-        const myDepth = trueDepth(m, bx, by);
-        const neighbors = [
-          [bx, (by + NBY_[m] - 1) % NBY_[m]], [bx, (by + 1) % NBY_[m]],
-          [(bx + 1) % NBX_[m], by], [(bx + NBX_[m] - 1) % NBX_[m], by],
-        ];
-        for (const [nbx, nby] of neighbors) {
-          const nDepth = trueDepth(m, nbx, nby);
-          if (Math.abs(myDepth - nDepth) > 1) violations.push({ level: m, bx, by, myDepth, neighbor: [nbx, nby], nDepth });
+        if (hasChild(m, bx, by)) continue; // not a leaf -- checked one level deeper instead
+        for (const [edge, dx, dy] of NEIGHBOR_OFFSETS) {
+          const nbx = (bx + dx + NBX_[m]) % NBX_[m];
+          const nby = (by + dy + NBY_[m]) % NBY_[m];
+          const nDepth = activeSets[m].has(`${nbx},${nby}`)
+            ? borderMaxDepth(m, nbx, nby, OPPOSITE[edge])
+            : ancestorDepth(m, nbx, nby);
+          if (Math.abs(m - nDepth) > 1) violations.push({ level: m, bx, by, myDepth: m, neighbor: [nbx, nby], nDepth, edge });
         }
       }
     }
