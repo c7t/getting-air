@@ -29,16 +29,45 @@
 //   is what forces those missing neighbors active, in the SAME
 //   coarsest-to-finest sweep, so a later same-round refine (of a level
 //   closer to the root) unblocks this one before it's re-evaluated.
-// - coarsen(): SCOPE LIMIT, flagged explicitly rather than silently
-//   incomplete -- a fully general implementation would also need to check
-//   (a) does this quad itself have active level-(m+2) children, and
-//   (b) does a same-level neighbor have active level-(m+2) children,
-//   both requiring a THIRD level's blockSlot data. Neither check is
-//   implemented here because at this plan's validated depth (N=3), this
-//   shader's only real instantiation (parent=level 1, deciding level 2)
-//   has level 2 as the DEEPEST configured level -- there is no level 3
-//   for either condition to ever be true, so omitting them is exact, not
-//   approximate, for N<=3. Revisit before ever running this at N>=4.
+// - coarsen()/refine() BOTH also need a THIRD level's data (grandchild,
+//   level m+2) to stay exact once N_LEVELS>=4 -- FIXED, not scope-limited
+//   anymore. Discovered live: forcing N_LEVELS=4 (after the free-list
+//   eager-init fix elsewhere in this milestone let level>=2 refinement
+//   actually engage for the first time) produced real, reproducible
+//   debugCheck21Balance violations -- a level-1-only tile directly
+//   adjacent to a level-3 tile (depth diff 2). Root cause: refine()'s
+//   existing same-level-m neighbor check only verifies neighbors are
+//   ACTIVE at level m, which is necessary but not sufficient -- it says
+//   nothing about whether one of those neighbors is ITSELF about to grow
+//   a level-(m+2) grandchild, which would make this parent's own level-
+//   (m+1) presence mandatory too, not optional. Two additions, gated by
+//   HAS_GRANDCHILD (0 when m+2>=N_LEVELS, so behavior at this level's
+//   own deepest-configured case is provably unchanged -- grandchildBlockSlot
+//   is a harmless dummy buffer in that case, never read):
+//   - refine(): cascade -- force this parent to spawn its level-(m+1) quad
+//     even if its own criterion doesn't call for it, if a same-level-m
+//     EDGE-NEIGHBOR already has an ACTIVE level-(m+1) child that itself
+//     already HAS an active level-(m+2) grandchild. EXISTENCE
+//     (hasGrandchild), not desire -- an earlier version of this fix used a
+//     criterion-based "does the neighbor's child WANT a grandchild" test
+//     (mirroring amr_manage.wgsl's own level2WantsRefine one level down)
+//     and it was live-verified wrong: debugCheck21Balance still caught
+//     real depth-1-vs-depth-3 violations with it, because criterion is
+//     re-evaluated fresh every round and can read as "doesn't want it
+//     anymore" for a grandchild that's still genuinely active (coarsen()
+//     hasn't released it yet) -- the cascade must react to what's actually
+//     THERE right now, not to a lagging/flickering desire signal.
+//   - coarsen(): blocked if any of the 4 children about to be released
+//     itself has an active level-(m+2) child, OR if any of those 4
+//     children's own same-level-(m+1) EDGE-NEIGHBORS has one (releasing
+//     would leave that neighbor's grandchild directly adjacent to this
+//     now-coarser region). Same-level-(m+1) neighbor lookup reuses
+//     childBlockSlot (already bound for this file's own quad bookkeeping),
+//     not a parent-level traversal -- level (m+1) is the level actually
+//     being coarsened, so its own same-level neighbor structure is what
+//     2:1 balance is checked against, exactly mirroring how refine()'s
+//     existing check operates at the PARENT's own level m, not one level
+//     removed from what's being decided.
 
 struct CardState {
   cx     : f32,
@@ -84,6 +113,12 @@ struct CardState {
 @group(0) @binding(12) var<storage, read>       parentSlotToBlock : array<i32>;
 @group(0) @binding(13) var<storage, read>       parentOriginX     : array<f32>; // dummy if !PARENT_HAS_CACHED_ORIGIN
 @group(0) @binding(14) var<storage, read>       parentOriginY     : array<f32>; // dummy if !PARENT_HAS_CACHED_ORIGIN
+// Grandchild (level m+2) blockSlot, for the 2:1-balance cascade/coarsen-
+// block checks -- dummy if !HAS_GRANDCHILD, see header. Both refine() and
+// coarsen() only ever need EXISTENCE (hasGrandchild), never level (m+2)'s
+// criterion -- see hasGrandchild's own comment on why "wants" isn't the
+// right test for maintaining balance against an already-active grandchild.
+@group(0) @binding(15) var<storage, read>       grandchildBlockSlot : array<i32>;
 
 override W : u32;
 override H : u32;
@@ -92,6 +127,7 @@ override NBX_PARENT : u32;
 override NBY_PARENT : u32;
 override PARENT_CELL_SIZE_L0 : f32;
 override PARENT_HAS_CACHED_ORIGIN : u32;
+override HAS_GRANDCHILD : u32 = 0u;
 override REFINE_THRESH : f32;
 override COARSEN_THRESH : f32;
 override FORCE_REFINE_MARGIN : f32;
@@ -129,6 +165,31 @@ fn isNearBodyAt(centerX_L0: f32, centerY_L0: f32) -> bool {
   let phi_future = get_phi(p_future, future);
 
   return min(phi_now, phi_future) < FORCE_REFINE_MARGIN;
+}
+
+// True if the level-(m+1) tile at `childBlockID` currently has an active
+// level-(m+2) child (quadrant 0 stands for all 4 -- decision 3's all-or-
+// nothing invariant, same as hasLevel2Child in amr_manage.wgsl).
+fn hasGrandchild(childBlockID: u32) -> bool {
+  let nbxChild = NBX_PARENT * 2u;
+  let bx = childBlockID % nbxChild; let by = childBlockID / nbxChild;
+  let nbxGrandchild = nbxChild * 2u;
+  let gcBlockID0 = (by * 2u) * nbxGrandchild + (bx * 2u);
+  return grandchildBlockSlot[gcBlockID0] >= 0;
+}
+
+// Level-(m+1)'s own 4 edge-neighbor blockIDs (level-(m+1) coordinate
+// space, NBX_PARENT*2 wide) -- same shape as amr_manage.wgsl's
+// edgeNeighbors, just at the child level instead of the dense L0/L1 one.
+fn childEdgeNeighbors(childBlockID: u32) -> array<u32, 4> {
+  let nbxChild = NBX_PARENT * 2u; let nbyChild = NBY_PARENT * 2u;
+  let bx = childBlockID % nbxChild; let by = childBlockID / nbxChild;
+  return array<u32, 4>(
+    ((by + nbyChild - 1u) % nbyChild) * nbxChild + bx,
+    ((by + 1u) % nbyChild) * nbxChild + bx,
+    by * nbxChild + ((bx + 1u) % nbxChild),
+    by * nbxChild + ((bx + nbxChild - 1u) % nbxChild),
+  );
 }
 
 @compute @workgroup_size(64)
@@ -176,7 +237,34 @@ fn refine(@builtin(global_invocation_id) gid: vec3<u32>) {
   let parentCenterX_L0 = parentOriginX_L0 + f32(RB) * PARENT_CELL_SIZE_L0 * 0.5f;
   let parentCenterY_L0 = parentOriginY_L0 + f32(RB) * PARENT_CELL_SIZE_L0 * 0.5f;
 
-  let wantsRefine = eps >= REFINE_THRESH || isNearBodyAt(parentCenterX_L0, parentCenterY_L0);
+  // Grandchild cascade (see header): even if THIS parent's own criterion
+  // doesn't call for a level-(m+1) child, force one anyway if a same-
+  // level-m edge-neighbor ALREADY HAS an active level-(m+1) child that
+  // itself already has an active level-(m+2) grandchild -- otherwise that
+  // grandchild sits directly adjacent to this still-level-m region, a
+  // 2-level gap. Existence (hasGrandchild), not desire: a "would level-
+  // (m+2) want to refine here right now" test can flicker false on a round
+  // where the ALREADY-ACTIVE grandchild's own criterion has since dropped
+  // (flow evolved, criterion re-evaluated fresh each round) even though
+  // coarsen() hasn't released it yet -- using "wants" here let a genuinely
+  // still-active depth-(m+2) region go uncascaded for however many rounds
+  // its own criterion stayed fresh-per-round negative, a live-verified bug
+  // in an earlier version of this fix (debugCheck21Balance caught real
+  // depth-1-vs-depth-3 violations with the "wants" version).
+  var cascadeWanted = false;
+  if (HAS_GRANDCHILD != 0u) {
+    let nbrBX = array<u32, 4>(bxP, bxP, (bxP + 1u) % NBX_PARENT, (bxP + NBX_PARENT - 1u) % NBX_PARENT);
+    let nbrBY = array<u32, 4>((byP + NBY_PARENT - 1u) % NBY_PARENT, (byP + 1u) % NBY_PARENT, byP, byP);
+    for (var i = 0u; i < 4u; i++) {
+      let nbxN = nbrBX[i]; let nbyN = nbrBY[i];
+      let childBlockIDN = (nbyN * 2u) * nbxChild + (nbxN * 2u);
+      if (childBlockSlot[childBlockIDN] >= 0 && hasGrandchild(childBlockIDN)) {
+        cascadeWanted = true;
+      }
+    }
+  }
+
+  let wantsRefine = eps >= REFINE_THRESH || isNearBodyAt(parentCenterX_L0, parentCenterY_L0) || cascadeWanted;
   if (!wantsRefine) { return; }
 
   // 2:1 balance (see header): all 4 same-level (level-m) edge-neighbors of
@@ -253,10 +341,23 @@ fn coarsen(@builtin(global_invocation_id) gid: vec3<u32>) {
   let centerY_L0 = childOriginY[slot] + f32(RB) * (PARENT_CELL_SIZE_L0 * 0.5f) * 0.5f;
 
   if (eps < COARSEN_THRESH && !isNearBodyAt(centerX_L0, centerY_L0)) {
-    // See header's coarsen scope-limit note: no check here for "do I (or a
-    // same-level neighbor) have active level-(m+2) children" -- exact, not
-    // approximate, as long as this level is the deepest configured one.
-    let quadIdx = slot / 4u;
+    let quadIdx = slot / 4u; // slot IS quadrant 0's own slot (childQuadrant[slot]==0 checked above), so quadIdx*4u==slot
+    // See header: blocked if any of the 4 children about to release has
+    // an active level-(m+2) grandchild itself, or if any of their own
+    // same-level-(m+1) edge-neighbors does -- releasing either would leave
+    // that grandchild directly adjacent to this now-coarser region.
+    if (HAS_GRANDCHILD != 0u) {
+      for (var q = 0u; q < 4u; q++) {
+        let s = quadIdx * 4u + q;
+        let bID = childSlotToBlock[s];
+        if (bID < 0) { continue; }
+        if (hasGrandchild(u32(bID))) { return; }
+        let nbrs = childEdgeNeighbors(u32(bID));
+        for (var i = 0u; i < 4u; i++) {
+          if (childBlockSlot[nbrs[i]] >= 0 && hasGrandchild(nbrs[i])) { return; }
+        }
+      }
+    }
     let oldCount = atomicAdd(&childFreeCount, 1);
     childFreeList[u32(oldCount)] = i32(quadIdx);
     for (var q = 0u; q < 4u; q++) {
