@@ -78,17 +78,35 @@ const NBX = W / BLOCK, NBY = H / BLOCK, NBLOCKS = NBX * NBY; // coarse block gri
 const N_LEVELS = urlParams.has('levels') ? parseInt(urlParams.get('levels')) : 2;
 if (N_LEVELS < 2) throw new Error(`?levels=${N_LEVELS} invalid -- must be >= 2 (L0 + at least one fine level)`);
 
-// KNOWN ISSUE, not yet root-caused: USE_BOUNCEBACK is validated correct at
-// N_LEVELS<=2 (L0+L1 only -- Cd/St match the literature within tolerance,
-// see tools/validate-cylinder.js) but diverges catastrophically (Cd in the
-// hundreds, wrong sign) as soon as a pool level (L>=2) is active. Isolated
-// via debugForceBreakdown() to the level>=2 pool shaders specifically
-// (amr_step1_pool.wgsl/amr_force1_pool.wgsl) or their interaction with the
-// multi-substep fine-fine ghost-refresh cycle those levels go through and
-// L1 doesn't -- not yet narrowed further. Fail loud rather than silently
-// producing garbage numbers.
-if (USE_BOUNCEBACK && N_LEVELS > 2) {
-  throw new Error('?bounceback with ?levels>2 is known-broken (diverges) -- see this file\'s own comment above N_LEVELS. Use ?levels=2 for a validated bounce-back run.');
+// KNOWN ISSUE, narrowed but not yet fully fixed: USE_BOUNCEBACK is
+// validated correct at N_LEVELS<=2 (L0+L1 only -- Cd/St match the
+// literature within tolerance, see tools/validate-cylinder.js) but
+// diverges as soon as a pool level (L>=2) is active. Two DISTINCT things
+// contribute, confirmed via debugForceBreakdown() + a live-forced
+// FORCE_REFINE_MARGIN2 bump (?forceRefineMargin2=10):
+// 1. L1's own reported force goes to garbage whenever the geometry-forced
+//    refinement leaves a COVERAGE GAP -- some L1 tiles well within the
+//    force-refine margin (e.g. phi=1.98 with the default margin2~4) don't
+//    get an L2 child at all (likely blocked by the 2:1-balance same-level
+//    neighbor-cascade requirement in amr_manage_pool.wgsl -- not yet
+//    root-caused further), leaving L1 to handle real solid-crossing
+//    bounce-back links along a seam adjacent to masked (L2-covered)
+//    tiles. Confirmed NOT an L1 formula bug: forcing full L2 coverage
+//    (?forceRefineMargin2=10) makes L1's own contribution exactly zero,
+//    matching design intent (M8: push the body's surface onto the finest
+//    configured level) -- L1 alone (N_LEVELS<=2, or the dense reference)
+//    is correct in every test run.
+// 2. With L1 correctly reporting zero, level 2's OWN bounce-back force is
+//    STILL wrong (wrong sign, ~4x magnitude) even in full isolation --
+//    the field itself is confirmed healthy (debugReadPool: rho~1,
+//    populations bounded) at every level, so this is a force-bookkeeping
+//    bug specifically, not a step-shader/streaming one. A real, separate
+//    pre-existing dx-scale bug in amr_step1_pool.wgsl/amr_force1_pool.wgsl
+//    was found and fixed along the way (see that file's own header) but
+//    didn't fully resolve this.
+// ?forceBounceback bypasses this guard for continued investigation.
+if (USE_BOUNCEBACK && N_LEVELS > 2 && !urlParams.has('forceBounceback')) {
+  throw new Error('?bounceback with ?levels>2 is known-broken (diverges) -- see this file\'s own comment above N_LEVELS. Use ?levels=2 for a validated bounce-back run, or ?forceBounceback to bypass for investigation.');
 }
 
 // ── Milestone 4b (plans/AMR.md): automatic vorticity-driven refinement,
