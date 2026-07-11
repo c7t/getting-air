@@ -164,8 +164,17 @@ fn refine(@builtin(global_invocation_id) gid: vec3<u32>) {
     parentOriginX_L0 = parentOriginX[parentSlot];
     parentOriginY_L0 = parentOriginY[parentSlot];
   }
-  let parentCenterX_L0 = parentOriginX_L0 + f32(RB) * PARENT_CELL_SIZE_L0;
-  let parentCenterY_L0 = parentOriginY_L0 + f32(RB) * PARENT_CELL_SIZE_L0;
+  // BUGFIX (Milestone 10): center = origin + HALF the block's own physical
+  // width, not the full width -- compare amr_manage.wgsl's own isNearBody,
+  // which correctly uses `bx * BLOCK + BLOCK / 2u`. This omitted-*0.5 bug
+  // shifted every geometry-forced-refinement candidate's position estimate
+  // by a full block-width toward (+X,+Y), biasing which blocks isNearBodyAt
+  // considers "near" and (independently of the childOriginX/Y quadrant-
+  // offset bug fixed above) contributing to level 2's refined region coming
+  // out far smaller/off-center than the vorticity-only criterion alone
+  // would predict.
+  let parentCenterX_L0 = parentOriginX_L0 + f32(RB) * PARENT_CELL_SIZE_L0 * 0.5f;
+  let parentCenterY_L0 = parentOriginY_L0 + f32(RB) * PARENT_CELL_SIZE_L0 * 0.5f;
 
   let wantsRefine = eps >= REFINE_THRESH || isNearBodyAt(parentCenterX_L0, parentCenterY_L0);
   if (!wantsRefine) { return; }
@@ -196,8 +205,23 @@ fn refine(@builtin(global_invocation_id) gid: vec3<u32>) {
         childSlotToBlock[slot] = i32(childBlockID);
         childParentSlot[slot] = i32(parentSlot);
         childQuadrant[slot] = quadrant;
-        childOriginX[slot] = parentOriginX_L0 + f32(qx) * f32(RB) * PARENT_CELL_SIZE_L0;
-        childOriginY[slot] = parentOriginY_L0 + f32(qy) * f32(RB) * PARENT_CELL_SIZE_L0;
+        // BUGFIX (Milestone 10): a quadrant step must offset by ONE
+        // QUADRANT-WIDTH, not one full PARENT-block-width. The parent's own
+        // interior is RB cells at PARENT_CELL_SIZE_L0 each (physical width
+        // RB*PARENT_CELL_SIZE_L0); the quad's 4 children tile that SAME
+        // footprint 2x2, so each quadrant only spans HALF of it per axis --
+        // omitting the *0.5f here (as this did before) placed qx=1/qy=1
+        // children a full parent-block-width away from the parent's origin
+        // (double the correct offset), silently mis-registering every
+        // auto-refined level>=2 tile's physical position against the body
+        // geometry it exists to resolve. Caught because it made N=3
+        // integrated force ~17x too small (most cells' chi evaluated far
+        // outside the true epsilon band), not from any topology/2:1-balance
+        // check (those only look at bx/by indices, which this bug never
+        // touched -- see main-cylinder-amr.js's debugActivateBlock, which
+        // had the identical bug in its own JS-side mirror of this formula).
+        childOriginX[slot] = parentOriginX_L0 + f32(qx) * f32(RB) * PARENT_CELL_SIZE_L0 * 0.5f;
+        childOriginY[slot] = parentOriginY_L0 + f32(qy) * f32(RB) * PARENT_CELL_SIZE_L0 * 0.5f;
         childNewlyActivated[slot] = 1u;
       }
     }
@@ -220,8 +244,13 @@ fn coarsen(@builtin(global_invocation_id) gid: vec3<u32>) {
   let eps = min(1.0f, log2(max(childCriterion[u32(blockID)], EPS_FLOOR)));
   // This quad's own center (quadrant 0's cached origin is this quad's own
   // origin -- see header) -- same generous-margin isNearBody test as refine.
-  let centerX_L0 = childOriginX[slot] + f32(RB) * (PARENT_CELL_SIZE_L0 * 0.5f);
-  let centerY_L0 = childOriginY[slot] + f32(RB) * (PARENT_CELL_SIZE_L0 * 0.5f);
+  // BUGFIX (Milestone 10): same missing-*0.5 center-vs-origin bug as
+  // refine()'s parentCenterX_L0 above -- (PARENT_CELL_SIZE_L0*0.5f) is
+  // already this CHILD level's own cell size (dx_child = dx_parent/2), so
+  // `f32(RB) * dx_child` is the child block's FULL width; its center needs
+  // one more *0.5.
+  let centerX_L0 = childOriginX[slot] + f32(RB) * (PARENT_CELL_SIZE_L0 * 0.5f) * 0.5f;
+  let centerY_L0 = childOriginY[slot] + f32(RB) * (PARENT_CELL_SIZE_L0 * 0.5f) * 0.5f;
 
   if (eps < COARSEN_THRESH && !isNearBodyAt(centerX_L0, centerY_L0)) {
     // See header's coarsen scope-limit note: no check here for "do I (or a
