@@ -54,8 +54,20 @@ override H : u32;
 const FSCALE = 10000f;
 const BLOCK = 8u;
 
+// Optional sharp momentum-exchange bounce-back force -- mirrors
+// lbm_force.wgsl's USE_BOUNCEBACK exactly (same formula); see that file's
+// header for the full rationale.
+override USE_BOUNCEBACK : u32 = 0u;
+
 const ex = array<i32,9>( 0, 1, 0,-1, 0, 1,-1,-1, 1);
 const ey = array<i32,9>( 0, 0, 1, 0,-1, 1, 1,-1,-1);
+const opp = array<u32,9>(0u, 3u, 4u, 1u, 2u, 7u, 8u, 5u, 6u);
+const wt = array<f32,9>(
+  0.44444444f,
+  0.11111111f, 0.11111111f, 0.11111111f, 0.11111111f,
+  0.02777778f, 0.02777778f, 0.02777778f, 0.02777778f
+);
+const CS2 = 0.33333333f;
 
 // Block-major linear index for a cell at BUFFER coordinates (cx, cy).
 // See amr_step.wgsl for the full derivation.
@@ -126,7 +138,29 @@ fn main(
       let phi = get_phi(p, state);
       let chi = get_chi(phi);
 
-      if (chi >= 1e-6) {
+      if (USE_BOUNCEBACK != 0u) {
+        // See lbm_force.wgsl's identical branch for the MEM formula.
+        if (phi >= 0f) {
+          var rx = p.x - state.cx;
+          var ry = p.y - state.cy;
+          rx -= f32(W) * round(rx / f32(W));
+          ry -= f32(H) * round(ry / f32(H));
+          let usx = state.vx - state.omega * ry;
+          let usy = state.vy + state.omega * rx;
+
+          for (var i = 0u; i < 9u; i++) {
+            let wx_src = (wx + W - u32(ex[i])) % W;
+            let wy_src = (wy + H - u32(ey[i])) % H;
+            if (get_phi(vec2<f32>(f32(wx_src), f32(wy_src)), state) < 0f) {
+              let f_opp = f_in[opp[i] * (W * H) + cell];
+              let corr = 2f * wt[i] * (f32(ex[i]) * usx + f32(ey[i]) * usy) / CS2;
+              fx_body += -f32(ex[i]) * (2f * f_opp + corr);
+              fy_body += -f32(ey[i]) * (2f * f_opp + corr);
+            }
+          }
+          tz_body = rx * fy_body - ry * fx_body;
+        }
+      } else if (chi >= 1e-6) {
         // Pull-gather from buffer-space neighbors, matching amr_step.wgsl's
         // streaming step exactly (see that file's header for the buffer-space
         // vs window-space derivation). Reading f_in[cell] directly here (as

@@ -37,6 +37,30 @@ override W : u32;
 override H : u32;
 const FSCALE = 10000f;
 
+// Optional: sharp momentum-exchange bounce-back force instead of
+// integrating the diffuse penalty force -- must match lbm_step.wgsl's own
+// USE_BOUNCEBACK setting (they're independent pipelines/overrides, but
+// main-cylinder.js always creates them in matching pairs). Standard MEM
+// formula (Ladd 1994 / Mei-Luo-Shyy): for a fluid cell with a link into a
+// solid neighbor in direction i, the momentum transferred to the solid
+// this step is e_i * (2*f_opp(x) + correction), where f_opp(x) is this
+// cell's OWN pre-streaming population in direction opp[i] (the population
+// that was heading toward that same solid neighbor -- see
+// lbm_step.wgsl's identical reflection for why opp[i], not i). f_in here
+// is read at the SAME point in the dispatch sequence lbm_step.wgsl reads
+// it as ITS OWN f_in this macro-step (force runs before step, same buffer
+// selection -- see main-cylinder.js's dispatchMacroStep), so this is
+// exactly the pre-streaming, time-t data the formula needs, with no
+// separate buffer-timing bookkeeping required.
+override USE_BOUNCEBACK : u32 = 0u;
+const opp = array<u32,9>(0u, 3u, 4u, 1u, 2u, 7u, 8u, 5u, 6u);
+const wt = array<f32,9>(
+  0.44444444f,
+  0.11111111f, 0.11111111f, 0.11111111f, 0.11111111f,
+  0.02777778f, 0.02777778f, 0.02777778f, 0.02777778f
+);
+const CS2 = 0.33333333f;
+
 const ex = array<i32,9>( 0, 1, 0,-1, 0, 1,-1,-1, 1);
 const ey = array<i32,9>( 0, 0, 1, 0,-1, 1, 1,-1,-1);
 
@@ -91,7 +115,31 @@ fn main(
     let phi = get_phi(p, state);
     let chi = get_chi(phi);
 
-    if (chi >= 1e-6) {
+    if (USE_BOUNCEBACK != 0u) {
+      // Only a FLUID cell (phi>=0) with at least one link into a solid
+      // neighbor contributes -- a solid-interior cell has no meaningful
+      // "own outgoing population" to interpret as momentum transfer.
+      if (phi >= 0f) {
+        var rx = p.x - state.cx;
+        var ry = p.y - state.cy;
+        rx -= f32(W) * round(rx / f32(W));
+        ry -= f32(H) * round(ry / f32(H));
+        let usx = state.vx - state.omega * ry;
+        let usy = state.vy + state.omega * rx;
+
+        for (var i = 0u; i < 9u; i++) {
+          let wx_src = (x + W - u32(ex[i])) % W;
+          let wy_src = (y + H - u32(ey[i])) % H;
+          if (get_phi(vec2<f32>(f32(wx_src), f32(wy_src)), state) < 0f) {
+            let f_opp = f_in[opp[i] * (W * H) + cell];
+            let corr = 2f * wt[i] * (f32(ex[i]) * usx + f32(ey[i]) * usy) / CS2;
+            fx_body += -f32(ex[i]) * (2f * f_opp + corr);
+            fy_body += -f32(ey[i]) * (2f * f_opp + corr);
+          }
+        }
+        tz_body = rx * fy_body - ry * fx_body;
+      }
+    } else if (chi >= 1e-6) {
       // Pull-gather from upstream neighbors, matching lbm_step.wgsl's
       // streaming step exactly. Reading f_in[cell] directly here (as this
       // used to) computes rho/u* from the RAW pre-streaming buffer, which

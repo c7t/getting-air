@@ -34,6 +34,13 @@ let W = 1 << resLog2;
 let H = W;
 let NCELLS = W * H;
 
+// Optional: sharp momentum-exchange bounce-back solid coupling instead of
+// the default diffuse (Brinkman/Guo) volume penalization, at every level
+// -- see shaders/lbm_step.wgsl's USE_BOUNCEBACK header for the method and
+// main-cylinder.js's identical flag for the dense-reference copy this
+// pairs with. Default off (0) reproduces today's exact behavior.
+const USE_BOUNCEBACK = urlParams.has('bounceback') ? 1 : 0;
+
 // ── Milestone 4 (plans/AMR.md): dynamic refinement via a fixed-capacity ───
 // fine-block pool. Supersedes Milestone 2's single hardcoded fine region:
 // refinement now happens at M1's own 8x8 coarse-block granularity, and any
@@ -70,6 +77,19 @@ const NBX = W / BLOCK, NBY = H / BLOCK, NBLOCKS = NBX * NBY; // coarse block gri
 // quadtree pool levels that no shader/dispatch reads yet (Milestone 6/7).
 const N_LEVELS = urlParams.has('levels') ? parseInt(urlParams.get('levels')) : 2;
 if (N_LEVELS < 2) throw new Error(`?levels=${N_LEVELS} invalid -- must be >= 2 (L0 + at least one fine level)`);
+
+// KNOWN ISSUE, not yet root-caused: USE_BOUNCEBACK is validated correct at
+// N_LEVELS<=2 (L0+L1 only -- Cd/St match the literature within tolerance,
+// see tools/validate-cylinder.js) but diverges catastrophically (Cd in the
+// hundreds, wrong sign) as soon as a pool level (L>=2) is active. Isolated
+// via debugForceBreakdown() to the level>=2 pool shaders specifically
+// (amr_step1_pool.wgsl/amr_force1_pool.wgsl) or their interaction with the
+// multi-substep fine-fine ghost-refresh cycle those levels go through and
+// L1 doesn't -- not yet narrowed further. Fail loud rather than silently
+// producing garbage numbers.
+if (USE_BOUNCEBACK && N_LEVELS > 2) {
+  throw new Error('?bounceback with ?levels>2 is known-broken (diverges) -- see this file\'s own comment above N_LEVELS. Use ?levels=2 for a validated bounce-back run.');
+}
 
 // ── Milestone 4b (plans/AMR.md): automatic vorticity-driven refinement,
 // retuned for the cylinder scenario (main-amr.js's -6/-7 was calibrated
@@ -114,11 +134,31 @@ const FORCE_REFINE_LOOKAHEAD = urlParams.has('forceRefineLookahead') ? parseFloa
 // numerically larger |omega| one level down (finer central differences
 // resolve thinner gradients a coarser stencil partly averages out) --
 // reusing L0->L1's thresholds verbatim for L1->L2 is not expected to be
-// correct by construction; see this milestone's retuning note below for the
-// actual measured numbers. `refineThresh{child}`/`coarsenThresh{child}`/etc.
-// (child=2,3,...) override the L(child-1)->L(child) decision; any level
-// without its own override falls back to the base (L0->L1) values, so a
-// build that never sets them behaves exactly as before this change.
+// correct by construction. `refineThresh{child}`/`coarsenThresh{child}`/etc.
+// (child=2,3,...) override the L(child-1)->L(child) decision.
+//
+// FORCE_REFINE_MARGIN's default (unlike REFINE_THRESH/COARSEN_THRESH,
+// which fall back to the raw base value -- no clean scaling law derived
+// for those yet) DOES get a scaled fallback: the geometric force-refine
+// test isn't spatially aware of level at all -- it asks "is this
+// candidate within MARGIN physical units of the body", the same physical
+// margin regardless of which level is deciding. Reusing the L0->L1
+// margin (8 L0-units, order-of-magnitude the body's own radius, sized
+// generously for the coarsest level -- see the base FORCE_REFINE_MARGIN's
+// own comment) unchanged at L1->L2, L2->L3, etc. means EVERY level within
+// that same physical band wants to refine as deep as it can go, live-
+// verified to saturate level 3's entire 128-slot pool on first contact
+// (?levels=4 with no overrides) -- not a buffer shell hugging the body,
+// the whole near-body region trying to be maximally fine. Scaling by the
+// PARENT level's own cell size (cellSizeL0AtLevel(childLevel-1) -- 0.5 at
+// L1->L2, 0.25 at L2->L3, halving each level down, matching dx itself)
+// keeps the force-refine band shrinking in step with resolution, so
+// deeper levels only claim a thin shell right at the surface instead of
+// re-claiming the same physical footprint their parent already covers --
+// live-verified: N=4 with this scaling active gives level 3 a bounded,
+// non-saturated tile count (88/128 in one test run) and clean
+// debugCheck21Balance, vs. saturated-and-still-passing-only-because-
+// clamped without it.
 function paramsForChildLevel(childLevel) {
   if (childLevel === 1) {
     return { REFINE_THRESH, COARSEN_THRESH, FORCE_REFINE_MARGIN, FORCE_REFINE_LOOKAHEAD };
@@ -127,7 +167,7 @@ function paramsForChildLevel(childLevel) {
   return {
     REFINE_THRESH: get('refineThresh', REFINE_THRESH),
     COARSEN_THRESH: get('coarsenThresh', COARSEN_THRESH),
-    FORCE_REFINE_MARGIN: get('forceRefineMargin', FORCE_REFINE_MARGIN),
+    FORCE_REFINE_MARGIN: get('forceRefineMargin', FORCE_REFINE_MARGIN * cellSizeL0AtLevel(childLevel - 1)),
     FORCE_REFINE_LOOKAHEAD: get('forceRefineLookahead', FORCE_REFINE_LOOKAHEAD),
   };
 }
@@ -861,7 +901,7 @@ async function init() {
   // Coarse step needs the freestream sponge target; force/physics/render/
   // criterion/manage don't reference SPONGE_UX/UY at all, so they keep the
   // plain {W,H} constants dict above.
-  const stepConstants = { W, H, SPONGE_UX: U0, SPONGE_UY: 0 };
+  const stepConstants = { W, H, SPONGE_UX: U0, SPONGE_UY: 0, USE_BOUNCEBACK };
   const fineConstants = { W, H, RB };
   // GHOST_ONLY=1: steady-state ghost-only reinterpolation (every macro-step).
   // GHOST_ONLY=0: full-slot fill, used once on block activation (see debugActivateBlock).
@@ -873,7 +913,7 @@ async function init() {
   // Fine step(s) also need the freestream sponge target (see amr_step1*.wgsl's
   // SPONGE_UX/UY -- both L1's dedicated file and the level>=2 shared one have
   // their own copy of the sponge, not shared with the coarse kernel).
-  const step1Constants = { W, H, RB, SPONGE_UX: U0, SPONGE_UY: 0 };
+  const step1Constants = { W, H, RB, SPONGE_UX: U0, SPONGE_UY: 0, USE_BOUNCEBACK };
   const criterionConstants = { W, H };
   const manageConstants = { W, H, REFINE_THRESH, COARSEN_THRESH, FORCE_REFINE_MARGIN, FORCE_REFINE_LOOKAHEAD, HAS_LEVEL2: N_LEVELS > 2 ? 1 : 0 };
 
@@ -883,7 +923,7 @@ async function init() {
   });
   const frcPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [frcBGL] }),
-    compute: { module: frcSM, entryPoint: 'main', constants }
+    compute: { module: frcSM, entryPoint: 'main', constants: { ...constants, USE_BOUNCEBACK } }
   });
   const phyPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [phyBGL] }),
@@ -961,14 +1001,14 @@ async function init() {
   // whole session (see amr_force1.wgsl's header).
   const force1PL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [force1BGL] }),
-    compute: { module: force1SM, entryPoint: 'main', constants: { W, H, RB, HAS_CHILD: N_LEVELS > 2 ? 1 : 0 } }
+    compute: { module: force1SM, entryPoint: 'main', constants: { W, H, RB, HAS_CHILD: N_LEVELS > 2 ? 1 : 0, USE_BOUNCEBACK } }
   });
   // Milestone 8: level>=2's own force pass, one pipeline reused across
   // every such level (no per-level overrides -- hasChild/dxL are runtime
   // LevelParams reads, see amr_force1_pool.wgsl's header).
   const force1PoolPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [force1PoolBGL] }),
-    compute: { module: force1PoolSM, entryPoint: 'main', constants: { W, H, RB, K_EPS: K_EPS_POOL } }
+    compute: { module: force1PoolSM, entryPoint: 'main', constants: { W, H, RB, K_EPS: K_EPS_POOL, USE_BOUNCEBACK } }
   });
   const criterionPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [criterionBGL] }),
