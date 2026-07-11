@@ -45,6 +45,11 @@ struct CardState {
 // of change here.
 @group(0) @binding(5) var<storage, read> vel_pool2   : array<f32>;
 @group(0) @binding(6) var<storage, read> blockSlot2  : array<i32>;
+// Quadtree outline opacity [0,1] -- optional, off (0) by default. Separate
+// uniform from overlayOpacity (the coverage FILL) so the two can be toggled
+// independently -- an outline-only view is useful precisely when the fill
+// is turned down/off to see the underlying flow field.
+@group(0) @binding(7) var<uniform>       outlineOpacity : f32;
 
 override W : u32;
 override H : u32;
@@ -223,6 +228,15 @@ fn fs_main(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> {
   let bBY = u32(wrapf(bufY + 0.5, f32(H))) / RB;
   let slot = blockSlot[i32(bBY * nbx + bBX)];
   var level2Active = false;
+  // Quadtree outline: additive line color, drawn along each ACTIVE block's
+  // own 4 edges (not a fixed background grid -- only where a level actually
+  // owns this footprint), one color per level so the tree structure itself
+  // is legible, not just "some refinement happened here" (that's what the
+  // fill overlay below already shows). LINE_WIDTH is in L0-buffer-space
+  // units, so it renders thinner at higher sim resolution, same as every
+  // other buffer-space-native visual element here.
+  const LINE_WIDTH = 0.15f;
+  var outlineColor = vec3(0.0f);
   if (slot >= 0) {
     let s = u32(slot);
     var dxr = bufX - f32(bBX * RB); dxr -= f32(W) * round(dxr / f32(W));
@@ -235,6 +249,10 @@ fn fs_main(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> {
         mix(fineOmegaCell(s, fx0, fy0),     fineOmegaCell(s, fx0 + 1, fy0),     ftx),
         mix(fineOmegaCell(s, fx0, fy0 + 1), fineOmegaCell(s, fx0 + 1, fy0 + 1), ftx),
         fty);
+
+    // This L1 block's own edge distance (periodic within [0,RB)), white.
+    let edgeDist1 = min(min(dxr, f32(RB) - dxr), min(dyr, f32(RB) - dyr));
+    if (edgeDist1 < LINE_WIDTH) { outlineColor = vec3(1.0f, 1.0f, 1.0f); }
 
     // Milestone 10: finest-active-level-wins. If this L1 block also has an
     // active level-2 child covering this pixel's own quadrant, override
@@ -264,6 +282,12 @@ fn fs_main(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> {
           mix(fineOmegaCell2(s2, fx02, fy02),     fineOmegaCell2(s2, fx02 + 1, fy02),     ftx2),
           mix(fineOmegaCell2(s2, fx02, fy02 + 1), fineOmegaCell2(s2, fx02 + 1, fy02 + 1), ftx2),
           fty2);
+
+      // This L2 quadrant's own edge distance (periodic within [0,halfRB)),
+      // yellow -- takes over from level 1's white where finer, same
+      // finest-wins precedence the omega field itself just used above.
+      let edgeDist2 = min(min(dxr2, halfRB - dxr2), min(dyr2, halfRB - dyr2));
+      if (edgeDist2 < LINE_WIDTH) { outlineColor = vec3(1.0f, 1.0f, 0.0f); }
     }
   }
 
@@ -298,6 +322,13 @@ fn fs_main(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> {
   // Blend with solid color
   let solid_color = vec3(1.0, 0.8, 0.4);
   c = mix(c, solid_color, chi);
+
+  // Quadtree outline, drawn last (on top of the solid body too) so block
+  // structure stays legible even where it crosses the body -- mix rather
+  // than additive, since the line colors are already saturated and an
+  // additive white/yellow would blow out unpredictably over a bright
+  // vorticity or solid-body pixel.
+  c = mix(c, outlineColor, outlineOpacity * step(0.5f, dot(outlineColor, outlineColor)));
 
   return vec4(c, 1.0);
 }
