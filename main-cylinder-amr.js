@@ -83,6 +83,11 @@ if (N_LEVELS < 2) throw new Error(`?levels=${N_LEVELS} invalid -- must be >= 2 (
 // the N=3-specific values (level 2 tighter around the body, level 1 as
 // the 2:1-balance buffer shell needs a looser threshold than a single-
 // tier build would).
+// TEMPORARY diagnostic (Milestone 10 Cd investigation): level>=2's own
+// K_EPS override, defaulting to the same 1.5 every other level uses --
+// see shaders/amr_step1_pool.wgsl/amr_force1_pool.wgsl's own K_EPS comment.
+const K_EPS_POOL = urlParams.has('kEpsPool') ? parseFloat(urlParams.get('kEpsPool')) : 1.5;
+
 const REFINE_EVERY = urlParams.has('refineEvery') ? parseInt(urlParams.get('refineEvery')) : 16;
 const REFINE_THRESH = urlParams.has('refineThresh') ? parseFloat(urlParams.get('refineThresh')) : -8;
 const COARSEN_THRESH = urlParams.has('coarsenThresh') ? parseFloat(urlParams.get('coarsenThresh')) : -9;
@@ -905,7 +910,7 @@ async function init() {
   // interpPoolParentPL).
   const step1PoolPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [step1PoolBGL] }),
-    compute: { module: step1PoolSM, entryPoint: 'main', constants: step1Constants }
+    compute: { module: step1PoolSM, entryPoint: 'main', constants: { ...step1Constants, K_EPS: K_EPS_POOL } }
   });
   const avgPoolPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [avgPoolBGL] }),
@@ -924,7 +929,7 @@ async function init() {
   // LevelParams reads, see amr_force1_pool.wgsl's header).
   const force1PoolPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [force1PoolBGL] }),
-    compute: { module: force1PoolSM, entryPoint: 'main', constants: { W, H, RB } }
+    compute: { module: force1PoolSM, entryPoint: 'main', constants: { W, H, RB, K_EPS: K_EPS_POOL } }
   });
   const criterionPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [criterionBGL] }),
@@ -2220,6 +2225,53 @@ async function init() {
     return { l0, l1, perLevel };
   }
 
+  // TEMPORARY diagnostic: write a UNIFORM non-equilibrium field directly
+  // into ONE active level>=2 slot's INTERIOR cells (not ghost), bypassing
+  // all real physics/forcing entirely -- the cleanest possible test of
+  // whether ghost-copy propagation to a same-level neighbor works AT ALL,
+  // stripped of the confounding timing/attenuation questions a live-forcing
+  // scenario raises.
+  function debugPokeSlot(level, bx, by, ux, uy) {
+    const pool = pools[level];
+    const dims = { FB: RB * 2 + 2 * GHOST };
+    const blockID = by * pool.NBX + bx;
+    const slotArr = level === 1 ? blockSlotCPUAtLevel(1) : quadCPU[level].blockSlotCPU;
+    const slot = slotArr[blockID];
+    if (slot === -1) throw new Error(`debugPokeSlot: level ${level} block (${bx},${by}) not active`);
+    const rho = 1.0;
+    const NCELLS1_local = dims.FB * dims.FB;
+    const poolPlaneStride = pool.MAX_FINE_BLOCKS * NCELLS1_local;
+    const f = new Float32Array(9);
+    for (let i = 0; i < 9; i++) f[i] = feq(rho, ux, uy, i);
+    for (let fy = GHOST; fy < GHOST + RB * 2; fy++) {
+      for (let fx = GHOST; fx < GHOST + RB * 2; fx++) {
+        const cell = slot * NCELLS1_local + fy * dims.FB + fx;
+        for (let i = 0; i < 9; i++) {
+          device.queue.writeBuffer(pool.finePoolF_a, (i * poolPlaneStride + cell) * 4, f, i, 1);
+        }
+      }
+    }
+    return { slot };
+  }
+
+  // TEMPORARY diagnostic: raw cardState readback (cx/cy/off_x/off_y etc),
+  // for cross-checking a suspected AMR data-flow artifact against the
+  // body's own actual position -- not exposed anywhere else.
+  async function debugReadCardState() {
+    const stage = device.createBuffer({ size: 104, usage: U.MAP_READ | U.COPY_DST });
+    const enc = device.createCommandEncoder();
+    enc.copyBufferToBuffer(cardStateBuf, 0, stage, 0, 104);
+    device.queue.submit([enc.finish()]);
+    await stage.mapAsync(GPUMapMode.READ);
+    const d = Array.from(new Float32Array(stage.getMappedRange()));
+    stage.unmap();
+    stage.destroy();
+    const keys = ['cx','cy','theta','vx','vy','omega','fx','fy','tz','mass','i_body','g_eff','a','b','v_max','o_max','cx_old','cy_old','th_old','tau','y_total','x_total','off_x','off_y','off_x_old','off_y_old'];
+    const out = {};
+    keys.forEach((k,i) => out[k] = d[i]);
+    return out;
+  }
+
   async function debugStepSync(n) {
     liveMode = false;
     for (let k = 0; k < n; k += STEPS_PER_FRAME) {
@@ -2302,6 +2354,8 @@ async function init() {
     debugStepOne,
     debugStepOneChecked,
     debugForceBreakdown,
+    debugPokeSlot,
+    debugReadCardState,
     debugActivateBlock,
     debugDeactivateBlock,
     debugListActiveBlocks,
