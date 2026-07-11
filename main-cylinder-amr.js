@@ -78,32 +78,47 @@ const NBX = W / BLOCK, NBY = H / BLOCK, NBLOCKS = NBX * NBY; // coarse block gri
 const N_LEVELS = urlParams.has('levels') ? parseInt(urlParams.get('levels')) : 2;
 if (N_LEVELS < 2) throw new Error(`?levels=${N_LEVELS} invalid -- must be >= 2 (L0 + at least one fine level)`);
 
-// KNOWN ISSUE, narrowed but not yet fully fixed: USE_BOUNCEBACK is
-// validated correct at N_LEVELS<=2 (L0+L1 only -- Cd/St match the
+// KNOWN ISSUE, substantially narrowed, not yet fully fixed: USE_BOUNCEBACK
+// is validated correct at N_LEVELS<=2 (L0+L1 only -- Cd/St match the
 // literature within tolerance, see tools/validate-cylinder.js) but
-// diverges as soon as a pool level (L>=2) is active. Two DISTINCT things
-// contribute, confirmed via debugForceBreakdown() + a live-forced
-// FORCE_REFINE_MARGIN2 bump (?forceRefineMargin2=10):
-// 1. L1's own reported force goes to garbage whenever the geometry-forced
-//    refinement leaves a COVERAGE GAP -- some L1 tiles well within the
-//    force-refine margin (e.g. phi=1.98 with the default margin2~4) don't
-//    get an L2 child at all (likely blocked by the 2:1-balance same-level
-//    neighbor-cascade requirement in amr_manage_pool.wgsl -- not yet
-//    root-caused further), leaving L1 to handle real solid-crossing
-//    bounce-back links along a seam adjacent to masked (L2-covered)
-//    tiles. Confirmed NOT an L1 formula bug: forcing full L2 coverage
-//    (?forceRefineMargin2=10) makes L1's own contribution exactly zero,
-//    matching design intent (M8: push the body's surface onto the finest
-//    configured level) -- L1 alone (N_LEVELS<=2, or the dense reference)
-//    is correct in every test run.
-// 2. With L1 correctly reporting zero, level 2's OWN bounce-back force is
-//    STILL wrong (wrong sign, ~4x magnitude) even in full isolation --
-//    the field itself is confirmed healthy (debugReadPool: rho~1,
-//    populations bounded) at every level, so this is a force-bookkeeping
-//    bug specifically, not a step-shader/streaming one. A real, separate
-//    pre-existing dx-scale bug in amr_step1_pool.wgsl/amr_force1_pool.wgsl
-//    was found and fixed along the way (see that file's own header) but
-//    didn't fully resolve this.
+// diverges as soon as a pool level (L>=2) is active. Originally traced to
+// TWO distinct issues; the first is now mostly fixed at the root:
+// 1. COVERAGE GAP, root-caused and fixed: geometry-forced refinement is
+//    meant to be a HARD constraint (M8: push the body's surface onto the
+//    finest configured level, 2:1 balance driven FROM that, not used to
+//    veto it) but wasn't reliably reaching it. Two real, independent
+//    causes, both in amr_manage_pool.wgsl: (a) the same-level-neighbor
+//    2:1-balance gate could block a refine() even when isNearBodyAt was
+//    true, so a geometrically-qualifying candidate could sit unrefined
+//    for the same-level neighbor's sake -- now bypassed for hard-required
+//    (geometric or cascade) refines, kept only for pure-criterion ones;
+//    (b) a genuine pre-existing half-width bug in the isNearBodyAt center
+//    computation (missing that a tile's own interior is 2*RB cells, not
+//    RB -- see amr_criterion_pool.wgsl's own header -- so the "Milestone
+//    10 BUGFIX" comment at that exact spot introduced a spurious extra
+//    *0.5, evaluating "near the body" 2 L0-units off from every other
+//    shader's own, correct position). Live-verified: a coverage_check.js-
+//    style scan (compare every active L1 tile's own geometric distance to
+//    the body against whether it has an L2 child) found L1 tiles as close
+//    as phi=1.98 (well inside the ~4-unit default margin) lacking a
+//    required child before these fixes; zero such gaps after, at default
+//    thresholds, no manual margin override needed. Also cut L1's own
+//    (previously garbage, coverage-gap-driven) bounce-back contribution
+//    from fx~2.9 to fx~-0.19 -- real, substantial, but not exactly zero;
+//    a small number of residual 2:1-balance violations remain (confirmed
+//    via debugCheck21Balance, level-2-granularity, criterion/wake-driven
+//    positions rather than geometry -- doubling FIXED_POINT_ITERS didn't
+//    change them, so it isn't a convergence-timing issue -- not yet
+//    root-caused further).
+// 2. Level 2's OWN bounce-back force is STILL wrong (wrong sign, several x
+//    magnitude) even in full isolation from issue 1 -- the field itself
+//    is confirmed healthy (debugReadPool: rho~1, populations bounded) at
+//    every level, so this is a force-bookkeeping bug specifically, not a
+//    step-shader/streaming one. A real, separate pre-existing dx-scale
+//    bug in amr_step1_pool.wgsl/amr_force1_pool.wgsl was found and fixed
+//    along the way (see that file's own header) but didn't fully resolve
+//    this -- now the dominant remaining blocker, cleanly isolated with
+//    issue 1 mostly out of the way.
 // ?forceBounceback bypasses this guard for continued investigation.
 if (USE_BOUNCEBACK && N_LEVELS > 2 && !urlParams.has('forceBounceback')) {
   throw new Error('?bounceback with ?levels>2 is known-broken (diverges) -- see this file\'s own comment above N_LEVELS. Use ?levels=2 for a validated bounce-back run, or ?forceBounceback to bypass for investigation.');
