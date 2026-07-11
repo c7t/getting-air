@@ -141,15 +141,23 @@ async function chromeDebugOk(port) {
   } catch { return false; }
 }
 
-async function ensureChrome(port, baseUrl) {
+async function ensureChrome(port) {
   if (await chromeDebugOk(port)) {
     console.log(`[setup] Chrome already listening on debug port ${port}`);
-    return { started: false, profileDir: null };
+    return { started: false, profileDir: null, pid: null };
   }
   console.log('[setup] launching dedicated WebGPU-capable Chrome');
   const profileRoot = '/tmp/vpm-chrome-profile';
   fs.mkdirSync(profileRoot, { recursive: true });
   const profileDir = fs.mkdtempSync(path.join(profileRoot, 'validate-all-'));
+  // about:blank, not a config's own URL -- this harness drives ONE tab for
+  // the whole run (Page.navigate between configs, see runAllConfigs), never
+  // more than one WebGPU context alive on the GPU at a time. A prior version
+  // opened a fresh tab per config and only closed them all at the very end,
+  // which left every earlier config's tab (and its GPU-resident buffers)
+  // running concurrently with whatever was currently under test -- live-
+  // observed as multiple tabs stuck "initializing" and GPU contention
+  // between them. One process, one tab, one test at a time, throughout.
   const proc = spawn('/opt/google/chrome/chrome', [
     `--remote-debugging-port=${port}`,
     '--enable-features=Vulkan,WebGPUService',
@@ -158,18 +166,26 @@ async function ensureChrome(port, baseUrl) {
     '--no-first-run', '--no-default-browser-check',
     `--user-data-dir=${profileDir}`,
     '--window-size=1400,900',
-    `${baseUrl}/index-cylinder.html`, // any valid page -- keeps a tab alive so Chrome doesn't quit before configs open their own
+    'about:blank',
   ], { env: { ...process.env, DISPLAY: process.env.DISPLAY || ':0' }, detached: true, stdio: 'ignore' });
   proc.unref();
   const ok = await waitFor(() => chromeDebugOk(port), 10000, 300);
   if (!ok) throw new Error(`Chrome did not come up on debug port ${port} within 10s`);
-  return { started: true, profileDir };
+  return { started: true, profileDir, pid: proc.pid };
 }
 
 async function openTab(port, url) {
   const res = await fetch(`http://localhost:${port}/json/new?${encodeURIComponent(url)}`, { method: 'PUT' });
   const target = await res.json();
   return target.id;
+}
+
+async function firstTab(port) {
+  const res = await fetch(`http://localhost:${port}/json/list`);
+  const targets = await res.json();
+  const page = targets.find(t => t.type === 'page');
+  if (!page) throw new Error('no page target found on debug port ' + port);
+  return page.id;
 }
 
 async function closeTab(port, id) {
@@ -182,6 +198,17 @@ async function waitForCYL(Runtime, timeoutMs) {
     return !r.exceptionDetails && r.result.value === true;
   }, timeoutMs, 300);
   if (!ok) throw new Error('window.__CYL never became available (page failed to load or WebGPU init failed)');
+}
+
+// Navigates the SAME tab to a new URL and waits for the load event -- reused
+// between every config so only one page (one WebGPU context) is ever alive
+// at a time. Plain Page.navigate to a genuinely different URL each call,
+// not the "repeated navigate to the same URL" pattern the webgpu-verify
+// skill warns is flaky -- that gotcha is about reloading a tab whose live
+// sim state you want to preserve; here every config starts fresh anyway.
+async function navigateTo(Page, url) {
+  await Page.navigate({ url });
+  await Page.loadEventFired();
 }
 
 // --- per-config runners -----------------------------------------------
@@ -219,69 +246,70 @@ async function main() {
   if (configs.length === 0) { console.error('No matching configs (check --configs= names against the default list in this file).'); process.exit(1); }
 
   const server = await ensureServer(opts.baseUrl);
-  const chrome = await ensureChrome(opts.port, opts.baseUrl);
+  const chrome = await ensureChrome(opts.port);
   // Chrome takes a moment past the debug port coming up before it's actually
   // ready to serve WebGPU pages -- same settle time the webgpu-verify skill
   // itself waits after launch.
   if (chrome.started) await new Promise(r => setTimeout(r, 2000));
 
   const report = [];
-  const openTabs = [];
+
+  // ONE tab for the entire run, reused via Page.navigate between configs --
+  // see ensureChrome's own header for why (this replaced an earlier version
+  // that opened a new tab per config and left every prior one running
+  // concurrently). If Chrome was already running (not ours), open exactly
+  // one new tab rather than disturbing whatever the caller already had open;
+  // if we launched Chrome ourselves, its one about:blank tab IS that tab.
+  const tabId = chrome.started ? await firstTab(opts.port) : await openTab(opts.port, 'about:blank');
+  const client = await CDP({ port: opts.port, target: tabId });
+  const { Runtime, Page } = client;
+  await Runtime.enable();
+  await Page.enable();
+  // Registered once, not per-config -- re-registering inside the loop would
+  // stack one listener per prior config by the end of the run, logging each
+  // later exception that many times over.
+  let currentConfigName = null;
+  Runtime.exceptionThrown(e => console.error(`  [${currentConfigName}] browser exception:`, e.exceptionDetails.text));
 
   try {
     for (const config of configs) {
       console.log(`\n=== ${config.name} (${config.url}) ===`);
-      const tabId = await openTab(opts.port, config.url);
-      openTabs.push(tabId);
-      const client = await CDP({ port: opts.port, target: tabId });
-      const { Runtime } = client;
-      await Runtime.enable();
-      Runtime.exceptionThrown(e => console.error(`  [${config.name}] browser exception:`, e.exceptionDetails.text));
+      currentConfigName = config.name;
 
       let physics = null, invariants = null;
-      try {
-        await waitForCYL(Runtime, 15000);
+      await navigateTo(Page, config.url);
+      await waitForCYL(Runtime, 15000);
 
-        if (config.checkPhysics) {
-          console.log('  -- physics (Cd/St) --');
-          physics = await runPhysics(Runtime, opts);
-        }
-        if (config.checkInvariants) {
-          console.log('  -- structural invariants --');
-          invariants = await runInvariants(Runtime, opts);
-        }
-      } finally {
-        await client.close();
+      if (config.checkPhysics) {
+        console.log('  -- physics (Cd/St) --');
+        physics = await runPhysics(Runtime, opts);
+      }
+      if (config.checkInvariants) {
+        console.log('  -- structural invariants --');
+        invariants = await runInvariants(Runtime, opts);
       }
 
       report.push({ config, physics, invariants });
     }
   } finally {
-    for (const id of openTabs) await closeTab(opts.port, id);
+    await client.close();
     if (!opts.keepOpen) {
+      await closeTab(opts.port, tabId);
       if (chrome.started) {
-        // Closing every tab we opened leaves Chrome with none left (we
-        // seeded it with one extra tab in ensureChrome specifically to
-        // avoid it quitting mid-run when a config's own tab closes) --
-        // fetch a fresh list and close whatever's left, then it exits on
-        // its own once its last window is gone.
-        try {
-          const res = await fetch(`http://localhost:${opts.port}/json/list`);
-          const targets = await res.json();
-          for (const t of targets) await closeTab(opts.port, t.id);
-        } catch { /* best-effort cleanup */ }
-        // Give the browser process a moment to actually exit once its last
-        // tab closes before removing the profile dir out from under it --
-        // and remove it even on a clean exit: --user-data-dir profiles are
-        // never reused across runs (a fresh mkdtemp every launch), so
-        // leaving them behind is pure accumulation, not caching anything.
-        // Live-measured during this tool's own development: prior manual
-        // webgpu-verify sessions across this project's history had left
-        // 6.5GB across 70 uncleaned profile dirs under /tmp/vpm-chrome-
-        // profile -- this owns the whole Chrome lifecycle, so it's the one
-        // place that can safely clean up after itself instead of relying on
-        // whoever's driving it to remember the skill's own manual cleanup step.
+        // Kill the process directly rather than the earlier "close every
+        // tab and hope it exits on its own" dance -- we have its pid right
+        // here, no need to infer exit from tab count.
+        if (chrome.pid) { try { process.kill(chrome.pid); } catch { /* already gone */ } }
         await new Promise(r => setTimeout(r, 1000));
+        // --user-data-dir profiles are never reused across runs (a fresh
+        // mkdtemp every launch), so leaving them behind is pure
+        // accumulation, not caching anything. Live-measured during this
+        // tool's own development: prior manual webgpu-verify sessions
+        // across this project's history had left 6.5GB across 70 uncleaned
+        // profile dirs under /tmp/vpm-chrome-profile -- this owns the whole
+        // Chrome lifecycle, so it's the one place that can safely clean up
+        // instead of relying on whoever's driving it to remember the
+        // skill's own manual cleanup step.
         if (chrome.profileDir) { try { fs.rmSync(chrome.profileDir, { recursive: true, force: true }); } catch { /* best-effort cleanup */ } }
       }
       if (server.started && server.proc) { try { process.kill(-server.proc.pid); } catch { /* already gone */ } }
