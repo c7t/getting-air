@@ -70,7 +70,7 @@ override H : u32;
 override RB : u32;
 const GHOST = 2u;
 const FSCALE = 10000f;
-const K_EPS = 1.5f;
+override K_EPS : f32 = 1.5f;
 
 const ex = array<i32,9>( 0, 1, 0,-1, 0, 1,-1,-1, 1);
 const ey = array<i32,9>( 0, 0, 1, 0,-1, 1, 1,-1,-1);

@@ -93,7 +93,7 @@ override SPONGE_UY : f32 = 0.0f;
 // is why THEIR epsilon values don't change); this shared pipeline's dx_L
 // genuinely varies per level (levelParams.dxL, runtime -- see header), so
 // epsilon must be computed here, not hardcoded.
-const K_EPS = 1.5f;
+override K_EPS : f32 = 1.5f;
 
 const ex = array<i32,9>( 0, 1, 0,-1, 0, 1,-1,-1, 1);
 const ey = array<i32,9>( 0, 0, 1, 0,-1, 1, 1,-1,-1);
