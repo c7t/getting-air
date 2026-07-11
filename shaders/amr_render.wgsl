@@ -62,6 +62,15 @@ const BLOCK = 8u;
 override RB : u32;
 const GHOST = 2u;
 
+// Whether level 2 exists (N_LEVELS > 2). When 0, blockSlot2/vel_pool2 are
+// harmless dummy bindings and the level-2 override below MUST be gated off:
+// the dummy blockSlot2 is a single -1 element, so the childBlockID index is
+// out of bounds, and an OOB storage read is NOT guaranteed to return the
+// in-bounds -1 (Dawn clamps to element 0, but other WebGPU stacks can return
+// >=0, which falsely activates the L2 override and renders every refined
+// block black). Mirror amr_manage.wgsl's own HAS_LEVEL2 gate.
+override HAS_LEVEL2 : u32 = 0u;
+
 // Block-major linear index for a cell at BUFFER coordinates (cx, cy).
 // See amr_step.wgsl for the full derivation; vel is laid out this way
 // (Milestone 1, plans/AMR.md) instead of flat row-major.
@@ -266,7 +275,7 @@ fn fs_main(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> {
     let nbxL2 = nbx * 2u;
     let childBlockID = (bBY * 2u + qy) * nbxL2 + (bBX * 2u + qx);
     let slot2 = blockSlot2[i32(childBlockID)];
-    if (slot2 >= 0) {
+    if (HAS_LEVEL2 != 0u && slot2 >= 0) {
       level2Active = true;
       let s2 = u32(slot2);
       // This pixel's own offset WITHIN the quadrant (L0 units, [0,halfRB)),
