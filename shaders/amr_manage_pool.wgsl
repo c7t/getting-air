@@ -149,6 +149,10 @@ override REFINE_THRESH : f32;
 override COARSEN_THRESH : f32;
 override FORCE_REFINE_MARGIN : f32;
 override FORCE_REFINE_LOOKAHEAD : f32;
+// L0 window-space edge band excluded from vorticity-driven refinement (same
+// fixed L0-window strip as amr_manage.wgsl -- unscaled per level, since the
+// sponge is a fixed L0 strip). Gated off when <= 0.
+override SPONGE_EXCLUDE_W : f32 = 0.0f;
 const EPS_FLOOR = 1e-6f;
 
 fn get_phi(p: vec2<f32>, s: CardState) -> f32 {
@@ -182,6 +186,18 @@ fn isNearBodyAt(centerX_L0: f32, centerY_L0: f32) -> bool {
   let phi_future = get_phi(p_future, future);
 
   return min(phi_now, phi_future) < FORCE_REFINE_MARGIN;
+}
+
+// True if the given L0-buffer-space center lies within SPONGE_EXCLUDE_W of any
+// window edge (the ALBC sponge band). Mirrors amr_manage.wgsl's inSpongeBand,
+// parametrized by an already-computed L0 center like isNearBodyAt above.
+fn inSpongeBandAt(centerX_L0: f32, centerY_L0: f32) -> bool {
+  if (SPONGE_EXCLUDE_W <= 0.0f) { return false; }
+  let wx = (u32(centerX_L0) + W - u32(state.off_x)) % W;
+  let wy = (u32(centerY_L0) + H - u32(state.off_y)) % H;
+  let distX = min(f32(wx), f32(W - wx));
+  let distY = min(f32(wy), f32(H - wy));
+  return min(distX, distY) < SPONGE_EXCLUDE_W;
 }
 
 // True if the level-(m+1) tile at `childBlockID` currently has an active
@@ -303,7 +319,7 @@ fn refine(@builtin(global_invocation_id) gid: vec3<u32>) {
   // conservative gate, so criterion-driven growth alone still can't
   // outrun its own coarser neighborhood.
   let isHardRequired = isNearBodyAt(parentCenterX_L0, parentCenterY_L0) || cascadeWanted;
-  let wantsRefine = isHardRequired || eps >= REFINE_THRESH;
+  let wantsRefine = isHardRequired || (eps >= REFINE_THRESH && !inSpongeBandAt(parentCenterX_L0, parentCenterY_L0));
   if (!wantsRefine) { return; }
 
   if (!isHardRequired) {
@@ -380,7 +396,7 @@ fn coarsen(@builtin(global_invocation_id) gid: vec3<u32>) {
   let centerX_L0 = childOriginX[slot] + f32(RB) * (PARENT_CELL_SIZE_L0 * 0.5f);
   let centerY_L0 = childOriginY[slot] + f32(RB) * (PARENT_CELL_SIZE_L0 * 0.5f);
 
-  if (eps < COARSEN_THRESH && !isNearBodyAt(centerX_L0, centerY_L0)) {
+  if ((eps < COARSEN_THRESH || inSpongeBandAt(centerX_L0, centerY_L0)) && !isNearBodyAt(centerX_L0, centerY_L0)) {
     let quadIdx = slot / 4u; // slot IS quadrant 0's own slot (childQuadrant[slot]==0 checked above), so quadIdx*4u==slot
     // See header: blocked if any of the 4 children about to release has
     // an active level-(m+2) grandchild itself, or if any of their own
