@@ -23,6 +23,13 @@ let resLog2 = parseInt(urlParams.get('res')) || 9;
 if (resLog2 < 7) resLog2 = 7;
 if (resLog2 > 11) resLog2 = 11;
 
+// Optional: sharp momentum-exchange bounce-back solid coupling instead of
+// the default diffuse (Brinkman/Guo) volume penalization -- see
+// shaders/lbm_step.wgsl/lbm_force.wgsl's own USE_BOUNCEBACK header for the
+// method. Default off (0) reproduces today's exact behavior; main.js never
+// sets this at all, so the falling-card scenario is untouched either way.
+const USE_BOUNCEBACK = urlParams.has('bounceback') ? 1 : 0;
+
 let W = 1 << resLog2;
 let H = W;
 let NCELLS = W * H;
@@ -249,7 +256,7 @@ async function init() {
     { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } }
   ]});
 
-  const stepConstants = { W, H, SPONGE_UX: U0, SPONGE_UY: 0 };
+  const stepConstants = { W, H, SPONGE_UX: U0, SPONGE_UY: 0, USE_BOUNCEBACK };
   const constants     = { W, H };
 
   const stepPL = device.createComputePipeline({
@@ -258,7 +265,7 @@ async function init() {
   });
   const frcPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [frcBGL] }),
-    compute: { module: frcSM, entryPoint: 'main', constants }
+    compute: { module: frcSM, entryPoint: 'main', constants: { ...constants, USE_BOUNCEBACK } }
   });
   const phyPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [phyBGL] }),

@@ -94,7 +94,12 @@ const FORCE_REFINE_LOOKAHEAD = urlParams.has('forceRefineLookahead') ? parseFloa
 // verbatim for L1->L2 is not expected to be correct by construction).
 // `refineThresh{child}`/`coarsenThresh{child}`/etc. (child=2,3,...) override
 // the L(child-1)->L(child) decision; unset levels fall back to the base
-// (L0->L1) values, so a build that never sets them is unchanged.
+// (L0->L1) values, so a build that never sets them is unchanged -- EXCEPT
+// FORCE_REFINE_MARGIN, whose default fallback scales by the parent
+// level's own cell size (cellSizeL0AtLevel(childLevel-1)) instead of
+// reusing the raw base value -- see main-cylinder-amr.js's copy for why
+// (live-verified: without scaling, N_LEVELS=4 saturates level 3's entire
+// pool on first contact instead of forming a thin shell).
 function paramsForChildLevel(childLevel) {
   if (childLevel === 1) {
     return { REFINE_THRESH, COARSEN_THRESH, FORCE_REFINE_MARGIN, FORCE_REFINE_LOOKAHEAD };
@@ -103,7 +108,7 @@ function paramsForChildLevel(childLevel) {
   return {
     REFINE_THRESH: get('refineThresh', REFINE_THRESH),
     COARSEN_THRESH: get('coarsenThresh', COARSEN_THRESH),
-    FORCE_REFINE_MARGIN: get('forceRefineMargin', FORCE_REFINE_MARGIN),
+    FORCE_REFINE_MARGIN: get('forceRefineMargin', FORCE_REFINE_MARGIN * cellSizeL0AtLevel(childLevel - 1)),
     FORCE_REFINE_LOOKAHEAD: get('forceRefineLookahead', FORCE_REFINE_LOOKAHEAD),
   };
 }

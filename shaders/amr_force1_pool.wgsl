@@ -71,12 +71,27 @@ override RB : u32;
 const GHOST = 2u;
 const FSCALE = 10000f;
 override K_EPS : f32 = 1.5f;
+// Optional sharp momentum-exchange bounce-back force -- see
+// amr_step1_pool.wgsl's USE_BOUNCEBACK header for the shared rationale.
+override USE_BOUNCEBACK : u32 = 0u;
 
 const ex = array<i32,9>( 0, 1, 0,-1, 0, 1,-1,-1, 1);
 const ey = array<i32,9>( 0, 0, 1, 0,-1, 1, 1,-1,-1);
+const opp = array<u32,9>(0u, 3u, 4u, 1u, 2u, 7u, 8u, 5u, 6u);
+const wt = array<f32,9>(
+  0.44444444f,
+  0.11111111f, 0.11111111f, 0.11111111f, 0.11111111f,
+  0.02777778f, 0.02777778f, 0.02777778f, 0.02777778f
+);
+const CS2 = 0.33333333f;
 
 fn fineToCoarseUnit(fCoord: u32, origin: f32) -> f32 {
   let j = f32(i32(fCoord) - i32(GHOST));
+  return origin - 0.25 + 0.5 * j;
+}
+
+fn fineToCoarseUnitI(fCoordI: i32, origin: f32) -> f32 {
+  let j = f32(fCoordI - i32(GHOST));
   return origin - 0.25 + 0.5 * j;
 }
 
@@ -157,38 +172,69 @@ fn main(
         let p = vec2<f32>(wx, wy);
 
         let phi = get_phi(p, state);
-        let chi = get_chi(phi);
+        let poolPlaneStride = arrayLength(&f_in) / 9u;
+        let cell = slot * (FB * FB) + fy * FB + fx;
+        let areaWeight = levelParams.dxL * levelParams.dxL;
+        // Bounce-back's MEM sum is a PERIMETER integral, not the diffuse
+        // method's VOLUME integral -- dx^1, not dx^2. See amr_force1.wgsl's
+        // LINE_WEIGHT comment for the full rationale and live measurement.
+        let lineWeight = levelParams.dxL;
 
-        if (chi >= 1e-6) {
-          let poolPlaneStride = arrayLength(&f_in) / 9u;
-          let cell = slot * (FB * FB) + fy * FB + fx;
+        if (USE_BOUNCEBACK != 0u) {
+          // See lbm_force.wgsl's identical branch for the MEM formula;
+          // amr_step1.wgsl's own USE_BOUNCEBACK header for why the sharp
+          // test uses the UNCLAMPED source position.
+          if (phi >= 0f) {
+            var rx = p.x - state.cx;
+            var ry = p.y - state.cy;
+            rx -= f32(W) * round(rx / f32(W));
+            ry -= f32(H) * round(ry / f32(H));
+            let usx = state.vx - state.omega * ry;
+            let usy = state.vy + state.omega * rx;
 
-          var rho = 0f; var ux_star = 0f; var uy_star = 0f;
-          for (var i = 0u; i < 9u; i++) {
-            let srcX = clamp(i32(fx) - ex[i], 0, i32(FB) - 1);
-            let srcY = clamp(i32(fy) - ey[i], 0, i32(FB) - 1);
-            let srcCell = slot * (FB * FB) + u32(srcY) * FB + u32(srcX);
-            let fi = f_in[i * poolPlaneStride + srcCell];
-            rho     += fi;
-            ux_star += fi * f32(ex[i]);
-            uy_star += fi * f32(ey[i]);
+            for (var i = 0u; i < 9u; i++) {
+              let srcBufX = fineToCoarseUnitI(i32(fx) - ex[i], originX_L0);
+              let srcBufY = fineToCoarseUnitI(i32(fy) - ey[i], originY_L0);
+              let srcWx = wrapf(srcBufX - state.off_x, f32(W));
+              let srcWy = wrapf(srcBufY - state.off_y, f32(H));
+              if (get_phi(vec2<f32>(srcWx, srcWy), state) < 0f) {
+                let f_opp = f_in[opp[i] * poolPlaneStride + cell];
+                let corr = 2f * wt[i] * (f32(ex[i]) * usx + f32(ey[i]) * usy) / CS2;
+                fx_body += -f32(ex[i]) * (2f * f_opp + corr) * lineWeight;
+                fy_body += -f32(ey[i]) * (2f * f_opp + corr) * lineWeight;
+              }
+            }
+            tz_body = rx * fy_body - ry * fx_body;
           }
-          ux_star /= max(rho, 1e-6f); uy_star /= max(rho, 1e-6f);
+        } else {
+          let chi = get_chi(phi);
+          if (chi >= 1e-6) {
+            var rho = 0f; var ux_star = 0f; var uy_star = 0f;
+            for (var i = 0u; i < 9u; i++) {
+              let srcX = clamp(i32(fx) - ex[i], 0, i32(FB) - 1);
+              let srcY = clamp(i32(fy) - ey[i], 0, i32(FB) - 1);
+              let srcCell = slot * (FB * FB) + u32(srcY) * FB + u32(srcX);
+              let fi = f_in[i * poolPlaneStride + srcCell];
+              rho     += fi;
+              ux_star += fi * f32(ex[i]);
+              uy_star += fi * f32(ey[i]);
+            }
+            ux_star /= max(rho, 1e-6f); uy_star /= max(rho, 1e-6f);
 
-          var rx = p.x - state.cx;
-          var ry = p.y - state.cy;
-          rx -= f32(W) * round(rx / f32(W));
-          ry -= f32(H) * round(ry / f32(H));
-          let usx = state.vx - state.omega * ry;
-          let usy = state.vy + state.omega * rx;
+            var rx = p.x - state.cx;
+            var ry = p.y - state.cy;
+            rx -= f32(W) * round(rx / f32(W));
+            ry -= f32(H) * round(ry / f32(H));
+            let usx = state.vx - state.omega * ry;
+            let usy = state.vy + state.omega * rx;
 
-          let Fx = rho * chi * (usx - ux_star);
-          let Fy = rho * chi * (usy - uy_star);
+            let Fx = rho * chi * (usx - ux_star);
+            let Fy = rho * chi * (usy - uy_star);
 
-          let areaWeight = levelParams.dxL * levelParams.dxL;
-          fx_body = -Fx * areaWeight;
-          fy_body = -Fy * areaWeight;
-          tz_body = rx * fy_body - ry * fx_body;
+            fx_body = -Fx * areaWeight;
+            fy_body = -Fy * areaWeight;
+            tz_body = rx * fy_body - ry * fx_body;
+          }
         }
       }
     }

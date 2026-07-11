@@ -63,6 +63,12 @@ const BLOCK = 8u;
 override SPONGE_UX : f32 = 0.0f;
 override SPONGE_UY : f32 = 0.0f;
 
+// Optional sharp bounce-back solid coupling -- mirrors lbm_step.wgsl's
+// USE_BOUNCEBACK exactly (same formula, same default-0 no-op), just
+// operating in this file's window/buffer split addressing. See that
+// file's header for the full rationale.
+override USE_BOUNCEBACK : u32 = 0u;
+
 const ex = array<i32,9>( 0, 1, 0,-1, 0, 1,-1,-1, 1);
 const ey = array<i32,9>( 0, 0, 1, 0,-1, 1, 1,-1,-1);
 const wt = array<f32,9>(
@@ -70,6 +76,8 @@ const wt = array<f32,9>(
   0.11111111f, 0.11111111f, 0.11111111f, 0.11111111f,
   0.02777778f, 0.02777778f, 0.02777778f, 0.02777778f
 );
+const opp = array<u32,9>(0u, 3u, 4u, 1u, 2u, 7u, 8u, 5u, 6u);
+const CS2 = 0.33333333f;
 
 // Block-major linear index for a cell at BUFFER coordinates (cx, cy).
 // W and H are always exact multiples of BLOCK (resLog2 clamps W,H to
@@ -112,9 +120,35 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let wx = (cx + W - u32(state.off_x)) % W;
   let wy = (cy + H - u32(state.off_y)) % H;
 
+  // Position/solid-velocity/own-cell-index terms, hoisted ABOVE the gather
+  // loop -- see lbm_step.wgsl's identical hoist for why USE_BOUNCEBACK
+  // needs these before streaming, not after.
+  let p = vec2<f32>(f32(wx), f32(wy));
+  var rx = p.x - state.cx;
+  var ry = p.y - state.cy;
+  rx -= f32(W) * round(rx / f32(W));
+  ry -= f32(H) * round(ry / f32(H));
+
+  let usx = state.vx - state.omega * ry;
+  let usy = state.vy + state.omega * rx;
+
+  let phi = get_phi(p, state);
+  let cell = cellIndex(cx, cy);
+
   // 1. Pull Streaming: buffer-space neighbor (see file header derivation).
   var f: array<f32,9>;
   for (var i = 0u; i < 9u; i++) {
+    if (USE_BOUNCEBACK != 0u) {
+      let wx_src = (wx + W - u32(ex[i])) % W;
+      let wy_src = (wy + H - u32(ey[i])) % H;
+      if (get_phi(vec2<f32>(f32(wx_src), f32(wy_src)), state) < 0f) {
+        // Bounce-back -- see lbm_step.wgsl's identical branch for the
+        // formula/derivation.
+        let corr = 2f * wt[i] * (f32(ex[i]) * usx + f32(ey[i]) * usy) / CS2;
+        f[i] = f_in[opp[i] * (W * H) + cell] + corr;
+        continue;
+      }
+    }
     let bx_src = (cx + W - u32(ex[i])) % W;
     let by_src = (cy + H - u32(ey[i])) % H;
     f[i] = f_in[i * (W * H) + cellIndex(bx_src, by_src)];
@@ -134,18 +168,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let rhoDen = max(rho, 1e-6f);
   ux_star /= rhoDen; uy_star /= rhoDen;
 
-  // 3. Penalty Force and Solid Coupling (window-space)
-  let p = vec2<f32>(f32(wx), f32(wy));
-  var rx = p.x - state.cx;
-  var ry = p.y - state.cy;
-  rx -= f32(W) * round(rx / f32(W));
-  ry -= f32(H) * round(ry / f32(H));
-
-  let usx = state.vx - state.omega * ry;
-  let usy = state.vy + state.omega * rx;
-
-  let phi = get_phi(p, state);
-  let chi = get_chi(phi);
+  // 3. Penalty Force and Solid Coupling (window-space) -- chi forced to 0
+  // under USE_BOUNCEBACK, same as lbm_step.wgsl.
+  let chi = select(get_chi(phi), 0f, USE_BOUNCEBACK != 0u);
 
   // Penalty Force F = rho * chi * (Us - u*)
   let Fx = rho * chi * (usx - ux_star);
@@ -157,7 +182,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let u_sq = ux*ux + uy*uy;
 
   // Store velocity for rendering (block-major buffer cell index)
-  let cell = cellIndex(cx, cy);
   vel[cell * 2u] = ux; vel[cell * 2u + 1u] = uy;
 
   // 4. Collision and ALBC Sponge (window-space distance to window edges)

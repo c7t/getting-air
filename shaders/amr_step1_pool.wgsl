@@ -95,6 +95,12 @@ override SPONGE_UY : f32 = 0.0f;
 // epsilon must be computed here, not hardcoded.
 override K_EPS : f32 = 1.5f;
 
+// Optional sharp momentum-exchange bounce-back solid coupling -- see
+// amr_step1.wgsl's USE_BOUNCEBACK header for the unclamped-source
+// rationale this shares (identical here, just with a cached f32 origin
+// instead of a blockID-derived one -- see this file's own header).
+override USE_BOUNCEBACK : u32 = 0u;
+
 const ex = array<i32,9>( 0, 1, 0,-1, 0, 1,-1,-1, 1);
 const ey = array<i32,9>( 0, 0, 1, 0,-1, 1, 1,-1,-1);
 const wt = array<f32,9>(
@@ -102,9 +108,16 @@ const wt = array<f32,9>(
   0.11111111f, 0.11111111f, 0.11111111f, 0.11111111f,
   0.02777778f, 0.02777778f, 0.02777778f, 0.02777778f
 );
+const opp = array<u32,9>(0u, 3u, 4u, 1u, 2u, 7u, 8u, 5u, 6u);
+const CS2 = 0.33333333f;
 
 fn fineToCoarseUnit(fCoord: u32, origin: f32) -> f32 {
   let j = f32(i32(fCoord) - i32(GHOST));
+  return origin - 0.25 + 0.5 * j;
+}
+
+fn fineToCoarseUnitI(fCoordI: i32, origin: f32) -> f32 {
+  let j = f32(fCoordI - i32(GHOST));
   return origin - 0.25 + 0.5 * j;
 }
 
@@ -151,26 +164,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let poolPlaneStride = arrayLength(&f_in) / 9u;
   let cell = slot * (FB * FB) + fy * FB + fx;
 
-  // 1. Pull Streaming: clamp at the slot's own buffer edge.
-  var f: array<f32,9>;
-  for (var i = 0u; i < 9u; i++) {
-    let srcX = clamp(i32(fx) - ex[i], 0, i32(FB) - 1);
-    let srcY = clamp(i32(fy) - ey[i], 0, i32(FB) - 1);
-    let srcCell = slot * (FB * FB) + u32(srcY) * FB + u32(srcX);
-    f[i] = f_in[i * poolPlaneStride + srcCell];
-  }
-
-  // 2. Local Macroscopic Variables
-  var rho = 0f; var ux_star = 0f; var uy_star = 0f;
-  for (var i = 0u; i < 9u; i++) {
-    rho     += f[i];
-    ux_star += f[i] * f32(ex[i]);
-    uy_star += f[i] * f32(ey[i]);
-  }
-  let rhoDen = max(rho, 1e-6f);
-  ux_star /= rhoDen; uy_star /= rhoDen;
-
-  // 3. Penalty Force and Solid Coupling. Buffer-space fine position (L0
+  // Position/solid-velocity terms, hoisted ABOVE the gather loop -- see
+  // amr_step1.wgsl's identical hoist. Buffer-space fine position (L0
   // units, via the cached origin) -> window position by inverting
   // off_x/off_y (same as amr_step1.wgsl).
   let bufX = fineToCoarseUnit(fx, originX_L0);
@@ -187,7 +182,41 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let usy = state.vy + state.omega * rx;
 
   let phi = get_phi(p, state);
-  let chi = get_chi(phi);
+
+  // 1. Pull Streaming: clamp at the slot's own buffer edge (or bounce back
+  // off the solid -- see USE_BOUNCEBACK's own header comment).
+  var f: array<f32,9>;
+  for (var i = 0u; i < 9u; i++) {
+    if (USE_BOUNCEBACK != 0u) {
+      let srcBufX = fineToCoarseUnitI(i32(fx) - ex[i], originX_L0);
+      let srcBufY = fineToCoarseUnitI(i32(fy) - ey[i], originY_L0);
+      let srcWx = wrapf(srcBufX - state.off_x, f32(W));
+      let srcWy = wrapf(srcBufY - state.off_y, f32(H));
+      if (get_phi(vec2<f32>(srcWx, srcWy), state) < 0f) {
+        let corr = 2f * wt[i] * (f32(ex[i]) * usx + f32(ey[i]) * usy) / CS2;
+        f[i] = f_in[opp[i] * poolPlaneStride + cell] + corr;
+        continue;
+      }
+    }
+    let srcX = clamp(i32(fx) - ex[i], 0, i32(FB) - 1);
+    let srcY = clamp(i32(fy) - ey[i], 0, i32(FB) - 1);
+    let srcCell = slot * (FB * FB) + u32(srcY) * FB + u32(srcX);
+    f[i] = f_in[i * poolPlaneStride + srcCell];
+  }
+
+  // 2. Local Macroscopic Variables
+  var rho = 0f; var ux_star = 0f; var uy_star = 0f;
+  for (var i = 0u; i < 9u; i++) {
+    rho     += f[i];
+    ux_star += f[i] * f32(ex[i]);
+    uy_star += f[i] * f32(ey[i]);
+  }
+  let rhoDen = max(rho, 1e-6f);
+  ux_star /= rhoDen; uy_star /= rhoDen;
+
+  // 3. Penalty Force and Solid Coupling -- chi forced to 0 under
+  // USE_BOUNCEBACK, same as lbm_step.wgsl.
+  let chi = select(get_chi(phi), 0f, USE_BOUNCEBACK != 0u);
 
   let Fx = rho * chi * (usx - ux_star);
   let Fy = rho * chi * (usy - uy_star);
