@@ -85,6 +85,12 @@ const COARSEN_THRESH = urlParams.has('coarsenThresh') ? parseFloat(urlParams.get
 // REFINE_THRESH/COARSEN_THRESH once exercised against a live run.
 const FORCE_REFINE_MARGIN = urlParams.has('forceRefineMargin') ? parseFloat(urlParams.get('forceRefineMargin')) : 8;
 const FORCE_REFINE_LOOKAHEAD = urlParams.has('forceRefineLookahead') ? parseFloat(urlParams.get('forceRefineLookahead')) : REFINE_EVERY;
+// L0 window-space edge band (coarse cells) excluded from vorticity-driven
+// refinement -- keeps fine blocks out of the ALBC sponge (amr_step.wgsl
+// SPONGE_W=4). A fixed L0-window strip, so the same value applies at every
+// refinement level (unlike FORCE_REFINE_MARGIN). Default 8; ?spongeExclude=0
+// disables it.
+const SPONGE_EXCLUDE_W = urlParams.has('spongeExclude') ? parseFloat(urlParams.get('spongeExclude')) : 8;
 
 // Milestone 10: per-CHILD-level threshold overrides -- see
 // main-cylinder-amr.js's copy of this function for the full rationale (a
@@ -831,7 +837,7 @@ async function init() {
   const interpFFConstants = { W, H, RB, GHOST_ONLY: 1, FINE_FINE_ONLY: 1 };
   const step1Constants = { W, H, RB };
   const criterionConstants = { W, H };
-  const manageConstants = { W, H, REFINE_THRESH, COARSEN_THRESH, FORCE_REFINE_MARGIN, FORCE_REFINE_LOOKAHEAD, HAS_LEVEL2: N_LEVELS > 2 ? 1 : 0 };
+  const manageConstants = { W, H, REFINE_THRESH, COARSEN_THRESH, FORCE_REFINE_MARGIN, FORCE_REFINE_LOOKAHEAD, SPONGE_EXCLUDE_W, HAS_LEVEL2: N_LEVELS > 2 ? 1 : 0 };
 
   const stepPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [stepBGL] }),
@@ -970,6 +976,7 @@ async function init() {
       NBX_PARENT: parentPool.NBX, NBY_PARENT: parentPool.NBY,
       PARENT_CELL_SIZE_L0: cellSizeL0AtLevel(m),
       PARENT_HAS_CACHED_ORIGIN: parentIsDense ? 0 : 1,
+      SPONGE_EXCLUDE_W,
       ...childParams,
       HAS_GRANDCHILD: hasGrandchild ? 1 : 0,
     };
