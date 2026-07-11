@@ -2325,6 +2325,134 @@ async function init() {
     return { ok: violations.length === 0, violations, counts };
   }
 
+  // Persisted form of the "coverage_check.js-style scan" described (but
+  // never committed) in the bounce-back N>=3 investigation -- see this
+  // file's own comment above N_LEVELS. Geometry-forced refinement is meant
+  // to be a HARD constraint (amr_manage_pool.wgsl/amr_manage.wgsl's own
+  // isNearBody(At)): every active LEAF tile whose own center falls within
+  // THAT LEVEL's own FORCE_REFINE_MARGIN of the body (now, or
+  // FORCE_REFINE_LOOKAHEAD macro-steps out) must already have a child one
+  // level down, unless it's already at the finest configured level (N_LEVELS
+  // -1, nothing deeper to grow). A violation here is exactly the class of
+  // bug that produced both historical fixes (the 2:1-gate veto, and the
+  // isNearBodyAt half-width bug): a body-adjacent block computing its force
+  // contribution at a coarser level than the build is configured to
+  // support, which is what corrupted level 2's own bounce-back force.
+  //
+  // get_phi/isNearBodyAt below are a deliberate line-for-line JS mirror of
+  // amr_manage_pool.wgsl's own (shared with amr_manage.wgsl) WGSL -- kept
+  // duplicated rather than "simplified" because the whole point is an
+  // INDEPENDENT re-derivation to catch drift in the shader's own version,
+  // not a shared helper that would silently pass if both copies had the
+  // same bug.
+  //
+  // Center computation mirrors amr_manage_pool.wgsl refine()'s own
+  // parentCenterX_L0 (origin + RB*(this level's own dx), see that file's
+  // BUGFIX comment on why no further *0.5 belongs there) and
+  // amr_manage.wgsl isNearBody's dense bx*BLOCK+BLOCK/2 special case for
+  // L0 (numerically identical: RB=BLOCK=8, cellSizeL0AtLevel(1)=0.5, so
+  // RB*0.5=4=BLOCK/2).
+  async function debugCheckGeometryCoverage() {
+    const state = await debugReadCardState();
+    // paramsForChildLevel(m+1), not the window.__CYL.getRefineParams() wrapper
+    // (that's an inline arrow property, not a name in scope here) -- same
+    // per-child-level REFINE_THRESH/COARSEN_THRESH/FORCE_REFINE_MARGIN/
+    // FORCE_REFINE_LOOKAHEAD resolution the manage passes themselves use.
+    const perLevel = Array.from({ length: N_LEVELS - 1 }, (_, i) => paramsForChildLevel(i + 1));
+
+    function getPhi(px, py, cx, cy, theta, a, b) {
+      const ca = Math.cos(theta), sa = Math.sin(theta);
+      let dx = px - cx, dy = py - cy;
+      dx -= W * Math.round(dx / W);
+      dy -= H * Math.round(dy / H);
+      const lx = dx * ca + dy * sa;
+      const ly = -dx * sa + dy * ca;
+      const d = Math.sqrt((lx * lx) / (a * a) + (ly * ly) / (b * b)) - 1.0;
+      return d * b;
+    }
+
+    function isNearBodyAt(centerX_L0, centerY_L0, margin, lookahead) {
+      const wx = (((centerX_L0 + W - state.off_x) % W) + W) % W;
+      const wy = (((centerY_L0 + H - state.off_y) % H) + H) % H;
+      const phiNow = getPhi(wx, wy, state.cx, state.cy, state.theta, state.a, state.b);
+
+      const pfx = wx - state.vx * lookahead;
+      const pfy = wy - state.vy * lookahead;
+      const thetaFuture = state.theta + state.omega * lookahead;
+      const phiFuture = getPhi(pfx, pfy, state.cx, state.cy, thetaFuture, state.a, state.b);
+
+      return Math.min(phiNow, phiFuture) < margin;
+    }
+
+    const violations = [];
+
+    // L0 -> L1: dense parent, footprint-preserving 1:1 (blockID indexes
+    // both L0's own coarse block and L1's pool block identically).
+    {
+      const { FORCE_REFINE_MARGIN, FORCE_REFINE_LOOKAHEAD } = perLevel[0];
+      const { blockSlot } = await readPoolIndirection(1);
+      for (let blockID = 0; blockID < NBLOCKS; blockID++) {
+        if (blockSlot[blockID] !== -1) continue; // has an L1 child -- not a leaf at L0
+        const bx = blockID % NBX, by = Math.floor(blockID / NBX);
+        const centerX = bx * RB + RB * cellSizeL0AtLevel(1);
+        const centerY = by * RB + RB * cellSizeL0AtLevel(1);
+        if (isNearBodyAt(centerX, centerY, FORCE_REFINE_MARGIN, FORCE_REFINE_LOOKAHEAD)) {
+          violations.push({ level: 0, bx, by, wantsChildLevel: 1 });
+        }
+      }
+    }
+
+    // L(m) -> L(m+1) for m = 1..N_LEVELS-2: pool levels. Origin split
+    // exactly mirrors amr_manage_pool.wgsl's own PARENT_HAS_CACHED_ORIGIN
+    // branch -- level 1 has NO originXBuf/originYBuf at all (allocLevelPool
+    // only allocates those for m!==1; level 1's own origin is always cheaply
+    // re-derivable from blockID, footprint-preserving 1:1 with L0's dense
+    // blocks), only levels >=2 cache it. Read back fresh here rather than
+    // trusting the CPU-side quadCPU mirror (which goes stale under
+    // autoRefine, same caveat as readPoolIndirection's own header).
+    for (let m = 1; m < N_LEVELS - 1; m++) {
+      const { FORCE_REFINE_MARGIN, FORCE_REFINE_LOOKAHEAD } = perLevel[m];
+      const pool = pools[m];
+      const { slotToBlock } = await readPoolIndirection(m);
+      const { blockSlot: childBlockSlot } = await readPoolIndirection(m + 1);
+      const nbxChild = pools[m + 1].NBX;
+
+      let originX = null, originY = null;
+      if (m >= 2) {
+        const stageOX = device.createBuffer({ size: pool.MAX_FINE_BLOCKS * 4, usage: U.MAP_READ | U.COPY_DST });
+        const stageOY = device.createBuffer({ size: pool.MAX_FINE_BLOCKS * 4, usage: U.MAP_READ | U.COPY_DST });
+        const enc = device.createCommandEncoder();
+        enc.copyBufferToBuffer(pool.originXBuf, 0, stageOX, 0, pool.MAX_FINE_BLOCKS * 4);
+        enc.copyBufferToBuffer(pool.originYBuf, 0, stageOY, 0, pool.MAX_FINE_BLOCKS * 4);
+        device.queue.submit([enc.finish()]);
+        await Promise.all([stageOX.mapAsync(GPUMapMode.READ), stageOY.mapAsync(GPUMapMode.READ)]);
+        originX = new Float32Array(stageOX.getMappedRange()).slice();
+        originY = new Float32Array(stageOY.getMappedRange()).slice();
+        stageOX.unmap(); stageOY.unmap();
+        stageOX.destroy(); stageOY.destroy();
+      }
+
+      const dxL = cellSizeL0AtLevel(m);
+      for (let slot = 0; slot < pool.MAX_FINE_BLOCKS; slot++) {
+        const blockID = slotToBlock[slot];
+        if (blockID < 0) continue; // slot not active
+        const bx = blockID % pool.NBX, by = Math.floor(blockID / pool.NBX);
+        const childBlockID0 = (by * 2) * nbxChild + (bx * 2);
+        if (childBlockSlot[childBlockID0] >= 0) continue; // has an L(m+1) child -- not a leaf
+
+        const originX_L0 = m === 1 ? bx * RB : originX[slot];
+        const originY_L0 = m === 1 ? by * RB : originY[slot];
+        const centerX = originX_L0 + RB * dxL;
+        const centerY = originY_L0 + RB * dxL;
+        if (isNearBodyAt(centerX, centerY, FORCE_REFINE_MARGIN, FORCE_REFINE_LOOKAHEAD)) {
+          violations.push({ level: m, bx, by, slot, wantsChildLevel: m + 1 });
+        }
+      }
+    }
+
+    return { ok: violations.length === 0, violations };
+  }
+
   // Deterministic synchronous stepping, bypassing rAF entirely -- lets two
   // separate builds be driven to an EXACT matching step count for a fair
   // diff. Wall-clock polling of the normal rAF-driven `liveMode` loop can't
@@ -2528,6 +2656,7 @@ async function init() {
     debugDeactivateBlock,
     debugListActiveBlocks,
     debugCheck21Balance,
+    debugCheckGeometryCoverage,
     debugProbeGhostFill,
     debugRunSteadyGhostFill,
     debugReadPool,
