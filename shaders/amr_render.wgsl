@@ -31,9 +31,20 @@ struct CardState {
 
 @group(0) @binding(0) var<storage, read> vel         : array<f32>;
 @group(0) @binding(1) var<storage, read> state       : CardState;
-@group(0) @binding(2) var<storage, read> vel_pool    : array<f32>; // Milestone 4: fine pool
-@group(0) @binding(3) var<storage, read> blockSlot   : array<i32>; // Milestone 4: coarse block -> pool slot
+@group(0) @binding(2) var<storage, read> vel_pool    : array<f32>; // Milestone 4: fine pool (level 1)
+@group(0) @binding(3) var<storage, read> blockSlot   : array<i32>; // Milestone 4: coarse block -> pool slot (level 1)
 @group(0) @binding(4) var<uniform>       overlayOpacity : f32;     // refinement-coverage overlay opacity [0,1]
+// Milestone 10: level 2's own vel_pool/blockSlot, for finest-active-level-
+// wins compositing -- harmless dummy buffers (blockSlot2 all -1) when
+// N_LEVELS<3, in which case level 2 is simply never "active" anywhere and
+// this file's behavior is exactly today's fixed two-tier logic. See this
+// file's header comment on why a third tier doesn't need a bigger
+// redesign (bindless/dynamic-arity level arrays) -- this plan's own scope
+// stops at N<=3 (plans/AMR-multilevel.md's own scalability notes), so one
+// more fixed set of bindings, not a generalized loop, is the right size
+// of change here.
+@group(0) @binding(5) var<storage, read> vel_pool2   : array<f32>;
+@group(0) @binding(6) var<storage, read> blockSlot2  : array<i32>;
 
 override W : u32;
 override H : u32;
@@ -149,6 +160,26 @@ fn fineOmegaCell(slot: u32, cx: i32, cy: i32) -> f32 {
   return (uyp - uym) - (uxp - uxm);
 }
 
+// Milestone 10: level 2's own vel_pool/omega, same shape as
+// poolVelCell/fineOmegaCell above, one level deeper. Level 2's own spacing
+// is 0.25 coarse units, so the normalizing factor is 1/(2*0.25)=2 (not 1
+// like level 1) -- same per-coarse-unit convention, still directly
+// comparable at interfaces.
+fn poolVelCell2(slot: u32, cx: i32, cy: i32) -> vec2<f32> {
+  let FBl = RB * 2u + 2u * GHOST;
+  let ix = u32(clamp(cx, 0, i32(FBl) - 1));
+  let iy = u32(clamp(cy, 0, i32(FBl) - 1));
+  let cell = slot * (FBl * FBl) + iy * FBl + ix;
+  return vec2<f32>(vel_pool2[cell * 2u], vel_pool2[cell * 2u + 1u]);
+}
+fn fineOmegaCell2(slot: u32, cx: i32, cy: i32) -> f32 {
+  let uyp = poolVelCell2(slot, cx + 1, cy).y;
+  let uym = poolVelCell2(slot, cx - 1, cy).y;
+  let uxp = poolVelCell2(slot, cx, cy + 1).x;
+  let uxm = poolVelCell2(slot, cx, cy - 1).x;
+  return ((uyp - uym) - (uxp - uxm)) * 2.0f;
+}
+
 @fragment
 fn fs_main(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> {
   let fx = uv.x * f32(W); let fy = (1.0 - uv.y) * f32(H);
@@ -191,6 +222,7 @@ fn fs_main(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> {
   let bBX = u32(wrapf(bufX + 0.5, f32(W))) / RB;
   let bBY = u32(wrapf(bufY + 0.5, f32(H))) / RB;
   let slot = blockSlot[i32(bBY * nbx + bBX)];
+  var level2Active = false;
   if (slot >= 0) {
     let s = u32(slot);
     var dxr = bufX - f32(bBX * RB); dxr -= f32(W) * round(dxr / f32(W));
@@ -203,6 +235,36 @@ fn fs_main(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> {
         mix(fineOmegaCell(s, fx0, fy0),     fineOmegaCell(s, fx0 + 1, fy0),     ftx),
         mix(fineOmegaCell(s, fx0, fy0 + 1), fineOmegaCell(s, fx0 + 1, fy0 + 1), ftx),
         fty);
+
+    // Milestone 10: finest-active-level-wins. If this L1 block also has an
+    // active level-2 child covering this pixel's own quadrant, override
+    // again with level 2's own (denser) field. Which quadrant (0/1 on each
+    // axis) is exactly dxr/dyr's own half of the RB-wide L1 footprint --
+    // same test amr_force1.wgsl's masking check uses, just reading instead
+    // of masking.
+    let halfRB = f32(RB) * 0.5f;
+    let qx = select(0u, 1u, dxr >= halfRB);
+    let qy = select(0u, 1u, dyr >= halfRB);
+    let nbxL2 = nbx * 2u;
+    let childBlockID = (bBY * 2u + qy) * nbxL2 + (bBX * 2u + qx);
+    let slot2 = blockSlot2[i32(childBlockID)];
+    if (slot2 >= 0) {
+      level2Active = true;
+      let s2 = u32(slot2);
+      // This pixel's own offset WITHIN the quadrant (L0 units, [0,halfRB)),
+      // then the same fine-coordinate mapping as level 1's own above, just
+      // at level 2's own 4x-of-L0 density (coefficient 4.0, not 2.0).
+      let dxr2 = dxr - f32(qx) * halfRB;
+      let dyr2 = dyr - f32(qy) * halfRB;
+      let fxc2 = f32(GHOST) + 4.0 * dxr2 + 0.5;
+      let fyc2 = f32(GHOST) + 4.0 * dyr2 + 0.5;
+      let fx02 = i32(floor(fxc2)); let fy02 = i32(floor(fyc2));
+      let ftx2 = fxc2 - f32(fx02);  let fty2 = fyc2 - f32(fy02);
+      omega = mix(
+          mix(fineOmegaCell2(s2, fx02, fy02),     fineOmegaCell2(s2, fx02 + 1, fy02),     ftx2),
+          mix(fineOmegaCell2(s2, fx02, fy02 + 1), fineOmegaCell2(s2, fx02 + 1, fy02 + 1), ftx2),
+          fty2);
+    }
   }
 
   // Blue for clockwise (negative), red for counter-clockwise (positive)
@@ -221,7 +283,15 @@ fn fs_main(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> {
   // just its sampled interior. Reuses slot already computed above at no
   // extra cost. Canvas output is unorm, so this saturates harmlessly in
   // already-bright (high-vorticity or solid-body) regions.
-  if (slot >= 0) {
+  //
+  // Milestone 10: brighter/bluer green for level 2's own quadrant
+  // footprint, so the two refinement tiers are visually distinguishable,
+  // not just "some refinement happened here" -- level2Active is already
+  // computed per-pixel above (this level's own quadrant only, not the
+  // whole L1 block, since level 2 doesn't necessarily cover all 4).
+  if (level2Active) {
+    c += vec3(0.0, 0.32, 0.12) * overlayOpacity;
+  } else if (slot >= 0) {
     c += vec3(0.0, 0.22, 0.0) * overlayOpacity;
   }
 

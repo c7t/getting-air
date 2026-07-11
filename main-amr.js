@@ -86,6 +86,28 @@ const COARSEN_THRESH = urlParams.has('coarsenThresh') ? parseFloat(urlParams.get
 const FORCE_REFINE_MARGIN = urlParams.has('forceRefineMargin') ? parseFloat(urlParams.get('forceRefineMargin')) : 8;
 const FORCE_REFINE_LOOKAHEAD = urlParams.has('forceRefineLookahead') ? parseFloat(urlParams.get('forceRefineLookahead')) : REFINE_EVERY;
 
+// Milestone 10: per-CHILD-level threshold overrides -- see
+// main-cylinder-amr.js's copy of this function for the full rationale (a
+// level-2 block's vorticity is measured on the same RB=8 stencil at half
+// the physical spacing of level 1's, so the same physical feature reads as
+// a different numeric |omega| one level down; reusing L0->L1's thresholds
+// verbatim for L1->L2 is not expected to be correct by construction).
+// `refineThresh{child}`/`coarsenThresh{child}`/etc. (child=2,3,...) override
+// the L(child-1)->L(child) decision; unset levels fall back to the base
+// (L0->L1) values, so a build that never sets them is unchanged.
+function paramsForChildLevel(childLevel) {
+  if (childLevel === 1) {
+    return { REFINE_THRESH, COARSEN_THRESH, FORCE_REFINE_MARGIN, FORCE_REFINE_LOOKAHEAD };
+  }
+  const get = (name, base) => urlParams.has(`${name}${childLevel}`) ? parseFloat(urlParams.get(`${name}${childLevel}`)) : base;
+  return {
+    REFINE_THRESH: get('refineThresh', REFINE_THRESH),
+    COARSEN_THRESH: get('coarsenThresh', COARSEN_THRESH),
+    FORCE_REFINE_MARGIN: get('forceRefineMargin', FORCE_REFINE_MARGIN),
+    FORCE_REFINE_LOOKAHEAD: get('forceRefineLookahead', FORCE_REFINE_LOOKAHEAD),
+  };
+}
+
 const resSlider = document.getElementById('slider-RES');
 const resVal    = document.getElementById('val-RES');
 resSlider.value = resLog2;
@@ -289,8 +311,13 @@ function allocLevelPool(device, U, m, NBX_m, NBY_m, maxFineBlocks) {
     // which parent-level slot it was carved from (parentSlot) and which
     // of the 4 quadrants it occupies (quadrant) -- see
     // plans/AMR-multilevel-M5.md §2 and shaders/amr_interp_pool_parent.wgsl.
-    pool.parentSlotBuf = device.createBuffer({ size: maxFineBlocks * 4, usage: U.STORAGE | U.COPY_DST });
-    pool.quadrantBuf   = device.createBuffer({ size: maxFineBlocks * 4, usage: U.STORAGE | U.COPY_DST });
+    // COPY_SRC (not just STORAGE|COPY_DST): Milestone 10's debugSnapshotSave
+    // reads these back via copyBufferToBuffer -- without it, that copy is an
+    // invalid WebGPU command, which poisons the WHOLE shared command encoder
+    // (all commands in an invalid GPUCommandBuffer become no-ops on submit),
+    // silently zeroing out every OTHER staging buffer in the same save too.
+    pool.parentSlotBuf = device.createBuffer({ size: maxFineBlocks * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
+    pool.quadrantBuf   = device.createBuffer({ size: maxFineBlocks * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
     // Milestone 7: a level>=2 tile's own physical (L0-buffer-space) origin,
     // cached at quad-activation time -- unlike ownBX/ownBY (correctly
     // dropped, see the amendment above), this is NOT cheaply re-derivable
@@ -299,8 +326,8 @@ function allocLevelPool(device, U, m, NBX_m, NBY_m, maxFineBlocks) {
     // plus the parent's own origin, recursively), a cross-BUFFER,
     // cross-LEVEL computation, not a same-buffer mod/div. See
     // shaders/amr_step1_pool.wgsl's header.
-    pool.originXBuf = device.createBuffer({ size: maxFineBlocks * 4, usage: U.STORAGE | U.COPY_DST });
-    pool.originYBuf = device.createBuffer({ size: maxFineBlocks * 4, usage: U.STORAGE | U.COPY_DST });
+    pool.originXBuf = device.createBuffer({ size: maxFineBlocks * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
+    pool.originYBuf = device.createBuffer({ size: maxFineBlocks * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
     // parentSlot has no meaningful "unset" value read anywhere unless
     // slotToBlock already says active (initialized below) -- 0 is harmless
     // filler, not a correctness requirement, so left at WebGPU's own
@@ -593,12 +620,17 @@ async function init() {
     { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
     { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }
   ]});
+  // Milestone 10: bindings 5/6 (level 2's own vel_pool/blockSlot) are for
+  // finest-active-level-wins compositing -- harmless dummies when
+  // N_LEVELS<3, see amr_render.wgsl's header.
   const renBGL = device.createBindGroupLayout({ label: 'renBGL', entries: [
     { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
     { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
     { binding: 2, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
     { binding: 3, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
-    { binding: 4, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } }
+    { binding: 4, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
+    { binding: 5, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
+    { binding: 6, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } }
   ]});
 
   // Milestone 4: interp (coarse->fine ghosts), fine step, average (fine->coarse),
@@ -880,12 +912,16 @@ async function init() {
   for (let m = 1; m < N_LEVELS - 1; m++) {
     const parentPool = pools[m];
     const parentIsDense = m === 1; // level 1's parent is L0 -- see amr_step1.wgsl's header
+    // childLevel = m+1: this loop only ever decides some child level >=2,
+    // so it always picks up that child's own override (or falls back to
+    // the base L0->L1 values if unset). See paramsForChildLevel's header.
+    const childParams = paramsForChildLevel(m + 1);
     const poolConstants = {
       W, H, RB,
       NBX_PARENT: parentPool.NBX, NBY_PARENT: parentPool.NBY,
       PARENT_CELL_SIZE_L0: cellSizeL0AtLevel(m),
       PARENT_HAS_CACHED_ORIGIN: parentIsDense ? 0 : 1,
-      REFINE_THRESH, COARSEN_THRESH, FORCE_REFINE_MARGIN, FORCE_REFINE_LOOKAHEAD,
+      ...childParams,
     };
     criterionPoolPLs[m] = device.createComputePipeline({
       layout: device.createPipelineLayout({ bindGroupLayouts: [criterionPoolBGL] }),
@@ -910,7 +946,7 @@ async function init() {
   const phyBG = device.createBindGroup({ layout: phyBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: forceBuf } }]});
   const overlayOpacityBuf = device.createBuffer({ size: 4, usage: U.UNIFORM | U.COPY_DST });
   device.queue.writeBuffer(overlayOpacityBuf, 0, new Float32Array([1.0])); // overlay fully on by default
-  const renBG = device.createBindGroup({ layout: renBGL, entries: [{ binding: 0, resource: { buffer: velBuf } }, { binding: 1, resource: { buffer: cardStateBuf } }, { binding: 2, resource: { buffer: pools[1].finePoolVel } }, { binding: 3, resource: { buffer: pools[1].blockSlotBuf } }, { binding: 4, resource: { buffer: overlayOpacityBuf } }]});
+  const renBG = device.createBindGroup({ layout: renBGL, entries: [{ binding: 0, resource: { buffer: velBuf } }, { binding: 1, resource: { buffer: cardStateBuf } }, { binding: 2, resource: { buffer: pools[1].finePoolVel } }, { binding: 3, resource: { buffer: pools[1].blockSlotBuf } }, { binding: 4, resource: { buffer: overlayOpacityBuf } }, { binding: 5, resource: { buffer: N_LEVELS > 2 ? pools[2].finePoolVel : pools[1].finePoolVel } }, { binding: 6, resource: { buffer: N_LEVELS > 2 ? pools[2].blockSlotBuf : dummyBlockSlotBuf } }]});
 
   // Milestone 4 bind groups (pool-aware, superseding M2's single-region ones).
   // interp always WRITES pools[1].finePoolF_a (the pool's current-at-macro-step-
@@ -1141,6 +1177,14 @@ async function init() {
   // returns to its initial value (false) at a frame boundary, meaning f_a
   // (not f_b) is always the authoritative/current buffer whenever no frame
   // is mid-flight. Only call snapshot save/load while liveMode is false.
+  // Milestone 10: pool array indexed by level (formatVersion 5), replacing
+  // the old singular `pool` key (levels 1-only, formatVersion 4) -- see
+  // debugSnapshotLoad's own explicit-reject note. Level 1's own staging
+  // still uses the fixed global buffers (stagingFPool etc -- unchanged,
+  // still the only thing debugProbeGhostFill/debugRunSteadyGhostFill
+  // need); levels >=2 use ephemeral per-call staging buffers, same
+  // approach as debugReadPool/readPoolIndirection, since N_LEVELS (and
+  // each level's own sizes) are only known at runtime.
   async function debugSnapshotSave() {
     const enc = device.createCommandEncoder();
     enc.copyBufferToBuffer(f_a, 0, stagingF, 0, fSize);
@@ -1150,16 +1194,36 @@ async function init() {
     enc.copyBufferToBuffer(pools[1].finePoolVel, 0, stagingVelPool, 0, MAX_FINE_BLOCKS * NCELLS1 * 2 * 4);
     enc.copyBufferToBuffer(pools[1].blockSlotBuf, 0, stagingBlockSlot, 0, NBLOCKS * 4);
     enc.copyBufferToBuffer(pools[1].slotToBlockBuf, 0, stagingSlotToBlock, 0, MAX_FINE_BLOCKS * 4);
+
+    const levelStaging = [];
+    for (let m = 2; m < N_LEVELS; m++) {
+      const pool = pools[m];
+      const st = {
+        f: device.createBuffer({ size: pool.fSizePool, usage: U.MAP_READ | U.COPY_DST }),
+        vel: device.createBuffer({ size: pool.MAX_FINE_BLOCKS * NCELLS1 * 2 * 4, usage: U.MAP_READ | U.COPY_DST }),
+        blockSlot: device.createBuffer({ size: pool.NBLOCKS * 4, usage: U.MAP_READ | U.COPY_DST }),
+        slotToBlock: device.createBuffer({ size: pool.MAX_FINE_BLOCKS * 4, usage: U.MAP_READ | U.COPY_DST }),
+        parentSlot: device.createBuffer({ size: pool.MAX_FINE_BLOCKS * 4, usage: U.MAP_READ | U.COPY_DST }),
+        quadrant: device.createBuffer({ size: pool.MAX_FINE_BLOCKS * 4, usage: U.MAP_READ | U.COPY_DST }),
+        originX: device.createBuffer({ size: pool.MAX_FINE_BLOCKS * 4, usage: U.MAP_READ | U.COPY_DST }),
+        originY: device.createBuffer({ size: pool.MAX_FINE_BLOCKS * 4, usage: U.MAP_READ | U.COPY_DST }),
+      };
+      enc.copyBufferToBuffer(pool.finePoolF_a, 0, st.f, 0, pool.fSizePool);
+      enc.copyBufferToBuffer(pool.finePoolVel, 0, st.vel, 0, pool.MAX_FINE_BLOCKS * NCELLS1 * 2 * 4);
+      enc.copyBufferToBuffer(pool.blockSlotBuf, 0, st.blockSlot, 0, pool.NBLOCKS * 4);
+      enc.copyBufferToBuffer(pool.slotToBlockBuf, 0, st.slotToBlock, 0, pool.MAX_FINE_BLOCKS * 4);
+      enc.copyBufferToBuffer(pool.parentSlotBuf, 0, st.parentSlot, 0, pool.MAX_FINE_BLOCKS * 4);
+      enc.copyBufferToBuffer(pool.quadrantBuf, 0, st.quadrant, 0, pool.MAX_FINE_BLOCKS * 4);
+      enc.copyBufferToBuffer(pool.originXBuf, 0, st.originX, 0, pool.MAX_FINE_BLOCKS * 4);
+      enc.copyBufferToBuffer(pool.originYBuf, 0, st.originY, 0, pool.MAX_FINE_BLOCKS * 4);
+      levelStaging.push(st);
+    }
+
     device.queue.submit([enc.finish()]);
-    await Promise.all([
-      stagingF.mapAsync(GPUMapMode.READ),
-      stagingVel.mapAsync(GPUMapMode.READ),
-      stagingCard.mapAsync(GPUMapMode.READ),
-      stagingFPool.mapAsync(GPUMapMode.READ),
-      stagingVelPool.mapAsync(GPUMapMode.READ),
-      stagingBlockSlot.mapAsync(GPUMapMode.READ),
-      stagingSlotToBlock.mapAsync(GPUMapMode.READ),
-    ]);
+    const allBuffers = [stagingF, stagingVel, stagingCard, stagingFPool, stagingVelPool, stagingBlockSlot, stagingSlotToBlock];
+    for (const st of levelStaging) allBuffers.push(st.f, st.vel, st.blockSlot, st.slotToBlock, st.parentSlot, st.quadrant, st.originX, st.originY);
+    await Promise.all(allBuffers.map(b => b.mapAsync(GPUMapMode.READ)));
+
     const f = new Float32Array(stagingF.getMappedRange()).slice();
     const vel = new Float32Array(stagingVel.getMappedRange()).slice();
     const card = Array.from(new Float32Array(stagingCard.getMappedRange()).slice());
@@ -1175,8 +1239,39 @@ async function init() {
     stagingBlockSlot.unmap();
     stagingSlotToBlock.unmap();
 
+    const poolsOut = [
+      null, // index 0 unused -- L0 is the dense grid, matches the live pools[] convention
+      {
+        level: 1, RB, GHOST, FB, MAX_FINE_BLOCKS, NBLOCKS, NBX, NBY,
+        blockSlot: blockSlotArr, slotToBlock: slotToBlockArr,
+        fB64: bytesToB64(new Uint8Array(fPool.buffer, fPool.byteOffset, fPool.byteLength)),
+        velB64: bytesToB64(new Uint8Array(velPool.buffer, velPool.byteOffset, velPool.byteLength)),
+      },
+    ];
+    for (let i = 0; i < levelStaging.length; i++) {
+      const m = i + 2;
+      const pool = pools[m];
+      const st = levelStaging[i];
+      const fPool_m = new Float32Array(st.f.getMappedRange()).slice();
+      const velPool_m = new Float32Array(st.vel.getMappedRange()).slice();
+      const blockSlotArr_m = Array.from(new Int32Array(st.blockSlot.getMappedRange()).slice());
+      const slotToBlockArr_m = Array.from(new Int32Array(st.slotToBlock.getMappedRange()).slice());
+      const parentSlotArr = Array.from(new Int32Array(st.parentSlot.getMappedRange()).slice());
+      const quadrantArr = Array.from(new Uint32Array(st.quadrant.getMappedRange()).slice());
+      const originXArr = Array.from(new Float32Array(st.originX.getMappedRange()).slice());
+      const originYArr = Array.from(new Float32Array(st.originY.getMappedRange()).slice());
+      for (const b of [st.f, st.vel, st.blockSlot, st.slotToBlock, st.parentSlot, st.quadrant, st.originX, st.originY]) { b.unmap(); b.destroy(); }
+      poolsOut.push({
+        level: m, RB, GHOST, FB, MAX_FINE_BLOCKS: pool.MAX_FINE_BLOCKS, NBLOCKS: pool.NBLOCKS, NBX: pool.NBX, NBY: pool.NBY,
+        blockSlot: blockSlotArr_m, slotToBlock: slotToBlockArr_m,
+        parentSlot: parentSlotArr, quadrant: quadrantArr, originX: originXArr, originY: originYArr,
+        fB64: bytesToB64(new Uint8Array(fPool_m.buffer, fPool_m.byteOffset, fPool_m.byteLength)),
+        velB64: bytesToB64(new Uint8Array(velPool_m.buffer, velPool_m.byteOffset, velPool_m.byteLength)),
+      });
+    }
+
     const snapshot = {
-      formatVersion: 4,
+      formatVersion: 5,
       // 'block8': f/vel are laid out in fixed 8x8 buffer-space cell-blocks
       // (see shaders/amr_step.wgsl's cellIndex, Milestone 1 of
       // plans/AMR.md), not flat row-major -- tools/amr-diff.js needs this
@@ -1187,16 +1282,10 @@ async function init() {
       fB64: bytesToB64(new Uint8Array(f.buffer, f.byteOffset, f.byteLength)),
       velB64: bytesToB64(new Uint8Array(vel.buffer, vel.byteOffset, vel.byteLength)),
       params: { A, B, I_STAR, TAU, U_T, resLog2 },
-      // Milestone 4: fine-block pool (supersedes M2's single fine region).
-      // pool.f/vel are indexed slot*(FB*FB)+local (see amr_step1.wgsl).
-      pool: {
-        RB, GHOST, FB, MAX_FINE_BLOCKS, NBLOCKS,
-        blockSlot: blockSlotArr, slotToBlock: slotToBlockArr,
-        fB64: bytesToB64(new Uint8Array(fPool.buffer, fPool.byteOffset, fPool.byteLength)),
-        velB64: bytesToB64(new Uint8Array(velPool.buffer, velPool.byteOffset, velPool.byteLength)),
-      },
+      numLevels: N_LEVELS,
+      pools: poolsOut,
     };
-    console.log('[AMR snapshot] saved', { W, H, step });
+    console.log('[AMR snapshot] saved', { W, H, step, numLevels: N_LEVELS });
     return snapshot;
   }
 
@@ -1213,6 +1302,16 @@ async function init() {
     if (snapshot.layout !== 'block8') {
       throw new Error(`snapshot layout is '${snapshot.layout}', this build expects 'block8'`);
     }
+    // Milestone 10: formatVersion 4's singular `pool` key (level 1 only)
+    // is REJECTED explicitly, not silently reinterpreted as pools[1] --
+    // same "fail loud on layout mismatch" convention as the `layout`
+    // check above, not a new one.
+    if (snapshot.formatVersion < 5 || !Array.isArray(snapshot.pools)) {
+      throw new Error(`snapshot formatVersion ${snapshot.formatVersion} uses the old singular 'pool' shape (pre-Milestone-10) -- this build expects a 'pools' array indexed by level. Re-capture the snapshot.`);
+    }
+    if (snapshot.numLevels !== N_LEVELS) {
+      throw new Error(`snapshot has numLevels=${snapshot.numLevels}, this page has N_LEVELS=${N_LEVELS} -- reload with ?levels=${snapshot.numLevels}`);
+    }
     const f = b64ToFloat32(snapshot.fB64, NCELLS * 9);
     const vel = b64ToFloat32(snapshot.velB64, NCELLS * 2);
     device.queue.writeBuffer(f_a, 0, f.buffer, f.byteOffset, fSize);
@@ -1224,40 +1323,68 @@ async function init() {
     // (read from velBuf) didn't -- the asymmetry was the tell.
     device.queue.writeBuffer(velBuf, 0, vel.buffer, vel.byteOffset, NCELLS * 2 * 4);
     device.queue.writeBuffer(cardStateBuf, 0, new Float32Array(snapshot.cardState));
-    if (snapshot.pool) {
-      if (snapshot.pool.RB !== RB || snapshot.pool.MAX_FINE_BLOCKS !== MAX_FINE_BLOCKS || snapshot.pool.NBLOCKS !== NBLOCKS) {
-        throw new Error(`snapshot pool (RB=${snapshot.pool.RB},MAX_FINE_BLOCKS=${snapshot.pool.MAX_FINE_BLOCKS},NBLOCKS=${snapshot.pool.NBLOCKS}) doesn't match this page's (RB=${RB},MAX_FINE_BLOCKS=${MAX_FINE_BLOCKS},NBLOCKS=${NBLOCKS})`);
+
+    for (let m = 1; m < N_LEVELS; m++) {
+      const pool = pools[m];
+      const snapPool = snapshot.pools[m];
+      if (!snapPool) throw new Error(`snapshot missing pools[${m}] (numLevels=${snapshot.numLevels} but this level's entry is absent)`);
+      if (snapPool.RB !== RB || snapPool.MAX_FINE_BLOCKS !== pool.MAX_FINE_BLOCKS || snapPool.NBLOCKS !== pool.NBLOCKS) {
+        throw new Error(`snapshot pools[${m}] (RB=${snapPool.RB},MAX_FINE_BLOCKS=${snapPool.MAX_FINE_BLOCKS},NBLOCKS=${snapPool.NBLOCKS}) doesn't match this page's (RB=${RB},MAX_FINE_BLOCKS=${pool.MAX_FINE_BLOCKS},NBLOCKS=${pool.NBLOCKS})`);
       }
-      const fPool = b64ToFloat32(snapshot.pool.fB64, MAX_FINE_BLOCKS * NCELLS1 * 9);
-      const velPool = b64ToFloat32(snapshot.pool.velB64, MAX_FINE_BLOCKS * NCELLS1 * 2);
-      device.queue.writeBuffer(pools[1].finePoolF_a, 0, fPool.buffer, fPool.byteOffset, fSizePool);
-      device.queue.writeBuffer(pools[1].finePoolVel, 0, velPool.buffer, velPool.byteOffset, MAX_FINE_BLOCKS * NCELLS1 * 2 * 4);
-      device.queue.writeBuffer(pools[1].blockSlotBuf, 0, new Int32Array(snapshot.pool.blockSlot));
-      device.queue.writeBuffer(pools[1].slotToBlockBuf, 0, new Int32Array(snapshot.pool.slotToBlock));
-      // Sync the CPU-side mirrors debugActivateBlock/debugDeactivateBlock
-      // rely on -- omitting this would leave them reflecting whatever was
-      // active before the load, not what the loaded snapshot actually has,
-      // exactly the class of GPU/CPU-state desync bug this project has
-      // already been bitten by once (see debugSnapshotSave's velBuf note).
-      blockSlotCPU.set(snapshot.pool.blockSlot);
-      slotToBlockCPU.set(snapshot.pool.slotToBlock);
-      freeSlots = [];
-      for (let slot = 0; slot < MAX_FINE_BLOCKS; slot++) {
-        if (slotToBlockCPU[slot] === -1) freeSlots.push(slot);
+      const fPool_m = b64ToFloat32(snapPool.fB64, pool.MAX_FINE_BLOCKS * NCELLS1 * 9);
+      const velPool_m = b64ToFloat32(snapPool.velB64, pool.MAX_FINE_BLOCKS * NCELLS1 * 2);
+      device.queue.writeBuffer(pool.finePoolF_a, 0, fPool_m.buffer, fPool_m.byteOffset, pool.fSizePool);
+      device.queue.writeBuffer(pool.finePoolVel, 0, velPool_m.buffer, velPool_m.byteOffset, pool.MAX_FINE_BLOCKS * NCELLS1 * 2 * 4);
+      device.queue.writeBuffer(pool.blockSlotBuf, 0, new Int32Array(snapPool.blockSlot));
+      device.queue.writeBuffer(pool.slotToBlockBuf, 0, new Int32Array(snapPool.slotToBlock));
+
+      if (m === 1) {
+        // Sync the CPU-side mirrors debugActivateBlock/debugDeactivateBlock
+        // rely on -- omitting this would leave them reflecting whatever was
+        // active before the load, not what the loaded snapshot actually has,
+        // exactly the class of GPU/CPU-state desync bug this project has
+        // already been bitten by once (see debugSnapshotSave's velBuf note).
+        blockSlotCPU.set(snapPool.blockSlot);
+        slotToBlockCPU.set(snapPool.slotToBlock);
+        freeSlots = [];
+        for (let slot = 0; slot < MAX_FINE_BLOCKS; slot++) {
+          if (slotToBlockCPU[slot] === -1) freeSlots.push(slot);
+        }
+        // Milestone 4b: the GPU-side freeList/freeCount (which the automatic
+        // management pass owns) aren't part of the snapshot -- rebuild them
+        // from the loaded slotToBlock instead of restoring a captured copy.
+        // Free-list ORDER doesn't affect correctness (any permutation of the
+        // free slots works equally as a stack), so this is exact, not an
+        // approximation, and avoids growing the snapshot format for state
+        // that's fully redundant with slotToBlock.
+        device.queue.writeBuffer(pool.freeListBuf, 0, new Int32Array(freeSlots));
+        device.queue.writeBuffer(pool.freeCountBuf, 0, new Int32Array([freeSlots.length]));
+      } else {
+        device.queue.writeBuffer(pool.parentSlotBuf, 0, new Int32Array(snapPool.parentSlot));
+        device.queue.writeBuffer(pool.quadrantBuf, 0, new Uint32Array(snapPool.quadrant));
+        device.queue.writeBuffer(pool.originXBuf, 0, new Float32Array(snapPool.originX));
+        device.queue.writeBuffer(pool.originYBuf, 0, new Float32Array(snapPool.originY));
+
+        const qc = quadCPU[m];
+        qc.blockSlotCPU.set(snapPool.blockSlot);
+        qc.slotToBlockCPU.set(snapPool.slotToBlock);
+        qc.originXCPU.set(snapPool.originX);
+        qc.originYCPU.set(snapPool.originY);
+        // Same free-list-is-redundant-with-slotToBlock reasoning as level 1
+        // above, at quad granularity: quadrant 0's own slot stands for the
+        // whole quad (decision 3's all-or-nothing invariant).
+        qc.freeQuads = [];
+        for (let quadIdx = 0; quadIdx < pool.MAX_FINE_BLOCKS / 4; quadIdx++) {
+          if (qc.slotToBlockCPU[quadIdx * 4] === -1) qc.freeQuads.push(quadIdx);
+        }
+        device.queue.writeBuffer(pool.freeListBuf, 0, new Int32Array(qc.freeQuads));
+        device.queue.writeBuffer(pool.freeCountBuf, 0, new Int32Array([qc.freeQuads.length]));
       }
-      // Milestone 4b: the GPU-side freeList/freeCount (which the automatic
-      // management pass owns) aren't part of the snapshot -- rebuild them
-      // from the loaded slotToBlock instead of restoring a captured copy.
-      // Free-list ORDER doesn't affect correctness (any permutation of the
-      // free slots works equally as a stack), so this is exact, not an
-      // approximation, and avoids growing the snapshot format for state
-      // that's fully redundant with slotToBlock.
-      device.queue.writeBuffer(pools[1].freeListBuf, 0, new Int32Array(freeSlots));
-      device.queue.writeBuffer(pools[1].freeCountBuf, 0, new Int32Array([freeSlots.length]));
     }
+
     useB = false;
     step = snapshot.step;
-    console.log('[AMR snapshot] loaded', { W, H, step });
+    console.log('[AMR snapshot] loaded', { W, H, step, numLevels: N_LEVELS });
     return { step };
   }
 
@@ -1715,8 +1842,14 @@ async function init() {
         const slot = baseSlot + quadrant;
         const childBX = parentBX * 2 + qx, childBY = parentBY * 2 + qy;
         const childBlockID = childBY * pool.NBX + childBX;
-        const originX_L0 = parentOrigin.x + qx * RB * parentCellSizeL0;
-        const originY_L0 = parentOrigin.y + qy * RB * parentCellSizeL0;
+        // BUGFIX (Milestone 10): see shaders/amr_manage_pool.wgsl's refine()
+        // for the derivation -- a quadrant step is HALF the parent's own
+        // block width, not the whole thing. Omitting *0.5 here (this file's
+        // own mirror of the same formula) mis-registered every MANUALLY
+        // activated level>=2 tile's physical origin the identical way the
+        // GPU-side auto-refine path did.
+        const originX_L0 = parentOrigin.x + qx * RB * parentCellSizeL0 * 0.5;
+        const originY_L0 = parentOrigin.y + qy * RB * parentCellSizeL0 * 0.5;
         qc.blockSlotCPU[childBlockID] = slot;
         qc.slotToBlockCPU[slot] = childBlockID;
         qc.originXCPU[slot] = originX_L0;
@@ -2052,7 +2185,10 @@ async function init() {
     setAutoRefine,
     isAutoRefine: () => autoRefine,
     getBlockGridDims: () => ({ NBX, NBY, RB, GHOST, FB, NCELLS1, MAX_FINE_BLOCKS }),
-    getRefineParams: () => ({ REFINE_EVERY, REFINE_THRESH, COARSEN_THRESH }),
+    getRefineParams: () => ({
+      REFINE_EVERY, REFINE_THRESH, COARSEN_THRESH, FORCE_REFINE_MARGIN, FORCE_REFINE_LOOKAHEAD,
+      perLevel: Array.from({ length: N_LEVELS - 1 }, (_, i) => ({ childLevel: i + 1, ...paramsForChildLevel(i + 1) })),
+    }),
     getNumLevels: () => N_LEVELS,
     getLevelPoolSizes,
     tauAtLevel,
