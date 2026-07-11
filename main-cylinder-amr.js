@@ -354,6 +354,23 @@ function allocLevelPool(device, U, m, NBX_m, NBY_m, maxFineBlocks) {
       throw new Error(`level ${m}: MAX_FINE_BLOCKS (${maxFineBlocks}) must be a multiple of 4 (quad allocation)`);
     }
     pool.freeListBuf = device.createBuffer({ size: (maxFineBlocks / 4) * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
+    // BUGFIX: same "fix at the source, every level" gap as the blockSlot/
+    // slotToBlock -1 init below, but for the free-list/free-count pair --
+    // level 1 gets its eager freeListBuf/freeCountBuf write from an
+    // explicit caller-side write right after the pools loop, but that was
+    // never generalized to levels >=2 either. Left at WebGPU's zero-init
+    // default, freeCountBuf reads back 0 ("no free quads"), so refine()
+    // always takes the "pool exhausted" branch and NO level>=2 quad can
+    // ever be granted until something explicitly calls resetSim() --
+    // silently, with no GPU validation error, since this is application
+    // logic, not an API misuse. resetSim()/debugSnapshotLoad already write
+    // these correctly on their own paths; nothing wrote them at bare
+    // allocation time, and nothing calls resetSim() automatically on page
+    // load, so a fresh page (or any driver script that steps without
+    // calling reset() first) saw permanent level>=2 refinement failure.
+    const freeQuads_m = maxFineBlocks / 4;
+    device.queue.writeBuffer(pool.freeListBuf, 0, new Int32Array(freeQuads_m).map((_, i) => i));
+    device.queue.writeBuffer(pool.freeCountBuf, 0, new Int32Array([freeQuads_m]));
     // New vs. level 1: a quadtree child needs its own parent lookup --
     // which parent-level slot it was carved from (parentSlot) and which
     // of the 4 quadrants it occupies (quadrant) -- see
@@ -2145,35 +2162,66 @@ async function init() {
   // the live per-macro-step path (that would need a GPU-side assertion
   // mechanism this project doesn't have; a readback-based debug function
   // is enough to catch a real violation during testing).
+  //
+  // Generalized to N_LEVELS>=2 (was hardcoded to compare level 1 against
+  // level 2 only, silently ignoring level 3+ -- fine at this plan's
+  // original N<=3 validated depth, but a real blind spot once N_LEVELS=4
+  // is exercised). Checks EVERY level m=1..N_LEVELS-1 against its own
+  // same-level neighbors, where "effective depth" at a given level-m
+  // position walks DOWN through active children (if this position is
+  // itself active at m) to find the deepest actual coverage, or UP
+  // through active ancestors (if not active at m) to find the shallowest
+  // level that actually covers this position -- exactly what the old
+  // 2-level-only levelOf() did, just recursive instead of one hardcoded
+  // hop.
   async function debugCheck21Balance() {
-    const level1 = await debugListActiveBlocks(1);
-    const level1Set = new Set(level1.map(b => `${b.bx},${b.by}`));
-    const level2Set = new Set();
-    let level2Count = 0;
-    if (N_LEVELS > 2) {
-      const level2 = await debugListActiveBlocks(2);
-      level2Count = level2.length;
-      for (const b of level2) level2Set.add(`${Math.floor(b.bx / 2)},${Math.floor(b.by / 2)}`);
+    const activeSets = {}, NBX_ = {}, NBY_ = {}, counts = {};
+    for (let m = 1; m < N_LEVELS; m++) {
+      const active = await debugListActiveBlocks(m);
+      activeSets[m] = new Set(active.map(b => `${b.bx},${b.by}`));
+      NBX_[m] = pools[m].NBX; NBY_[m] = pools[m].NBY;
+      counts[m] = active.length;
     }
-    const { NBX, NBY } = pools[1];
-    function levelOf(bx, by) {
-      const key = `${bx},${by}`;
-      if (!level1Set.has(key)) return 0;
-      return level2Set.has(key) ? 2 : 1;
+    function ancestorDepth(m, bx, by) {
+      let level = m, x = bx, y = by;
+      while (level >= 1) {
+        if (activeSets[level].has(`${x},${y}`)) return level;
+        x = Math.floor(x / 2); y = Math.floor(y / 2);
+        level--;
+      }
+      return 0;
+    }
+    // Quad-atomic allocation (decision 3) means all 4 children of an
+    // active parent exist together, so checking one quadrant is enough to
+    // detect "has a child at all"; still recurse into all 4 to find the
+    // true MAX depth, since siblings can independently refine further.
+    function descendantDepth(m, bx, by) {
+      if (m + 1 >= N_LEVELS || !activeSets[m + 1].has(`${bx * 2},${by * 2}`)) return m;
+      let maxD = m;
+      for (const [dx, dy] of [[0, 0], [1, 0], [0, 1], [1, 1]]) {
+        maxD = Math.max(maxD, descendantDepth(m + 1, bx * 2 + dx, by * 2 + dy));
+      }
+      return maxD;
+    }
+    function trueDepth(m, bx, by) {
+      return activeSets[m].has(`${bx},${by}`) ? descendantDepth(m, bx, by) : ancestorDepth(m, bx, by);
     }
     const violations = [];
-    for (const b of level1) {
-      const l = levelOf(b.bx, b.by);
-      const neighbors = [
-        [b.bx, (b.by + NBY - 1) % NBY], [b.bx, (b.by + 1) % NBY],
-        [(b.bx + 1) % NBX, b.by], [(b.bx + NBX - 1) % NBX, b.by],
-      ];
-      for (const [nbx, nby] of neighbors) {
-        const nl = levelOf(nbx, nby);
-        if (Math.abs(l - nl) > 1) violations.push({ bx: b.bx, by: b.by, level: l, neighbor: [nbx, nby], neighborLevel: nl });
+    for (let m = 1; m < N_LEVELS; m++) {
+      for (const key of activeSets[m]) {
+        const [bx, by] = key.split(',').map(Number);
+        const myDepth = trueDepth(m, bx, by);
+        const neighbors = [
+          [bx, (by + NBY_[m] - 1) % NBY_[m]], [bx, (by + 1) % NBY_[m]],
+          [(bx + 1) % NBX_[m], by], [(bx + NBX_[m] - 1) % NBX_[m], by],
+        ];
+        for (const [nbx, nby] of neighbors) {
+          const nDepth = trueDepth(m, nbx, nby);
+          if (Math.abs(myDepth - nDepth) > 1) violations.push({ level: m, bx, by, myDepth, neighbor: [nbx, nby], nDepth });
+        }
       }
     }
-    return { ok: violations.length === 0, violations, level1Count: level1.length, level2Count };
+    return { ok: violations.length === 0, violations, counts };
   }
 
   // Deterministic synchronous stepping, bypassing rAF entirely -- lets two
