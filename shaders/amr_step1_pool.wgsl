@@ -111,14 +111,35 @@ const wt = array<f32,9>(
 const opp = array<u32,9>(0u, 3u, 4u, 1u, 2u, 7u, 8u, 5u, 6u);
 const CS2 = 0.33333333f;
 
+// BUGFIX: this file serves EVERY level>=2 through one shared pipeline
+// (dx varies per level -- 0.25 at level 2, 0.125 at level 3, ...), but
+// this function hardcoded level 1's OWN fixed dx=0.5/half-cell=0.25
+// (correct only for amr_step1.wgsl, the level-1-DEDICATED file this was
+// presumably copied from) instead of reading levelParams.dxL -- a
+// pre-existing bug (confirmed present before this session's own changes),
+// not something introduced by the bounce-back work that surfaced it.
+// Effect: every level>=2 cell's computed physical position was stretched
+// by (0.5/dxL)x too wide relative to its tile's true origin-anchored
+// footprint -- e.g. 2x at level 2, 4x at level 3 -- corrupting BOTH the
+// diffuse method's chi/phi and bounce-back's sharp inside/outside test.
+// Live-verified impact, NEITHER fully resolved by this fix alone (both
+// have at least one more separate, unresolved issue -- flagged near
+// N_LEVELS in main-cylinder-amr.js for bounce-back's own remaining one):
+// diffuse-method Cd at N=3 moved from 0.152 to 0.228 (still far below the
+// ~1.35 target -- confirms this bug was A contributor to the project's
+// separately-tracked ~9x AMR Cd deficit, not the sole cause); bounce-
+// back's level-2-ONLY force (L1 forced to the diffuse path, isolating
+// level 2) moved from wrong-signed fx=-7.09 (1201 boundary-link triggers)
+// to still-wrong-but-improved fx=-6.05 (797 triggers) -- real
+// measured progress, not a full fix.
 fn fineToCoarseUnit(fCoord: u32, origin: f32) -> f32 {
   let j = f32(i32(fCoord) - i32(GHOST));
-  return origin - 0.25 + 0.5 * j;
+  return origin - 0.5 * levelParams.dxL + levelParams.dxL * j;
 }
 
 fn fineToCoarseUnitI(fCoordI: i32, origin: f32) -> f32 {
   let j = f32(fCoordI - i32(GHOST));
-  return origin - 0.25 + 0.5 * j;
+  return origin - 0.5 * levelParams.dxL + levelParams.dxL * j;
 }
 
 fn wrapf(v: f32, n: f32) -> f32 {

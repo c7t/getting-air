@@ -85,14 +85,17 @@ const wt = array<f32,9>(
 );
 const CS2 = 0.33333333f;
 
+// BUGFIX: see amr_step1_pool.wgsl's identical comment -- this file's copy
+// of the same functions had the same pre-existing hardcoded-dx=0.5 bug
+// (this level's own dx varies, levelParams.dxL, not a fixed 0.5/0.25).
 fn fineToCoarseUnit(fCoord: u32, origin: f32) -> f32 {
   let j = f32(i32(fCoord) - i32(GHOST));
-  return origin - 0.25 + 0.5 * j;
+  return origin - 0.5 * levelParams.dxL + levelParams.dxL * j;
 }
 
 fn fineToCoarseUnitI(fCoordI: i32, origin: f32) -> f32 {
   let j = f32(fCoordI - i32(GHOST));
-  return origin - 0.25 + 0.5 * j;
+  return origin - 0.5 * levelParams.dxL + levelParams.dxL * j;
 }
 
 fn wrapf(v: f32, n: f32) -> f32 {
