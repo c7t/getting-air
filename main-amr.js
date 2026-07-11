@@ -822,6 +822,10 @@ async function init() {
 
   const constants = { W, H };
   const fineConstants = { W, H, RB };
+  // Render fragment needs HAS_LEVEL2 to gate the level-2 override; keep it
+  // separate from fineConstants, which is also fed to the avg compute
+  // pipeline (whose shader has no HAS_LEVEL2 override).
+  const renderConstants = { W, H, RB, HAS_LEVEL2: N_LEVELS > 2 ? 1 : 0 };
   // GHOST_ONLY=1: steady-state ghost-only reinterpolation (every macro-step).
   // GHOST_ONLY=0: full-slot fill, used once on block activation (see debugActivateBlock).
   const interpConstants = { W, H, RB, GHOST_ONLY: 1 };
@@ -848,7 +852,7 @@ async function init() {
   const renPL = device.createRenderPipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [renBGL] }),
     vertex: { module: renSM, entryPoint: 'vs_main', constants },
-    fragment: { module: renSM, entryPoint: 'fs_main', targets: [{ format: fmt }], constants: fineConstants },
+    fragment: { module: renSM, entryPoint: 'fs_main', targets: [{ format: fmt }], constants: renderConstants },
     primitive: { topology: 'triangle-list' },
   });
   const interpPL = device.createComputePipeline({
