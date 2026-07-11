@@ -113,6 +113,10 @@ struct CardState {
 @group(0) @binding(6) var<storage, read>       state           : CardState;
 // Milestone 9: level 2's own blockCriterion/blockSlot, for the cascade/
 // coarsen-block checks -- harmless dummies when HAS_LEVEL2=0 (N_LEVELS==2).
+// blockCriterionL2 itself is unread since the cascade below switched to
+// hasLevel2Child (existence, not criterion-based "wants") -- left bound
+// rather than removed, to avoid a bind-group-shape change across every
+// JS call site for a pure dead-binding cleanup.
 @group(0) @binding(7) var<storage, read>       blockCriterionL2 : array<f32>;
 @group(0) @binding(8) var<storage, read>       blockSlotL2      : array<i32>;
 
@@ -182,28 +186,6 @@ fn isNearBody(blockID: u32) -> bool {
   return min(phi_now, phi_future) < FORCE_REFINE_MARGIN;
 }
 
-// Milestone 9: does the L1 tile at L0 blockID `blockID1` (which MUST
-// already be active -- see call sites) itself want a level-2 child? Same
-// criterion/isNearBody test amr_manage_pool.wgsl's own refine() uses for
-// this exact parent, just expressed in terms of level 2's own
-// blockCriterion instead of the runtime LevelParams that shader reads
-// (this file bakes NBX as an override already, like every L0-addressed
-// function here).
-fn level2WantsRefine(blockID1: u32) -> bool {
-  let nbx = W / BLOCK;
-  let bx = blockID1 % nbx; let by = blockID1 / nbx;
-  let nbxL2 = nbx * 2u;
-  var maxCrit = 0f;
-  for (var qy = 0u; qy < 2u; qy++) {
-    for (var qx = 0u; qx < 2u; qx++) {
-      let cb = (by * 2u + qy) * nbxL2 + (bx * 2u + qx);
-      maxCrit = max(maxCrit, blockCriterionL2[cb]);
-    }
-  }
-  let eps = min(1.0f, log2(max(maxCrit, EPS_FLOOR)));
-  return eps >= REFINE_THRESH || isNearBody(blockID1);
-}
-
 // True if the L1 tile at `blockID1` currently has an active level-2 child
 // (quadrant 0 stands for all 4 -- decision 3's all-or-nothing invariant).
 fn hasLevel2Child(blockID1: u32) -> bool {
@@ -261,14 +243,18 @@ fn refine(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   let currentSlot = blockSlot[blockID];
   // Milestone 9: cascade -- refine even if blockID's OWN criterion doesn't
-  // call for it, if an ALREADY-ACTIVE same-level neighbor wants a level-2
-  // child (2:1 balance: that neighbor's future level-2 child can't sit
+  // call for it, if an ALREADY-ACTIVE same-level neighbor ALREADY HAS a
+  // level-2 child (2:1 balance: that neighbor's level-2 child can't sit
   // directly next to a level-0-only region) -- see this file's header.
+  // EXISTENCE (hasLevel2Child), not desire -- see amr_manage_pool.wgsl's
+  // own identical fix/rationale (a criterion-based "wants" test can
+  // flicker false for a still-genuinely-active child whose criterion
+  // dipped this round, letting a real imbalance go uncascaded).
   var cascadeWanted = false;
   if (HAS_LEVEL2 != 0u && currentSlot < 0) {
     let neighbors = edgeNeighbors(blockID);
     for (var i = 0u; i < 4u; i++) {
-      if (blockSlot[neighbors[i]] >= 0 && level2WantsRefine(neighbors[i])) { cascadeWanted = true; }
+      if (blockSlot[neighbors[i]] >= 0 && hasLevel2Child(neighbors[i])) { cascadeWanted = true; }
     }
   }
   if ((epsFor(blockID) >= REFINE_THRESH || isNearBody(blockID) || cascadeWanted) && currentSlot < 0) {

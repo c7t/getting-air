@@ -23,12 +23,29 @@
 //
 // 2:1 balance (decision from plans/AMR-multilevel.md's Milestone 9):
 // - refine(): a parent slot may only spawn a level-(m+1) quad if its own
-//   same-level (level-m) edge-neighbors are ALSO active. If not, this
-//   quad's refine is blocked THIS round -- amr_manage.wgsl's own cascade
-//   check (or, recursively, a shallower amr_manage_pool.wgsl instance)
-//   is what forces those missing neighbors active, in the SAME
-//   coarsest-to-finest sweep, so a later same-round refine (of a level
-//   closer to the root) unblocks this one before it's re-evaluated.
+//   same-level (level-m) edge-neighbors are ALSO active, UNLESS this
+//   refine is HARD-REQUIRED (geometry -- isNearBodyAt -- or a mandatory
+//   2:1-balance cascade from a deeper neighbor), in which case the
+//   neighbor-active gate doesn't apply at all. Changed from an earlier
+//   version where the gate applied unconditionally: geometry-forced
+//   refinement is meant to be a HARD constraint (the body's surface
+//   reaches the finest configured level regardless of what its coarser
+//   neighborhood happens to look like this round), with 2:1 balance then
+//   DRIVEN FROM that outward, not used as a precondition that can veto
+//   it. Live-verified this was a real, live bug, not just a theoretical
+//   gap: candidates well within the geometric margin (e.g. phi=1.98
+//   against a ~4-unit margin) were found NOT getting their required
+//   child, because a same-level neighbor happened not to be active yet
+//   -- the cascade meant to catch this up within the same round didn't
+//   always converge in time. The OUTWARD cascade that restores 2:1
+//   balance after a hard-required deep refine is amr_manage.wgsl's own
+//   cascade (or, recursively, a shallower amr_manage_pool.wgsl
+//   instance) -- see that file's header, now also existence- (not
+//   criterion-) based for the same reason this file's own grandchild
+//   cascade is, below. A criterion (vorticity)-only refine -- no
+//   geometric or cascade reason -- still needs the gate, so vorticity-
+//   driven growth alone can't outrun its own coarser neighborhood; only
+//   the two MANDATORY reasons bypass it.
 // - coarsen()/refine() BOTH also need a THIRD level's data (grandchild,
 //   level m+2) to stay exact once N_LEVELS>=4 -- FIXED, not scope-limited
 //   anymore. Discovered live: forcing N_LEVELS=4 (after the free-list
@@ -225,17 +242,25 @@ fn refine(@builtin(global_invocation_id) gid: vec3<u32>) {
     parentOriginX_L0 = parentOriginX[parentSlot];
     parentOriginY_L0 = parentOriginY[parentSlot];
   }
-  // BUGFIX (Milestone 10): center = origin + HALF the block's own physical
-  // width, not the full width -- compare amr_manage.wgsl's own isNearBody,
-  // which correctly uses `bx * BLOCK + BLOCK / 2u`. This omitted-*0.5 bug
-  // shifted every geometry-forced-refinement candidate's position estimate
-  // by a full block-width toward (+X,+Y), biasing which blocks isNearBodyAt
-  // considers "near" and (independently of the childOriginX/Y quadrant-
-  // offset bug fixed above) contributing to level 2's refined region coming
-  // out far smaller/off-center than the vorticity-only criterion alone
-  // would predict.
-  let parentCenterX_L0 = parentOriginX_L0 + f32(RB) * PARENT_CELL_SIZE_L0 * 0.5f;
-  let parentCenterY_L0 = parentOriginY_L0 + f32(RB) * PARENT_CELL_SIZE_L0 * 0.5f;
+  // BUGFIX: center = origin + HALF the block's own physical width. The
+  // parent's own interior is 2*RB cells (not RB -- see amr_criterion_pool.
+  // wgsl's own header: "a parent slot's own interior is 2*RB x 2*RB
+  // cells"), each PARENT_CELL_SIZE_L0 wide, so the full physical width is
+  // 2*RB*PARENT_CELL_SIZE_L0 and the HALF-width is RB*PARENT_CELL_SIZE_L0
+  // -- RB is already "half the interior" by construction, so no further
+  // *0.5 belongs here. The previous "Milestone 10 BUGFIX" comment at this
+  // exact spot claimed to match amr_manage.wgsl's own (correct, already-
+  // validated) `bx*BLOCK+BLOCK/2u` convention but actually computed HALF
+  // of that (RB=BLOCK=8, PARENT_CELL_SIZE_L0=0.5 at m=1 numerically gives
+  // RB*dx*0.5=2, not BLOCK/2=4) -- a real, live-verified bug: candidates
+  // well within the geometric force-refine margin (phi as low as ~2
+  // against a ~4-unit margin) were STILL not getting their required
+  // level-(m+1) child, because THIS shader's own idea of "near the body"
+  // was evaluated 2 L0-units off from where amr_manage.wgsl (and every
+  // other shader's own chi/phi position, which all use the correct,
+  // unscaled-by-an-extra-0.5 physical center) actually place it.
+  let parentCenterX_L0 = parentOriginX_L0 + f32(RB) * PARENT_CELL_SIZE_L0;
+  let parentCenterY_L0 = parentOriginY_L0 + f32(RB) * PARENT_CELL_SIZE_L0;
 
   // Grandchild cascade (see header): even if THIS parent's own criterion
   // doesn't call for a level-(m+1) child, force one anyway if a same-
@@ -264,19 +289,35 @@ fn refine(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
   }
 
-  let wantsRefine = eps >= REFINE_THRESH || isNearBodyAt(parentCenterX_L0, parentCenterY_L0) || cascadeWanted;
+  // HARD constraints, never blocked by the 2:1-balance neighbor gate below
+  // -- geometry (this candidate's own surface proximity) and cascade (a
+  // same-level neighbor ALREADY has a 2-level-deeper descendant) are both
+  // mandatory: the body's surface must reach the finest configured level
+  // regardless of a same-level neighbor's current activity, and 2:1
+  // balance is then DRIVEN from that requirement outward (neighbors get
+  // pulled up to satisfy it -- see amr_manage.wgsl's own cascade, now
+  // existence- not criterion-based, for the mechanism one level further
+  // out) rather than used to VETO the requirement itself. Only a
+  // criterion (vorticity)-only refine -- no geometric or cascade reason,
+  // just "this cell's own flow looks interesting" -- keeps the
+  // conservative gate, so criterion-driven growth alone still can't
+  // outrun its own coarser neighborhood.
+  let isHardRequired = isNearBodyAt(parentCenterX_L0, parentCenterY_L0) || cascadeWanted;
+  let wantsRefine = isHardRequired || eps >= REFINE_THRESH;
   if (!wantsRefine) { return; }
 
-  // 2:1 balance (see header): all 4 same-level (level-m) edge-neighbors of
-  // the PARENT must already be active, or this refine is blocked this
-  // round -- whichever shader manages the parent's own level is
-  // responsible for cascading them active (reading THIS shader's own
-  // childCriterion to detect the demand -- see amr_manage.wgsl's header).
-  let neighborN = parentBlockSlot[((byP + NBY_PARENT - 1u) % NBY_PARENT) * NBX_PARENT + bxP];
-  let neighborS = parentBlockSlot[((byP + 1u) % NBY_PARENT) * NBX_PARENT + bxP];
-  let neighborE = parentBlockSlot[byP * NBX_PARENT + ((bxP + 1u) % NBX_PARENT)];
-  let neighborW = parentBlockSlot[byP * NBX_PARENT + ((bxP + NBX_PARENT - 1u) % NBX_PARENT)];
-  if (neighborN < 0 || neighborS < 0 || neighborE < 0 || neighborW < 0) { return; }
+  if (!isHardRequired) {
+    // 2:1 balance (see header): all 4 same-level (level-m) edge-neighbors
+    // of the PARENT must already be active, or this refine is blocked
+    // this round -- whichever shader manages the parent's own level is
+    // responsible for cascading them active (reading THIS shader's own
+    // childCriterion to detect the demand -- see amr_manage.wgsl's header).
+    let neighborN = parentBlockSlot[((byP + NBY_PARENT - 1u) % NBY_PARENT) * NBX_PARENT + bxP];
+    let neighborS = parentBlockSlot[((byP + 1u) % NBY_PARENT) * NBX_PARENT + bxP];
+    let neighborE = parentBlockSlot[byP * NBX_PARENT + ((bxP + 1u) % NBX_PARENT)];
+    let neighborW = parentBlockSlot[byP * NBX_PARENT + ((bxP + NBX_PARENT - 1u) % NBX_PARENT)];
+    if (neighborN < 0 || neighborS < 0 || neighborE < 0 || neighborW < 0) { return; }
+  }
 
   let oldCount = atomicSub(&childFreeCount, 1);
   if (oldCount > 0) {
@@ -332,13 +373,12 @@ fn coarsen(@builtin(global_invocation_id) gid: vec3<u32>) {
   let eps = min(1.0f, log2(max(childCriterion[u32(blockID)], EPS_FLOOR)));
   // This quad's own center (quadrant 0's cached origin is this quad's own
   // origin -- see header) -- same generous-margin isNearBody test as refine.
-  // BUGFIX (Milestone 10): same missing-*0.5 center-vs-origin bug as
-  // refine()'s parentCenterX_L0 above -- (PARENT_CELL_SIZE_L0*0.5f) is
-  // already this CHILD level's own cell size (dx_child = dx_parent/2), so
-  // `f32(RB) * dx_child` is the child block's FULL width; its center needs
-  // one more *0.5.
-  let centerX_L0 = childOriginX[slot] + f32(RB) * (PARENT_CELL_SIZE_L0 * 0.5f) * 0.5f;
-  let centerY_L0 = childOriginY[slot] + f32(RB) * (PARENT_CELL_SIZE_L0 * 0.5f) * 0.5f;
+  // BUGFIX: see refine()'s parentCenterX_L0 for the full derivation -- this
+  // level's own interior is 2*RB cells (not RB) at this level's own dx
+  // (PARENT_CELL_SIZE_L0*0.5f, i.e. dx_child=dx_parent/2), so the HALF-
+  // width is RB*dx_child directly, no further *0.5.
+  let centerX_L0 = childOriginX[slot] + f32(RB) * (PARENT_CELL_SIZE_L0 * 0.5f);
+  let centerY_L0 = childOriginY[slot] + f32(RB) * (PARENT_CELL_SIZE_L0 * 0.5f);
 
   if (eps < COARSEN_THRESH && !isNearBodyAt(centerX_L0, centerY_L0)) {
     let quadIdx = slot / 4u; // slot IS quadrant 0's own slot (childQuadrant[slot]==0 checked above), so quadIdx*4u==slot
