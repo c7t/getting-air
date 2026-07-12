@@ -35,6 +35,7 @@ const path = require('path');
 const CDP = require('/usr/lib/node_modules/chrome-remote-interface');
 const { evalExpr: evalExprCyl, runCase } = require('./lib/cylinder-metrics');
 const { evalExpr: evalExprChan, runCase: runChanCase } = require('./lib/channel-metrics');
+const { evalExpr: evalExprTgv, runCase: runTgvCase } = require('./lib/tgv-metrics');
 const { runInvariantSweep } = require('./lib/amr-invariants');
 const {
   ensureServer, ensureChrome, openTab, firstTab, navigateTo, waitForGlobal, teardown,
@@ -173,6 +174,33 @@ function defaultConfigs(baseUrl) {
       chanLevels: 2,
       chanResFilter: [32],
     },
+    // Taylor-Green vortex: exact closed-form space-time solution, not just
+    // a steady-state target -- see benchmarks/tgv.json and
+    // tools/lib/tgv-metrics.js. Every case parameter (N, u0, tau, and for
+    // AMR, levels) is page-load-time on both index-tgv.html and
+    // index-tgv-amr.html (no live-settable Re here), so runTgvPhysics
+    // navigates once per case, filtered from the shared benchmark file by
+    // whether `levels` is set and to what -- `url` here is a display label
+    // only, not navigated to directly (same convention as the channel
+    // configs above).
+    {
+      name: 'tgv-dense',
+      url: `${baseUrl}/index-tgv.html`,
+      checkTgvPhysics: true,
+      tgvFilter: c => !c.levels,
+    },
+    {
+      name: 'tgv-amr-N2',
+      url: `${baseUrl}/index-tgv-amr.html?levels=2`,
+      checkTgvPhysics: true,
+      tgvFilter: c => c.levels === 2,
+    },
+    {
+      name: 'tgv-amr-N3',
+      url: `${baseUrl}/index-tgv-amr.html?levels=3`,
+      checkTgvPhysics: true,
+      tgvFilter: c => c.levels === 3,
+    },
   ];
 }
 
@@ -271,6 +299,34 @@ async function runChannelPhysics(Page, Runtime, opts, config) {
   return { ok, results };
 }
 
+// TGV configs sweep dense/AMR cases from benchmarks/tgv.json, filtered by
+// config.tgvFilter -- unlike runChannelPhysics, there's no grouping to do
+// (every TGV parameter is page-load-time, and no two cases in the default
+// benchmark share an (N,u0,tau[,levels]) tuple), so this just navigates
+// once per matching case. See tools/validate-tgv.js's identical per-case
+// navigation (kept as a separate copy there since that tool owns its own
+// Chrome connection/lifecycle, not sharing this file's Page/tab).
+async function runTgvPhysics(Page, Runtime, opts, config) {
+  const benchPath = path.join(REPO_ROOT, 'benchmarks', 'tgv.json');
+  const bench = JSON.parse(fs.readFileSync(benchPath, 'utf8'));
+  const cases = bench.cases.filter(config.tgvFilter);
+
+  const results = [];
+  for (const c of cases) {
+    // main-tgv-amr.js's ?res= is log2(N), matching every other AMR page's
+    // convention -- see runChannelPhysics's identical note.
+    const url = c.levels
+      ? `${opts.baseUrl}/index-tgv-amr.html?res=${Math.log2(c.N)}&u0=${c.u0}&tau=${c.tau}&levels=${c.levels}`
+      : `${opts.baseUrl}/index-tgv.html?res=${c.N}&u0=${c.u0}&tau=${c.tau}`;
+    await navigateTo(Page, url);
+    await waitForGlobal(Runtime, 'window.__CYL', 15000);
+    await evalExprTgv(Runtime, `window.__CYL.setLive(false)`);
+    results.push({ name: c.name, ...(await runTgvCase(Runtime, { timeout: opts.physicsTimeout }, c, s => console.log('    ' + s))) });
+  }
+  const ok = results.every(r => r.fieldCheck.pass && r.rateCheck.pass);
+  return { ok, results };
+}
+
 async function runInvariants(Runtime, opts) {
   return runInvariantSweep(Runtime, {
     steps: opts.invariantSteps,
@@ -329,6 +385,9 @@ async function main() {
         // every other config below uses.
         console.log('  -- physics (u(y) vs. analytic) --');
         physics = await runChannelPhysics(Page, Runtime, opts, config);
+      } else if (config.checkTgvPhysics) {
+        console.log('  -- physics (field vs. analytic TGV solution) --');
+        physics = await runTgvPhysics(Page, Runtime, opts, config);
       } else {
         await navigateTo(Page, config.url);
         if (config.checkBoots) {
@@ -387,6 +446,9 @@ async function main() {
         if (config.checkChannelPhysics) {
           if (!r.converged) console.log(`    ${r.mode} res=${r.res} Re=${r.re} did not converge within budget (step=${r.step})`);
           if (!r.l2.pass) console.log(`    ${r.mode} res=${r.res} Re=${r.re} L2rel=${r.l2rel.toExponential(3)} tol=${r.l2.tol} FAIL`);
+        } else if (config.checkTgvPhysics) {
+          if (!r.fieldCheck.pass) console.log(`    ${r.name} N=${r.N} fieldL2rel=${r.maxL2rel.toExponential(3)} tol=${r.fieldCheck.tol} FAIL`);
+          if (!r.rateCheck.pass) console.log(`    ${r.name} N=${r.N} decayRateRelErr=${r.rateRelErr.toExponential(3)} tol=${r.rateCheck.tol} FAIL`);
         } else {
           if (!r.cd.pass) console.log(`    Re=${r.re} Cd=${r.cd.measured?.toFixed(3)} target=${r.cd.target}±${r.cd.tol} FAIL`);
           if (!r.st.pass) console.log(`    Re=${r.re} St=${r.st.measured?.toFixed(4)} target=${r.st.target}±${r.st.tol} FAIL`);
