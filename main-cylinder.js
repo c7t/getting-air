@@ -154,6 +154,20 @@ function handleErr(e) {
   console.error('WebGPU Error:', e);
 }
 
+// base64 chunked in 8192-byte pieces -- a single huge String.fromCharCode
+// spread risks "Maximum call stack size exceeded" for larger grids. Copied
+// verbatim from main-cylinder-amr.js's own helper (this project keeps each
+// main*.js entry point self-contained rather than cross-importing, even for
+// larger overlap than a 10-line helper).
+function bytesToB64(bytes) {
+  let binary = '';
+  const chunk = 8192;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+  }
+  return btoa(binary);
+}
+
 async function init() {
   if (!navigator.gpu) { statusEl.textContent = 'WebGPU not available'; return; }
   const adapter = await navigator.gpu.requestAdapter();
@@ -176,9 +190,13 @@ async function init() {
 
   const U = GPUBufferUsage;
   const fSize    = NCELLS * 9 * 4;
-  const f_a      = device.createBuffer({ size: fSize, usage: U.STORAGE | U.COPY_DST });
+  // f_a/velBuf need COPY_SRC (not just STORAGE|COPY_DST) so debugSnapshotSave
+  // below can copyBufferToBuffer out of them -- main-cylinder-amr.js's own
+  // debugSnapshotSave comment documents hitting exactly this "forgot
+  // COPY_SRC" class of bug once already.
+  const f_a      = device.createBuffer({ size: fSize, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
   const f_b      = device.createBuffer({ size: fSize, usage: U.STORAGE });
-  const velBuf   = device.createBuffer({ size: NCELLS * 2 * 4, usage: U.STORAGE });
+  const velBuf   = device.createBuffer({ size: NCELLS * 2 * 4, usage: U.STORAGE | U.COPY_SRC });
   const forceBuf = device.createBuffer({ size: 16, usage: U.STORAGE | U.COPY_SRC | U.COPY_DST });
 
   // CardState: 26 floats = 104 bytes. Cylinder placed UPSTREAM diameters
@@ -366,6 +384,60 @@ async function init() {
     return { step, history: trajectory.slice() };
   }
 
+  // ── Debug/verification support: field snapshot ────────────────────────
+  // Dedicated staging buffers, separate from the triple-buffered readback
+  // stages above, so a debug read can't race frame()'s own in-flight
+  // readback.
+  const stagingF    = device.createBuffer({ size: fSize, usage: U.MAP_READ | U.COPY_DST });
+  const stagingVel  = device.createBuffer({ size: NCELLS * 2 * 4, usage: U.MAP_READ | U.COPY_DST });
+  const stagingCard = device.createBuffer({ size: 104, usage: U.MAP_READ | U.COPY_DST });
+
+  // Mirrors main-cylinder-amr.js's own debugSnapshotSave, minus pools (this
+  // is the dense/single-level harness -- no AMR machinery to snapshot).
+  // Produces the same shape tools/lib/field-reconstruct.js's
+  // loadDenseFields already expects (layout:'flat', the pinned-cylinder
+  // harnesses' shared convention -- see that function's own comment).
+  // `params` intentionally matches main-cylinder-amr.js's own
+  // debugSnapshotSave params shape (R,U0,RE,TAU,BLOCKAGE,UPSTREAM,resLog2):
+  // lets tools/validate-amr-vs-dense.js assert
+  // denseSnapshot.params.BLOCKAGE === amrSnapshot.params.BLOCKAGE etc. as a
+  // cheap extra guard against a URL-construction bug in
+  // tools/lib/amr-resolution-mapping.js, before it ever reaches the field
+  // diff.
+  //
+  // Invariant this relies on (same as main-cylinder-amr.js's own
+  // debugSnapshotSave): only call while liveMode is false. STEPS_PER_FRAME
+  // (64) is even, so useB always returns to its initial value (false) at a
+  // macro-step-block boundary -- f_a (not f_b) is always the authoritative/
+  // current buffer whenever no frame is mid-flight.
+  async function debugSnapshotSave() {
+    const enc = device.createCommandEncoder();
+    enc.copyBufferToBuffer(f_a, 0, stagingF, 0, fSize);
+    enc.copyBufferToBuffer(velBuf, 0, stagingVel, 0, NCELLS * 2 * 4);
+    enc.copyBufferToBuffer(cardStateBuf, 0, stagingCard, 0, 104);
+    device.queue.submit([enc.finish()]);
+
+    await Promise.all([stagingF, stagingVel, stagingCard].map(b => b.mapAsync(GPUMapMode.READ)));
+    const f = new Float32Array(stagingF.getMappedRange()).slice();
+    const vel = new Float32Array(stagingVel.getMappedRange()).slice();
+    const card = Array.from(new Float32Array(stagingCard.getMappedRange()).slice());
+    stagingF.unmap();
+    stagingVel.unmap();
+    stagingCard.unmap();
+
+    const snapshot = {
+      formatVersion: 1,
+      layout: 'flat', // plain row-major (cy*W+cx) -- matches shaders/lbm_step.wgsl, no block8 sub-tiling
+      W, H, step,
+      cardState: card,
+      fB64: bytesToB64(new Uint8Array(f.buffer, f.byteOffset, f.byteLength)),
+      velB64: bytesToB64(new Uint8Array(vel.buffer, vel.byteOffset, vel.byteLength)),
+      params: { R, U0, RE, TAU, BLOCKAGE, UPSTREAM, resLog2 },
+    };
+    console.log('[CYL snapshot] saved', { W, H, step });
+    return snapshot;
+  }
+
   window.__CYL = {
     setLive: (v) => { liveMode = !!v; },
     isLive: () => liveMode,
@@ -376,6 +448,7 @@ async function init() {
     getParams: () => ({ R, D: 2 * R, U0, Re: RE, TAU, blockage: BLOCKAGE, upstream: UPSTREAM, perturb: PERTURB, seed: SEED, W, H }),
     getForceHistory: () => trajectory.slice(),
     debugRunAndCollect,
+    debugSnapshotSave,
   };
 
   async function frame() {

@@ -30,13 +30,14 @@
 //   node tools/validate-all.js --re=20,40,100,200 --steps=20000
 //   node tools/validate-all.js --port=9333 --baseUrl=https://localhost:4444
 
-const { spawn } = require('child_process');
-const https = require('https');
-const path = require('path');
 const fs = require('fs');
+const path = require('path');
 const CDP = require('/usr/lib/node_modules/chrome-remote-interface');
 const { evalExpr: evalExprCyl, runCase } = require('./lib/cylinder-metrics');
-const { evalExpr, runInvariantSweep } = require('./lib/amr-invariants');
+const { runInvariantSweep } = require('./lib/amr-invariants');
+const {
+  ensureServer, ensureChrome, openTab, firstTab, navigateTo, waitForGlobal, teardown,
+} = require('./lib/browser-lifecycle');
 
 const REPO_ROOT = path.join(__dirname, '..');
 
@@ -132,112 +133,13 @@ function defaultConfigs(baseUrl) {
 }
 
 // --- process lifecycle: HTTPS dev server + dedicated debug-port Chrome ----
-
-function httpsGetOk(url) {
-  return new Promise((resolve) => {
-    const req = https.get(url, { rejectUnauthorized: false, timeout: 2000 }, (res) => { res.resume(); resolve(res.statusCode < 500); });
-    req.on('error', () => resolve(false));
-    req.on('timeout', () => { req.destroy(); resolve(false); });
-  });
-}
-
-async function waitFor(fn, timeoutMs, intervalMs) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (await fn()) return true;
-    await new Promise(r => setTimeout(r, intervalMs));
-  }
-  return false;
-}
-
-async function ensureServer(baseUrl) {
-  if (await httpsGetOk(`${baseUrl}/index.html`)) {
-    console.log(`[setup] HTTPS dev server already up at ${baseUrl}`);
-    return { started: false, proc: null };
-  }
-  console.log('[setup] starting https.py dev server');
-  const proc = spawn('python3', ['https.py'], { cwd: REPO_ROOT, detached: true, stdio: 'ignore' });
-  proc.unref();
-  const ok = await waitFor(() => httpsGetOk(`${baseUrl}/index.html`), 10000, 300);
-  if (!ok) throw new Error(`https.py did not come up at ${baseUrl} within 10s`);
-  return { started: true, proc };
-}
-
-async function chromeDebugOk(port) {
-  try {
-    const res = await fetch(`http://localhost:${port}/json/version`, { signal: AbortSignal.timeout(2000) });
-    return res.ok;
-  } catch { return false; }
-}
-
-async function ensureChrome(port) {
-  if (await chromeDebugOk(port)) {
-    console.log(`[setup] Chrome already listening on debug port ${port}`);
-    return { started: false, profileDir: null, pid: null };
-  }
-  console.log('[setup] launching dedicated WebGPU-capable Chrome');
-  const profileRoot = '/tmp/vpm-chrome-profile';
-  fs.mkdirSync(profileRoot, { recursive: true });
-  const profileDir = fs.mkdtempSync(path.join(profileRoot, 'validate-all-'));
-  // about:blank, not a config's own URL -- this harness drives ONE tab for
-  // the whole run (Page.navigate between configs, see runAllConfigs), never
-  // more than one WebGPU context alive on the GPU at a time. A prior version
-  // opened a fresh tab per config and only closed them all at the very end,
-  // which left every earlier config's tab (and its GPU-resident buffers)
-  // running concurrently with whatever was currently under test -- live-
-  // observed as multiple tabs stuck "initializing" and GPU contention
-  // between them. One process, one tab, one test at a time, throughout.
-  const proc = spawn('/opt/google/chrome/chrome', [
-    `--remote-debugging-port=${port}`,
-    '--enable-features=Vulkan,WebGPUService',
-    '--enable-unsafe-webgpu',
-    '--ignore-certificate-errors',
-    '--no-first-run', '--no-default-browser-check',
-    `--user-data-dir=${profileDir}`,
-    '--window-size=1400,900',
-    'about:blank',
-  ], { env: { ...process.env, DISPLAY: process.env.DISPLAY || ':0' }, detached: true, stdio: 'ignore' });
-  proc.unref();
-  const ok = await waitFor(() => chromeDebugOk(port), 10000, 300);
-  if (!ok) throw new Error(`Chrome did not come up on debug port ${port} within 10s`);
-  return { started: true, profileDir, pid: proc.pid };
-}
-
-async function openTab(port, url) {
-  const res = await fetch(`http://localhost:${port}/json/new?${encodeURIComponent(url)}`, { method: 'PUT' });
-  const target = await res.json();
-  return target.id;
-}
-
-async function firstTab(port) {
-  const res = await fetch(`http://localhost:${port}/json/list`);
-  const targets = await res.json();
-  const page = targets.find(t => t.type === 'page');
-  if (!page) throw new Error('no page target found on debug port ' + port);
-  return page.id;
-}
-
-async function closeTab(port, id) {
-  try { await fetch(`http://localhost:${port}/json/close/${id}`); } catch { /* best-effort */ }
-}
+// (ensureServer/ensureChrome/openTab/firstTab/closeTab/navigateTo/waitFor
+// now live in tools/lib/browser-lifecycle.js, shared with
+// tools/validate-amr-vs-dense.js -- see that file's own header for the "one
+// tab reused across the whole run" invariant this relies on.)
 
 async function waitForCYL(Runtime, timeoutMs) {
-  const ok = await waitFor(async () => {
-    const r = await evalExpr(Runtime, `typeof window.__CYL !== 'undefined'`);
-    return !r.exceptionDetails && r.result.value === true;
-  }, timeoutMs, 300);
-  if (!ok) throw new Error('window.__CYL never became available (page failed to load or WebGPU init failed)');
-}
-
-// Navigates the SAME tab to a new URL and waits for the load event -- reused
-// between every config so only one page (one WebGPU context) is ever alive
-// at a time. Plain Page.navigate to a genuinely different URL each call,
-// not the "repeated navigate to the same URL" pattern the webgpu-verify
-// skill warns is flaky -- that gotcha is about reloading a tab whose live
-// sim state you want to preserve; here every config starts fresh anyway.
-async function navigateTo(Page, url) {
-  await Page.navigate({ url });
-  await Page.loadEventFired();
+  return waitForGlobal(Runtime, 'window.__CYL', timeoutMs);
 }
 
 // --- per-config runners -----------------------------------------------
@@ -304,7 +206,7 @@ async function main() {
   const configs = opts.configs ? allConfigs.filter(c => opts.configs.includes(c.name)) : allConfigs;
   if (configs.length === 0) { console.error('No matching configs (check --configs= names against the default list in this file).'); process.exit(1); }
 
-  const server = await ensureServer(opts.baseUrl);
+  const server = await ensureServer(opts.baseUrl, REPO_ROOT);
   const chrome = await ensureChrome(opts.port);
   // Chrome takes a moment past the debug port coming up before it's actually
   // ready to serve WebGPU pages -- same settle time the webgpu-verify skill
@@ -358,27 +260,11 @@ async function main() {
     }
   } finally {
     await client.close();
-    if (!opts.keepOpen) {
-      await closeTab(opts.port, tabId);
-      if (chrome.started) {
-        // Kill the process directly rather than the earlier "close every
-        // tab and hope it exits on its own" dance -- we have its pid right
-        // here, no need to infer exit from tab count.
-        if (chrome.pid) { try { process.kill(chrome.pid); } catch { /* already gone */ } }
-        await new Promise(r => setTimeout(r, 1000));
-        // --user-data-dir profiles are never reused across runs (a fresh
-        // mkdtemp every launch), so leaving them behind is pure
-        // accumulation, not caching anything. Live-measured during this
-        // tool's own development: prior manual webgpu-verify sessions
-        // across this project's history had left 6.5GB across 70 uncleaned
-        // profile dirs under /tmp/vpm-chrome-profile -- this owns the whole
-        // Chrome lifecycle, so it's the one place that can safely clean up
-        // instead of relying on whoever's driving it to remember the
-        // skill's own manual cleanup step.
-        if (chrome.profileDir) { try { fs.rmSync(chrome.profileDir, { recursive: true, force: true }); } catch { /* best-effort cleanup */ } }
-      }
-      if (server.started && server.proc) { try { process.kill(-server.proc.pid); } catch { /* already gone */ } }
-    }
+    // See tools/lib/browser-lifecycle.js's teardown for the profile-dir
+    // cleanup rationale (prior manual webgpu-verify sessions across this
+    // project's history had left 6.5GB across 70 uncleaned profile dirs
+    // under /tmp/vpm-chrome-profile before this owned the whole lifecycle).
+    await teardown({ port: opts.port, tabId, chrome, server, keepOpen: opts.keepOpen });
   }
 
   // --- final report ---
