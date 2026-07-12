@@ -62,9 +62,26 @@ invariants the AMR machinery depends on:
   hard constraint — every leaf tile near the body must already be at the
   finest configured level (`debugCheckGeometryCoverage`) — plus a cheap
   field-finite (NaN/blowup) smoke check.
+- **`tools/validate-amr-vs-dense.js`** — standalone/opt-in, **not** part of
+  `validate-all.js`'s default sweep (a high-resolution dense run is far more
+  expensive than that suite's default configs). Runs the dense reference at
+  a high target resolution and AMR refined down to that *same* physical
+  resolution at the cylinder surface, then diffs the two solvers'
+  velocity/density/vorticity **fields** directly against each other (not
+  just each vs. literature Cd/St, which is all the tools above check) —
+  reconstructing AMR's quadtree pool data onto a uniform grid for the
+  comparison (`tools/lib/field-reconstruct.js`). The base-resolution/levels
+  scaling law and its own validity checks (clamp, validated-levels cap, a
+  base-grid relaxation-time stability margin) live in
+  `tools/lib/amr-resolution-mapping.js`. Own header comment documents a
+  currently-open finding worth reading before trusting a run.
+      node tools/validate-amr-vs-dense.js --res=10 --levels=2,3 --re=20,40
+      node tools/validate-amr-vs-dense.js --res=8 --levels=2 --re=20 --mode=fullrefine
 - Shared analysis code lives in `tools/lib/` (`cylinder-metrics.js`,
-  `amr-invariants.js`) — both the leaf tools and `validate-all.js` call the
-  same logic, not independently-drifting copies.
+  `amr-invariants.js`, `field-reconstruct.js`, `amr-resolution-mapping.js`,
+  `amr-cost.js`, `browser-lifecycle.js`) — both the leaf tools and
+  `validate-all.js`/`validate-amr-vs-dense.js` call the same logic, not
+  independently-drifting copies.
 
 Current known-issue state (e.g. which `?levels=N` combinations are physics-
 validated) drifts with active work — see `main-cylinder-amr.js`'s own
