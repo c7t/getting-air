@@ -42,34 +42,8 @@
 // shared across levels), so whether level 2 exists at all is fixed for the
 // whole session, known at pipeline-creation time.
 
-struct CardState {
-  cx     : f32,
-  cy     : f32,
-  theta  : f32,
-  vx     : f32,
-  vy     : f32,
-  omega  : f32,
-  fx     : f32,
-  fy     : f32,
-  tz     : f32,
-  mass   : f32,
-  i_body : f32,
-  g_eff  : f32,
-  a      : f32,
-  b      : f32,
-  v_max  : f32,
-  o_max  : f32,
-  cx_old : f32,
-  cy_old : f32,
-  th_old : f32,
-  tau    : f32,
-  y_total: f32,
-  x_total: f32,
-  off_x  : f32,
-  off_y  : f32,
-  off_x_old : f32,
-  off_y_old : f32,
-}
+// @include "common_geometry.wgsl"
+// @include "common_lattice.wgsl"
 
 @group(0) @binding(0) var<storage, read>       state          : CardState;
 @group(0) @binding(1) var<storage, read>       f_in           : array<f32>;
@@ -99,16 +73,6 @@ const AREA_WEIGHT = 0.25f; // dx_L1^2 = 0.5^2 -- see header
 // cylinder case; dx^1 gives Cd=1.262, matching within tolerance.
 const LINE_WEIGHT = 0.5f; // dx_L1 -- see above
 
-const ex = array<i32,9>( 0, 1, 0,-1, 0, 1,-1,-1, 1);
-const ey = array<i32,9>( 0, 0, 1, 0,-1, 1, 1,-1,-1);
-const opp = array<u32,9>(0u, 3u, 4u, 1u, 2u, 7u, 8u, 5u, 6u);
-const wt = array<f32,9>(
-  0.44444444f,
-  0.11111111f, 0.11111111f, 0.11111111f, 0.11111111f,
-  0.02777778f, 0.02777778f, 0.02777778f, 0.02777778f
-);
-const CS2 = 0.33333333f;
-
 fn fineToCoarseUnit(fCoord: u32, origin: u32) -> f32 {
   let j = f32(i32(fCoord) - i32(GHOST));
   return f32(origin) - 0.25 + 0.5 * j;
@@ -125,22 +89,8 @@ fn wrapf(v: f32, n: f32) -> f32 {
   return r;
 }
 
-fn get_phi(p: vec2<f32>, state: CardState) -> f32 {
-    let ca = cos(state.theta);
-    let sa = sin(state.theta);
-    var dx = p.x - state.cx;
-    var dy = p.y - state.cy;
-    dx -= f32(W) * round(dx / f32(W));
-    dy -= f32(H) * round(dy / f32(H));
-    let lx = dx * ca + dy * sa;
-    let ly = -dx * sa + dy * ca;
-    let d = sqrt((lx*lx)/(state.a*state.a) + (ly*ly)/(state.b*state.b)) - 1.0;
-    return d * state.b;
-}
-
 fn get_chi(phi: f32) -> f32 {
-    let epsilon = K_EPS * 0.5f; // see header -- L1's own dx is a fixed literal
-    return 0.5f * (1.0f - tanh(clamp(phi / epsilon, -20.0f, 20.0f)));
+    return chiFromPhiEps(phi, K_EPS * 0.5f); // see header -- L1's own dx is a fixed literal
 }
 
 fn safeFixed(x: f32) -> i32 {

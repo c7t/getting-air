@@ -75,34 +75,7 @@
 // coarse sampling -- fine to retune alongside REFINE_THRESH/COARSEN_THRESH
 // once this is exercised against a live run.
 
-struct CardState {
-  cx     : f32,
-  cy     : f32,
-  theta  : f32,
-  vx     : f32,
-  vy     : f32,
-  omega  : f32,
-  fx     : f32,
-  fy     : f32,
-  tz     : f32,
-  mass   : f32,
-  i_body : f32,
-  g_eff  : f32,
-  a      : f32,
-  b      : f32,
-  v_max  : f32,
-  o_max  : f32,
-  cx_old : f32,
-  cy_old : f32,
-  th_old : f32,
-  tau    : f32,
-  y_total: f32,
-  x_total: f32,
-  off_x  : f32,
-  off_y  : f32,
-  off_x_old : f32,
-  off_y_old : f32,
-}
+// @include "common_geometry.wgsl"
 
 @group(0) @binding(0) var<storage, read>       blockCriterion  : array<f32>;
 @group(0) @binding(1) var<storage, read_write> blockSlot       : array<i32>;
@@ -138,23 +111,6 @@ const EPS_FLOOR = 1e-6f;
 
 fn epsFor(blockID: u32) -> f32 {
   return min(1.0f, log2(max(blockCriterion[blockID], EPS_FLOOR)));
-}
-
-// Same ellipse pseudo-distance as amr_step.wgsl/amr_step1.wgsl's get_phi
-// (positive outside, ~0 at the boundary, scaled by the semi-minor axis --
-// not exact Euclidean distance, but that's already how this project uses
-// it elsewhere, e.g. get_chi's tanh blend).
-fn get_phi(p: vec2<f32>, s: CardState) -> f32 {
-  let ca = cos(s.theta);
-  let sa = sin(s.theta);
-  var dx = p.x - s.cx;
-  var dy = p.y - s.cy;
-  dx -= f32(W) * round(dx / f32(W));
-  dy -= f32(H) * round(dy / f32(H));
-  let lx = dx * ca + dy * sa;
-  let ly = -dx * sa + dy * ca;
-  let d = sqrt((lx*lx)/(s.a*s.a) + (ly*ly)/(s.b*s.b)) - 1.0;
-  return d * s.b;
 }
 
 // True if blockID's center is within FORCE_REFINE_MARGIN of the card's

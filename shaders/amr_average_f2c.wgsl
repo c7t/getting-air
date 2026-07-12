@@ -13,34 +13,8 @@
 // Non-equilibrium part: inverse-Dupuis-Chopard-rescaled by
 // tau_coarse/tau_fine (see amr_interp_c2f.wgsl for the forward direction).
 
-struct CardState {
-  cx     : f32,
-  cy     : f32,
-  theta  : f32,
-  vx     : f32,
-  vy     : f32,
-  omega  : f32,
-  fx     : f32,
-  fy     : f32,
-  tz     : f32,
-  mass   : f32,
-  i_body : f32,
-  g_eff  : f32,
-  a      : f32,
-  b      : f32,
-  v_max  : f32,
-  o_max  : f32,
-  cx_old : f32,
-  cy_old : f32,
-  th_old : f32,
-  tau    : f32,
-  y_total: f32,
-  x_total: f32,
-  off_x  : f32,
-  off_y  : f32,
-  off_x_old : f32,
-  off_y_old : f32,
-}
+// @include "common_geometry.wgsl"
+// @include "common_lattice.wgsl"
 
 @group(0) @binding(0) var<storage, read>       state       : CardState;
 @group(0) @binding(1) var<storage, read>       f_pool      : array<f32>;
@@ -52,19 +26,6 @@ override H : u32;
 override RB : u32;
 const BLOCK = 8u;
 const GHOST = 2u;
-
-const ex = array<i32,9>( 0, 1, 0,-1, 0, 1,-1,-1, 1);
-const ey = array<i32,9>( 0, 0, 1, 0,-1, 1, 1,-1,-1);
-const wt = array<f32,9>(
-  0.44444444f,
-  0.11111111f, 0.11111111f, 0.11111111f, 0.11111111f,
-  0.02777778f, 0.02777778f, 0.02777778f, 0.02777778f
-);
-
-fn feq(rho: f32, ux: f32, uy: f32, i: u32) -> f32 {
-  let eu = f32(ex[i]) * ux + f32(ey[i]) * uy;
-  return wt[i] * rho * (1f + 3f*eu + 4.5f*eu*eu - 1.5f*(ux*ux+uy*uy));
-}
 
 fn cellIndex(cx: u32, cy: u32) -> u32 {
   let nbx = W / BLOCK;
@@ -134,7 +95,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wgi
   for (var i = 0u; i < 9u; i++) {
     var s = 0f;
     for (var c = 0u; c < 4u; c++) {
-      s += f_children[c][i] - feq(rho_children[c], ux_children[c], uy_children[c], i);
+      s += f_children[c][i] - feqD2Q9(rho_children[c], ux_children[c], uy_children[c], i);
     }
     fneq_avg[i] = s * 0.25f;
   }
@@ -146,6 +107,6 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wgi
   let coarseCell = cellIndex(cbx, cby);
 
   for (var i = 0u; i < 9u; i++) {
-    f_coarse[i * (W * H) + coarseCell] = feq(rho_avg, ux_avg, uy_avg, i) + rescale * fneq_avg[i];
+    f_coarse[i * (W * H) + coarseCell] = feqD2Q9(rho_avg, ux_avg, uy_avg, i) + rescale * fneq_avg[i];
   }
 }

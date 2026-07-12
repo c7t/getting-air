@@ -15,6 +15,8 @@
 // with workgroup_size(8,8) -- RB*RB=64 cells is exactly one workgroup, one
 // thread per coarse-equivalent cell of THIS level's own footprint.
 
+// @include "common_lattice.wgsl"
+
 struct LevelParams {
   nbx: u32,        // unused here (destination is parentSlot+quadrant, not a
   nby: u32,        // cellIndex() lookup) -- shared verbatim with the interp/
@@ -34,19 +36,6 @@ struct LevelParams {
 
 override RB : u32;
 const GHOST = 2u;
-
-const ex = array<i32,9>( 0, 1, 0,-1, 0, 1,-1,-1, 1);
-const ey = array<i32,9>( 0, 0, 1, 0,-1, 1, 1,-1,-1);
-const wt = array<f32,9>(
-  0.44444444f,
-  0.11111111f, 0.11111111f, 0.11111111f, 0.11111111f,
-  0.02777778f, 0.02777778f, 0.02777778f, 0.02777778f
-);
-
-fn feq(rho: f32, ux: f32, uy: f32, i: u32) -> f32 {
-  let eu = f32(ex[i]) * ux + f32(ey[i]) * uy;
-  return wt[i] * rho * (1f + 3f*eu + 4.5f*eu*eu - 1.5f*(ux*ux+uy*uy));
-}
 
 @compute @workgroup_size(8, 8)
 fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wgid: vec3<u32>) {
@@ -105,7 +94,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wgi
   for (var i = 0u; i < 9u; i++) {
     var s = 0f;
     for (var c = 0u; c < 4u; c++) {
-      s += f_children[c][i] - feq(rho_children[c], ux_children[c], uy_children[c], i);
+      s += f_children[c][i] - feqD2Q9(rho_children[c], ux_children[c], uy_children[c], i);
     }
     fneq_avg[i] = s * 0.25f;
   }
@@ -123,6 +112,6 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wgi
   let parentCell = pSlot * (FB * FB) + (ply + GHOST) * FB + (plx + GHOST);
 
   for (var i = 0u; i < 9u; i++) {
-    f_parent_pool[i * parentPlaneStride + parentCell] = feq(rho_avg, ux_avg, uy_avg, i) + rescale * fneq_avg[i];
+    f_parent_pool[i * parentPlaneStride + parentCell] = feqD2Q9(rho_avg, ux_avg, uy_avg, i) + rescale * fneq_avg[i];
   }
 }

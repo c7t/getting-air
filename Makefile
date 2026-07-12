@@ -49,8 +49,23 @@ wgsl: ## validate every WGSL shader with naga (needs Rust-built naga)
 	@command -v naga >/dev/null 2>&1 || { echo "naga not found -- run 'make tools' (needs Rust)"; exit 1; }
 	@test -n "$(strip $(SHADERS))" || { echo "no shaders found matching shaders/*.wgsl (run from repo root?)"; exit 1; }
 	@rc=0; for f in $(SHADERS); do \
-	  if out=$$(naga "$$f" 2>&1); then echo "  ok    $$f"; \
-	  else echo "  FAIL  $$f"; echo "$$out" | sed 's/^/        /'; rc=1; fi; \
+	  case "$$f" in \
+	    shaders/common_*.wgsl) echo "  skip  $$f (fragment-only, never compiled alone -- validated via every includer's assembled output)"; continue;; \
+	  esac; \
+	  if grep -q '^// @include' "$$f"; then \
+	    command -v node >/dev/null 2>&1 || { echo "node not found -- needed to assemble $$f's @include fragments"; exit 1; }; \
+	    tmp=$$(mktemp --suffix=.wgsl); \
+	    if ! node tools/assemble-shader.js "$$f" > "$$tmp" 2>"$$tmp.err"; then \
+	      echo "  FAIL  $$f (assemble)"; sed 's/^/        /' "$$tmp.err"; rc=1; rm -f "$$tmp" "$$tmp.err"; continue; \
+	    fi; \
+	    rm -f "$$tmp.err"; \
+	    if out=$$(naga "$$tmp" 2>&1); then echo "  ok    $$f (assembled)"; \
+	    else echo "  FAIL  $$f"; echo "$$out" | sed 's/^/        /'; rc=1; fi; \
+	    rm -f "$$tmp"; \
+	  else \
+	    if out=$$(naga "$$f" 2>&1); then echo "  ok    $$f"; \
+	    else echo "  FAIL  $$f"; echo "$$out" | sed 's/^/        /'; rc=1; fi; \
+	  fi; \
 	done; \
 	if [ $$rc -eq 0 ]; then echo "wgsl: $(words $(SHADERS)) shader(s) valid"; else echo "wgsl: FAILED"; fi; \
 	exit $$rc

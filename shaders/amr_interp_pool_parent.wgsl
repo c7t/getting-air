@@ -45,6 +45,8 @@
 // which are identical at every level) NBX/NBY differ per child level and
 // this one compiled pipeline is reused across all of them (decision 2).
 
+// @include "common_lattice.wgsl"
+
 struct LevelParams {
   nbx: u32,
   nby: u32,
@@ -71,19 +73,6 @@ override GHOST_ONLY : u32;
 override FINE_FINE_ONLY : u32 = 0u;
 
 const GHOST = 2u;
-
-const ex = array<i32,9>( 0, 1, 0,-1, 0, 1,-1,-1, 1);
-const ey = array<i32,9>( 0, 0, 1, 0,-1, 1, 1,-1,-1);
-const wt = array<f32,9>(
-  0.44444444f,
-  0.11111111f, 0.11111111f, 0.11111111f, 0.11111111f,
-  0.02777778f, 0.02777778f, 0.02777778f, 0.02777778f
-);
-
-fn feq(rho: f32, ux: f32, uy: f32, i: u32) -> f32 {
-  let eu = f32(ex[i]) * ux + f32(ey[i]) * uy;
-  return wt[i] * rho * (1f + 3f*eu + 4.5f*eu*eu - 1.5f*(ux*ux+uy*uy));
-}
 
 // Fine ghost-local coordinate -> position in parent-local-interior units
 // (identical formula to amr_interp_dense_parent.wgsl's fineToCoarseUnit;
@@ -134,7 +123,7 @@ fn sampleParentPool(pSlot: u32, ix: i32, iy: i32) -> CoarseSample {
   var out: CoarseSample;
   out.rho = rho; out.ux = ux; out.uy = uy;
   for (var i = 0u; i < 9u; i++) {
-    out.fneq[i] = f[i] - feq(rho, ux, uy, i);
+    out.fneq[i] = f[i] - feqD2Q9(rho, ux, uy, i);
   }
   return out;
 }
@@ -253,6 +242,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let poolCellBase = slot * (FB * FB) + fy * FB + fx;
   for (var i = 0u; i < 9u; i++) {
     let fneq = w00*s00.fneq[i] + w10*s10.fneq[i] + w01*s01.fneq[i] + w11*s11.fneq[i];
-    f_pool[i * poolPlaneStride + poolCellBase] = feq(rho, ux, uy, i) + rescale * fneq;
+    f_pool[i * poolPlaneStride + poolCellBase] = feqD2Q9(rho, ux, uy, i) + rescale * fneq;
   }
 }

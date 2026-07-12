@@ -15,6 +15,8 @@
 // window.__CYL is the CDP-tooling surface (see tools/validate-cylinder.js),
 // modeled directly on main-amr.js's window.__AMR.
 
+import { assembleShader } from './shader-loader.mjs';
+
 const canvas   = document.getElementById('c');
 const statusEl = document.getElementById('status');
 
@@ -142,9 +144,11 @@ function initF() {
 }
 
 async function loadShader(device, path) {
-  const r = await fetch(path + '?v=' + Date.now());
-  if (!r.ok) throw new Error(`failed to load ${path}`);
-  const code = await r.text();
+  const code = await assembleShader(path, async (p) => {
+    const r = await fetch(p + '?v=' + Date.now());
+    if (!r.ok) throw new Error(`failed to load ${p}`);
+    return r.text();
+  });
   return device.createShaderModule({ code });
 }
 
