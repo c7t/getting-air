@@ -33,10 +33,23 @@ invariants the AMR machinery depends on:
   config via `Page.navigate`, never more than one WebGPU context alive at
   once). Runs both checks below across the dense reference and every AMR
   levels/bounce-back combination (`dense-reference`, `amr-N2-diffuse`,
-  `amr-N2-bounceback`, `amr-N3-diffuse`, `amr-N3-bounceback`), prints
-  one aggregated PASS/FAIL report.
+  `amr-N2-bounceback`, `amr-N3-diffuse`, `amr-N3-bounceback`), plus a cheap
+  boot smoke check (`index-boot`, `amr-dev-boot`) against `index.html` and
+  `index-amr.html` — the two dev pages with no `window.__CYL`, so the Cd/St
+  and invariant checks don't apply, but that used to mean this suite never
+  loaded them at all. Added after a shared-shader/JS-bind-group mismatch
+  broke `index-amr.html` in production (a WGSL binding count change was
+  mirrored into `main-cylinder-amr.js`'s own bind group but not
+  `main-amr.js`'s separate copy of the same one) without failing anything
+  here, since nothing had ever visited that page — `runBootSmoke` polls
+  `#status`: a pipeline-creation failure is caught internally by that page's
+  own `init().catch(handleErr)`, written as `error: ...` into `#status` (not
+  an uncaught exception `Runtime.exceptionThrown` would catch), so this
+  checks the status text itself advances past its initial value without
+  ever starting with `error:`. Prints one aggregated PASS/FAIL report.
       node tools/validate-all.js                        # full default sweep
       node tools/validate-all.js --configs=amr-N2-bounceback
+      node tools/validate-all.js --configs=index-boot,amr-dev-boot
       node tools/validate-all.js --re=20,40,100,200 --steps=20000
 - **`tools/validate-cylinder.js`** — physics: pinned cylinder in uniform
   crossflow, time-averaged Cd/Strouhal vs. literature values in
