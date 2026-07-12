@@ -34,6 +34,7 @@ const fs = require('fs');
 const path = require('path');
 const CDP = require('/usr/lib/node_modules/chrome-remote-interface');
 const { evalExpr: evalExprCyl, runCase } = require('./lib/cylinder-metrics');
+const { evalExpr: evalExprChan, runCase: runChanCase } = require('./lib/channel-metrics');
 const { runInvariantSweep } = require('./lib/amr-invariants');
 const {
   ensureServer, ensureChrome, openTab, firstTab, navigateTo, waitForGlobal, teardown,
@@ -129,6 +130,49 @@ function defaultConfigs(baseUrl) {
       checkPhysics: true,
       checkInvariants: true,
     },
+    // Analytical-solution benchmarks (exact closed-form target, not a
+    // literature band -- see benchmarks/channel.json and
+    // tools/lib/channel-metrics.js). checkChannelPhysics configs sweep
+    // BOTH res and re from benchmarks/channel.json's cases, so (unlike
+    // every config above) they navigate multiple times each -- see
+    // runChannelPhysics. `url` here is a display label only, not
+    // navigated to directly. AMR configs default to a single mid-sweep
+    // resolution (chanResFilter) -- AMR channel flow's own marginal value
+    // is "does amr_step.wgsl match lbm_step.wgsl," already the same at
+    // every resolution, not a resolution study of its own (see
+    // main-channel-amr.js's header on autoRefine defaulting off here).
+    {
+      name: 'channel-poiseuille-dense',
+      url: `${baseUrl}/index-channel.html?mode=poiseuille`,
+      checkChannelPhysics: true,
+      chanMode: 'poiseuille',
+      chanPage: 'index-channel.html',
+    },
+    {
+      name: 'channel-couette-dense',
+      url: `${baseUrl}/index-channel.html?mode=couette`,
+      checkChannelPhysics: true,
+      chanMode: 'couette',
+      chanPage: 'index-channel.html',
+    },
+    {
+      name: 'channel-poiseuille-amr-N2',
+      url: `${baseUrl}/index-channel-amr.html?mode=poiseuille&levels=2`,
+      checkChannelPhysics: true,
+      chanMode: 'poiseuille',
+      chanPage: 'index-channel-amr.html',
+      chanLevels: 2,
+      chanResFilter: [32],
+    },
+    {
+      name: 'channel-couette-amr-N2',
+      url: `${baseUrl}/index-channel-amr.html?mode=couette&levels=2`,
+      checkChannelPhysics: true,
+      chanMode: 'couette',
+      chanPage: 'index-channel-amr.html',
+      chanLevels: 2,
+      chanResFilter: [32],
+    },
   ];
 }
 
@@ -187,6 +231,46 @@ async function runPhysics(Runtime, opts) {
   return { ok, results };
 }
 
+// Channel-flow configs sweep BOTH res and re, and res is page-load-time
+// (not live-settable), so this owns its own per-(mode,res)-group
+// navigation -- unlike runPhysics/runInvariants above, which assume the
+// main loop already navigated once to config.url. See tools/validate-
+// channel.js's identical grouping logic (kept as a separate copy there
+// since that tool owns its own Chrome connection/lifecycle, not sharing
+// this file's Page/tab).
+async function runChannelPhysics(Page, Runtime, opts, config) {
+  const benchPath = path.join(REPO_ROOT, 'benchmarks', 'channel.json');
+  const bench = JSON.parse(fs.readFileSync(benchPath, 'utf8'));
+  let cases = bench.cases.filter(c => c.mode === config.chanMode);
+  if (config.chanResFilter) cases = cases.filter(c => config.chanResFilter.includes(c.res));
+
+  const groups = new Map();
+  for (const c of cases) {
+    if (!groups.has(c.res)) groups.set(c.res, []);
+    groups.get(c.res).push(c);
+  }
+
+  const results = [];
+  for (const [res, groupCases] of groups) {
+    const levelsParam = config.chanLevels ? `&levels=${config.chanLevels}` : '';
+    // main-channel.js's `?res=` is H directly; main-channel-amr.js's is
+    // log2(H), matching every other AMR page's convention (its domain is
+    // square and power-of-two by construction, unlike the dense harness).
+    // benchmarks/channel.json's own `res` field is always H -- convert for
+    // AMR pages here rather than making the benchmark data page-shape-aware.
+    const resParam = config.chanPage === 'index-channel-amr.html' ? Math.log2(res) : res;
+    const url = `${opts.baseUrl}/${config.chanPage}?mode=${config.chanMode}&res=${resParam}${levelsParam}`;
+    await navigateTo(Page, url);
+    await waitForGlobal(Runtime, 'window.__CYL', 15000);
+    await evalExprChan(Runtime, `window.__CYL.setLive(false)`);
+    for (const c of groupCases) {
+      results.push(await runChanCase(Runtime, { timeout: opts.physicsTimeout }, c, s => console.log('    ' + s)));
+    }
+  }
+  const ok = results.every(r => r.l2.pass && r.converged);
+  return { ok, results };
+}
+
 async function runInvariants(Runtime, opts) {
   return runInvariantSweep(Runtime, {
     steps: opts.invariantSteps,
@@ -238,21 +322,29 @@ async function main() {
       currentConfigName = config.name;
 
       let physics = null, invariants = null, boot = null;
-      await navigateTo(Page, config.url);
 
-      if (config.checkBoots) {
-        console.log('  -- boot smoke (#status advancing, no error) --');
-        boot = await runBootSmoke(Runtime);
-        console.log(`    ${boot.ok ? 'OK' : 'FAIL: ' + boot.reason}`);
+      if (config.checkChannelPhysics) {
+        // Owns its own per-(mode,res) navigation -- see runChannelPhysics's
+        // header for why this can't share the single-navigateTo pattern
+        // every other config below uses.
+        console.log('  -- physics (u(y) vs. analytic) --');
+        physics = await runChannelPhysics(Page, Runtime, opts, config);
       } else {
-        await waitForCYL(Runtime, 15000);
-        if (config.checkPhysics) {
-          console.log('  -- physics (Cd/St) --');
-          physics = await runPhysics(Runtime, opts);
-        }
-        if (config.checkInvariants) {
-          console.log('  -- structural invariants --');
-          invariants = await runInvariants(Runtime, opts);
+        await navigateTo(Page, config.url);
+        if (config.checkBoots) {
+          console.log('  -- boot smoke (#status advancing, no error) --');
+          boot = await runBootSmoke(Runtime);
+          console.log(`    ${boot.ok ? 'OK' : 'FAIL: ' + boot.reason}`);
+        } else {
+          await waitForCYL(Runtime, 15000);
+          if (config.checkPhysics) {
+            console.log('  -- physics (Cd/St) --');
+            physics = await runPhysics(Runtime, opts);
+          }
+          if (config.checkInvariants) {
+            console.log('  -- structural invariants --');
+            invariants = await runInvariants(Runtime, opts);
+          }
         }
       }
 
@@ -292,8 +384,13 @@ async function main() {
     if (physics && !physics.ok) {
       console.log(`  [${config.name}] physics:`);
       for (const r of physics.results) {
-        if (!r.cd.pass) console.log(`    Re=${r.re} Cd=${r.cd.measured?.toFixed(3)} target=${r.cd.target}±${r.cd.tol} FAIL`);
-        if (!r.st.pass) console.log(`    Re=${r.re} St=${r.st.measured?.toFixed(4)} target=${r.st.target}±${r.st.tol} FAIL`);
+        if (config.checkChannelPhysics) {
+          if (!r.converged) console.log(`    ${r.mode} res=${r.res} Re=${r.re} did not converge within budget (step=${r.step})`);
+          if (!r.l2.pass) console.log(`    ${r.mode} res=${r.res} Re=${r.re} L2rel=${r.l2rel.toExponential(3)} tol=${r.l2.tol} FAIL`);
+        } else {
+          if (!r.cd.pass) console.log(`    Re=${r.re} Cd=${r.cd.measured?.toFixed(3)} target=${r.cd.target}±${r.cd.tol} FAIL`);
+          if (!r.st.pass) console.log(`    Re=${r.re} St=${r.st.measured?.toFixed(4)} target=${r.st.target}±${r.st.tol} FAIL`);
+        }
       }
     }
     if (invariants && !invariants.ok) {

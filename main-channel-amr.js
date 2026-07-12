@@ -894,7 +894,12 @@ async function init() {
       device.queue.writeBuffer(pool.freeListBuf, 0, new Int32Array(freeQuads));
       device.queue.writeBuffer(pool.freeCountBuf, 0, new Int32Array([freeQuads.length]));
     }
-    autoRefine = true;
+    // Deliberately does NOT reset autoRefine to true (unlike main-cylinder-
+    // amr.js's identical reset, whose default IS true) -- this harness
+    // defaults autoRefine OFF for a real reason (see its own declaration's
+    // header), and every benchmark case calls reset() between runs; forcing
+    // it back on here would silently re-enable the unsafe path on every
+    // single case instead of just once at page load.
     macroStepCounter = 0;
     useB = false;
     step = 0;
