@@ -238,15 +238,33 @@ function initCardState() {
 
 async function loadShader(device, path) {
   const r = await fetch(path + '?v=' + Date.now());
-  if (!r.ok) throw new Error(`failed to load ${path}`);
+  if (!r.ok) throw new Error(`failed to load ${path} (HTTP ${r.status} ${r.statusText})`);
   const code = await r.text();
   return device.createShaderModule({ code });
 }
 
+// Prominent, readable fatal-error overlay (the 12px status line hides real errors).
+function showFatal(msg) {
+  let el = document.getElementById('fatal-overlay');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'fatal-overlay';
+    el.style.cssText = 'position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);' +
+      'max-width:80%;max-height:72%;overflow:auto;background:rgba(50,0,0,0.93);color:#fdd;' +
+      'border:1px solid #a55;border-radius:5px;padding:14px 18px;font:12px/1.55 monospace;' +
+      'white-space:pre-wrap;z-index:20;';
+    (document.getElementById('canvas-container') || document.body).appendChild(el);
+  }
+  el.textContent = msg;
+  el.style.display = 'block';
+}
+
 function handleErr(e) {
-  statusEl.textContent = `error: ${e.message}`;
+  const msg = (e && e.message) ? e.message : String(e);
+  statusEl.textContent = `error: ${msg}`;
   statusEl.style.color = '#f77';
-  console.error('WebGPU Error:', e);
+  console.error('[getting-air] error:', e, (e && e.stack) ? '\n' + e.stack : '');
+  showFatal('Error: ' + msg + ((e && e.stack) ? '\n\n' + e.stack : ''));
 }
 
 // base64 chunked in 8192-byte pieces -- a single huge String.fromCharCode
@@ -388,9 +406,26 @@ function cellSizeL0AtLevel(m) {
 }
 
 async function init() {
-  if (!navigator.gpu) { statusEl.textContent = 'WebGPU not available'; return; }
+  if (!navigator.gpu) {
+    const secure = window.isSecureContext;
+    const reason = !secure
+      ? `This origin (${location.origin}) is NOT a secure context. navigator.gpu requires https, or http on localhost / 127.0.0.1 / [::1]. A LAN IP over http will NOT work even with Chrome's --unsafely-treat-insecure-origin-as-secure flag (Chrome deliberately refuses WebGPU on non-localhost http). Fix: serve over https (a self-signed cert is fine — accept the browser warning), or open it as http://localhost.`
+      : `navigator.gpu is undefined even though this IS a secure context. Your browser may not support WebGPU, it may be disabled (chrome://flags/#enable-unsafe-webgpu), or on Linux the GPU/Vulkan stack may be unavailable (see chrome://gpu).`;
+    statusEl.textContent = 'WebGPU not available';
+    statusEl.style.color = '#f77';
+    console.error('[getting-air] WebGPU not available:', reason, { isSecureContext: secure, origin: location.origin });
+    showFatal('WebGPU not available.\n\n' + reason);
+    return;
+  }
   const adapter = await navigator.gpu.requestAdapter();
-  if (!adapter) { statusEl.textContent = 'No adapter'; return; }
+  if (!adapter) {
+    const msg = 'navigator.gpu.requestAdapter() returned null — no compatible GPU adapter. On Linux, Chrome may need a working Vulkan driver / --enable-unsafe-webgpu; check chrome://gpu for WebGPU status.';
+    statusEl.textContent = 'No adapter';
+    statusEl.style.color = '#f77';
+    console.error('[getting-air]', msg);
+    showFatal('No GPU adapter.\n\n' + msg);
+    return;
+  }
 
   // Milestone 6 needs real per-level GPU timing; leave this on for the AMR
   // dev build from the start (main.js keeps it off with `0 &&` -- don't
