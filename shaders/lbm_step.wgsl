@@ -4,6 +4,7 @@
 // @include "common_geometry.wgsl"
 // @include "common_lattice.wgsl"
 // @include "common_sponge.wgsl"
+// @include "common_walls.wgsl"
 
 @group(0) @binding(0) var<storage, read>       state : CardState;
 @group(0) @binding(1) var<storage, read>       f_in  : array<f32>;
@@ -35,6 +36,29 @@ override SPONGE_W : f32 = 4.0f;
 // header for the momentum-exchange force formula this pairs with, and
 // shaders/amr_step*.wgsl for the AMR-side copies of this same flag.
 override USE_BOUNCEBACK : u32 = 0u;
+
+// When 0, skip all CardState/get_phi/chi solid-coupling work entirely --
+// there is no interior body at all (channel-flow and Taylor-Green-vortex
+// validation scenarios, which have no card, only domain-edge conditions).
+// Default 1 reproduces today's behavior exactly.
+override HAS_BODY : u32 = 1u;
+
+// Axis-aligned no-slip channel walls at the y=0/y=H-1 domain edges (see
+// shaders/common_walls.wgsl) -- independent of HAS_BODY/USE_BOUNCEBACK, so
+// a wall-bounded channel with no body works the same as a body without
+// walls. 0 = none (today's periodic-or-sponge edges, unchanged); nonzero =
+// on, with each edge's own x-velocity given by WALL_U0/WALL_U1 (both 0 for
+// a stationary channel, one nonzero for Couette flow). Default 0 is a
+// no-op.
+override WALL_Y : u32 = 0u;
+override WALL_U0 : f32 = 0.0f;
+override WALL_U1 : f32 = 0.0f;
+
+// Uniform body-force density (e.g. Poiseuille's driving force), added to
+// every cell's Guo forcing source term unconditionally -- not gated by
+// chi, unlike the near-body penalty force. Default (0,0) is a no-op.
+override FORCE_X : f32 = 0.0f;
+override FORCE_Y : f32 = 0.0f;
 
 fn get_chi(phi: f32) -> f32 {
     return chiFromPhiEps(phi, 1.5f);
@@ -71,7 +95,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let wx_src = (x + W - u32(ex[i])) % W;
     let wy_src = (y + H - u32(ey[i])) % H;
 
-    if (USE_BOUNCEBACK != 0u && get_phi(vec2<f32>(f32(wx_src), f32(wy_src)), state) < 0f) {
+    if (USE_BOUNCEBACK != 0u && HAS_BODY != 0u && get_phi(vec2<f32>(f32(wx_src), f32(wy_src)), state) < 0f) {
       // Bounce-back: the streaming source is inside the solid, so there's
       // no valid fluid population to pull -- reflect this cell's OWN
       // pre-streaming population that was heading toward that same
@@ -85,6 +109,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       // term specifically) avoids a circular dependency on this cell's own
       // not-yet-gathered rho.
       let corr = 2f * wt[i] * (f32(ex[i]) * usx + f32(ey[i]) * usy) / CS2;
+      f[i] = f_in[opp[i] * (W * H) + cell] + corr;
+    } else if (WALL_Y != 0u && wallSourceOutside(y, ey[i])) {
+      // Channel wall bounce-back (see shaders/common_walls.wgsl) -- same
+      // reflect-and-correct idiom as the body case above, just a position
+      // test instead of an SDF test. usy is always 0 (horizontal walls).
+      let wallUx = wallVelocityX(y, ey[i], WALL_U0, WALL_U1);
+      let corr = 2f * wt[i] * f32(ex[i]) * wallUx / CS2;
       f[i] = f_in[opp[i] * (W * H) + cell] + corr;
     } else {
       // Map window source to buffer source
@@ -107,12 +138,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   // 3. Penalty Force and Solid Coupling -- chi forced to 0 under
   // USE_BOUNCEBACK (the sharp bounce-back streaming above is the ENTIRE
   // solid boundary condition in that mode; Fx/Fy/Si below collapse to 0
-  // and this becomes plain BGK relaxation everywhere, exactly as intended).
-  let chi = select(get_chi(phi), 0f, USE_BOUNCEBACK != 0u);
+  // and this becomes plain BGK relaxation everywhere, exactly as intended)
+  // or when there's no body at all (HAS_BODY=0).
+  let chi = select(get_chi(phi), 0f, USE_BOUNCEBACK != 0u || HAS_BODY == 0u);
 
-  // Penalty Force F = rho * chi * (Us - u*)
-  let Fx = rho * chi * (usx - ux_star);
-  let Fy = rho * chi * (usy - uy_star);
+  // Penalty Force F = rho * chi * (Us - u*), plus a uniform body-force
+  // density (e.g. Poiseuille's driving force -- FORCE_X/Y default 0, a
+  // no-op for every existing scenario).
+  let Fx = rho * chi * (usx - ux_star) + FORCE_X;
+  let Fy = rho * chi * (usy - uy_star) + FORCE_Y;
 
   // Actual fluid velocity u = u* + F/(2rho)
   let ux = ux_star + Fx / (2.0f * rhoDen);
