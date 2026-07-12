@@ -387,14 +387,45 @@ fn coarsen(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (childQuadrant[slot] != 0u) { return; }
 
   let eps = min(1.0f, log2(max(childCriterion[u32(blockID)], EPS_FLOOR)));
-  // This quad's own center (quadrant 0's cached origin is this quad's own
-  // origin -- see header) -- same generous-margin isNearBody test as refine.
-  // BUGFIX: see refine()'s parentCenterX_L0 for the full derivation -- this
-  // level's own interior is 2*RB cells (not RB) at this level's own dx
-  // (PARENT_CELL_SIZE_L0*0.5f, i.e. dx_child=dx_parent/2), so the HALF-
-  // width is RB*dx_child directly, no further *0.5.
-  let centerX_L0 = childOriginX[slot] + f32(RB) * (PARENT_CELL_SIZE_L0 * 0.5f);
-  let centerY_L0 = childOriginY[slot] + f32(RB) * (PARENT_CELL_SIZE_L0 * 0.5f);
+  // Geometric protection uses the PARENT's own center -- matching refine()'s
+  // isHardRequired/inSpongeBandAt test EXACTLY (same parentCenterX_L0/Y_L0
+  // derivation as that function), not this quad's own (quadrant-0) center
+  // as before.
+  //
+  // BUGFIX: using the quad's own center here let refine() and coarsen()
+  // disagree about whether the SAME quad qualifies as "near body," because
+  // they tested DIFFERENT points -- refine()'s isHardRequired decides for
+  // the WHOLE quad using the PARENT's center, but this function's old
+  // isNearBodyAt/inSpongeBandAt used quadrant-0's own center instead (up to
+  // half a parent-cell away). Live-verified: a parent phi=1.98 (comfortably
+  // under a 4-unit margin, hard-required) whose OWN quadrant-0 child center
+  // measured phi=4.56 (just OVER that same margin) -- refine() recreated
+  // the quad every fixed-point iteration (parent qualifies), coarsen()
+  // released it every iteration right after (quadrant-0 doesn't) -- a
+  // genuine create/destroy oscillation on EVERY evaluation, not a rare edge
+  // case. This starved amr_manage.wgsl's own L0->L1 cascade (checking
+  // hasLevel2Child) of ever observing the child in its "exists" state,
+  // since coarsen() (always releasing it) runs immediately before that
+  // cascade check in dispatch order every fixed-point iteration -- ground-
+  // truth confirmed via a temporary GPU-side instrumentation capture (not
+  // just static reasoning) that hasLevel2Child read false at every single
+  // one of 20 consecutive evaluations despite the child externally
+  // appearing active "most of the time." This was the actual mechanism
+  // behind a debugCheck21Balance violation that reproduced identically
+  // across thousands of steps, previously characterized only as "wake/
+  // criterion-driven... not yet root-caused."
+  let parentSlot = u32(childParentSlot[slot]);
+  let parentBlockID = parentSlotToBlock[parentSlot];
+  let bxP = u32(parentBlockID) % NBX_PARENT;
+  let byP = u32(parentBlockID) / NBX_PARENT;
+  var parentOriginX_L0 = f32(bxP * RB);
+  var parentOriginY_L0 = f32(byP * RB);
+  if (PARENT_HAS_CACHED_ORIGIN != 0u) {
+    parentOriginX_L0 = parentOriginX[parentSlot];
+    parentOriginY_L0 = parentOriginY[parentSlot];
+  }
+  let centerX_L0 = parentOriginX_L0 + f32(RB) * PARENT_CELL_SIZE_L0;
+  let centerY_L0 = parentOriginY_L0 + f32(RB) * PARENT_CELL_SIZE_L0;
 
   if ((eps < COARSEN_THRESH || inSpongeBandAt(centerX_L0, centerY_L0)) && !isNearBodyAt(centerX_L0, centerY_L0)) {
     let quadIdx = slot / 4u; // slot IS quadrant 0's own slot (childQuadrant[slot]==0 checked above), so quadIdx*4u==slot
