@@ -6,12 +6,16 @@
 // across a fixed list of scenarios: the dense reference, and the AMR
 // cylinder harness at each of the levels/coupling combinations this
 // project's own commit history and plans/AMR-multilevel.md milestones
-// track as meaningfully different states (N=2 diffuse, N=2 bounce-back --
-// both currently validated -- and N=3 diffuse / N=3 bounce-back-forced --
-// both currently open work, per main-cylinder-amr.js's own comment above
-// N_LEVELS). One command, one report, instead of hand-launching Chrome and
-// running tools/validate-cylinder.js and tools/validate-amr-invariants.js
-// separately per config.
+// track as meaningfully different states (N=2 diffuse, N=2 bounce-back,
+// N=3 diffuse, N=3 bounce-back). Also runs a cheap boot smoke check
+// (checkBoots -- see defaultConfigs' own comment) against index.html and
+// index-amr.html, the two dev pages this suite otherwise never visits
+// (they have no window.__CYL, so checkPhysics/checkInvariants don't
+// apply) -- added after a shared-shader/JS-bind-group mismatch broke
+// index-amr.html in production without failing anything in this suite,
+// since nothing here had ever loaded that page. One command, one report,
+// instead of hand-launching Chrome and running tools/validate-cylinder.js
+// and tools/validate-amr-invariants.js separately per config.
 //
 // Unlike the two leaf tools (which assume a Chrome + page are already up),
 // this one owns the whole lifecycle: starts the HTTPS dev server and a
@@ -62,6 +66,33 @@ function parseArgs(argv) {
 
 function defaultConfigs(baseUrl) {
   return [
+    // Boot smoke checks: index.html/index-amr.html have no window.__CYL (no
+    // Cd/St, no AMR-invariant surface -- those are the cylinder harness's
+    // own addition), so checkPhysics/checkInvariants don't apply to them.
+    // They're the ONLY consumers of shaders/lbm_*.wgsl (index.html) and one
+    // of two consumers of shaders/amr_*.wgsl (index-amr.html, alongside
+    // index-cylinder-amr.html) -- but before checkBoots existed, neither
+    // page was ever loaded by this harness at all, only the cylinder pages
+    // were. That gap is exactly what let a shared-shader/JS-bind-group
+    // mismatch break index-amr.html in production undetected (see git log
+    // for "Fix index-amr.html: force1PoolBGL was missing the new
+    // debugSlotForce binding") -- a WGSL binding count change was made to
+    // shaders/amr_force1_pool.wgsl and mirrored into main-cylinder-amr.js's
+    // own bind group, but main-amr.js's SEPARATE copy of that same bind
+    // group (index-amr.html's only path to that shader) was missed, and
+    // nothing in this suite ever visited index-amr.html to notice.
+    // checkBoots is the cheap fix: load the page, confirm the compute loop
+    // is actually advancing.
+    {
+      name: 'index-boot',
+      url: `${baseUrl}/index.html`,
+      checkBoots: true,
+    },
+    {
+      name: 'amr-dev-boot',
+      url: `${baseUrl}/index-amr.html`,
+      checkBoots: true,
+    },
     {
       name: 'dense-reference',
       url: `${baseUrl}/index-cylinder.html`,
@@ -211,6 +242,36 @@ async function navigateTo(Page, url) {
 
 // --- per-config runners -----------------------------------------------
 
+// Boot smoke check (see defaultConfigs' own header on why this exists): a
+// pipeline-creation failure inside init() (e.g. a bind-group-layout
+// mismatch against a shared shader's binding count) is caught by that
+// page's own `init().catch(handleErr)` -- see main.js/main-amr.js -- which
+// writes "error: <message>" into #status and does a console.error, NOT an
+// uncaught exception. Runtime.exceptionThrown (this file's existing
+// listener, registered for every config) would NOT have caught the bug
+// this check was added for -- the only real signal is #status itself
+// either starting with "error:" or never advancing past its initial
+// "initializing..." text, so that's what this polls for instead of relying
+// on the exception listener.
+async function runBootSmoke(Runtime) {
+  const readStatus = async () => {
+    const r = await evalExprCyl(Runtime, `document.getElementById('status') ? document.getElementById('status').textContent : null`);
+    return r.exceptionDetails ? null : r.result.value;
+  };
+  const first = await readStatus();
+  if (first == null) return { ok: false, reason: 'no #status element found' };
+  if (/^error:/i.test(first)) return { ok: false, reason: `status shows an error: "${first}"` };
+  // A few seconds is enough for a healthy page to get well past its first
+  // status write (typically several frames/macro-steps in); capped well
+  // under opts.physicsTimeout since this check doesn't need a real run.
+  await new Promise(r => setTimeout(r, 4000));
+  const second = await readStatus();
+  if (second == null) return { ok: false, reason: 'no #status element found (second read)' };
+  if (/^error:/i.test(second)) return { ok: false, reason: `status shows an error: "${second}"` };
+  if (second === first) return { ok: false, reason: `status never advanced past "${first}" -- page may be stuck` };
+  return { ok: true, first, second };
+}
+
 async function runPhysics(Runtime, opts) {
   const benchPath = path.join(REPO_ROOT, 'benchmarks', 'cylinder.json');
   const bench = JSON.parse(fs.readFileSync(benchPath, 'utf8'));
@@ -274,20 +335,26 @@ async function main() {
       console.log(`\n=== ${config.name} (${config.url}) ===`);
       currentConfigName = config.name;
 
-      let physics = null, invariants = null;
+      let physics = null, invariants = null, boot = null;
       await navigateTo(Page, config.url);
-      await waitForCYL(Runtime, 15000);
 
-      if (config.checkPhysics) {
-        console.log('  -- physics (Cd/St) --');
-        physics = await runPhysics(Runtime, opts);
-      }
-      if (config.checkInvariants) {
-        console.log('  -- structural invariants --');
-        invariants = await runInvariants(Runtime, opts);
+      if (config.checkBoots) {
+        console.log('  -- boot smoke (#status advancing, no error) --');
+        boot = await runBootSmoke(Runtime);
+        console.log(`    ${boot.ok ? 'OK' : 'FAIL: ' + boot.reason}`);
+      } else {
+        await waitForCYL(Runtime, 15000);
+        if (config.checkPhysics) {
+          console.log('  -- physics (Cd/St) --');
+          physics = await runPhysics(Runtime, opts);
+        }
+        if (config.checkInvariants) {
+          console.log('  -- structural invariants --');
+          invariants = await runInvariants(Runtime, opts);
+        }
       }
 
-      report.push({ config, physics, invariants });
+      report.push({ config, physics, invariants, boot });
     }
   } finally {
     await client.close();
@@ -319,18 +386,23 @@ async function main() {
   console.log('SUMMARY');
   console.log('='.repeat(72));
   const pad = (s, n) => (String(s) + ' '.repeat(n)).slice(0, Math.max(String(s).length, n)) + ' ';
-  console.log(pad('config', 26) + pad('physics', 12) + pad('invariants', 12));
+  console.log(pad('config', 26) + pad('boot', 8) + pad('physics', 12) + pad('invariants', 12));
   let allOk = true;
-  for (const { config, physics, invariants } of report) {
+  for (const { config, physics, invariants, boot } of report) {
+    const bootStr = boot ? (boot.ok ? 'PASS' : 'FAIL') : 'n/a';
     const physStr = physics ? (physics.ok ? 'PASS' : 'FAIL') : 'n/a';
     const invStr = invariants ? (invariants.ok ? 'PASS' : 'FAIL') : 'n/a';
-    console.log(pad(config.name, 26) + pad(physStr, 12) + pad(invStr, 12));
+    console.log(pad(config.name, 26) + pad(bootStr, 8) + pad(physStr, 12) + pad(invStr, 12));
+    if (boot && !boot.ok) allOk = false;
     if (physics && !physics.ok) allOk = false;
     if (invariants && !invariants.ok) allOk = false;
   }
 
   console.log('\nDetails for anything not PASS:');
-  for (const { config, physics, invariants } of report) {
+  for (const { config, physics, invariants, boot } of report) {
+    if (boot && !boot.ok) {
+      console.log(`  [${config.name}] boot: ${boot.reason}`);
+    }
     if (physics && !physics.ok) {
       console.log(`  [${config.name}] physics:`);
       for (const r of physics.results) {
