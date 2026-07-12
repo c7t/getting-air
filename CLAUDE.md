@@ -22,6 +22,41 @@ it does **not** prove the app renders; for that use the `webgpu-verify` skill
 (`.claude/skills/webgpu-verify/`), which drives a real GPU Chrome and
 screenshots. A black/blank canvas is a failure, not success.
 
+## Physics & AMR validation (needs a GPU)
+`make check` doesn't run the simulation. These do — they drive a real WebGPU
+Chrome via CDP and either compare against known physics or assert structural
+invariants the AMR machinery depends on:
+
+- **`tools/validate-all.js`** — single top-level harness, run this by
+  default. Owns the whole Chrome/HTTPS-server lifecycle (launches its own
+  dedicated debug-port Chrome if none is running; one tab reused across every
+  config via `Page.navigate`, never more than one WebGPU context alive at
+  once). Runs both checks below across the dense reference and every AMR
+  levels/bounce-back combination (`dense-reference`, `amr-N2-diffuse`,
+  `amr-N2-bounceback`, `amr-N3-diffuse`, `amr-N3-bounceback-forced`), prints
+  one aggregated PASS/FAIL report.
+      node tools/validate-all.js                        # full default sweep
+      node tools/validate-all.js --configs=amr-N2-bounceback
+      node tools/validate-all.js --re=20,40,100,200 --steps=20000
+- **`tools/validate-cylinder.js`** — physics: pinned cylinder in uniform
+  crossflow, time-averaged Cd/Strouhal vs. literature values in
+  `benchmarks/cylinder.json`. Assumes a Chrome + page are already up (see
+  `webgpu-verify`) — `validate-all.js` is the one-command version.
+- **`tools/validate-amr-invariants.js`** — AMR structural invariants,
+  asserted periodically through a run (not just at the end, so a transient
+  violation can't slip past): 2:1 balance between neighboring tiles
+  (`window.__CYL.debugCheck21Balance`) and the geometry-forced-refinement
+  hard constraint — every leaf tile near the body must already be at the
+  finest configured level (`debugCheckGeometryCoverage`) — plus a cheap
+  field-finite (NaN/blowup) smoke check.
+- Shared analysis code lives in `tools/lib/` (`cylinder-metrics.js`,
+  `amr-invariants.js`) — both the leaf tools and `validate-all.js` call the
+  same logic, not independently-drifting copies.
+
+Current known-issue state (e.g. which `?levels=N` combinations are physics-
+validated) drifts with active work — see `main-cylinder-amr.js`'s own
+comment above `N_LEVELS`, not this file, for what's current.
+
 ## Branch model
 - **`main`** — canonical, always-buildable, default branch. All PRs land here.
 - **`gh-pages`** — the *published* snapshot; the GitHub Pages source. **Never edit
