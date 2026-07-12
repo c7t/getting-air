@@ -1,0 +1,18 @@
+{
+  "geometry": "plane channel flow, 2D, halfway-bounce-back no-slip walls at y=0/y=H-1 (wall-to-wall physical height exactly H), exactly periodic in x",
+  "note": "Unlike benchmarks/cylinder.json's literature-derived Cd/St bands, this is an EXACT closed-form solution (parabolic for force-driven Poiseuille flow, linear for moving-wall Couette flow) -- see main-channel.js's own header for the derivation. l2_tol is the relative L2 norm of (simulated steady-state u(y) minus analytic u(y)) over the analytic profile's own L2 norm, so tolerances can be tight and should shrink with resolution (the known O(dx^2) discretization order of this scheme). `re` values are chosen per resolution to keep peak Mach number roughly constant (~0.03-0.06) across the sweep, isolating spatial discretization error from compressibility error -- Re is not held fixed across resolutions the way it conceptually 'is' the flow being simulated, because doing so would push U_max (and Ma) to instability/inaccuracy at larger H for a fixed tau. Capped at res=32: diffusive convergence time scales as H^2/nu, so res=64 needs well over 400000 steps to actually reach a tight steady-state tolerance -- fine for an occasional deep convergence-order study (pass --res=64 to tools/validate-channel.js directly with a larger --maxSteps), but conflicts with 'cheap test that runs frequently' as a default.",
+  "measurement": {
+    "tau": "Fixed at 0.8 (nu=0.1) for every case in this default sweep -- a numerically comfortable relaxation time, not derived from Re (see main-channel.js's header: Re is hit by solving for the driving parameter FORCE_X/WALL_U1 at a fixed tau, not the other way around).",
+    "convergence": "Steady state detected via the u(y) profile's relative L2 change between successive 1024-step blocks dropping below 1e-6 (window.__CYL.debugRunToSteady), capped at 200000 steps -- see tools/lib/channel-metrics.js's runCase defaults."
+  },
+  "cases": [
+    { "mode": "poiseuille", "res": 16, "re": 5,  "tau": 0.8, "l2_tol": 0.01 },
+    { "mode": "poiseuille", "res": 16, "re": 10, "tau": 0.8, "l2_tol": 0.01 },
+    { "mode": "poiseuille", "res": 32, "re": 10, "tau": 0.8, "l2_tol": 0.005 },
+    { "mode": "poiseuille", "res": 32, "re": 20, "tau": 0.8, "l2_tol": 0.005 },
+    { "mode": "couette",    "res": 16, "re": 5,  "tau": 0.8, "l2_tol": 0.01 },
+    { "mode": "couette",    "res": 16, "re": 10, "tau": 0.8, "l2_tol": 0.01 },
+    { "mode": "couette",    "res": 32, "re": 10, "tau": 0.8, "l2_tol": 0.005 },
+    { "mode": "couette",    "res": 32, "re": 20, "tau": 0.8, "l2_tol": 0.005 }
+  ]
+}
