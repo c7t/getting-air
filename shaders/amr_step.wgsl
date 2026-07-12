@@ -21,6 +21,7 @@
 // @include "common_geometry.wgsl"
 // @include "common_lattice.wgsl"
 // @include "common_sponge.wgsl"
+// @include "common_walls.wgsl"
 
 @group(0) @binding(0) var<storage, read>       state : CardState;
 @group(0) @binding(1) var<storage, read>       f_in  : array<f32>;
@@ -45,6 +46,17 @@ override SPONGE_W : f32 = 4.0f;
 // operating in this file's window/buffer split addressing. See that
 // file's header for the full rationale.
 override USE_BOUNCEBACK : u32 = 0u;
+
+// Channel/TGV-scenario overrides -- see shaders/lbm_step.wgsl's identical
+// set for the full rationale (HAS_BODY, WALL_Y/WALL_U0/WALL_U1,
+// FORCE_X/FORCE_Y). All default to a no-op, so this file's existing
+// falling-card/cylinder behavior is byte-for-byte unaffected.
+override HAS_BODY : u32 = 1u;
+override WALL_Y : u32 = 0u;
+override WALL_U0 : f32 = 0.0f;
+override WALL_U1 : f32 = 0.0f;
+override FORCE_X : f32 = 0.0f;
+override FORCE_Y : f32 = 0.0f;
 
 // Block-major linear index for a cell at BUFFER coordinates (cx, cy).
 // W and H are always exact multiples of BLOCK (resLog2 clamps W,H to
@@ -88,20 +100,26 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   // 1. Pull Streaming: buffer-space neighbor (see file header derivation).
   var f: array<f32,9>;
   for (var i = 0u; i < 9u; i++) {
-    if (USE_BOUNCEBACK != 0u) {
-      let wx_src = (wx + W - u32(ex[i])) % W;
-      let wy_src = (wy + H - u32(ey[i])) % H;
-      if (get_phi(vec2<f32>(f32(wx_src), f32(wy_src)), state) < 0f) {
-        // Bounce-back -- see lbm_step.wgsl's identical branch for the
-        // formula/derivation.
-        let corr = 2f * wt[i] * (f32(ex[i]) * usx + f32(ey[i]) * usy) / CS2;
-        f[i] = f_in[opp[i] * (W * H) + cell] + corr;
-        continue;
-      }
+    let wx_src = (wx + W - u32(ex[i])) % W;
+    let wy_src = (wy + H - u32(ey[i])) % H;
+    if (USE_BOUNCEBACK != 0u && HAS_BODY != 0u && get_phi(vec2<f32>(f32(wx_src), f32(wy_src)), state) < 0f) {
+      // Bounce-back -- see lbm_step.wgsl's identical branch for the
+      // formula/derivation.
+      let corr = 2f * wt[i] * (f32(ex[i]) * usx + f32(ey[i]) * usy) / CS2;
+      f[i] = f_in[opp[i] * (W * H) + cell] + corr;
+    } else if (WALL_Y != 0u && wallSourceOutside(wy, ey[i])) {
+      // Channel wall bounce-back (window-space -- the physical wall is
+      // anchored in window coordinates, same as the body SDF and sponge
+      // above) -- see shaders/common_walls.wgsl / lbm_step.wgsl's
+      // identical branch.
+      let wallUx = wallVelocityX(wy, ey[i], WALL_U0, WALL_U1);
+      let corr = 2f * wt[i] * f32(ex[i]) * wallUx / CS2;
+      f[i] = f_in[opp[i] * (W * H) + cell] + corr;
+    } else {
+      let bx_src = (cx + W - u32(ex[i])) % W;
+      let by_src = (cy + H - u32(ey[i])) % H;
+      f[i] = f_in[i * (W * H) + cellIndex(bx_src, by_src)];
     }
-    let bx_src = (cx + W - u32(ex[i])) % W;
-    let by_src = (cy + H - u32(ey[i])) % H;
-    f[i] = f_in[i * (W * H) + cellIndex(bx_src, by_src)];
   }
 
   // 2. Local Macroscopic Variables
@@ -119,12 +137,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   ux_star /= rhoDen; uy_star /= rhoDen;
 
   // 3. Penalty Force and Solid Coupling (window-space) -- chi forced to 0
-  // under USE_BOUNCEBACK, same as lbm_step.wgsl.
-  let chi = select(get_chi(phi), 0f, USE_BOUNCEBACK != 0u);
+  // under USE_BOUNCEBACK or when there's no body at all, same as
+  // lbm_step.wgsl.
+  let chi = select(get_chi(phi), 0f, USE_BOUNCEBACK != 0u || HAS_BODY == 0u);
 
-  // Penalty Force F = rho * chi * (Us - u*)
-  let Fx = rho * chi * (usx - ux_star);
-  let Fy = rho * chi * (usy - uy_star);
+  // Penalty Force F = rho * chi * (Us - u*), plus a uniform body-force
+  // density (see lbm_step.wgsl's identical FORCE_X/Y).
+  let Fx = rho * chi * (usx - ux_star) + FORCE_X;
+  let Fy = rho * chi * (usy - uy_star) + FORCE_Y;
 
   // Actual fluid velocity u = u* + F/(2rho)
   let ux = ux_star + Fx / (2.0f * rhoDen);

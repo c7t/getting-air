@@ -100,6 +100,10 @@ override COARSEN_THRESH : f32;
 override FORCE_REFINE_MARGIN : f32;
 override FORCE_REFINE_LOOKAHEAD : f32;
 override HAS_LEVEL2 : u32 = 0u;
+// When 0, isNearBody is unconditionally false -- no interior geometry to
+// force-refine toward (channel-flow/TGV scenarios), so refinement is
+// purely vorticity-driven. See shaders/lbm_step.wgsl's identical override.
+override HAS_BODY : u32 = 1u;
 // L0 window-space edge band (coarse cells) excluded from vorticity-driven
 // refinement -- keeps fine blocks out of the ALBC sponge (amr_step.wgsl
 // SPONGE_W=4). Default 0 disables it; the JS default is 8. Preserves
@@ -130,6 +134,7 @@ fn epsFor(blockID: u32) -> f32 {
 // is the one quantity the window doesn't absorb, so it still extrapolates
 // forward normally.
 fn isNearBody(blockID: u32) -> bool {
+  if (HAS_BODY == 0u) { return false; }
   let nbx = W / BLOCK;
   let bx = blockID % nbx; let by = blockID / nbx;
   let cx_buf = bx * BLOCK + BLOCK / 2u;

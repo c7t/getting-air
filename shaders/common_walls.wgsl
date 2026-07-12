@@ -27,3 +27,19 @@ fn wallVelocityX(y: u32, eyi: i32, u0: f32, u1: f32) -> f32 {
   let ySrc = i32(y) - eyi;
   return select(u1, u0, ySrc < 0);
 }
+
+// Continuous-position counterparts of the two functions above, for AMR
+// fine-level kernels where a cell's coarse-equivalent y position is a
+// float (fractional fine-cell offsets), not an integer row index. Callers
+// pass the UNWRAPPED buffer-space coarse-unit position of the streaming
+// source directly (e.g. amr_step1.wgsl's own fineToCoarseUnitI output) --
+// this assumes off_y is always 0 for any scenario using WALL_Y (no
+// moving-window panning), so buffer-space position IS window-space
+// position with no further conversion needed.
+fn wallSourceOutsideF(yPos: f32) -> bool {
+  return yPos < 0.0f || yPos >= f32(H);
+}
+
+fn wallVelocityXF(yPos: f32, u0: f32, u1: f32) -> f32 {
+  return select(u1, u0, yPos < 0.0f);
+}

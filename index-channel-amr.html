@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>getting-air — channel flow AMR validation</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #111;
+      color: #eee;
+      font-family: monospace;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      height: 100dvh;
+    }
+    #canvas-container {
+      flex: 1;
+      position: relative;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #000;
+      overflow: hidden;
+      container-type: size;
+    }
+    canvas {
+      display: block;
+      width:  min(100cqw, 100cqh);
+      height: min(100cqw, 100cqh);
+    }
+    #status {
+      position: absolute; top: 8px; left: 8px;
+      font-size: 12px; color: #7f7; background: rgba(0,0,0,0.6);
+      padding: 4px 8px; border-radius: 3px; pointer-events: none;
+    }
+    #controls {
+      flex-shrink: 0;
+      background: rgba(0,0,0,0.85);
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      border-top: 1px solid #444;
+    }
+    .control-row { display: flex; align-items: center; gap: 10px; }
+    .control-row label { width: 100px; font-size: 11px; color: #aaa; }
+    .control-row input { flex-grow: 1; cursor: pointer; }
+    .control-row span { width: 50px; text-align: right; font-size: 11px; color: #fff; }
+  </style>
+</head>
+<body>
+  <div id="canvas-container">
+    <canvas id="c"></canvas>
+    <div id="status">initializing...</div>
+  </div>
+
+  <div id="controls">
+    <div class="control-row">
+      <label>Resolution</label>
+      <input type="range" id="slider-RES" min="5" max="11" step="1" value="8">
+      <span id="val-RES">256</span>
+    </div>
+    <div class="control-row">
+      <label>Re (Reynolds)</label>
+      <input type="range" id="slider-RE" min="1" max="500" step="1" value="50">
+      <span id="val-RE">50</span>
+    </div>
+    <div class="control-row">
+      <label>Overlay</label>
+      <input type="range" id="slider-overlay" min="0" max="1" step="0.05" value="1">
+      <span id="val-overlay">1.00</span>
+    </div>
+  </div>
+
+  <script type="module" src="main-channel-amr.js"></script>
+</body>
+</html>
