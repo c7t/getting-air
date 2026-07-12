@@ -823,7 +823,10 @@ async function init() {
     { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
-    { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }
+    { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    // TEMPORARY diagnostic (level-2 bounce-back sign investigation) -- see
+    // amr_force1_pool.wgsl's own debugSlotForce header.
+    { binding: 8, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }
   ]});
 
   const constants = { W, H };
@@ -1163,6 +1166,9 @@ async function init() {
     // blockSlot if it exists in this configuration, else the dummy --
     // matches this level's own levelParams.hasChild value written above.
     const childBlockSlotBuf = (c + 1 < N_LEVELS) ? pools[c + 1].blockSlotBuf : dummyBlockSlotBuf;
+    // TEMPORARY diagnostic (level-2 bounce-back sign investigation) -- see
+    // amr_force1_pool.wgsl's own debugSlotForce header.
+    childPool.debugSlotForceBuf = device.createBuffer({ size: childPool.MAX_FINE_BLOCKS * 8, usage: U.STORAGE | U.COPY_SRC });
     childPool.force1PoolBG = device.createBindGroup({ layout: force1PoolBGL, entries: [
       { binding: 0, resource: { buffer: cardStateBuf } },
       { binding: 1, resource: { buffer: childPool.finePoolF_a } },
@@ -1172,6 +1178,7 @@ async function init() {
       { binding: 5, resource: { buffer: childPool.originYBuf } },
       { binding: 6, resource: { buffer: childPool.levelParamsBuf } },
       { binding: 7, resource: { buffer: childBlockSlotBuf } },
+      { binding: 8, resource: { buffer: childPool.debugSlotForceBuf } },
     ]});
   }
 
