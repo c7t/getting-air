@@ -22,7 +22,11 @@ export PATH := $(if $(CARGO_HOME),$(CARGO_HOME),$(HOME)/.cargo)/bin:$(PATH)
 NAGA_VERSION ?= 30
 
 SHADERS := $(wildcard shaders/*.wgsl)
-JS      := $(wildcard *.js)
+# Recursive, not $(wildcard *.js) -- that only ever matched root-level files,
+# silently skipping tools/ and tools/lib/ (real, actively-used JS, not just
+# root main*.js). venv/ (Python virtualenv) and AGAL/ (vendored C++/CUDA
+# sub-repo) are excluded -- neither is this project's own JS source.
+JS      := $(shell find . -name '*.js' -not -path './node_modules/*' -not -path './.git/*' -not -path './venv/*' -not -path './AGAL/*')
 
 .DEFAULT_GOAL := help
 
