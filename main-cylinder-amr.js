@@ -78,12 +78,15 @@ const NBX = W / BLOCK, NBY = H / BLOCK, NBLOCKS = NBX * NBY; // coarse block gri
 const N_LEVELS = urlParams.has('levels') ? parseInt(urlParams.get('levels')) : 2;
 if (N_LEVELS < 2) throw new Error(`?levels=${N_LEVELS} invalid -- must be >= 2 (L0 + at least one fine level)`);
 
-// KNOWN ISSUE, narrowed further: USE_BOUNCEBACK is validated correct at
-// N_LEVELS<=2 (L0+L1 only -- Cd/St match the literature within tolerance,
-// see tools/validate-cylinder.js) but diverges as soon as a pool level
-// (L>=2) is active. Originally traced to TWO distinct issues; the first is
-// now FULLY fixed at the root (was two sub-bugs, then a third found and
-// fixed afterward -- see below):
+// RESOLVED (was "KNOWN ISSUE, narrowed further"): USE_BOUNCEBACK is now
+// validated correct through N_LEVELS<=3 (Cd/St match the literature within
+// tolerance at res=9 default, see tools/validate-cylinder.js) -- previously
+// diverged as soon as a pool level (L>=2) was active. N_LEVELS>=4 is still
+// unvalidated (the guard below still blocks it without ?forceBounceback).
+// Originally traced to TWO distinct issues, both now fully fixed at the
+// root (issue 1 was two sub-bugs, then a third found and fixed afterward;
+// issue 2 turned out to be two MORE bugs, uncovered only once issue 1 was
+// completely clean -- see below):
 // 1. COVERAGE GAP, root-caused and fixed: geometry-forced refinement is
 //    meant to be a HARD constraint (M8: push the body's surface onto the
 //    finest configured level, 2:1 balance driven FROM that, not used to
@@ -130,21 +133,50 @@ if (N_LEVELS < 2) throw new Error(`?levels=${N_LEVELS} invalid -- must be >= 2 (
 //    center test refine() does. debugCheck21Balance clean over 40,000
 //    steps at N=3 after the fix (was reproducible every ~2048 steps
 //    before, identically, across many independent test runs).
-// 2. Level 2's OWN bounce-back force is STILL wrong (wrong sign, large
+// 2. Level 2's OWN bounce-back force was wrong (wrong sign, large
 //    magnitude relative to L1's own contribution -- e.g. fx~-5.6 vs L1's
-//    fx~-0.19 in one post-fix debugForceBreakdown measurement) -- confirmed
-//    this is NOT resolved by fixing issue 1 above (re-measured after that
-//    fix landed: same qualitative symptom, 2:1 balance itself now clean).
-//    The field itself is confirmed healthy (debugReadPool: rho~1,
-//    populations bounded) at every level, so this is a force-bookkeeping
-//    bug specifically, not a step-shader/streaming one. A real, separate
-//    pre-existing dx-scale bug in amr_step1_pool.wgsl/amr_force1_pool.wgsl
-//    was found and fixed along the way (see that file's own header) but
-//    didn't fully resolve this -- now the SOLE remaining blocker, cleanly
-//    isolated with issue 1 fully resolved.
-// ?forceBounceback bypasses this guard for continued investigation.
-if (USE_BOUNCEBACK && N_LEVELS > 2 && !urlParams.has('forceBounceback')) {
-  throw new Error('?bounceback with ?levels>2 is known-broken (diverges) -- see this file\'s own comment above N_LEVELS. Use ?levels=2 for a validated bounce-back run, or ?forceBounceback to bypass for investigation.');
+//    fx~-0.19 in one post-issue-1-fix debugForceBreakdown measurement),
+//    NOW FIXED -- root-caused to two further, independent bugs, both only
+//    cleanly separable once issue 1 above was completely resolved (its own
+//    noise had been masking these):
+//    (a) REGISTRATION: amr_manage_pool.wgsl's refine() (and its JS-side
+//        mirror, debugActivateBlock) placed every level>=2 child tile's
+//        own origin at HALF its correct offset from the parent -- an
+//        erroneous extra *0.5 introduced by a well-intentioned but WRONG
+//        "Milestone 10 BUGFIX" (that comment assumed a parent's own
+//        interior is RB cells, when every step/force pool shader actually
+//        treats it as 2*RB -- see amr_criterion_pool.wgsl's header, and
+//        parentCenterX_L0's OWN correctly-fixed BUGFIX comment a few dozen
+//        lines above childOriginX/Y in that same file, which already
+//        establishes "RB is already half the interior, no further *0.5
+//        belongs" for the sibling center computation but was never
+//        back-applied to the origin one). This misregistered every
+//        qx=1/qy=1 (etc) child's physical position, so level>=2 tiles no
+//        longer tiled their parent's footprint 2x2 without gap/overlap --
+//        live-verified via a per-slot force readback (amr_force1_pool.
+//        wgsl's debugSlotForce / debugReadSlotForces) that restoring the
+//        original (pre-Milestone-10) formula fixes it.
+//    (b) COVERAGE MARGIN: separately, paramsForChildLevel's L1->L2 default
+//        margin (FORCE_REFINE_MARGIN*0.5=4) is exactly equal to an L1
+//        tile's own half-width, not comfortably larger the way the base
+//        L0->L1 margin (8) is relative to an L0 block's -- a tile whose
+//        CENTER just missed that margin could still have an edge (or, at
+//        shallow surface incidence, a corner) touching the body, so
+//        debugCheckGeometryCoverage's center-only test could pass while a
+//        handful of body-adjacent L1 tiles permanently lacked their
+//        required L2 child. Symptom: L1's own force pass sat at a
+//        bit-identical fx~-0.19 for 20,000+ steps regardless of the wake's
+//        live vorticity-driven L1 churn elsewhere -- a permanently-stuck
+//        coarse patch, not real unsteady flow. See paramsForChildLevel's
+//        own BUGFIX comment for the fix (childLevel===2 special case).
+//    Both live-verified together: N=3 forced-bounceback Cd/St now pass
+//    tools/validate-cylinder.js at res=9 default (was Cd=-10.07 vs 1.35
+//    target; now within tolerance).
+// N_LEVELS>=4 is untested against this fix (paramsForChildLevel's
+// childLevel>=3 scaling is deliberately left untouched -- see its own
+// comment) -- ?forceBounceback still bypasses the guard below for that.
+if (USE_BOUNCEBACK && N_LEVELS > 3 && !urlParams.has('forceBounceback')) {
+  throw new Error('?bounceback with ?levels>3 is untested against the N=3 bounce-back fix -- see this file\'s own comment above N_LEVELS. Use ?levels<=3 for a validated bounce-back run, or ?forceBounceback to bypass for investigation.');
 }
 
 // ── Milestone 4b (plans/AMR.md): automatic vorticity-driven refinement,
@@ -215,15 +247,42 @@ const FORCE_REFINE_LOOKAHEAD = urlParams.has('forceRefineLookahead') ? parseFloa
 // non-saturated tile count (88/128 in one test run) and clean
 // debugCheck21Balance, vs. saturated-and-still-passing-only-because-
 // clamped without it.
+//
+// BUGFIX (L2 bounce-back investigation, childLevel===2 special case): the
+// L1->L2 hop's own scaled default (8*0.5=4) is EXACTLY equal to an L1
+// tile's own half-width (RB*cellSizeL0AtLevel(1) = 8*0.5 = 4), not
+// comfortably larger than it the way L0->L1's own margin (8) is relative
+// to an L0 "tile" (BLOCK=8 dense cells, half-width 8*cellSizeL0AtLevel(0)
+// = 8) -- both nominally "one tile half-width", but a candidate whose
+// CENTER sits just outside a margin equal to its own half-width can still
+// have its NEAR edge (or a grazing corner, at shallow surface incidence)
+// touching the body, so isNearBodyAt's center-only test silently passed
+// some genuinely body-touching L1 tiles as "not near enough" -- a real,
+// live-verified coverage gap distinct from (and only exposed after fixing)
+// amr_manage_pool.wgsl's childOriginX/Y registration bug: at res=9's N=3
+// forced-bounceback, this alone left level 1's own force pass NOT fully
+// masked (a small number of body-adjacent L1 tiles permanently missing
+// their required L2 child, each contributing a small but nonzero,
+// non-decaying bounce-back force every step -- debugForceBreakdown's own
+// l1 total sat at a bit-identical fx~-0.19 for 20000+ steps regardless of
+// the wake's live vorticity-driven L1 churn elsewhere, the tell that it
+// was a permanently-stuck coarse patch rather than real unsteady flow).
+// Doubling margin2 back to the unscaled base (8) closed the gap (l1 force
+// pass fully masked to exactly 0 again) and the N=3 forced-bounceback Cd/St
+// both validated against tools/validate-cylinder.js's own literature
+// benchmarks (previously Cd=-10.07 vs 1.35 target; now within tolerance).
+// Scoped to childLevel===2 only -- childLevel>=3's own scaled defaults are
+// untouched, still whatever kept level 3 from saturating at N=4 above.
 function paramsForChildLevel(childLevel) {
   if (childLevel === 1) {
     return { REFINE_THRESH, COARSEN_THRESH, FORCE_REFINE_MARGIN, FORCE_REFINE_LOOKAHEAD };
   }
   const get = (name, base) => urlParams.has(`${name}${childLevel}`) ? parseFloat(urlParams.get(`${name}${childLevel}`)) : base;
+  const scaledMargin = childLevel === 2 ? FORCE_REFINE_MARGIN : FORCE_REFINE_MARGIN * cellSizeL0AtLevel(childLevel - 1);
   return {
     REFINE_THRESH: get('refineThresh', REFINE_THRESH),
     COARSEN_THRESH: get('coarsenThresh', COARSEN_THRESH),
-    FORCE_REFINE_MARGIN: get('forceRefineMargin', FORCE_REFINE_MARGIN * cellSizeL0AtLevel(childLevel - 1)),
+    FORCE_REFINE_MARGIN: get('forceRefineMargin', scaledMargin),
     FORCE_REFINE_LOOKAHEAD: get('forceRefineLookahead', FORCE_REFINE_LOOKAHEAD),
   };
 }
@@ -950,7 +1009,10 @@ async function init() {
     { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
-    { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }
+    { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    // TEMPORARY diagnostic (level-2 bounce-back sign investigation) -- see
+    // amr_force1_pool.wgsl's own debugSlotForce header.
+    { binding: 8, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }
   ]});
 
   const constants = { W, H };
@@ -1294,6 +1356,9 @@ async function init() {
     // blockSlot if it exists in this configuration, else the dummy --
     // matches this level's own levelParams.hasChild value written above.
     const childBlockSlotBuf = (c + 1 < N_LEVELS) ? pools[c + 1].blockSlotBuf : dummyBlockSlotBuf;
+    // TEMPORARY diagnostic (level-2 bounce-back sign investigation) -- see
+    // amr_force1_pool.wgsl's own debugSlotForce header.
+    childPool.debugSlotForceBuf = device.createBuffer({ size: childPool.MAX_FINE_BLOCKS * 8, usage: U.STORAGE | U.COPY_SRC });
     childPool.force1PoolBG = device.createBindGroup({ layout: force1PoolBGL, entries: [
       { binding: 0, resource: { buffer: cardStateBuf } },
       { binding: 1, resource: { buffer: childPool.finePoolF_a } },
@@ -1303,6 +1368,7 @@ async function init() {
       { binding: 5, resource: { buffer: childPool.originYBuf } },
       { binding: 6, resource: { buffer: childPool.levelParamsBuf } },
       { binding: 7, resource: { buffer: childBlockSlotBuf } },
+      { binding: 8, resource: { buffer: childPool.debugSlotForceBuf } },
     ]});
   }
 
@@ -2046,14 +2112,15 @@ async function init() {
         const slot = baseSlot + quadrant;
         const childBX = parentBX * 2 + qx, childBY = parentBY * 2 + qy;
         const childBlockID = childBY * pool.NBX + childBX;
-        // BUGFIX (Milestone 10): see shaders/amr_manage_pool.wgsl's refine()
-        // for the derivation -- a quadrant step is HALF the parent's own
-        // block width, not the whole thing. Omitting *0.5 here (this file's
-        // own mirror of the same formula) mis-registered every MANUALLY
-        // activated level>=2 tile's physical origin the identical way the
-        // GPU-side auto-refine path did.
-        const originX_L0 = parentOrigin.x + qx * RB * parentCellSizeL0 * 0.5;
-        const originY_L0 = parentOrigin.y + qy * RB * parentCellSizeL0 * 0.5;
+        // BUGFIX (L2 bounce-back sign/magnitude investigation): see
+        // shaders/amr_manage_pool.wgsl's refine() -- childOriginX/Y's own
+        // BUGFIX comment -- for the full derivation; this is that same
+        // formula's JS-side mirror, previously carrying the identical
+        // erroneous extra *0.5 (RB is already HALF the parent's own
+        // physical width, since the parent's interior is 2*RB cells, not
+        // RB -- no further halving belongs here).
+        const originX_L0 = parentOrigin.x + qx * RB * parentCellSizeL0;
+        const originY_L0 = parentOrigin.y + qy * RB * parentCellSizeL0;
         qc.blockSlotCPU[childBlockID] = slot;
         qc.slotToBlockCPU[slot] = childBlockID;
         qc.originXCPU[slot] = originX_L0;
@@ -2544,6 +2611,29 @@ async function init() {
     return { l0, l1, perLevel };
   }
 
+  // TEMPORARY diagnostic (level-2 bounce-back sign investigation): reads
+  // amr_force1_pool.wgsl's own debugSlotForce for `level` (>=2), cross-
+  // referenced against debugListActiveBlocks so each slot's (fx,fy) can be
+  // correlated with its own tile position -- does NOT re-run the force
+  // pass itself, just reads whatever the last dispatch (debugForceBreakdown
+  // or a real macro-step) left there.
+  async function debugReadSlotForces(level) {
+    const pool = pools[level];
+    const stage = device.createBuffer({ size: pool.MAX_FINE_BLOCKS * 8, usage: U.MAP_READ | U.COPY_DST });
+    const enc = device.createCommandEncoder();
+    enc.copyBufferToBuffer(pool.debugSlotForceBuf, 0, stage, 0, pool.MAX_FINE_BLOCKS * 8);
+    device.queue.submit([enc.finish()]);
+    await stage.mapAsync(GPUMapMode.READ);
+    const arr = new Float32Array(stage.getMappedRange()).slice();
+    stage.unmap();
+    stage.destroy();
+    const out = [];
+    for (let slot = 0; slot < pool.MAX_FINE_BLOCKS; slot++) {
+      out.push({ slot, fx: arr[slot * 2], fy: arr[slot * 2 + 1] });
+    }
+    return out;
+  }
+
   // TEMPORARY diagnostic: write a UNIFORM non-equilibrium field directly
   // into ONE active level>=2 slot's INTERIOR cells (not ghost), bypassing
   // all real physics/forcing entirely -- the cleanest possible test of
@@ -2673,6 +2763,7 @@ async function init() {
     debugStepOne,
     debugStepOneChecked,
     debugForceBreakdown,
+    debugReadSlotForces,
     debugPokeSlot,
     debugReadCardState,
     debugActivateBlock,

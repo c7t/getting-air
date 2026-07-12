@@ -64,6 +64,11 @@ struct LevelParams {
 @group(0) @binding(5) var<storage, read>       originY        : array<f32>;
 @group(0) @binding(6) var<uniform>             levelParams    : LevelParams;
 @group(0) @binding(7) var<storage, read>       childBlockSlot : array<i32>; // level+1's blockSlot, or a harmless dummy if hasChild==0
+// TEMPORARY diagnostic (level-2 bounce-back sign investigation): per-slot
+// (fx,fy) written unconditionally by every dispatch -- lets the JS side
+// correlate sign against each tile's own position instead of only ever
+// seeing the grand total.
+@group(0) @binding(8) var<storage, read_write> debugSlotForce : array<vec2<f32>>;
 
 override W : u32;
 override H : u32;
@@ -260,5 +265,6 @@ fn main(
     atomicAdd(&forces[0], safeFixed(sum_fx * FSCALE));
     atomicAdd(&forces[1], safeFixed(sum_fy * FSCALE));
     atomicAdd(&forces[2], safeFixed(sum_tz * FSCALE));
+    debugSlotForce[slot] = vec2<f32>(sum_fx, sum_fy);
   }
 }

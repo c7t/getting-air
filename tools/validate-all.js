@@ -87,16 +87,14 @@ function defaultConfigs(baseUrl) {
       checkInvariants: true,
     },
     {
-      // Known-broken per main-cylinder-amr.js's own guard (throws without
-      // ?forceBounceback at levels>2) -- included so the harness's report
-      // documents the CURRENT extent of the divergence on every run instead
-      // of relying on a comment staying accurate. Cd/St analysis assumes a
-      // stable oscillation to average over; skip it here in favor of the
-      // invariant sweep's own field-finite check, the right instrument for
-      // characterizing a divergence rather than a stable regime.
-      name: 'amr-N3-bounceback-forced',
-      url: `${baseUrl}/index-cylinder-amr.html?levels=3&bounceback&forceBounceback`,
-      checkPhysics: false,
+      // Was known-broken (required ?forceBounceback, checkPhysics:false)
+      // until the L2 bounce-back registration + coverage-margin fixes --
+      // see main-cylinder-amr.js's own comment above N_LEVELS. No longer
+      // needs ?forceBounceback (the guard only blocks levels>3 now), and
+      // Cd/St now validate like every other config.
+      name: 'amr-N3-bounceback',
+      url: `${baseUrl}/index-cylinder-amr.html?levels=3&bounceback`,
+      checkPhysics: true,
       checkInvariants: true,
     },
   ];

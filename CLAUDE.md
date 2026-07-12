@@ -33,7 +33,7 @@ invariants the AMR machinery depends on:
   config via `Page.navigate`, never more than one WebGPU context alive at
   once). Runs both checks below across the dense reference and every AMR
   levels/bounce-back combination (`dense-reference`, `amr-N2-diffuse`,
-  `amr-N2-bounceback`, `amr-N3-diffuse`, `amr-N3-bounceback-forced`), prints
+  `amr-N2-bounceback`, `amr-N3-diffuse`, `amr-N3-bounceback`), prints
   one aggregated PASS/FAIL report.
       node tools/validate-all.js                        # full default sweep
       node tools/validate-all.js --configs=amr-N2-bounceback
