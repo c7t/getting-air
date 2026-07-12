@@ -13,6 +13,20 @@ const canvas   = document.getElementById('c');
 const statusEl = document.getElementById('status');
 
 const urlParams = new URLSearchParams(window.location.search);
+
+// --- dev/debug harness (gated): detection + activation marker (inert on prod) ---
+// DEBUG gates the LOCAL debug UI only (drives window.__AMR in-page, no network).
+// Default OFF on any host except loopback / RFC1918 LAN / *.local(host); ?debug=1/0
+// overrides. The dev server injects a <meta name="devharness-token"> marker into the
+// HTML it serves; that marker gates snapshot uploads to /collect. A bare GitHub Pages
+// deploy has no marker -> uploads are disabled and the page is inert.
+const DEBUG = urlParams.has('debug')
+  ? urlParams.get('debug') !== '0'
+  : (/^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(location.hostname)
+     || location.hostname === '[::1]' || location.hostname === '::1'
+     || location.hostname.endsWith('.local') || location.hostname.endsWith('.localhost'));
+const DEVHARNESS_TOKEN = (document.querySelector('meta[name="devharness-token"]') || {}).content || null;
+
 let resLog2 = parseInt(urlParams.get('res')) || 8;
 if (resLog2 < 6) resLog2 = 6;
 if (resLog2 > 11) resLog2 = 11;
@@ -1226,6 +1240,71 @@ async function init() {
     a.download = `trajectory_amr_${W}x${H}.csv`;
     a.click();
   };
+
+  // --- dev/debug harness UI — gated behind DEBUG, inert on prod ---
+  if (DEBUG) {
+    const panel = document.getElementById('debug-panel');
+    if (panel) panel.style.display = 'flex';
+    const pauseBtn = document.getElementById('dbg-pause');
+    const snapBtn = document.getElementById('dbg-snapshot');
+    const stepBtn = document.getElementById('dbg-step');
+    const stepN = document.getElementById('dbg-stepn');
+    const resetBtn = document.getElementById('dbg-reset');
+    const dbgStat = document.getElementById('dbg-stat');
+
+    // Render the current sim state to the canvas once (after a paused step/reset, and
+    // before a snapshot — stepping/reset leave liveMode=false and don't draw).
+    const renderOnce = () => {
+      const enc = device.createCommandEncoder();
+      const rp = enc.beginRenderPass({ colorAttachments: [{ view: ctx.getCurrentTexture().createView(), clearValue: { r: 0.07, g: 0.07, b: 0.1, a: 1 }, loadOp: 'clear', storeOp: 'store' }] });
+      rp.setPipeline(renPL); rp.setBindGroup(0, renBG); rp.draw(6); rp.end();
+      device.queue.submit([enc.finish()]);
+    };
+
+    if (pauseBtn) pauseBtn.onclick = () => {
+      liveMode = !liveMode;
+      pauseBtn.textContent = liveMode ? 'Pause' : 'Resume';
+    };
+
+    if (stepBtn) stepBtn.onclick = async () => {
+      liveMode = false;
+      if (pauseBtn) pauseBtn.textContent = 'Resume';
+      const n = Math.max(1, parseInt((stepN && stepN.value) || '1', 10) || 1);
+      for (let i = 0; i < n; i++) await debugStepOne();  // exact macro-steps
+      renderOnce();
+    };
+
+    if (resetBtn) resetBtn.onclick = () => { resetSim(); renderOnce(); };
+
+    if (snapBtn) snapBtn.onclick = async () => {
+      const prev = snapBtn.textContent;
+      if (!DEVHARNESS_TOKEN) {  // not served by the dev server -> no upload target
+        snapBtn.textContent = 'no dev server';
+        setTimeout(() => { snapBtn.textContent = prev; }, 1500);
+        return;
+      }
+      snapBtn.textContent = 'sending…';
+      try {
+        renderOnce();
+        await device.queue.onSubmittedWorkDone();
+        const blob = await new Promise((res) => canvas.toBlob(res, 'image/png'));
+        const resp = await fetch(`/collect?tag=snap&step=${step}&ext=png`, {
+          method: 'POST',
+          headers: { 'X-Devharness-Token': DEVHARNESS_TOKEN },
+          body: blob,
+        });
+        snapBtn.textContent = resp.ok ? 'sent \u2713' : `err ${resp.status}`;
+      } catch (e) {
+        console.error('snapshot failed', e);
+        snapBtn.textContent = 'failed';
+      }
+      setTimeout(() => { snapBtn.textContent = prev; }, 1500);
+    };
+
+    setInterval(() => {
+      if (dbgStat) dbgStat.textContent = `step ${step} · ${liveMode ? 'live' : 'paused'}`;
+    }, 200);
+  }
 
   // Triple-buffering for readbacks to avoid CPU-GPU stalls
   const STAGES = 3;

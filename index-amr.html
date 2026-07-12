@@ -49,6 +49,26 @@
       cursor: pointer; font-family: monospace;
     }
     #download:hover { background: rgba(50,50,50,0.8); }
+    #debug-panel {
+      position: absolute; top: 40px; right: 8px;
+      display: none; flex-direction: column; gap: 4px; align-items: stretch;
+      width: 132px;
+      background: rgba(0,0,0,0.6); padding: 6px; border: 1px solid #555;
+      border-radius: 3px; font-size: 12px; color: #eee;
+    }
+    #debug-panel button {
+      font: inherit; color: #eee; background: rgba(30,30,30,0.9);
+      border: 1px solid #555; border-radius: 3px; padding: 3px 6px; cursor: pointer;
+      white-space: nowrap; overflow: hidden;
+    }
+    #debug-panel button:hover { background: rgba(70,70,70,0.9); }
+    .dbg-steprow { display: flex; gap: 4px; }
+    .dbg-steprow button { flex: 1; }
+    #dbg-stepn {
+      width: 48px; font: inherit; color: #eee; background: rgba(20,20,20,0.9);
+      border: 1px solid #555; border-radius: 3px; text-align: right;
+    }
+    #dbg-stat { color: #7f7; text-align: center; font-size: 11px; }
     #controls {
       flex-shrink: 0;
       background: rgba(0,0,0,0.85);
@@ -74,6 +94,16 @@
       <div><span class="perf-label">SYNC:</span> <span id="val-sync-ms">0.0</span> ms</div>
     </div>
     <button id="download">Download CSV</button>
+    <div id="debug-panel">
+      <button id="dbg-pause">Pause</button>
+      <div class="dbg-steprow">
+        <button id="dbg-step">Step</button>
+        <input id="dbg-stepn" type="number" min="1" value="1" title="macro-steps">
+      </div>
+      <button id="dbg-snapshot">Snapshot</button>
+      <button id="dbg-reset">Reset</button>
+      <div id="dbg-stat">–</div>
+    </div>
   </div>
 
   <div id="controls">
