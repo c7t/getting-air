@@ -216,26 +216,25 @@ function reconstructAMRToResolution(snapshot, targetResLog2) {
   // BUFFER-space L0 units -- unlike loadDenseFields, which unshifts the
   // dense grid into window space up front and stays there throughout, this
   // function stays in buffer space for the whole quadtree walk (matching
-  // amr_render.wgsl's own bufX/bufY-then-blockSlot-lookup order) and would
-  // need a buffer->window conversion applied AT THE POINT OF WRITING each
-  // painted target cell (not on the raw L0 array up front, which is what
-  // unshiftField below actually does) to be correct for a nonzero off_x/
-  // off_y. Every current caller of this function is the pinned-cylinder
-  // harness family (main-cylinder-amr.js), which never moves its body and
-  // so always has off_x=off_y=0 -- assert that explicitly rather than
-  // silently mis-place fields if this is ever reused for a moving body.
-  if (offX !== 0 || offY !== 0) {
-    throw new Error(`reconstructAMRToResolution: off_x=${offX} off_y=${offY} (nonzero) -- this function has only been verified for the pinned-cylinder ` +
-      `harnesses' fixed off_x=off_y=0 case; a moving-window snapshot needs the buffer->window conversion applied per painted target cell, not up front ` +
-      `on the raw L0 array the way it's written now. Don't use this against a falling-card (main-amr.js) snapshot without fixing that first.`);
-  }
+  // amr_render.wgsl's own bufX/bufY-then-blockSlot-lookup order) and applies
+  // the buffer->window conversion AT THE POINT OF WRITING each painted
+  // target cell (paintUniform below), not up front on the raw L0 array --
+  // so velRawL0/fL0 below are unshifted with offX=offY=0 (block8->flat
+  // RE-LAYOUT only, no window shift: they stay buffer-space-row-major,
+  // exactly like the pool levels' own buffer-space originX/originY, so
+  // every call site paintUniform sees is in the same coordinate space).
+  // Verified against a moving-window snapshot (main-reentry-amr.js's falling
+  // card, offX/offY both routinely nonzero) via
+  // tools/analyze-reentry-seam.js, not just main-cylinder-amr.js's
+  // fixed-off_x=off_y=0 case this function used to be restricted to.
+  const offXTarget = offX * (targetW / W0), offYTarget = offY * (targetW / W0);
   const NCELLS0 = W0 * H0;
-  const velRawL0 = unshiftField(b64ToFloat32(snapshot.velB64, NCELLS0 * 2), W0, H0, 2, offX, offY, 'block8');
+  const velRawL0 = unshiftField(b64ToFloat32(snapshot.velB64, NCELLS0 * 2), W0, H0, 2, 0, 0, 'block8');
   const fRawL0raw = b64ToFloat32(snapshot.fB64, NCELLS0 * 9);
   const fL0 = new Float32Array(NCELLS0 * 9);
   for (let i = 0; i < 9; i++) {
     const plane = fRawL0raw.subarray(i * NCELLS0, (i + 1) * NCELLS0);
-    fL0.set(unshiftField(plane, W0, H0, 1, offX, offY, 'block8'), i * NCELLS0);
+    fL0.set(unshiftField(plane, W0, H0, 1, 0, 0, 'block8'), i * NCELLS0);
   }
   const rhoL0 = rhoFromF(fL0, W0, H0);
 
@@ -272,7 +271,13 @@ function reconstructAMRToResolution(snapshot, targetResLog2) {
   // is too.
   function paintUniform(originX, originY, extent, sampleUx, sampleUy, sampleRho, isFinest) {
     const mult = targetW / W0;
-    const x0 = Math.round(originX * mult), y0 = Math.round(originY * mult);
+    // originX/originY are buffer-space (see this function's callers, all of
+    // which derive them from raw block/slot addressing) -- subtract
+    // offXTarget/offYTarget (this snapshot's moving-window pan, scaled into
+    // target-grid units) to land in WINDOW space, matching loadDenseFields'
+    // own unshiftField convention so the two sides of a diff are in the same
+    // physical coordinates regardless of either run's own off_x/off_y.
+    const x0 = Math.round(originX * mult - offXTarget), y0 = Math.round(originY * mult - offYTarget);
     const size = Math.round(extent * mult);
     for (let dy = 0; dy < size; dy++) {
       const wy = ((y0 + dy) % targetW + targetW) % targetW;
@@ -396,9 +401,14 @@ function buildLevelMap(snapshot, targetResLog2) {
   const RB = pools[1].RB, NBX0 = pools[1].NBX, NBY0 = pools[1].NBY;
   const mult = targetW / W0;
   const level = new Uint8Array(targetW * targetW);
+  // Buffer->window shift, same convention/derivation as
+  // reconstructAMRToResolution's own offXTarget/offYTarget -- needed for
+  // this to line up with that function's own (also window-space) output on
+  // a moving-window (nonzero off_x/off_y) snapshot.
+  const offXTarget = snapshot.cardState[22] * mult, offYTarget = snapshot.cardState[23] * mult;
 
   function paintLevel(originX, originY, extent, lvl) {
-    const x0 = Math.round(originX * mult), y0 = Math.round(originY * mult);
+    const x0 = Math.round(originX * mult - offXTarget), y0 = Math.round(originY * mult - offYTarget);
     const size = Math.round(extent * mult);
     for (let dy = 0; dy < size; dy++) {
       const wy = ((y0 + dy) % targetW + targetW) % targetW;
