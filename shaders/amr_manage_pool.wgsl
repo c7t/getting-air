@@ -350,23 +350,31 @@ fn refine(@builtin(global_invocation_id) gid: vec3<u32>) {
         childSlotToBlock[slot] = i32(childBlockID);
         childParentSlot[slot] = i32(parentSlot);
         childQuadrant[slot] = quadrant;
-        // BUGFIX (Milestone 10): a quadrant step must offset by ONE
-        // QUADRANT-WIDTH, not one full PARENT-block-width. The parent's own
-        // interior is RB cells at PARENT_CELL_SIZE_L0 each (physical width
-        // RB*PARENT_CELL_SIZE_L0); the quad's 4 children tile that SAME
-        // footprint 2x2, so each quadrant only spans HALF of it per axis --
-        // omitting the *0.5f here (as this did before) placed qx=1/qy=1
-        // children a full parent-block-width away from the parent's origin
-        // (double the correct offset), silently mis-registering every
-        // auto-refined level>=2 tile's physical position against the body
-        // geometry it exists to resolve. Caught because it made N=3
-        // integrated force ~17x too small (most cells' chi evaluated far
-        // outside the true epsilon band), not from any topology/2:1-balance
-        // check (those only look at bx/by indices, which this bug never
-        // touched -- see main-cylinder-amr.js's debugActivateBlock, which
-        // had the identical bug in its own JS-side mirror of this formula).
-        childOriginX[slot] = parentOriginX_L0 + f32(qx) * f32(RB) * PARENT_CELL_SIZE_L0 * 0.5f;
-        childOriginY[slot] = parentOriginY_L0 + f32(qy) * f32(RB) * PARENT_CELL_SIZE_L0 * 0.5f;
+        // BUGFIX (L2 bounce-back sign/magnitude investigation): the
+        // "Milestone 10 BUGFIX" that used to sit here had it backwards --
+        // see parentCenterX_L0's own BUGFIX comment above (same file, same
+        // root confusion): the parent's own interior is 2*RB cells (not
+        // RB -- amr_criterion_pool.wgsl's header), so RB is ALREADY half
+        // the parent's own physical width (RB*PARENT_CELL_SIZE_L0 out of a
+        // full 2*RB*PARENT_CELL_SIZE_L0), and that IS the correct quadrant
+        // step -- no further *0.5f belongs here, same as parentCenterX_L0
+        // needed none. The removed *0.5f halved every qx=1/qy=1 child's
+        // offset from its parent's origin, so the 4 children of a quad no
+        // longer tiled the parent's footprint 2x2 with no gap/overlap:
+        // quadrant 1 sat overlapping half of quadrant 0's true territory
+        // and left the outer half of the parent's footprint uncovered by
+        // any tile at all (masked-off at the parent level too, since
+        // masking only checks quadrant 0's existence, not its registered
+        // position) -- exactly the kind of corruption that would produce
+        // a wrong-sign, wrong-magnitude level>=2 bounce-back force while
+        // leaving 2:1-balance (an index-only check) and the field-finite
+        // check clean. Live-verified via a per-slot force readback
+        // (amr_force1_pool.wgsl's debugSlotForce / main-cylinder-amr.js's
+        // debugReadSlotForces) correlating each level-2 slot's own (fx,fy)
+        // against its geometric position -- restoring this formula to
+        // match the ORIGINAL (pre-Milestone-10) version fixes it.
+        childOriginX[slot] = parentOriginX_L0 + f32(qx) * f32(RB) * PARENT_CELL_SIZE_L0;
+        childOriginY[slot] = parentOriginY_L0 + f32(qy) * f32(RB) * PARENT_CELL_SIZE_L0;
         childNewlyActivated[slot] = 1u;
       }
     }
