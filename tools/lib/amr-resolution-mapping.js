@@ -52,14 +52,46 @@ function computeBaseTau({ W_base, blockage, u0, re }) {
   return 0.5 + 3 * nu;
 }
 
-// Below this, expect visible numerical noise (not necessarily blowup, BGK
-// is nominally stable down to tau>0.5) -- an unvalidated-in-this-project
-// regime, worth a loud warning rather than a silent go-ahead.
-const TAU_WARN_BELOW = 0.52;
-// Below this, close enough to the tau=0.5 floor that a field-relL2 FAIL
-// from this tool would be as likely to reflect base-grid noise as an AMR
-// bug -- require an explicit opt-in rather than silently running it.
-const TAU_BLOCK_BELOW = 0.505;
+// These two thresholds were originally guessed (0.52/0.505), not measured --
+// tightened far past what the BGK eigenvalue argument alone would justify,
+// out of caution. Superseded 2026-07-12 by direct experiment, after the
+// original 0.505 floor turned out to reject configurations that run fine.
+// Three separate checks, none of which found an actual failure point:
+//   1. Dense TGV (index-tgv.html, exact analytic ground truth, no body/
+//      boundary at all): tau swept 0.6 -> 0.5002 at N=64,128, 20480 steps
+//      each. relL2 vs. the exact decaying-vortex solution stayed ~1e-3
+//      throughout, flat -- no growth, no blowup, at any tested tau.
+//   2. AMR-coupled TGV (index-tgv-amr.html, forced fully-refined via
+//      refineThresh=-20 so every macro-step actually exercises coarse/fine
+//      ghost interpolation into the marginal-tau L0): same tau sweep, same
+//      N=64, 20480 steps. relL2 ~2e-3 (a real but bounded accuracy cost
+//      from the reconstruction, not instability) -- flat over time at
+//      every tau down to 0.5002, including at the hardest-hit case.
+//   3. The sharp-cornered-geometry case that actually matters for this
+//      project (index-reentry-amr.html, thin ellipse, real vortex
+//      shedding, res=7/levels=3): tau swept 0.509 -> 0.50021 (bypassing
+//      the page's own historical slider-min=0.501, itself an unvalidated
+//      guess), 12288 steps each. No NaN, no blowup; peak |u| grows only
+//      mildly as tau drops (0.081 at tau=0.509 -> 0.093 at tau=0.50021) --
+//      the expected signature of less numerical dissipation, not runaway
+//      growth.
+//   4. Cross-checked independently against AGAL's own published, literature-
+//      validated results (amr-lbm.pdf, Table 2): their Re=5000 lid-driven-
+//      cavity case (N_coarse=64, Lmax=4, flagged for validation) derives to
+//      tau_root ~= 0.502 by this project's own tau=0.5+3*nu_physical*N_x
+//      convention (nu_physical=U_lid/Re with L=1, matching their own
+//      Re=100 FPSC number exactly when checked against U0/D/nu directly) --
+//      independent evidence for the same ballpark, from a different
+//      collision kernel (plain SRT-BGK, per AGAL/src/solver_lbm/
+//      solver_lbm_kernels.cu's Cu_Collide -- same operator this project
+//      uses, not MRT).
+// None of this rules out failure at a LOWER tau, longer runs, or a
+// different geometry than what was tested above -- it only establishes
+// that the OLD thresholds were rejecting configurations with no
+// demonstrated problem. Revisit if a real field-relL2 FAIL is ever
+// actually traced to base-grid noise near these new floors.
+const TAU_WARN_BELOW = 0.501;
+const TAU_BLOCK_BELOW = 0.5005;
 
 // Throws with a specific, actionable message naming the exact violated
 // bound -- these errors are meant to be read by whoever typed the --res/
@@ -85,14 +117,14 @@ function deriveAMRParams({ targetResLog2, nLevels, blockage = 24, u0 = 0.04, re 
   const tauBase = computeBaseTau({ W_base, blockage, u0, re });
   if (tauBase < TAU_BLOCK_BELOW && !allowMarginalTau) {
     throw new Error(`deriveAMRParams: base-level tau=${tauBase.toFixed(4)} (W_base=${W_base}, Re=${re}, blockage=${blockage}, u0=${u0}) is within ` +
-      `${(tauBase - 0.5).toFixed(4)} of the BGK stability floor (tau=0.5) -- every finer AMR level derives its own tau FROM this one via ` +
-      `tau_fine=2*tau_coarse-0.5 (main-cylinder-amr.js:337-349), so the base level is always the tightest stability constraint. ` +
-      `A field-relL2 FAIL at this combination would be as likely to reflect base-grid numerical noise as a real AMR bug. ` +
+      `${(tauBase - 0.5).toFixed(4)} of the BGK stability floor (tau=0.5) -- beyond the ${TAU_BLOCK_BELOW} floor this project has actually run ` +
+      `stably down to (dense/AMR-coupled TGV to tau=0.5002, sharp-ellipse reentry-AMR to tau=0.50021 -- see tools/lib/amr-resolution-mapping.js's ` +
+      `own header for the full experiment trail), genuinely untested territory, not just a conservative guess. ` +
       `Pass allowMarginalTau:true / --allowMarginalTau to proceed anyway, or reduce nLevels / raise targetResLog2 to grow W_base.`);
   }
   const tauWarning = tauBase < TAU_WARN_BELOW
-    ? `base-level tau=${tauBase.toFixed(4)} (W_base=${W_base}, Re=${re}) is below ${TAU_WARN_BELOW} -- unvalidated-in-this-project numerical-noise ` +
-      `territory (see tools/lib/amr-resolution-mapping.js's own header). Not blocking, but treat a FAIL here with extra scrutiny.`
+    ? `base-level tau=${tauBase.toFixed(4)} (W_base=${W_base}, Re=${re}) is below ${TAU_WARN_BELOW} -- past the range this project has directly ` +
+      `tested (see tools/lib/amr-resolution-mapping.js's own header). Not blocking, but treat a FAIL here with extra scrutiny.`
     : null;
 
   return { baseResLog2, targetResLog2, nLevels, W_target, W_base, tauBase, tauWarning };
