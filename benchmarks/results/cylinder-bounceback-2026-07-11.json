@@ -1,0 +1,265 @@
+{
+  "date": "2026-07-11",
+  "commit": "be1fb169dbbb3b3f45dd97cab069146453e1b58d",
+  "description": "Full Re sweep (20,40,100,200) of the circular-cylinder bounce-back method against benchmarks/cylinder.json's literature values, run right after fixing the N=3 bounce-back divergence (childOriginX/Y mis-registration in shaders/amr_manage_pool.wgsl + the L1->L2 force-refine coverage margin in main-cylinder-amr.js -- see that commit and main-cylinder-amr.js's own comment above N_LEVELS). Covers three configs at the same Re values: the dense (non-AMR) reference, AMR N_LEVELS=2, and AMR N_LEVELS=3, all with ?bounceback. All 12 (config x Re) cases pass. Produced by an ad hoc sweep script (tools/lib/cylinder-metrics.js's runCase driven directly, one CDP tab reused across all runs, same pattern as tools/validate-all.js) -- not a committed tool, just this one snapshot.",
+  "results": [
+  {
+    "config": "dense-bounceback",
+    "re": 20,
+    "regime": "steady, no shedding",
+    "samples": 42,
+    "crossings": 0,
+    "cd": {
+      "pass": true,
+      "label": "Cd",
+      "measured": 2.179687508032657,
+      "target": 2.05,
+      "tol": 0.15
+    },
+    "st": {
+      "pass": true,
+      "label": "St",
+      "measured": null,
+      "target": null
+    },
+    "source": "Dennis & Chang (1970), J. Fluid Mech. 42(3):471-489; recirculation length corroborated experimentally by Coutanceau & Bouard (1977), J. Fluid Mech. 79(2)."
+  },
+  {
+    "config": "dense-bounceback",
+    "re": 40,
+    "regime": "steady, no shedding",
+    "samples": 42,
+    "crossings": 0,
+    "cd": {
+      "pass": true,
+      "label": "Cd",
+      "measured": 1.6230468463618308,
+      "target": 1.52,
+      "tol": 0.12
+    },
+    "st": {
+      "pass": true,
+      "label": "St",
+      "measured": null,
+      "target": null
+    },
+    "source": "Dennis & Chang (1970), J. Fluid Mech. 42(3):471-489."
+  },
+  {
+    "config": "dense-bounceback",
+    "re": 100,
+    "regime": "periodic vortex shedding (Karman street)",
+    "samples": 758,
+    "crossings": 15,
+    "cd": {
+      "pass": true,
+      "label": "Cd",
+      "measured": 1.326993803887924,
+      "target": 1.35,
+      "tol": 0.15
+    },
+    "st": {
+      "pass": true,
+      "label": "St",
+      "measured": 0.16137494128289825,
+      "target": 0.165,
+      "tol": 0.015
+    },
+    "source": "Braza, Chassaing & Ha Minh (1986), J. Fluid Mech. 165:79-130; He & Doolen (1997), J. Comput. Phys. 134(2) (LBM-specific); Williamson (1996), Annu. Rev. Fluid Mech. 28, St-Re correlation for the laminar shedding regime."
+  },
+  {
+    "config": "dense-bounceback",
+    "re": 200,
+    "regime": "periodic vortex shedding (Karman street)",
+    "samples": 635,
+    "crossings": 15,
+    "cd": {
+      "pass": true,
+      "label": "Cd",
+      "measured": 1.3691375122472504,
+      "target": 1.34,
+      "tol": 0.15
+    },
+    "st": {
+      "pass": true,
+      "label": "St",
+      "measured": 0.19727216751079932,
+      "target": 0.197,
+      "tol": 0.015
+    },
+    "source": "Henderson (1995), Phys. Fluids 7(9):2102-2104."
+  },
+  {
+    "config": "amr-N2-bounceback",
+    "re": 20,
+    "regime": "steady, no shedding",
+    "samples": 42,
+    "crossings": 0,
+    "cd": {
+      "pass": true,
+      "label": "Cd",
+      "measured": 2.003906120080501,
+      "target": 2.05,
+      "tol": 0.15
+    },
+    "st": {
+      "pass": true,
+      "label": "St",
+      "measured": null,
+      "target": null
+    },
+    "source": "Dennis & Chang (1970), J. Fluid Mech. 42(3):471-489; recirculation length corroborated experimentally by Coutanceau & Bouard (1977), J. Fluid Mech. 79(2)."
+  },
+  {
+    "config": "amr-N2-bounceback",
+    "re": 40,
+    "regime": "steady, no shedding",
+    "samples": 42,
+    "crossings": 0,
+    "cd": {
+      "pass": true,
+      "label": "Cd",
+      "measured": 1.5292967873392627,
+      "target": 1.52,
+      "tol": 0.12
+    },
+    "st": {
+      "pass": true,
+      "label": "St",
+      "measured": null,
+      "target": null
+    },
+    "source": "Dennis & Chang (1970), J. Fluid Mech. 42(3):471-489."
+  },
+  {
+    "config": "amr-N2-bounceback",
+    "re": 100,
+    "regime": "periodic vortex shedding (Karman street)",
+    "samples": 758,
+    "crossings": 15,
+    "cd": {
+      "pass": true,
+      "label": "Cd",
+      "measured": 1.285004213141028,
+      "target": 1.35,
+      "tol": 0.15
+    },
+    "st": {
+      "pass": true,
+      "label": "St",
+      "measured": 0.16394208475416622,
+      "target": 0.165,
+      "tol": 0.015
+    },
+    "source": "Braza, Chassaing & Ha Minh (1986), J. Fluid Mech. 165:79-130; He & Doolen (1997), J. Comput. Phys. 134(2) (LBM-specific); Williamson (1996), Annu. Rev. Fluid Mech. 28, St-Re correlation for the laminar shedding regime."
+  },
+  {
+    "config": "amr-N2-bounceback",
+    "re": 200,
+    "regime": "periodic vortex shedding (Karman street)",
+    "samples": 635,
+    "crossings": 15,
+    "cd": {
+      "pass": true,
+      "label": "Cd",
+      "measured": 1.310313084276437,
+      "target": 1.34,
+      "tol": 0.15
+    },
+    "st": {
+      "pass": true,
+      "label": "St",
+      "measured": 0.19738817038680734,
+      "target": 0.197,
+      "tol": 0.015
+    },
+    "source": "Henderson (1995), Phys. Fluids 7(9):2102-2104."
+  },
+  {
+    "config": "amr-N3-bounceback",
+    "re": 20,
+    "regime": "steady, no shedding",
+    "samples": 42,
+    "crossings": 0,
+    "cd": {
+      "pass": true,
+      "label": "Cd",
+      "measured": 1.945312469615601,
+      "target": 2.05,
+      "tol": 0.15
+    },
+    "st": {
+      "pass": true,
+      "label": "St",
+      "measured": null,
+      "target": null
+    },
+    "source": "Dennis & Chang (1970), J. Fluid Mech. 42(3):471-489; recirculation length corroborated experimentally by Coutanceau & Bouard (1977), J. Fluid Mech. 79(2)."
+  },
+  {
+    "config": "amr-N3-bounceback",
+    "re": 40,
+    "regime": "steady, no shedding",
+    "samples": 42,
+    "crossings": 0,
+    "cd": {
+      "pass": true,
+      "label": "Cd",
+      "measured": 1.5175780572462827,
+      "target": 1.52,
+      "tol": 0.12
+    },
+    "st": {
+      "pass": true,
+      "label": "St",
+      "measured": null,
+      "target": null
+    },
+    "source": "Dennis & Chang (1970), J. Fluid Mech. 42(3):471-489."
+  },
+  {
+    "config": "amr-N3-bounceback",
+    "re": 100,
+    "regime": "periodic vortex shedding (Karman street)",
+    "samples": 758,
+    "crossings": 15,
+    "cd": {
+      "pass": true,
+      "label": "Cd",
+      "measured": 1.314092343751437,
+      "target": 1.35,
+      "tol": 0.15
+    },
+    "st": {
+      "pass": true,
+      "label": "St",
+      "measured": 0.16547413494410054,
+      "target": 0.165,
+      "tol": 0.015
+    },
+    "source": "Braza, Chassaing & Ha Minh (1986), J. Fluid Mech. 165:79-130; He & Doolen (1997), J. Comput. Phys. 134(2) (LBM-specific); Williamson (1996), Annu. Rev. Fluid Mech. 28, St-Re correlation for the laminar shedding regime."
+  },
+  {
+    "config": "amr-N3-bounceback",
+    "re": 200,
+    "regime": "periodic vortex shedding (Karman street)",
+    "samples": 635,
+    "crossings": 15,
+    "cd": {
+      "pass": true,
+      "label": "Cd",
+      "measured": 1.350738148376397,
+      "target": 1.34,
+      "tol": 0.15
+    },
+    "st": {
+      "pass": true,
+      "label": "St",
+      "measured": 0.1974055273547659,
+      "target": 0.197,
+      "tol": 0.015
+    },
+    "source": "Henderson (1995), Phys. Fluids 7(9):2102-2104."
+  }
+  ]
+}
