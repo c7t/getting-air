@@ -1,0 +1,18 @@
+{
+  "geometry": "2D decaying Taylor-Green vortex, doubly periodic, N x N domain, kx=ky=2*PI/N (one wavelength fills the domain exactly)",
+  "note": "EXACT closed-form space-time solution (velocity field at every point AND time, not just steady state) -- see main-tgv.js's own header for the derivation. field_l2_tol bounds the worst-case (over checkpoints) relative L2 error of the simulated velocity field against the analytic field; decay_rate_tol bounds the relative error between the fitted RMS-velocity decay rate (measured between the last two checkpoints) and the analytic 1/td. checkpoints are given as multiples of the analytic decay time td so the same sample points (chosen to skip the brief initial-condition transient any equilibrium-distribution IC seed produces -- see main-tgv.js's own initF comment) are used regardless of N/u0/tau. AMR cases (levels present) run against index-tgv-amr.html at the SAME N as a same-named dense case would use, with autoRefine left at its default (on, but with conservative thresholds that don't trigger for these u0/N choices -- see main-tgv-amr.js's own header on the large-scale-simultaneous-refinement fragility this deliberately avoids triggering) -- the check here is 'does the AMR machinery reproduce the dense-equivalent decay when idle,' not a refinement-pattern accuracy study.",
+  "measurement": {
+    "checkpoints_meaning": "multiples of td=1/(nu*(kx^2+ky^2)), converted to a step count and rounded per case at run time",
+    "decay_rate": "fit via -ln(rms(t_b)/rms(t_a))/(t_b-t_a) between the last two checkpoints, rms = sqrt(mean(ux^2+uy^2)) over the field"
+  },
+  "cases": [
+    { "name": "dense-N32",       "N": 32,  "u0": 0.04, "tau": 0.8, "checkpoints": [0.5, 1.5, 3.0], "field_l2_tol": 0.01, "decay_rate_tol": 0.01 },
+    { "name": "dense-N64",       "N": 64,  "u0": 0.04, "tau": 0.8, "checkpoints": [0.5, 1.5, 3.0], "field_l2_tol": 0.01, "decay_rate_tol": 0.01 },
+    { "name": "dense-N128",      "N": 128, "u0": 0.04, "tau": 0.8, "checkpoints": [0.5, 1.5, 3.0], "field_l2_tol": 0.01, "decay_rate_tol": 0.01 },
+    { "name": "dense-N64-tau06", "N": 64,  "u0": 0.04, "tau": 0.6, "checkpoints": [0.5, 1.5, 3.0], "field_l2_tol": 0.01, "decay_rate_tol": 0.01 },
+    { "name": "dense-N64-tau10", "N": 64,  "u0": 0.04, "tau": 1.0, "checkpoints": [0.5, 1.5, 3.0], "field_l2_tol": 0.01, "decay_rate_tol": 0.01 },
+    { "name": "dense-N64-u0hi",  "N": 64,  "u0": 0.08, "tau": 0.8, "checkpoints": [0.5, 1.5, 3.0], "field_l2_tol": 0.01, "decay_rate_tol": 0.01 },
+    { "name": "amr-N64-L2",      "N": 64,  "u0": 0.04, "tau": 0.8, "levels": 2, "checkpoints": [0.5, 1.5, 3.0], "field_l2_tol": 0.01, "decay_rate_tol": 0.01 },
+    { "name": "amr-N64-L3",      "N": 64,  "u0": 0.04, "tau": 0.8, "levels": 3, "checkpoints": [0.5, 1.5, 3.0], "field_l2_tol": 0.01, "decay_rate_tol": 0.01 }
+  ]
+}
