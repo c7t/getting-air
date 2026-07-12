@@ -381,7 +381,67 @@ function reconstructAMRToResolution(snapshot, targetResLog2) {
   return { W: targetW, H: targetW, step: snapshot.step, ux, uy, rho, omega, finestCoverageFraction: finestCells / totalCells };
 }
 
+// Diagnostic: walks the exact same quadtree structure as
+// reconstructAMRToResolution above (paintQuad/paintSlotSubblock/
+// paintSlotFull), but paints the ACTIVE LEVEL NUMBER per target cell instead
+// of field values -- cheap to derive from blockSlot alone, no vel/f decoding
+// needed. Used by tools/analyze-seam-vorticity.js to test whether AMR-vs-
+// dense field error concentrates near coarse/fine level transitions (as
+// opposed to being spread uniformly, or concentrated at some unrelated real
+// flow feature) -- see that tool's header for the investigation this was
+// built for (vorticity visibly sheared at quadtree seams, 2026-07-11).
+function buildLevelMap(snapshot, targetResLog2) {
+  const { W: W0, numLevels, pools } = snapshot;
+  const targetW = 1 << targetResLog2;
+  const RB = pools[1].RB, NBX0 = pools[1].NBX, NBY0 = pools[1].NBY;
+  const mult = targetW / W0;
+  const level = new Uint8Array(targetW * targetW);
+
+  function paintLevel(originX, originY, extent, lvl) {
+    const x0 = Math.round(originX * mult), y0 = Math.round(originY * mult);
+    const size = Math.round(extent * mult);
+    for (let dy = 0; dy < size; dy++) {
+      const wy = ((y0 + dy) % targetW + targetW) % targetW;
+      for (let dx = 0; dx < size; dx++) {
+        const wx = ((x0 + dx) % targetW + targetW) % targetW;
+        level[wy * targetW + wx] = lvl;
+      }
+    }
+  }
+
+  // Mirrors paintQuad's recursion exactly (see above): a quadrant with no
+  // active child belongs to THIS level over its own RB*dxLparent footprint;
+  // a quadrant with an active child recurses one level deeper.
+  function walk(lvl, slot, bx, by, originX, originY) {
+    const childLevel = lvl + 1;
+    if (childLevel >= numLevels) { paintLevel(originX, originY, 2 * RB / (1 << lvl), lvl); return; }
+    const child = pools[childLevel];
+    const nbxChild = NBX0 * (1 << lvl);
+    const dxLparent = 1 / (1 << lvl);
+    for (let qy = 0; qy < 2; qy++) {
+      for (let qx = 0; qx < 2; qx++) {
+        const childBX = bx * 2 + qx, childBY = by * 2 + qy;
+        const childSlot = child.blockSlot[childBY * nbxChild + childBX];
+        const childOriginX = originX + qx * RB * dxLparent;
+        const childOriginY = originY + qy * RB * dxLparent;
+        if (childSlot === -1) paintLevel(childOriginX, childOriginY, RB * dxLparent, lvl);
+        else walk(childLevel, childSlot, childBX, childBY, childOriginX, childOriginY);
+      }
+    }
+  }
+
+  const L1 = pools[1];
+  for (let by = 0; by < NBY0; by++) {
+    for (let bx = 0; bx < NBX0; bx++) {
+      const slot1 = L1.blockSlot[by * NBX0 + bx];
+      if (slot1 === -1) paintLevel(bx * RB, by * RB, RB, 0);
+      else walk(1, slot1, bx, by, bx * RB, by * RB);
+    }
+  }
+  return level;
+}
+
 module.exports = {
   b64ToFloat32, rawIndex, unshiftField, rhoFromF, rhoFromPoolF, vorticityField, diffStats,
-  loadDenseFields, reconstructAMRToResolution,
+  loadDenseFields, reconstructAMRToResolution, buildLevelMap,
 };

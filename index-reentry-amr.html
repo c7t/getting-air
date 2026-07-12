@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>getting-air (AMR reentry)</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #111;
+      color: #eee;
+      font-family: monospace;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      height: 100dvh;
+    }
+    #canvas-container {
+      flex: 1;
+      position: relative;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #000;
+      overflow: hidden;
+      container-type: size; /* enable cqw/cqh inside */
+    }
+    canvas {
+      display: block;
+      width:  min(100cqw, 100cqh);
+      height: min(100cqw, 100cqh);
+    }
+    #status {
+      position: absolute; top: 8px; left: 8px;
+      font-size: 12px; color: #7f7; background: rgba(0,0,0,0.6);
+      padding: 4px 8px; border-radius: 3px; pointer-events: none;
+    }
+    #perf {
+      position: absolute; top: 40px; left: 8px;
+      font-size: 11px; color: #0cf; background: rgba(0,0,0,0.6);
+      padding: 4px 8px; border-radius: 3px; pointer-events: none;
+      display: flex; flex-direction: column; gap: 2px;
+    }
+    .perf-label { color: #888; margin-right: 4px; }
+    #download {
+      position: absolute; top: 8px; right: 8px;
+      font-size: 12px; color: #eee; background: rgba(0,0,0,0.6);
+      padding: 4px 8px; border: 1px solid #555; border-radius: 3px;
+      cursor: pointer; font-family: monospace;
+    }
+    #download:hover { background: rgba(50,50,50,0.8); }
+    #controls {
+      flex-shrink: 0;
+      background: rgba(0,0,0,0.85);
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      border-top: 1px solid #444;
+    }
+    .control-row { display: flex; align-items: center; gap: 10px; }
+    .control-row label { width: 100px; font-size: 11px; color: #aaa; }
+    .control-row input { flex-grow: 1; cursor: pointer; }
+    .control-row span { width: 50px; text-align: right; font-size: 11px; color: #fff; }
+  </style>
+</head>
+<body>
+  <div id="canvas-container">
+    <canvas id="c"></canvas>
+    <div id="status">initializing...</div>
+    <div id="perf">
+      <div><span class="perf-label">MLUPS:</span> <span id="val-mlups">0.0</span></div>
+      <div><span class="perf-label">GPU:</span> <span id="val-gpu-ms">0.0</span> ms</div>
+      <div><span class="perf-label">SYNC:</span> <span id="val-sync-ms">0.0</span> ms</div>
+    </div>
+    <button id="download">Download CSV</button>
+  </div>
+
+  <div id="controls">
+    <div class="control-row">
+      <label>Resolution</label>
+      <input type="range" id="slider-RES" min="6" max="11" step="1" value="10">
+      <span id="val-RES">1024</span>
+    </div>
+    <div class="control-row">
+      <label>A (semi-major)</label>
+      <input type="range" id="slider-A" min="10" max="128" step="1" value="32">
+      <span id="val-A">32</span>
+    </div>
+    <div class="control-row">
+      <label>B (semi-minor)</label>
+      <input type="range" id="slider-B" min="2" max="32" step="1" value="4">
+      <span id="val-B">4</span>
+    </div>
+    <div class="control-row">
+      <label>τ (viscosity)</label>
+      <input type="range" id="slider-TAU" min="0.501" max="0.6" step="0.001" value="0.509">
+      <span id="val-TAU">0.509</span>
+    </div>
+    <div class="control-row">
+      <label>Vy (sink rate)</label>
+      <input type="range" id="slider-VY" min="0" max="0.05" step="0.0005" value="0.0185">
+      <span id="val-VY">0.0185</span>
+    </div>
+    <div class="control-row">
+      <label>ω (tumble rate)</label>
+      <input type="range" id="slider-OMEGA" min="-0.002" max="0.002" step="0.00002" value="0.00059">
+      <span id="val-OMEGA">0.00059</span>
+    </div>
+    <div class="control-row">
+      <label>Refinement overlay</label>
+      <input type="range" id="slider-overlay" min="0" max="1" step="0.05" value="1">
+      <span id="val-overlay">1.00</span>
+    </div>
+    <div class="control-row">
+      <label>Quad outlines</label>
+      <input type="range" id="slider-outline" min="0" max="1" step="0.05" value="0">
+      <span id="val-outline">0.00</span>
+    </div>
+  </div>
+
+  <script type="module" src="main-reentry-amr.js"></script>
+</body>
+</html>
