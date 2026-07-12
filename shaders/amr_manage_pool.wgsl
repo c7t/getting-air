@@ -118,6 +118,9 @@ override NBY_PARENT : u32;
 override PARENT_CELL_SIZE_L0 : f32;
 override PARENT_HAS_CACHED_ORIGIN : u32;
 override HAS_GRANDCHILD : u32 = 0u;
+// When 0, isNearBodyAt is unconditionally false -- see amr_manage.wgsl's
+// identical override.
+override HAS_BODY : u32 = 1u;
 override REFINE_THRESH : f32;
 override COARSEN_THRESH : f32;
 override FORCE_REFINE_MARGIN : f32;
@@ -134,6 +137,7 @@ const EPS_FLOOR = 1e-6f;
 // (test point moves backward at -v, not the ellipse forward, since the
 // moving window absorbs bulk translation into off_x/off_y).
 fn isNearBodyAt(centerX_L0: f32, centerY_L0: f32) -> bool {
+  if (HAS_BODY == 0u) { return false; }
   let wx = (u32(centerX_L0) + W - u32(state.off_x)) % W;
   let wy = (u32(centerY_L0) + H - u32(state.off_y)) % H;
   let p_now = vec2<f32>(f32(wx), f32(wy));

@@ -34,6 +34,7 @@
 // @include "common_geometry.wgsl"
 // @include "common_lattice.wgsl"
 // @include "common_sponge.wgsl"
+// @include "common_walls.wgsl"
 
 struct LevelParams {
   nbx: u32,        // unused here (no cellIndex()/blockID-derived origin at this level -- see header) -- kept so this level's ONE uniform buffer is shared verbatim with amr_interp_pool_parent.wgsl/amr_average_pool_parent.wgsl, not a third near-duplicate.
@@ -77,6 +78,15 @@ override K_EPS : f32 = 1.5f;
 // rationale this shares (identical here, just with a cached f32 origin
 // instead of a blockID-derived one -- see this file's own header).
 override USE_BOUNCEBACK : u32 = 0u;
+
+// Channel/TGV-scenario overrides -- see shaders/lbm_step.wgsl's identical
+// set for the full rationale. All default to a no-op.
+override HAS_BODY : u32 = 1u;
+override WALL_Y : u32 = 0u;
+override WALL_U0 : f32 = 0.0f;
+override WALL_U1 : f32 = 0.0f;
+override FORCE_X : f32 = 0.0f;
+override FORCE_Y : f32 = 0.0f;
 
 // BUGFIX: this file serves EVERY level>=2 through one shared pipeline
 // (dx varies per level -- 0.25 at level 2, 0.125 at level 3, ...), but
@@ -161,13 +171,24 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   // off the solid -- see USE_BOUNCEBACK's own header comment).
   var f: array<f32,9>;
   for (var i = 0u; i < 9u; i++) {
-    if (USE_BOUNCEBACK != 0u) {
+    if (USE_BOUNCEBACK != 0u && HAS_BODY != 0u) {
       let srcBufX = fineToCoarseUnitI(i32(fx) - ex[i], originX_L0);
       let srcBufY = fineToCoarseUnitI(i32(fy) - ey[i], originY_L0);
       let srcWx = wrapf(srcBufX - state.off_x, f32(W));
       let srcWy = wrapf(srcBufY - state.off_y, f32(H));
       if (get_phi(vec2<f32>(srcWx, srcWy), state) < 0f) {
         let corr = 2f * wt[i] * (f32(ex[i]) * usx + f32(ey[i]) * usy) / CS2;
+        f[i] = f_in[opp[i] * poolPlaneStride + cell] + corr;
+        continue;
+      }
+    }
+    if (WALL_Y != 0u) {
+      // See amr_step1.wgsl's identical branch / common_walls.wgsl's *F
+      // helpers for why this uses the unwrapped source position.
+      let srcBufYUnwrapped = fineToCoarseUnitI(i32(fy) - ey[i], originY_L0);
+      if (wallSourceOutsideF(srcBufYUnwrapped)) {
+        let wallUx = wallVelocityXF(srcBufYUnwrapped, WALL_U0, WALL_U1);
+        let corr = 2f * wt[i] * f32(ex[i]) * wallUx / CS2;
         f[i] = f_in[opp[i] * poolPlaneStride + cell] + corr;
         continue;
       }
@@ -189,11 +210,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   ux_star /= rhoDen; uy_star /= rhoDen;
 
   // 3. Penalty Force and Solid Coupling -- chi forced to 0 under
-  // USE_BOUNCEBACK, same as lbm_step.wgsl.
-  let chi = select(get_chi(phi), 0f, USE_BOUNCEBACK != 0u);
+  // USE_BOUNCEBACK or when there's no body at all, same as lbm_step.wgsl.
+  let chi = select(get_chi(phi), 0f, USE_BOUNCEBACK != 0u || HAS_BODY == 0u);
 
-  let Fx = rho * chi * (usx - ux_star);
-  let Fy = rho * chi * (usy - uy_star);
+  let Fx = rho * chi * (usx - ux_star) + FORCE_X;
+  let Fy = rho * chi * (usy - uy_star) + FORCE_Y;
 
   let ux = ux_star + Fx / (2.0f * rhoDen);
   let uy = uy_star + Fy / (2.0f * rhoDen);

@@ -30,6 +30,17 @@
 // activation) fills the WHOLE slot including the "real" interior, needed
 // because a freshly-activated slot has no prior fine-level state to
 // evolve from.
+//
+// KNOWN GAP (channel-flow/WALL_Y scenarios, shaders/common_walls.wgsl):
+// sampleCoarse()'s wrapCoord assumes the coarse level is periodic in BOTH
+// x and y. A fine block refined adjacent to a real y=0/y=H-1 wall would
+// have its ghost cells sample the periodic image across the domain
+// instead of reflecting off the wall -- wrong physics, not just
+// imprecise. Not fixed yet: main-channel-amr.js's default refine
+// thresholds are deliberately kept high enough that refinement never
+// reaches the wall-adjacent blocks, so this stays latent rather than
+// exercised. Fix properly (wall-aware ghost rule, not a periodic wrap)
+// before validating any AMR channel-flow case that refines near a wall.
 
 // @include "common_geometry.wgsl"
 // @include "common_lattice.wgsl"
