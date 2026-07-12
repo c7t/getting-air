@@ -78,11 +78,12 @@ const NBX = W / BLOCK, NBY = H / BLOCK, NBLOCKS = NBX * NBY; // coarse block gri
 const N_LEVELS = urlParams.has('levels') ? parseInt(urlParams.get('levels')) : 2;
 if (N_LEVELS < 2) throw new Error(`?levels=${N_LEVELS} invalid -- must be >= 2 (L0 + at least one fine level)`);
 
-// KNOWN ISSUE, substantially narrowed, not yet fully fixed: USE_BOUNCEBACK
-// is validated correct at N_LEVELS<=2 (L0+L1 only -- Cd/St match the
-// literature within tolerance, see tools/validate-cylinder.js) but
-// diverges as soon as a pool level (L>=2) is active. Originally traced to
-// TWO distinct issues; the first is now mostly fixed at the root:
+// KNOWN ISSUE, narrowed further: USE_BOUNCEBACK is validated correct at
+// N_LEVELS<=2 (L0+L1 only -- Cd/St match the literature within tolerance,
+// see tools/validate-cylinder.js) but diverges as soon as a pool level
+// (L>=2) is active. Originally traced to TWO distinct issues; the first is
+// now FULLY fixed at the root (was two sub-bugs, then a third found and
+// fixed afterward -- see below):
 // 1. COVERAGE GAP, root-caused and fixed: geometry-forced refinement is
 //    meant to be a HARD constraint (M8: push the body's surface onto the
 //    finest configured level, 2:1 balance driven FROM that, not used to
@@ -102,23 +103,45 @@ if (N_LEVELS < 2) throw new Error(`?levels=${N_LEVELS} invalid -- must be >= 2 (
 //    the body against whether it has an L2 child) found L1 tiles as close
 //    as phi=1.98 (well inside the ~4-unit default margin) lacking a
 //    required child before these fixes; zero such gaps after, at default
-//    thresholds, no manual margin override needed. Also cut L1's own
-//    (previously garbage, coverage-gap-driven) bounce-back contribution
-//    from fx~2.9 to fx~-0.19 -- real, substantial, but not exactly zero;
-//    a small number of residual 2:1-balance violations remain (confirmed
-//    via debugCheck21Balance, level-2-granularity, criterion/wake-driven
-//    positions rather than geometry -- doubling FIXED_POINT_ITERS didn't
-//    change them, so it isn't a convergence-timing issue -- not yet
-//    root-caused further).
-// 2. Level 2's OWN bounce-back force is STILL wrong (wrong sign, several x
-//    magnitude) even in full isolation from issue 1 -- the field itself
-//    is confirmed healthy (debugReadPool: rho~1, populations bounded) at
-//    every level, so this is a force-bookkeeping bug specifically, not a
-//    step-shader/streaming one. A real, separate pre-existing dx-scale
-//    bug in amr_step1_pool.wgsl/amr_force1_pool.wgsl was found and fixed
-//    along the way (see that file's own header) but didn't fully resolve
-//    this -- now the dominant remaining blocker, cleanly isolated with
-//    issue 1 mostly out of the way.
+//    thresholds, no manual margin override needed. That scan is now a
+//    permanent debug function, not a one-off -- see
+//    debugCheckGeometryCoverage and tools/validate-amr-invariants.js. Also
+//    cut L1's own (previously garbage, coverage-gap-driven) bounce-back
+//    contribution from fx~2.9 to fx~-0.19.
+//    A THIRD, separate bug surfaced afterward and is NOW FIXED too (was:
+//    "a small number of residual 2:1-balance violations remain...
+//    criterion/wake-driven... not yet root-caused further"): amr_manage_
+//    pool.wgsl's coarsen() and refine() tested geometric proximity to the
+//    body at DIFFERENT points -- refine() decides for a WHOLE level-(m+1)
+//    quad using the PARENT's own center, but coarsen() used the quad's own
+//    quadrant-0 center instead. Where these disagree (live-verified via a
+//    temporary GPU-side instrumentation capture, not just static reading:
+//    a parent at phi=1.98 -- comfortably hard-required -- whose own
+//    quadrant-0 child center measured phi=4.56, just OVER the same
+//    4-unit margin), the quad was destroyed and recreated on EVERY
+//    fixed-point iteration: refine() (parent qualifies) recreates it,
+//    coarsen() (quadrant-0 doesn't) releases it again immediately after,
+//    every single evaluation. Since coarsen() always runs immediately
+//    before amr_manage.wgsl's own L0->L1 cascade check in dispatch order,
+//    that cascade could never observe the child in its "exists" state --
+//    ground-truth confirmed hasLevel2Child read false at every one of 20
+//    consecutive evaluations despite the child externally appearing active
+//    "most of the time." Fixed by making coarsen() use the same parent-
+//    center test refine() does. debugCheck21Balance clean over 40,000
+//    steps at N=3 after the fix (was reproducible every ~2048 steps
+//    before, identically, across many independent test runs).
+// 2. Level 2's OWN bounce-back force is STILL wrong (wrong sign, large
+//    magnitude relative to L1's own contribution -- e.g. fx~-5.6 vs L1's
+//    fx~-0.19 in one post-fix debugForceBreakdown measurement) -- confirmed
+//    this is NOT resolved by fixing issue 1 above (re-measured after that
+//    fix landed: same qualitative symptom, 2:1 balance itself now clean).
+//    The field itself is confirmed healthy (debugReadPool: rho~1,
+//    populations bounded) at every level, so this is a force-bookkeeping
+//    bug specifically, not a step-shader/streaming one. A real, separate
+//    pre-existing dx-scale bug in amr_step1_pool.wgsl/amr_force1_pool.wgsl
+//    was found and fixed along the way (see that file's own header) but
+//    didn't fully resolve this -- now the SOLE remaining blocker, cleanly
+//    isolated with issue 1 fully resolved.
 // ?forceBounceback bypasses this guard for continued investigation.
 if (USE_BOUNCEBACK && N_LEVELS > 2 && !urlParams.has('forceBounceback')) {
   throw new Error('?bounceback with ?levels>2 is known-broken (diverges) -- see this file\'s own comment above N_LEVELS. Use ?levels=2 for a validated bounce-back run, or ?forceBounceback to bypass for investigation.');
