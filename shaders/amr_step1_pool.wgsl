@@ -31,34 +31,9 @@
 // level uniform amr_interp_pool_parent.wgsl and amr_average_pool_parent.wgsl
 // already use (recursively: tauAtLevel(m) in main-amr.js).
 
-struct CardState {
-  cx     : f32,
-  cy     : f32,
-  theta  : f32,
-  vx     : f32,
-  vy     : f32,
-  omega  : f32,
-  fx     : f32,
-  fy     : f32,
-  tz     : f32,
-  mass   : f32,
-  i_body : f32,
-  g_eff  : f32,
-  a      : f32,
-  b      : f32,
-  v_max  : f32,
-  o_max  : f32,
-  cx_old : f32,
-  cy_old : f32,
-  th_old : f32,
-  tau    : f32,
-  y_total: f32,
-  x_total: f32,
-  off_x  : f32,
-  off_y  : f32,
-  off_x_old : f32,
-  off_y_old : f32,
-}
+// @include "common_geometry.wgsl"
+// @include "common_lattice.wgsl"
+// @include "common_sponge.wgsl"
 
 struct LevelParams {
   nbx: u32,        // unused here (no cellIndex()/blockID-derived origin at this level -- see header) -- kept so this level's ONE uniform buffer is shared verbatim with amr_interp_pool_parent.wgsl/amr_average_pool_parent.wgsl, not a third near-duplicate.
@@ -84,6 +59,8 @@ const GHOST = 2u;
 
 override SPONGE_UX : f32 = 0.0f;
 override SPONGE_UY : f32 = 0.0f;
+// Sponge ring width in cells -- see lbm_step.wgsl's identical override.
+override SPONGE_W : f32 = 4.0f;
 
 // Milestone 8 (plans/AMR-multilevel.md): epsilon = K_EPS * dx_L, not a fixed
 // physical constant -- a fixed epsilon means refinement only ever improves
@@ -100,16 +77,6 @@ override K_EPS : f32 = 1.5f;
 // rationale this shares (identical here, just with a cached f32 origin
 // instead of a blockID-derived one -- see this file's own header).
 override USE_BOUNCEBACK : u32 = 0u;
-
-const ex = array<i32,9>( 0, 1, 0,-1, 0, 1,-1,-1, 1);
-const ey = array<i32,9>( 0, 0, 1, 0,-1, 1, 1,-1,-1);
-const wt = array<f32,9>(
-  0.44444444f,
-  0.11111111f, 0.11111111f, 0.11111111f, 0.11111111f,
-  0.02777778f, 0.02777778f, 0.02777778f, 0.02777778f
-);
-const opp = array<u32,9>(0u, 3u, 4u, 1u, 2u, 7u, 8u, 5u, 6u);
-const CS2 = 0.33333333f;
 
 // BUGFIX: this file serves EVERY level>=2 through one shared pipeline
 // (dx varies per level -- 0.25 at level 2, 0.125 at level 3, ...), but
@@ -148,22 +115,8 @@ fn wrapf(v: f32, n: f32) -> f32 {
   return r;
 }
 
-fn get_phi(p: vec2<f32>, state: CardState) -> f32 {
-    let ca = cos(state.theta);
-    let sa = sin(state.theta);
-    var dx = p.x - state.cx;
-    var dy = p.y - state.cy;
-    dx -= f32(W) * round(dx / f32(W));
-    dy -= f32(H) * round(dy / f32(H));
-    let lx = dx * ca + dy * sa;
-    let ly = -dx * sa + dy * ca;
-    let d = sqrt((lx*lx)/(state.a*state.a) + (ly*ly)/(state.b*state.b)) - 1.0;
-    return d * state.b;
-}
-
 fn get_chi(phi: f32) -> f32 {
-    let epsilon = K_EPS * levelParams.dxL;
-    return 0.5f * (1.0f - tanh(clamp(phi / epsilon, -20.0f, 20.0f)));
+    return chiFromPhiEps(phi, K_EPS * levelParams.dxL);
 }
 
 @compute @workgroup_size(8, 8)
@@ -249,11 +202,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   vel_pool[cell * 2u] = ux; vel_pool[cell * 2u + 1u] = uy;
 
   // 4. Collision and ALBC sponge -- same formula as amr_step1.wgsl.
-  let SPONGE_W = 4.0f;
   let dist_x = min(wx, f32(W) - 1.0f - wx);
   let dist_y = min(wy, f32(H) - 1.0f - wy);
-  var sponge_weight = clamp(1.0f - min(dist_x, dist_y) / SPONGE_W, 0.0f, 1.0f);
-  sponge_weight = sponge_weight * sponge_weight * (3.0f - 2.0f * sponge_weight);
+  let sponge_weight = spongeWeight(dist_x, dist_y, SPONGE_W);
 
   // Relative to THIS level's own parent, not L0 -- see header.
   let tau_coarse = levelParams.parentTau;

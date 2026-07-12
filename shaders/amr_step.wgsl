@@ -18,34 +18,9 @@
 // cell, then the neighbor at window offset -ex lands at buffer offset -ex
 // too, regardless of off_x's actual value.
 
-struct CardState {
-  cx     : f32,
-  cy     : f32,
-  theta  : f32,
-  vx     : f32,
-  vy     : f32,
-  omega  : f32,
-  fx     : f32,
-  fy     : f32,
-  tz     : f32,
-  mass   : f32,
-  i_body : f32,
-  g_eff  : f32,
-  a      : f32,
-  b      : f32,
-  v_max  : f32,
-  o_max  : f32,
-  cx_old : f32,
-  cy_old : f32,
-  th_old : f32,
-  tau    : f32,
-  y_total: f32,
-  x_total: f32,
-  off_x  : f32,
-  off_y  : f32,
-  off_x_old : f32,
-  off_y_old : f32,
-}
+// @include "common_geometry.wgsl"
+// @include "common_lattice.wgsl"
+// @include "common_sponge.wgsl"
 
 @group(0) @binding(0) var<storage, read>       state : CardState;
 @group(0) @binding(1) var<storage, read>       f_in  : array<f32>;
@@ -62,22 +37,14 @@ const BLOCK = 8u;
 // lbm_step.wgsl's SPONGE_UX/UY -- see that file for the rationale.
 override SPONGE_UX : f32 = 0.0f;
 override SPONGE_UY : f32 = 0.0f;
+// Sponge ring width in cells -- see lbm_step.wgsl's identical override.
+override SPONGE_W : f32 = 4.0f;
 
 // Optional sharp bounce-back solid coupling -- mirrors lbm_step.wgsl's
 // USE_BOUNCEBACK exactly (same formula, same default-0 no-op), just
 // operating in this file's window/buffer split addressing. See that
 // file's header for the full rationale.
 override USE_BOUNCEBACK : u32 = 0u;
-
-const ex = array<i32,9>( 0, 1, 0,-1, 0, 1,-1,-1, 1);
-const ey = array<i32,9>( 0, 0, 1, 0,-1, 1, 1,-1,-1);
-const wt = array<f32,9>(
-  0.44444444f,
-  0.11111111f, 0.11111111f, 0.11111111f, 0.11111111f,
-  0.02777778f, 0.02777778f, 0.02777778f, 0.02777778f
-);
-const opp = array<u32,9>(0u, 3u, 4u, 1u, 2u, 7u, 8u, 5u, 6u);
-const CS2 = 0.33333333f;
 
 // Block-major linear index for a cell at BUFFER coordinates (cx, cy).
 // W and H are always exact multiples of BLOCK (resLog2 clamps W,H to
@@ -90,25 +57,8 @@ fn cellIndex(cx: u32, cy: u32) -> u32 {
   return blockID * (BLOCK * BLOCK) + ly * BLOCK + lx;
 }
 
-fn get_phi(p: vec2<f32>, state: CardState) -> f32 {
-    let ca = cos(state.theta);
-    let sa = sin(state.theta);
-    var dx = p.x - state.cx;
-    var dy = p.y - state.cy;
-    dx -= f32(W) * round(dx / f32(W));
-    dy -= f32(H) * round(dy / f32(H));
-    let lx = dx * ca + dy * sa;
-    let ly = -dx * sa + dy * ca;
-
-    // Algebraic distance approximation for ellipse
-    let d = sqrt((lx*lx)/(state.a*state.a) + (ly*ly)/(state.b*state.b)) - 1.0;
-    return d * state.b;
-}
-
 fn get_chi(phi: f32) -> f32 {
-    let epsilon = 1.5f;
-    // Clamp tanh arg: large |arg| overflows to NaN on some GPUs (e.g. Intel Gen12LP); saturated regime is unchanged. See PR.
-    return 0.5f * (1.0f - tanh(clamp(phi / epsilon, -20.0f, 20.0f)));
+    return chiFromPhiEps(phi, 1.5f);
 }
 
 @compute @workgroup_size(8, 8)
@@ -185,11 +135,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   vel[cell * 2u] = ux; vel[cell * 2u + 1u] = uy;
 
   // 4. Collision and ALBC Sponge (window-space distance to window edges)
-  let SPONGE_W = 4.0f;
   let dist_x = min(f32(wx), f32(W - 1u - wx));
   let dist_y = min(f32(wy), f32(H - 1u - wy));
-  var sponge_weight = clamp(1.0f - min(dist_x, dist_y) / SPONGE_W, 0.0f, 1.0f);
-  sponge_weight = sponge_weight * sponge_weight * (3.0f - 2.0f * sponge_weight);
+  let sponge_weight = spongeWeight(dist_x, dist_y, SPONGE_W);
 
   let omg = 1.0f / state.tau;
   for (var i = 0u; i < 9u; i++) {

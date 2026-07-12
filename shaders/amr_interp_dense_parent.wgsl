@@ -31,34 +31,8 @@
 // because a freshly-activated slot has no prior fine-level state to
 // evolve from.
 
-struct CardState {
-  cx     : f32,
-  cy     : f32,
-  theta  : f32,
-  vx     : f32,
-  vy     : f32,
-  omega  : f32,
-  fx     : f32,
-  fy     : f32,
-  tz     : f32,
-  mass   : f32,
-  i_body : f32,
-  g_eff  : f32,
-  a      : f32,
-  b      : f32,
-  v_max  : f32,
-  o_max  : f32,
-  cx_old : f32,
-  cy_old : f32,
-  th_old : f32,
-  tau    : f32,
-  y_total: f32,
-  x_total: f32,
-  off_x  : f32,
-  off_y  : f32,
-  off_x_old : f32,
-  off_y_old : f32,
-}
+// @include "common_geometry.wgsl"
+// @include "common_lattice.wgsl"
 
 @group(0) @binding(0) var<storage, read>       state       : CardState;
 @group(0) @binding(1) var<storage, read>       f_coarse       : array<f32>;
@@ -96,19 +70,6 @@ override FINE_FINE_ONLY : u32 = 0u;
 
 const BLOCK = 8u;
 const GHOST = 2u;
-
-const ex = array<i32,9>( 0, 1, 0,-1, 0, 1,-1,-1, 1);
-const ey = array<i32,9>( 0, 0, 1, 0,-1, 1, 1,-1,-1);
-const wt = array<f32,9>(
-  0.44444444f,
-  0.11111111f, 0.11111111f, 0.11111111f, 0.11111111f,
-  0.02777778f, 0.02777778f, 0.02777778f, 0.02777778f
-);
-
-fn feq(rho: f32, ux: f32, uy: f32, i: u32) -> f32 {
-  let eu = f32(ex[i]) * ux + f32(ey[i]) * uy;
-  return wt[i] * rho * (1f + 3f*eu + 4.5f*eu*eu - 1.5f*(ux*ux+uy*uy));
-}
 
 // Block-major linear index for a cell at COARSE buffer coordinates (cx, cy).
 fn cellIndex(cx: u32, cy: u32) -> u32 {
@@ -159,7 +120,7 @@ fn sampleCoarse(bx_in: i32, by_in: i32) -> CoarseSample {
   var out: CoarseSample;
   out.rho = rho; out.ux = ux; out.uy = uy;
   for (var i = 0u; i < 9u; i++) {
-    out.fneq[i] = f[i] - feq(rho, ux, uy, i);
+    out.fneq[i] = f[i] - feqD2Q9(rho, ux, uy, i);
   }
   return out;
 }
@@ -308,6 +269,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let poolCellBase = slot * (FB * FB) + fy * FB + fx;
   for (var i = 0u; i < 9u; i++) {
     let fneq = w00*s00.fneq[i] + w10*s10.fneq[i] + w01*s01.fneq[i] + w11*s11.fneq[i];
-    f_pool[i * poolPlaneStride + poolCellBase] = feq(rho, ux, uy, i) + rescale * fneq;
+    f_pool[i * poolPlaneStride + poolCellBase] = feqD2Q9(rho, ux, uy, i) + rescale * fneq;
   }
 }

@@ -86,34 +86,7 @@
 //     existing check operates at the PARENT's own level m, not one level
 //     removed from what's being decided.
 
-struct CardState {
-  cx     : f32,
-  cy     : f32,
-  theta  : f32,
-  vx     : f32,
-  vy     : f32,
-  omega  : f32,
-  fx     : f32,
-  fy     : f32,
-  tz     : f32,
-  mass   : f32,
-  i_body : f32,
-  g_eff  : f32,
-  a      : f32,
-  b      : f32,
-  v_max  : f32,
-  o_max  : f32,
-  cx_old : f32,
-  cy_old : f32,
-  th_old : f32,
-  tau    : f32,
-  y_total: f32,
-  x_total: f32,
-  off_x  : f32,
-  off_y  : f32,
-  off_x_old : f32,
-  off_y_old : f32,
-}
+// @include "common_geometry.wgsl"
 
 @group(0) @binding(0)  var<storage, read>       childCriterion    : array<f32>;
 @group(0) @binding(1)  var<storage, read_write> childBlockSlot    : array<i32>;
@@ -154,19 +127,6 @@ override FORCE_REFINE_LOOKAHEAD : f32;
 // sponge is a fixed L0 strip). Gated off when <= 0.
 override SPONGE_EXCLUDE_W : f32 = 0.0f;
 const EPS_FLOOR = 1e-6f;
-
-fn get_phi(p: vec2<f32>, s: CardState) -> f32 {
-  let ca = cos(s.theta);
-  let sa = sin(s.theta);
-  var dx = p.x - s.cx;
-  var dy = p.y - s.cy;
-  dx -= f32(W) * round(dx / f32(W));
-  dy -= f32(H) * round(dy / f32(H));
-  let lx = dx * ca + dy * sa;
-  let ly = -dx * sa + dy * ca;
-  let d = sqrt((lx*lx)/(s.a*s.a) + (ly*ly)/(s.b*s.b)) - 1.0;
-  return d * s.b;
-}
 
 // Same now/future test as amr_manage.wgsl's isNearBody, parametrized by an
 // already-computed L0-buffer-space center instead of deriving it from a
