@@ -4,9 +4,11 @@
 # changes before loading the sim in a browser. There is no build step for the
 # app itself (it is a static page); these targets only VALIDATE.
 #
-#   make check   run all static checks (JS always; WGSL if naga is available)
+#   make check   run all static checks (JS + Python always; WGSL if naga is available)
 #   make wgsl     validate every WGSL shader with naga (needs Rust-built naga)
 #   make js       syntax-check every JS module with `node --check`
+#   make py       syntax-check every Python module (ast.parse; no bytecode written)
+#   make serve    run the local dev server (tools/devserver.py); ARGS='--https' etc.
 #   make tools    install the validation tools (naga-cli via cargo; needs Rust)
 #   make help     list targets
 #
@@ -27,6 +29,7 @@ SHADERS := $(wildcard shaders/*.wgsl)
 # root main*.js). venv/ (Python virtualenv) and AGAL/ (vendored C++/CUDA
 # sub-repo) are excluded -- neither is this project's own JS source.
 JS      := $(shell find . -name '*.js' -not -path './node_modules/*' -not -path './.git/*' -not -path './venv/*' -not -path './AGAL/*')
+PY      := $(shell find . -name '*.py' -not -path './node_modules/*' -not -path './.git/*' -not -path './venv/*' -not -path './AGAL/*' -not -path './.devharness-collect/*')
 
 .DEFAULT_GOAL := help
 
@@ -36,7 +39,7 @@ help: ## list targets
 	  | awk 'BEGIN{FS=":.*## "}{printf "  make %-10s %s\n", $$1, $$2}'
 
 .PHONY: check
-check: js ## run all static checks (JS always; WGSL if naga is available)
+check: js py ## run all static checks (JS + Python always; WGSL if naga is available)
 	@if command -v naga >/dev/null 2>&1; then \
 	  $(MAKE) --no-print-directory wgsl; \
 	else \
@@ -80,6 +83,22 @@ js: ## syntax-check every JS module with `node --check`
 	done; \
 	if [ $$rc -eq 0 ]; then echo "js: $(words $(JS)) module(s) parse"; else echo "js: FAILED"; fi; \
 	exit $$rc
+
+.PHONY: py
+py: ## syntax-check every Python module (ast.parse; writes no bytecode)
+	@command -v python3 >/dev/null 2>&1 || { echo "python3 not found -- install Python 3"; exit 1; }
+	@test -n "$(strip $(PY))" && { \
+	  rc=0; for f in $(PY); do \
+	    if out=$$(python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read(), sys.argv[1])' "$$f" 2>&1); then echo "  ok    $$f"; \
+	    else echo "  FAIL  $$f"; echo "$$out" | sed 's/^/        /'; rc=1; fi; \
+	  done; \
+	  if [ $$rc -eq 0 ]; then echo "py: $(words $(PY)) module(s) compile"; else echo "py: FAILED"; fi; \
+	  exit $$rc; \
+	} || echo "py: no Python modules found"
+
+.PHONY: serve
+serve: ## run the local dev server (static + /collect); ARGS='--https' etc.
+	python3 tools/devserver.py $(ARGS)
 
 .PHONY: tools
 tools: ## install validation tools (naga-cli via cargo; needs Rust)

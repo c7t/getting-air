@@ -9,3 +9,4 @@ https.py
 *.pem
 *~
 *.mp4
+.devharness-collect/
