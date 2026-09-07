@@ -444,7 +444,18 @@ async function init() {
   // Milestone 6 needs real per-level GPU timing; leave this on for the AMR
   // dev build from the start (main.js keeps it off with `0 &&` -- don't
   // touch that file, this is deliberately different here).
-  const hasTimestamp = 0 && adapter.features.has('timestamp-query');
+  // GPU-side timing. Restored from a `0 &&` hard-disable (commit 30c9e86,
+  // "Nerf timestamp for mobile") which threw away desktop timing to
+  // accommodate mobile -- but the feature test on this same line already
+  // handles that: an adapter without 'timestamp-query' simply reports
+  // wall-clock instead. The reason it had to be disabled rather than merely
+  // feature-detected is that the old code used encoder.writeTimestamp(),
+  // which was REMOVED from WebGPU (it needed the
+  // chromium-experimental-timestamp-query-inside-passes flag); the supported
+  // form is timestampWrites in a pass descriptor, which is what is used
+  // below. Without this, "GPU" and "SYNC" in the overlay were the same
+  // wall-clock number wearing two labels.
+  const hasTimestamp = adapter.features.has('timestamp-query');
 
   // WebGPU devices default to the spec MINIMUM limits (128 MiB storage
   // buffer bindings, 256 MiB total buffer size) regardless of what the
@@ -493,17 +504,19 @@ async function init() {
     requiredLimits,
   });
 
+  // Slots 0/1 are the whole-frame span. 2..QUERY_CAP-1 are for
+  // debugProfileMacroStep's per-pass breakdown (2 per pass), which is what
+  // makes dispatch work attributable rather than guessed at. One macro-step
+  // is ~9 passes at N=2 and ~20 at N=3, rising to ~32 on a refine step, so
+  // 128 slots leaves generous headroom.
+  const QUERY_CAP = 128;
   const querySet = hasTimestamp ? device.createQuerySet({
     type: 'timestamp',
-    count: 2
+    count: QUERY_CAP
   }) : null;
   const queryResolveBuffer = hasTimestamp ? device.createBuffer({
-    size: 16,
+    size: QUERY_CAP * 8,
     usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC
-  }) : null;
-  const queryReadBuffer = hasTimestamp ? device.createBuffer({
-    size: 16,
-    usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
   }) : null;
 
   device.pushErrorScope('validation');
@@ -1613,13 +1626,13 @@ async function init() {
       const stepBG = useB ? stepBG_ba : stepBG_ab;
       if (hasChild) {
         const readBG = useB ? interpBG_readB : interpBG_readA;
-        const p = enc.beginComputePass(); p.setPipeline(interpPL); p.setBindGroup(0, readBG); p.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); p.end();
+        const p = beginPass(enc, 'L0->L1 interp'); p.setPipeline(interpPL); p.setBindGroup(0, readBG); p.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); p.end();
       }
-      const s = enc.beginComputePass(); s.setPipeline(stepPL); s.setBindGroup(0, stepBG); s.dispatchWorkgroups(WGX, WGY); s.end();
+      const s = beginPass(enc, 'L0 step'); s.setPipeline(stepPL); s.setBindGroup(0, stepBG); s.dispatchWorkgroups(WGX, WGY); s.end();
       if (hasChild) {
         S_Advance(1, enc);
         const avgBG = useB ? avgBG_targetA : avgBG_targetB;
-        const a = enc.beginComputePass(); a.setPipeline(avgPL); a.setBindGroup(0, avgBG); a.dispatchWorkgroups(1, 1, MAX_FINE_BLOCKS); a.end();
+        const a = beginPass(enc, 'L1->L0 average'); a.setPipeline(avgPL); a.setBindGroup(0, avgBG); a.dispatchWorkgroups(1, 1, MAX_FINE_BLOCKS); a.end();
       }
       return;
     }
@@ -1632,28 +1645,28 @@ async function init() {
       if (!hasChild) return;
       const childPool = pools[level + 1];
       const bg = readCur === 'a' ? childPool.interpPoolParentBG_readA : childPool.interpPoolParentBG_readB;
-      const p = enc.beginComputePass(); p.setPipeline(interpPoolParentPL); p.setBindGroup(0, bg); p.dispatchWorkgroups(WGX1, WGY1, childPool.MAX_FINE_BLOCKS); p.end();
+      const p = beginPass(enc, `L${level}->L${level+1} interp`); p.setPipeline(interpPoolParentPL); p.setBindGroup(0, bg); p.dispatchWorkgroups(WGX1, WGY1, childPool.MAX_FINE_BLOCKS); p.end();
     };
     const averageFromChild = (writeCur) => {
       if (!hasChild) return;
       const childPool = pools[level + 1];
       const bg = writeCur === 'a' ? childPool.avgPoolBG_targetA : childPool.avgPoolBG_targetB;
-      const p = enc.beginComputePass(); p.setPipeline(avgPoolPL); p.setBindGroup(0, bg); p.dispatchWorkgroups(1, 1, childPool.MAX_FINE_BLOCKS); p.end();
+      const p = beginPass(enc, `L${level+1}->L${level} average`); p.setPipeline(avgPoolPL); p.setBindGroup(0, bg); p.dispatchWorkgroups(1, 1, childPool.MAX_FINE_BLOCKS); p.end();
     };
     const substep = (readCur) => {
       if (isL1) {
         const bg = readCur === 'a' ? step1BG_ab : step1BG_ba;
-        const p = enc.beginComputePass(); p.setPipeline(step1PL); p.setBindGroup(0, bg); p.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); p.end();
+        const p = beginPass(enc, 'L1 step'); p.setPipeline(step1PL); p.setBindGroup(0, bg); p.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); p.end();
       } else {
         const bg = readCur === 'a' ? pool.step1PoolBG_ab : pool.step1PoolBG_ba;
-        const p = enc.beginComputePass(); p.setPipeline(step1PoolPL); p.setBindGroup(0, bg); p.dispatchWorkgroups(WGX1, WGY1, pool.MAX_FINE_BLOCKS); p.end();
+        const p = beginPass(enc, `L${level} step`); p.setPipeline(step1PoolPL); p.setBindGroup(0, bg); p.dispatchWorkgroups(WGX1, WGY1, pool.MAX_FINE_BLOCKS); p.end();
       }
     };
     const fineFineRefresh = () => {
       if (isL1) {
-        const p = enc.beginComputePass(); p.setPipeline(interpFFPL); p.setBindGroup(0, interpFFBG_b); p.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); p.end();
+        const p = beginPass(enc, 'L1 fine-fine ghost'); p.setPipeline(interpFFPL); p.setBindGroup(0, interpFFBG_b); p.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); p.end();
       } else {
-        const p = enc.beginComputePass(); p.setPipeline(interpPoolParentFFPL); p.setBindGroup(0, pool.interpPoolParentFFBG_b); p.dispatchWorkgroups(WGX1, WGY1, pool.MAX_FINE_BLOCKS); p.end();
+        const p = beginPass(enc, `L${level} fine-fine ghost`); p.setPipeline(interpPoolParentFFPL); p.setBindGroup(0, pool.interpPoolParentFFBG_b); p.dispatchWorkgroups(WGX1, WGY1, pool.MAX_FINE_BLOCKS); p.end();
       }
     };
 
@@ -1674,6 +1687,29 @@ async function init() {
       S_Advance(level + 1, enc);
       averageFromChild(cur);  // level+1's full cycle #2 lands in level's CURRENT ('a')
     }
+  }
+
+  // ── GPU pass timing ──────────────────────────────────────────────────────
+  // Every compute pass in the macro-step goes through beginPass() so it can
+  // be individually timed on demand. When `profiler` is null (the normal
+  // case) this is exactly enc.beginComputePass() with no overhead; when
+  // debugProfileMacroStep() sets it, each pass gets its own timestamp pair
+  // and a label, which is what turns "AMR is slow" into "this pass is slow".
+  //
+  // Timestamps come from the pass DESCRIPTOR (timestampWrites), not from
+  // encoder.writeTimestamp() -- that entry point was removed from WebGPU and
+  // is why timing was disabled here in the first place.
+  let profiler = null;
+  function beginPass(enc, label) {
+    if (profiler && profiler.next + 2 <= profiler.cap) {
+      const i = profiler.next;
+      profiler.next += 2;
+      profiler.labels.push({ label, i });
+      return enc.beginComputePass({
+        timestampWrites: { querySet, beginningOfPassWriteIndex: i, endOfPassWriteIndex: i + 1 },
+      });
+    }
+    return enc.beginComputePass();
   }
 
   // Factored out of frame()'s loop so debugStepSync can reuse it exactly --
@@ -1703,9 +1739,9 @@ async function init() {
       // Evaluated ONCE, before the fixed-point loop below -- a block's own
       // vorticity doesn't change just because a neighbor gets (de)activated
       // this round, so re-evaluating per iteration would be wasted work.
-      const crit = enc.beginComputePass(); crit.setPipeline(criterionPL); crit.setBindGroup(0, criterionBG); crit.dispatchWorkgroups(WGX, WGY); crit.end();
+      const crit = beginPass(enc, 'criterion L0'); crit.setPipeline(criterionPL); crit.setBindGroup(0, criterionBG); crit.dispatchWorkgroups(WGX, WGY); crit.end();
       for (let m = 1; m < N_LEVELS - 1; m++) {
-        const c = enc.beginComputePass(); c.setPipeline(criterionPoolPLs[m]); c.setBindGroup(0, criterionPoolBGs[m]); c.dispatchWorkgroups(2, 2, pools[m].MAX_FINE_BLOCKS); c.end();
+        const c = beginPass(enc, `criterion L${m}`); c.setPipeline(criterionPoolPLs[m]); c.setBindGroup(0, criterionPoolBGs[m]); c.dispatchWorkgroups(2, 2, pools[m].MAX_FINE_BLOCKS); c.end();
       }
 
       // Milestone 9: 2:1-balance fixed-point loop -- coarsen finest-to-
@@ -1723,20 +1759,20 @@ async function init() {
       for (let iter = 0; iter < FIXED_POINT_ITERS; iter++) {
         for (let m = N_LEVELS - 1; m >= 1; m--) {
           if (m === 1) {
-            const p = enc.beginComputePass(); p.setPipeline(manageCoarsenPL); p.setBindGroup(0, manageBG); p.dispatchWorkgroups(WG_MANAGE); p.end();
+            const p = beginPass(enc, 'manage coarsen L1'); p.setPipeline(manageCoarsenPL); p.setBindGroup(0, manageBG); p.dispatchWorkgroups(WG_MANAGE); p.end();
           } else {
             const parentLevel = m - 1;
             const wg = Math.ceil(pools[m].MAX_FINE_BLOCKS / 64);
-            const p = enc.beginComputePass(); p.setPipeline(managePoolCoarsenPLs[parentLevel]); p.setBindGroup(0, managePoolBGs[parentLevel]); p.dispatchWorkgroups(wg); p.end();
+            const p = beginPass(enc, `manage coarsen L${m}`); p.setPipeline(managePoolCoarsenPLs[parentLevel]); p.setBindGroup(0, managePoolBGs[parentLevel]); p.dispatchWorkgroups(wg); p.end();
           }
         }
         for (let m = 1; m < N_LEVELS; m++) {
           if (m === 1) {
-            const p = enc.beginComputePass(); p.setPipeline(manageRefinePL); p.setBindGroup(0, manageBG); p.dispatchWorkgroups(WG_MANAGE); p.end();
+            const p = beginPass(enc, 'manage refine L1'); p.setPipeline(manageRefinePL); p.setBindGroup(0, manageBG); p.dispatchWorkgroups(WG_MANAGE); p.end();
           } else {
             const parentLevel = m - 1;
             const wg = Math.ceil(pools[parentLevel].MAX_FINE_BLOCKS / 64);
-            const p = enc.beginComputePass(); p.setPipeline(managePoolRefinePLs[parentLevel]); p.setBindGroup(0, managePoolBGs[parentLevel]); p.dispatchWorkgroups(wg); p.end();
+            const p = beginPass(enc, `manage refine L${m}`); p.setPipeline(managePoolRefinePLs[parentLevel]); p.setBindGroup(0, managePoolBGs[parentLevel]); p.dispatchWorkgroups(wg); p.end();
           }
         }
       }
@@ -1746,10 +1782,10 @@ async function init() {
       // level>=2: pool-parent init pipeline, reading readA since a
       // level's own buffer is always "current" at a macro-step boundary --
       // same invariant debugActivateBlock already relies on).
-      const init = enc.beginComputePass(); init.setPipeline(interpInitPL); init.setBindGroup(0, interpInitBG); init.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); init.end();
+      const init = beginPass(enc, 'L1 init fill'); init.setPipeline(interpInitPL); init.setBindGroup(0, interpInitBG); init.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); init.end();
       for (let m = 2; m < N_LEVELS; m++) {
         const pool = pools[m];
-        const p = enc.beginComputePass(); p.setPipeline(interpPoolParentInitPL); p.setBindGroup(0, pool.interpPoolParentBG_readA); p.dispatchWorkgroups(WGX1, WGY1, pool.MAX_FINE_BLOCKS); p.end();
+        const p = beginPass(enc, `L${m} init fill`); p.setPipeline(interpPoolParentInitPL); p.setBindGroup(0, pool.interpPoolParentBG_readA); p.dispatchWorkgroups(WGX1, WGY1, pool.MAX_FINE_BLOCKS); p.end();
       }
     }
     macroStepCounter++;
@@ -1759,19 +1795,19 @@ async function init() {
     // once per macro-step, outside the fluid recursion entirely (same as
     // AGAL's own S_ComputeForces* calls, handled alongside S_Advance, not
     // inside it).
-    const frc = enc.beginComputePass(); frc.setPipeline(frcPL); frc.setBindGroup(0, frcBG); frc.dispatchWorkgroups(WGX, WGY); frc.end();
+    const frc = beginPass(enc, 'force L0'); frc.setPipeline(frcPL); frc.setBindGroup(0, frcBG); frc.dispatchWorkgroups(WGX, WGY); frc.end();
     // Milestone 8: every level's own force contribution, all before `phy`
     // drains+resets the shared atomic forces[] buffer. Order among these
     // (and vs. frc above) doesn't matter -- each reads only its own
     // level's "current, pre-macro-step" state and independently atomicAdds
     // into forces[], the same commutativity argument as interp-vs-step at
     // the root of S_Advance.
-    const f1frc = enc.beginComputePass(); f1frc.setPipeline(force1PL); f1frc.setBindGroup(0, force1BG); f1frc.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); f1frc.end();
+    const f1frc = beginPass(enc, 'force L1'); f1frc.setPipeline(force1PL); f1frc.setBindGroup(0, force1BG); f1frc.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); f1frc.end();
     for (let c = 2; c < N_LEVELS; c++) {
       const pool = pools[c];
-      const p = enc.beginComputePass(); p.setPipeline(force1PoolPL); p.setBindGroup(0, pool.force1PoolBG); p.dispatchWorkgroups(WGX1, WGY1, pool.MAX_FINE_BLOCKS); p.end();
+      const p = beginPass(enc, `force L${c}`); p.setPipeline(force1PoolPL); p.setBindGroup(0, pool.force1PoolBG); p.dispatchWorkgroups(WGX1, WGY1, pool.MAX_FINE_BLOCKS); p.end();
     }
-    const phy = enc.beginComputePass(); phy.setPipeline(phyPL); phy.setBindGroup(0, phyBG); phy.dispatchWorkgroups(1); phy.end();
+    const phy = beginPass(enc, 'body dynamics'); phy.setPipeline(phyPL); phy.setBindGroup(0, phyBG); phy.dispatchWorkgroups(1); phy.end();
 
     S_Advance(0, enc);
 
@@ -2364,7 +2400,120 @@ async function init() {
     }));
   }
 
+  // Per-pass GPU timing for ONE macro-step. Runs the identical dispatch
+  // sequence the live loop runs (dispatchMacroStep, not a reimplementation),
+  // with `profiler` set so every beginPass() call gets its own timestamp
+  // pair, then resolves and returns {label, ms} in dispatch order. This is
+  // the measurement that makes dispatch tuning falsifiable: it attributes
+  // frame time to individual passes rather than leaving it as one number.
+  //
+  // `reps` runs the macro-step several times and returns the MEDIAN per
+  // label -- a single macro-step is short enough that one sample is mostly
+  // scheduling noise. Passes that only appear on refine steps (criterion /
+  // manage / init fill, every REFINE_EVERY steps) will be present in some
+  // reps and absent in others; each label reports its own sample count.
+  async function debugProfileMacroStep(reps = 8) {
+    if (!hasTimestamp) {
+      throw new Error('debugProfileMacroStep: adapter lacks the timestamp-query feature -- no GPU timing available on this device');
+    }
+    const readBuf = device.createBuffer({ size: QUERY_CAP * 8, usage: U.MAP_READ | U.COPY_DST });
+    const byLabel = new Map();
+    for (let r = 0; r < reps; r++) {
+      profiler = { cap: QUERY_CAP, next: 2, labels: [] }; // 0/1 reserved for the frame span
+      const enc = device.createCommandEncoder();
+      dispatchMacroStep(enc);
+      const used = profiler.next;
+      enc.resolveQuerySet(querySet, 0, used, queryResolveBuffer, 0);
+      enc.copyBufferToBuffer(queryResolveBuffer, 0, readBuf, 0, used * 8);
+      device.queue.submit([enc.finish()]);
+      await device.queue.onSubmittedWorkDone();
+      await readBuf.mapAsync(GPUMapMode.READ);
+      const ts = new BigUint64Array(readBuf.getMappedRange()).slice();
+      readBuf.unmap();
+      for (const { label, i } of profiler.labels) {
+        const ms = Number(ts[i + 1] - ts[i]) / 1e6;
+        if (!Number.isFinite(ms) || ms < 0) continue; // a disjoint query reads back as 0/garbage
+        if (!byLabel.has(label)) byLabel.set(label, []);
+        byLabel.get(label).push(ms);
+      }
+      profiler = null;
+    }
+    readBuf.destroy();
+    const out = [];
+    let total = 0;
+    for (const [label, xs] of byLabel) {
+      xs.sort((a, b) => a - b);
+      const med = xs[Math.floor(xs.length / 2)];
+      out.push({ label, ms: med, samples: xs.length });
+      total += med;
+    }
+    return { passes: out, totalMs: total, reps };
+  }
+
+  // ── Telemetry back channel (opt-in: ?telemetry=1) ────────────────────────
+  // A device that is not the dev machine -- a phone on the LAN -- has no CDP
+  // endpoint to attach to, so its performance is otherwise unobservable, and
+  // "realtime on desktop AND mobile" is a stated goal of this project. With
+  // ?telemetry=1 the page POSTs a periodic sample to the dev server's
+  // /_telemetry endpoint (see https.py), which appends it to telemetry.log.
+  //
+  // Off unless explicitly requested, same-origin only, and local-only: the
+  // dev server writes a plain file next to the page and forwards nothing.
+  // Failures are swallowed -- a page serving from anywhere without the
+  // endpoint (GitHub Pages, say) must not break because a beacon 404s.
+  const TELEMETRY = urlParams.get('telemetry') === '1';
+  const TELEMETRY_EVERY_MS = 5000;
+  let telemetryLast = 0;
+  let telemetryInfo = null;
+  async function telemetrySample(gpuMs, syncMs, stepNow) {
+    if (!TELEMETRY) return;
+    const now = performance.now();
+    if (now - telemetryLast < TELEMETRY_EVERY_MS) return;
+    telemetryLast = now;
+    if (!telemetryInfo) {
+      let adapterInfo = {};
+      try {
+        const ai = adapter.info || (adapter.requestAdapterInfo ? await adapter.requestAdapterInfo() : {});
+        adapterInfo = { vendor: ai.vendor, architecture: ai.architecture, device: ai.device, description: ai.description };
+      } catch { /* adapter info is optional and gated on some browsers */ }
+      telemetryInfo = {
+        page: 'index-amr.html',
+        ua: navigator.userAgent,
+        dpr: window.devicePixelRatio,
+        screen: `${window.screen.width}x${window.screen.height}`,
+        adapter: adapterInfo,
+        hasTimestamp,
+        config: {
+          res: resLog2, W, levels: N_LEVELS, blockage: BLOCKAGE, aspect: ASPECT,
+          re: RE, tau: TAU, maxFineBlocks: MAX_FINE_BLOCKS,
+          forceRefineMargin: FORCE_REFINE_MARGIN, refineThresh: REFINE_THRESH,
+          stepsPerFrame: STEPS_PER_FRAME,
+        },
+      };
+    }
+    // Active fine-block counts per level, read from the CPU-visible free
+    // count rather than a GPU readback -- a readback here would stall the
+    // very frame loop being measured.
+    const body = {
+      ...telemetryInfo,
+      t: new Date().toISOString(),
+      step: stepNow,
+      gpuMs: Number.isFinite(gpuMs) ? +gpuMs.toFixed(3) : null,
+      syncMs: Number.isFinite(syncMs) ? +syncMs.toFixed(3) : null,
+      // L0-cell throughput only -- see the mlups comment in the frame loop.
+      l0Mlups: gpuMs > 0 ? +((NCELLS * STEPS_PER_FRAME) / (gpuMs * 1e3)).toFixed(1) : null,
+    };
+    try {
+      await fetch('/_telemetry', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body), keepalive: true,
+      });
+    } catch { /* no endpoint (static hosting) -- telemetry is best-effort */ }
+  }
+
   window.__AMR = {
+    hasTimestamp: () => hasTimestamp,
+    debugProfileMacroStep,
     setLive: (v) => { liveMode = !!v; },
     isLive: () => liveMode,
     reset: resetSim,
@@ -2415,15 +2564,20 @@ async function init() {
       device.pushErrorScope('validation');
       const enc = device.createCommandEncoder();
 
+      // Whole-frame GPU span. A compute pass may carry timestampWrites
+      // without dispatching anything, so an empty pass at each end brackets
+      // the frame's real work without touching dispatchMacroStep.
       if (hasTimestamp) {
-        // enc.writeTimestamp(querySet, 0);
+        const t0 = enc.beginComputePass({ timestampWrites: { querySet, beginningOfPassWriteIndex: 0 } });
+        t0.end();
       }
 
       for (let s = 0; s < STEPS_PER_FRAME; s++) dispatchMacroStep(enc);
       step += STEPS_PER_FRAME;
 
       if (hasTimestamp) {
-        // enc.writeTimestamp(querySet, 1);
+        const t1 = enc.beginComputePass({ timestampWrites: { querySet, endOfPassWriteIndex: 1 } });
+        t1.end();
         enc.resolveQuerySet(querySet, 0, 2, queryResolveBuffer, 0);
         enc.copyBufferToBuffer(queryResolveBuffer, 0, stage.query, 0, 16);
       }
@@ -2461,10 +2615,15 @@ async function init() {
         }
 
         if (performance.now() - lastT > 250) {
+          // L0 cells only -- it deliberately ignores every fine level, so it
+          // is a coarse-grid-throughput figure, NOT total work done, and is
+          // not comparable across level counts. tools/bench-amr.js computes
+          // the honest cell-updates/s using live per-level active counts.
           const mlups = (NCELLS * STEPS_PER_FRAME) / (gpuTime * 1e3);
           mlupsEl.textContent = mlups.toFixed(1);
           gpuMsEl.textContent = gpuTime.toFixed(2);
           syncMsEl.textContent = (performance.now() - tSubmit).toFixed(2);
+          telemetrySample(gpuTime, performance.now() - tSubmit, st.step);
           statusEl.textContent = `[AMR-dev] step ${st.step}  y=${d[20].toFixed(1)}  x=${d[21].toFixed(1)}  vy=${d[4].toFixed(4)}  Fy=${d[7].toExponential(2)}  θ=${d[2].toFixed(2)}`;
           lastT = performance.now();
         }
