@@ -58,7 +58,15 @@ const NCELLS1 = FB * FB; // cells per pool slot
 // means sharper vorticity gradients per unit length, so wake demand should
 // go up, not down) -- while still costing less fine-pool memory (~4.0 MiB)
 // than the coarse grid's own buffers (~5.24 MiB at the default W=256).
-const MAX_FINE_BLOCKS = urlParams.has('maxFineBlocks') ? parseInt(urlParams.get('maxFineBlocks')) : 128;
+// RAISED 128 -> 256 together with the REFINE_THRESH retune above, and the
+// two must move together: at -9/-10 the measured L1 demand over 84k steps
+// was min 95 / median 112 / MAX 168, so leaving the cap at 128 would put the
+// pool into permanent exhaustion. That failure is not graceful -- blocks are
+// granted in blockID order, so the free list runs dry part-way through a row
+// and the denied blocks form horizontal BANDS across the refined region (see
+// the same failure diagnosed at 256^2 in the SDF commit). 256 gives ~1.5x
+// headroom over the measured peak.
+const MAX_FINE_BLOCKS = urlParams.has('maxFineBlocks') ? parseInt(urlParams.get('maxFineBlocks')) : 256;
 const NBX = W / BLOCK, NBY = H / BLOCK, NBLOCKS = NBX * NBY; // coarse block grid
 
 // ── Milestone 5 (plans/AMR-multilevel.md, plans/AMR-multilevel-M5.md):
@@ -81,8 +89,44 @@ if (N_LEVELS < 2) throw new Error(`?levels=${N_LEVELS} invalid -- must be >= 2 (
 // retune as later milestones (larger domains, different A/B/tau) shift the
 // sim's operating range.
 const REFINE_EVERY = urlParams.has('refineEvery') ? parseInt(urlParams.get('refineEvery')) : 16;
-const REFINE_THRESH = urlParams.has('refineThresh') ? parseFloat(urlParams.get('refineThresh')) : -6;
-const COARSEN_THRESH = urlParams.has('coarsenThresh') ? parseFloat(urlParams.get('coarsenThresh')) : -7;
+// Vorticity refinement thresholds, log2|omega| per L0 block (see
+// amr_criterion.wgsl, which reduces max|omega| per block, and
+// amr_manage.wgsl's epsFor which does the comparison).
+//
+// RETUNED from -6/-7, which was leaving most of the shed wake unrefined.
+// Measured on one frozen flow state at res=8 levels=3, blockage=3.3
+// (1024 L0 blocks, domain max |omega| per block = 2.76e-2):
+//
+//   thresh   |omega| >=   blocks selected   % of wake (|omega|>=1e-3) covered
+//     -6       1.56e-2         14                    7%
+//     -7       7.81e-3         59                   29%
+//     -8       3.91e-3         91                   45%
+//     -9       1.95e-3        153                   76%
+//    -10       9.77e-4        202                  100%
+//
+// At -6 the bar sat at 57% of the DOMAIN MAXIMUM: only blocks carrying more
+// than half the peak vorticity anywhere got refined, which in practice meant
+// the body's immediate surroundings and nothing else. 68 of the 77 refined
+// blocks were coming from geometry forcing (isNearBody), not from this
+// criterion at all. A vortex shed from the card stayed refined only while
+// inside the body's geometric halo; once it convected out it dropped to L0
+// and dissipated, so a trail that is evenly spaced on the dense solver came
+// out of the AMR build with vortices MISSING -- the reported symptom.
+//
+// -9 covers 76% of vorticity-bearing blocks. -10 covers 100% but refines
+// ~20% of the whole domain, which starts giving back the point of AMR;
+// available via ?refineThresh=-10&coarsenThresh=-11 if fidelity matters more
+// than cost for a given run.
+//
+// CAVEAT worth knowing before re-tuning: an absolute threshold is
+// structurally fragile here. The domain peak |omega| was measured swinging
+// 2.4x (2.4e-2 .. 5.8e-2) across runs at identical nominal physics, purely
+// from where the card is in its tumble, so no single constant is right at
+// all phases. A criterion relative to the current domain maximum would be
+// scale- and phase-free; that is a design change to the refinement
+// machinery, not a retune, and has not been attempted.
+const REFINE_THRESH = urlParams.has('refineThresh') ? parseFloat(urlParams.get('refineThresh')) : -9;
+const COARSEN_THRESH = urlParams.has('coarsenThresh') ? parseFloat(urlParams.get('coarsenThresh')) : -10;
 
 // Geometry-forced refinement (see amr_manage.wgsl's isNearBody): blocks near
 // the card's SDF -- now or FORCE_REFINE_LOOKAHEAD macro-steps from now, by
@@ -584,7 +628,11 @@ async function init() {
     for (let m = 1; m < N_LEVELS; m++) {
       const maxFineBlocks = m === 1
         ? MAX_FINE_BLOCKS // unchanged param/default -- level 1 is byte-identical to today
-        : (urlParams.has(`maxFineBlocks${m}`) ? parseInt(urlParams.get(`maxFineBlocks${m}`)) : 128);
+        // 256, not 128: measured L2 demand at the retuned thresholds peaked
+        // at 136 over 84k steps, and at res=8 levels=3 the old 128 default
+        // saturated outright (128/128 active). See MAX_FINE_BLOCKS above for
+        // why exhaustion here shows up as horizontal bands.
+        : (urlParams.has(`maxFineBlocks${m}`) ? parseInt(urlParams.get(`maxFineBlocks${m}`)) : 256);
       const pool = allocLevelPool(device, U, m, curNBX, curNBY, maxFineBlocks);
       device.queue.writeBuffer(pool.finePoolF_a, 0, initFPool(maxFineBlocks));
       pools.push(pool);
