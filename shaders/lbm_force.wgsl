@@ -9,7 +9,9 @@
 
 override W : u32;
 override H : u32;
-const FSCALE = 10000f;
+// FSCALE: see shaders/amr_force1_pool.wgsl's FSCALE comment for why this
+// is 1e7 and not 1e4 (per-workgroup truncation in the atomic reduction).
+const FSCALE = 10000000f;
 
 // Optional: sharp momentum-exchange bounce-back force instead of
 // integrating the diffuse penalty force -- must match lbm_step.wgsl's own

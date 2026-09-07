@@ -8,7 +8,7 @@
 
 override W : u32;
 override H : u32;
-const FSCALE = 10000.0f;
+const FSCALE = 10000000.0f;
 
 // KINEMATIC ("reentry") mode: main-reentry-amr.js's own scenario, decoupling
 // the body's motion from fluid force feedback entirely -- vx/vy/omega are

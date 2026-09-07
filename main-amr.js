@@ -180,7 +180,7 @@ function tauAtLevel(m) {
   return tauAtLevelOf(TAU, m);
 }
 
-const FSCALE  = 1e4;
+const FSCALE  = 1e7;
 
 const EX = [0, 1, 0,-1, 0, 1,-1,-1, 1];
 const EY = [0, 0, 1, 0,-1, 1, 1,-1,-1];

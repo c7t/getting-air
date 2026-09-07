@@ -52,7 +52,7 @@ recalculate();
 // Used to convert floating-point forces/torques to integers for the GPU atomics.
 // Must be large enough for precision (1e4 = 0.0001 precision) but small enough
 // to avoid 32-bit integer overflow when summing 1000s of cells.
-const FSCALE  = 1e4;
+const FSCALE  = 1e7;
 
 const EX = [0, 1, 0,-1, 0, 1,-1,-1, 1];
 const EY = [0, 0, 1, 0,-1, 1, 1,-1,-1];

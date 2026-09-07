@@ -25,7 +25,9 @@
 
 override W : u32;
 override H : u32;
-const FSCALE = 10000f;
+// FSCALE: see shaders/amr_force1_pool.wgsl's FSCALE comment for why this
+// is 1e7 and not 1e4 (per-workgroup truncation in the atomic reduction).
+const FSCALE = 10000000f;
 const BLOCK = 8u;
 
 // Optional sharp momentum-exchange bounce-back force -- mirrors
@@ -50,7 +52,8 @@ fn get_chi(phi: f32) -> f32 {
 // Sanitize NaN to 0 and clamp to the representable fixed-point range so the
 // float->i32 conversion feeding the force atomics is always well-defined
 // (WGSL leaves out-of-range and NaN float->i32 conversion implementation-
-// defined). FSCALE=10000 and i32 max ~2.1e9, so +/-2e9 bounds |force| < 2e5.
+// defined). FSCALE=1e7 and i32 max ~2.1e9, so +/-2e9 bounds |force| < 200
+// -- still ~1000x the largest force either scenario produces.
 fn safeFixed(x: f32) -> i32 {
     let s = select(x, 0.0f, x != x);
     return i32(clamp(s, -2.0e9f, 2.0e9f));
