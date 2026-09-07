@@ -1626,13 +1626,13 @@ async function init() {
       const stepBG = useB ? stepBG_ba : stepBG_ab;
       if (hasChild) {
         const readBG = useB ? interpBG_readB : interpBG_readA;
-        const p = beginPass(enc, 'L0->L1 interp'); p.setPipeline(interpPL); p.setBindGroup(0, readBG); p.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); p.end();
+        if (!skipGroup('interp')) { const p = beginPass(enc, 'L0->L1 interp'); p.setPipeline(interpPL); p.setBindGroup(0, readBG); p.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); p.end(); }
       }
       const s = beginPass(enc, 'L0 step'); s.setPipeline(stepPL); s.setBindGroup(0, stepBG); s.dispatchWorkgroups(WGX, WGY); s.end();
       if (hasChild) {
         S_Advance(1, enc);
         const avgBG = useB ? avgBG_targetA : avgBG_targetB;
-        const a = beginPass(enc, 'L1->L0 average'); a.setPipeline(avgPL); a.setBindGroup(0, avgBG); a.dispatchWorkgroups(1, 1, MAX_FINE_BLOCKS); a.end();
+        if (!skipGroup('avg')) { const a = beginPass(enc, 'L1->L0 average'); a.setPipeline(avgPL); a.setBindGroup(0, avgBG); a.dispatchWorkgroups(1, 1, MAX_FINE_BLOCKS); a.end(); }
       }
       return;
     }
@@ -1645,28 +1645,28 @@ async function init() {
       if (!hasChild) return;
       const childPool = pools[level + 1];
       const bg = readCur === 'a' ? childPool.interpPoolParentBG_readA : childPool.interpPoolParentBG_readB;
-      const p = beginPass(enc, `L${level}->L${level+1} interp`); p.setPipeline(interpPoolParentPL); p.setBindGroup(0, bg); p.dispatchWorkgroups(WGX1, WGY1, childPool.MAX_FINE_BLOCKS); p.end();
+      if (skipGroup('interp')) return; const p = beginPass(enc, `L${level}->L${level+1} interp`); p.setPipeline(interpPoolParentPL); p.setBindGroup(0, bg); p.dispatchWorkgroups(WGX1, WGY1, childPool.MAX_FINE_BLOCKS); p.end();
     };
     const averageFromChild = (writeCur) => {
       if (!hasChild) return;
       const childPool = pools[level + 1];
       const bg = writeCur === 'a' ? childPool.avgPoolBG_targetA : childPool.avgPoolBG_targetB;
-      const p = beginPass(enc, `L${level+1}->L${level} average`); p.setPipeline(avgPoolPL); p.setBindGroup(0, bg); p.dispatchWorkgroups(1, 1, childPool.MAX_FINE_BLOCKS); p.end();
+      if (skipGroup('avg')) return; const p = beginPass(enc, `L${level+1}->L${level} average`); p.setPipeline(avgPoolPL); p.setBindGroup(0, bg); p.dispatchWorkgroups(1, 1, childPool.MAX_FINE_BLOCKS); p.end();
     };
     const substep = (readCur) => {
       if (isL1) {
         const bg = readCur === 'a' ? step1BG_ab : step1BG_ba;
-        const p = beginPass(enc, 'L1 step'); p.setPipeline(step1PL); p.setBindGroup(0, bg); p.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); p.end();
+        if (skipGroup('step1')) return; const p = beginPass(enc, 'L1 step'); p.setPipeline(step1PL); p.setBindGroup(0, bg); p.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); p.end();
       } else {
         const bg = readCur === 'a' ? pool.step1PoolBG_ab : pool.step1PoolBG_ba;
-        const p = beginPass(enc, `L${level} step`); p.setPipeline(step1PoolPL); p.setBindGroup(0, bg); p.dispatchWorkgroups(WGX1, WGY1, pool.MAX_FINE_BLOCKS); p.end();
+        if (skipGroup('step1')) return; const p = beginPass(enc, `L${level} step`); p.setPipeline(step1PoolPL); p.setBindGroup(0, bg); p.dispatchWorkgroups(WGX1, WGY1, pool.MAX_FINE_BLOCKS); p.end();
       }
     };
     const fineFineRefresh = () => {
       if (isL1) {
-        const p = beginPass(enc, 'L1 fine-fine ghost'); p.setPipeline(interpFFPL); p.setBindGroup(0, interpFFBG_b); p.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); p.end();
+        if (skipGroup('ghost')) return; const p = beginPass(enc, 'L1 fine-fine ghost'); p.setPipeline(interpFFPL); p.setBindGroup(0, interpFFBG_b); p.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); p.end();
       } else {
-        const p = beginPass(enc, `L${level} fine-fine ghost`); p.setPipeline(interpPoolParentFFPL); p.setBindGroup(0, pool.interpPoolParentFFBG_b); p.dispatchWorkgroups(WGX1, WGY1, pool.MAX_FINE_BLOCKS); p.end();
+        if (skipGroup('ghost')) return; const p = beginPass(enc, `L${level} fine-fine ghost`); p.setPipeline(interpPoolParentFFPL); p.setBindGroup(0, pool.interpPoolParentFFBG_b); p.dispatchWorkgroups(WGX1, WGY1, pool.MAX_FINE_BLOCKS); p.end();
       }
     };
 
@@ -1699,6 +1699,22 @@ async function init() {
   // Timestamps come from the pass DESCRIPTOR (timestampWrites), not from
   // encoder.writeTimestamp() -- that entry point was removed from WebGPU and
   // is why timing was disabled here in the first place.
+  // ── Pass-group skipping, for cost attribution on coarse-timer devices ────
+  // The per-pass timestamp profile is useless on hardware whose timestamp
+  // counter is coarse: the target PowerVR part ticks at 65536 ns, so a
+  // ~1125us macro-step is only ~17 ticks spread across 9-12 passes and every
+  // per-pass reading lands in a 1-8 tick bucket. (Confirmed: every value it
+  // reports is an exact integer multiple of 65536 ns.) Frame time, at ~1100
+  // ticks, is quantised by ~0.1% and is fine.
+  //
+  // So attribute at FRAME scale instead: skip a group of passes, measure the
+  // change in frame GPU time, and the difference is that group's real cost.
+  // ?benchSkip=force,ghost etc. This is a MEASUREMENT MODE -- skipping
+  // passes makes the physics wrong by construction. It exists to answer
+  // "what does this group cost", nothing else.
+  const benchSkip = new Set((urlParams.get('benchSkip') || '').split(',').filter(Boolean));
+  function skipGroup(g) { return benchSkip.has(g); }
+
   let profiler = null;
   function beginPass(enc, label) {
     if (profiler && profiler.next + 2 <= profiler.cap) {
@@ -1795,19 +1811,19 @@ async function init() {
     // once per macro-step, outside the fluid recursion entirely (same as
     // AGAL's own S_ComputeForces* calls, handled alongside S_Advance, not
     // inside it).
-    const frc = beginPass(enc, 'force L0'); frc.setPipeline(frcPL); frc.setBindGroup(0, frcBG); frc.dispatchWorkgroups(WGX, WGY); frc.end();
+    if (!skipGroup('force')) { const frc = beginPass(enc, 'force L0'); frc.setPipeline(frcPL); frc.setBindGroup(0, frcBG); frc.dispatchWorkgroups(WGX, WGY); frc.end(); }
     // Milestone 8: every level's own force contribution, all before `phy`
     // drains+resets the shared atomic forces[] buffer. Order among these
     // (and vs. frc above) doesn't matter -- each reads only its own
     // level's "current, pre-macro-step" state and independently atomicAdds
     // into forces[], the same commutativity argument as interp-vs-step at
     // the root of S_Advance.
-    const f1frc = beginPass(enc, 'force L1'); f1frc.setPipeline(force1PL); f1frc.setBindGroup(0, force1BG); f1frc.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); f1frc.end();
+    if (!skipGroup('force')) { const f1frc = beginPass(enc, 'force L1'); f1frc.setPipeline(force1PL); f1frc.setBindGroup(0, force1BG); f1frc.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); f1frc.end(); }
     for (let c = 2; c < N_LEVELS; c++) {
       const pool = pools[c];
-      const p = beginPass(enc, `force L${c}`); p.setPipeline(force1PoolPL); p.setBindGroup(0, pool.force1PoolBG); p.dispatchWorkgroups(WGX1, WGY1, pool.MAX_FINE_BLOCKS); p.end();
+      if (!skipGroup('force')) { const p = beginPass(enc, `force L${c}`); p.setPipeline(force1PoolPL); p.setBindGroup(0, pool.force1PoolBG); p.dispatchWorkgroups(WGX1, WGY1, pool.MAX_FINE_BLOCKS); p.end(); }
     }
-    const phy = beginPass(enc, 'body dynamics'); phy.setPipeline(phyPL); phy.setBindGroup(0, phyBG); phy.dispatchWorkgroups(1); phy.end();
+    if (!skipGroup('phy')) { const phy = beginPass(enc, 'body dynamics'); phy.setPipeline(phyPL); phy.setBindGroup(0, phyBG); phy.dispatchWorkgroups(1); phy.end(); }
 
     S_Advance(0, enc);
 
@@ -2517,6 +2533,15 @@ async function init() {
       // L0-cell throughput only -- see the mlups comment in the frame loop.
       l0Mlups: gpuMs > 0 ? +((NCELLS * STEPS_PER_FRAME) / (gpuMs * 1e3)).toFixed(1) : null,
     };
+    if (BENCH && !benchDone && !benchRunning) {
+      benchRunning = true;
+      try {
+        body.bench = await runBenchSweep();
+        benchDone = true;
+        statusEl.textContent = '[AMR-dev] benchmark sweep complete -- results sent';
+      } catch (e) { body.benchError = String(e && e.message || e); benchDone = true; }
+      finally { benchRunning = false; }
+    }
     if (TELEMETRY_PROFILE && hasTimestamp && now - telemetryProfileLast > TELEMETRY_PROFILE_EVERY_MS) {
       telemetryProfileLast = now;
       // Pause stepping across the profile. Timestamps taken while the frame
@@ -2548,7 +2573,60 @@ async function init() {
     } catch { /* no endpoint (static hosting) -- telemetry is best-effort */ }
   }
 
+  // ── On-device benchmark sweep (?bench=1) ─────────────────────────────────
+  // Frame-scale differential attribution, which is the only kind that works
+  // on a coarse-timestamp device (see the benchSkip comment above). Runs a
+  // sequence of pass-skip configurations, measuring median frame GPU time
+  // for each, then POSTs one summary. Difference from the 'none' baseline is
+  // that group's cost.
+  //
+  // Refinement is FROZEN for the duration (setAutoRefine(false)) so every
+  // configuration sees the same block topology -- otherwise skipping the
+  // criterion pass would change the active block count and the comparison
+  // would be measuring two different simulations.
+  //
+  // The physics is deliberately wrong while this runs. It is a stopwatch,
+  // not a simulation.
+  const BENCH = urlParams.get('bench') === '1';
+  const BENCH_CONFIGS = ['none', 'force', 'phy', 'force+phy', 'interp', 'avg', 'ghost', 'step1', 'interp+avg+ghost'];
+  async function runBenchSweep() {
+    const wasAuto = autoRefine;
+    await setAutoRefine(false);
+    const activeByLevel = {};
+    for (let m = 1; m < N_LEVELS; m++) {
+      try { activeByLevel[m] = (await debugListActiveBlocks(m)).length; } catch { /* best-effort */ }
+    }
+    const results = [];
+    for (const cfg of BENCH_CONFIGS) {
+      benchSkip.clear();
+      if (cfg !== 'none') for (const g of cfg.split('+')) benchSkip.add(g);
+      benchSamples = [];
+      benchCollecting = true;
+      // ~40 frames of settling then ~40 of measurement, paced by the frame loop.
+      await new Promise(r => setTimeout(r, 3000));
+      benchSamples = [];
+      await new Promise(r => setTimeout(r, 5000));
+      benchCollecting = false;
+      const xs = benchSamples.slice().sort((a, b) => a - b);
+      results.push({ cfg, n: xs.length, medianGpuMs: xs.length ? +xs[Math.floor(xs.length / 2)].toFixed(3) : null });
+    }
+    benchSkip.clear();
+    if (wasAuto) await setAutoRefine(true);
+    const base = results.find(r => r.cfg === 'none');
+    for (const r of results) {
+      r.deltaMs = (base && base.medianGpuMs != null && r.medianGpuMs != null)
+        ? +(base.medianGpuMs - r.medianGpuMs).toFixed(3) : null;
+      r.sharePct = (base && base.medianGpuMs) ? +((r.deltaMs / base.medianGpuMs) * 100).toFixed(1) : null;
+    }
+    return { activeByLevel, results };
+  }
+  let benchSamples = [];
+  let benchCollecting = false;
+  let benchRunning = false;
+  let benchDone = false;
+
   window.__AMR = {
+    runBenchSweep,
     hasTimestamp: () => hasTimestamp,
     debugProfileMacroStep,
     setLive: (v) => { liveMode = !!v; },
@@ -2664,6 +2742,11 @@ async function init() {
           statusEl.textContent = `[AMR-dev] step ${st.step}  y=${d[20].toFixed(1)}  x=${d[21].toFixed(1)}  vy=${d[4].toFixed(4)}  Fy=${d[7].toExponential(2)}  θ=${d[2].toFixed(2)}`;
           lastT = performance.now();
         }
+
+        // The bench sweep samples EVERY frame, not the 250ms-throttled ones
+        // the overlay uses -- it needs a real sample population per
+        // configuration, not four readings.
+        if (benchCollecting && Number.isFinite(gpuTime) && gpuTime > 0) benchSamples.push(gpuTime);
 
         st.card.unmap();
         st.inFlight = false;
