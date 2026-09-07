@@ -14,6 +14,11 @@ step** — the source *is* the artifact; GitHub Pages serves it directly.
 ## Validate before committing (no GPU needed)
 Run `make check` and make it pass before committing shader/JS changes:
 - `make js` — `node --check` every `*.js` (needs Node).
+- `make test` — the GPU-free unit tests (`tools/test-*.js`): the shared
+  card/regime parameterization, the AMR field reconstructor, and the
+  dense→AMR injector. Add a `tools/test-<name>.js` and it is picked up
+  automatically; each must run with no server/browser/GPU and exit nonzero
+  on failure.
 - `make wgsl` — validate every `shaders/*.wgsl` with `naga` (needs `naga`;
   `make tools` installs it via cargo/Rust). If `naga` is absent, `make check`
   still runs the JS checks and skips WGSL with a note.
@@ -77,11 +82,38 @@ invariants the AMR machinery depends on:
   currently-open finding worth reading before trusting a run.
       node tools/validate-amr-vs-dense.js --res=10 --levels=2,3 --re=20,40
       node tools/validate-amr-vs-dense.js --res=8 --levels=2 --re=20 --mode=fullrefine
+- **`tools/validate-divergence.js`** — standalone/opt-in. Runs the dense
+  reference and AMR forward from **one shared initial state** (seeded via
+  `tools/lib/dense-to-amr.js`, which overwrites a real AMR snapshot's field
+  data with the dense solver's and hands it to `debugSnapshotLoad`) and
+  reports how, where and how fast they diverge. Exists because comparing two
+  *independently-timed* runs is meaningless once the flow sheds — two correct
+  periodic solutions at uncorrelated phase disagree enormously (see
+  `plans/AMR-vs-dense-validation.md`'s Finding #3). Seeding both legs
+  removes phase from the comparison. Read the SHAPE, not the magnitude:
+  nonzero at step 0 is injection, a high `edge` column is a ghost/seam bug,
+  a high `half` column is the tile-registration class, the per-level error
+  share catches per-level tau/force, and low concentration means ordinary
+  truncation error. Always run `--mode=both` (the default): `fullrefine` has
+  no coarse/fine interface, so it is the noise floor, and the ratio to
+  `adaptive` is the interface error. Reports, does not PASS/FAIL — there is
+  no literature value for how fast two discretizations should diverge.
+      node tools/validate-divergence.js --res=9 --levels=3 --re=20
+      node tools/validate-divergence.js --diffuse --saveSnapshots=/tmp/div
+  A `fullrefine` seeding error must be exactly zero (the finest level maps
+  1:1 onto the dense grid, so injection is an exact copy); the tool warns if
+  it is not, and that means the injection/reconstruction path is at fault,
+  not the solver.
 - Shared analysis code lives in `tools/lib/` (`cylinder-metrics.js`,
   `amr-invariants.js`, `field-reconstruct.js`, `amr-resolution-mapping.js`,
-  `amr-cost.js`, `browser-lifecycle.js`) — both the leaf tools and
-  `validate-all.js`/`validate-amr-vs-dense.js` call the same logic, not
-  independently-drifting copies.
+  `amr-cost.js`, `browser-lifecycle.js`, `dense-to-amr.js`) — both the leaf
+  tools and `validate-all.js`/`validate-amr-vs-dense.js`/
+  `validate-divergence.js` call the same logic, not independently-drifting
+  copies. `dense-to-amr.js` (dense snapshot → AMR hierarchy) and
+  `field-reconstruct.js`'s `reconstructAMRToResolution` (AMR → uniform grid)
+  are inverses of each other by construction — they walk the same quadtree
+  recursion — which is what lets `tools/test-dense-to-amr.js` validate the
+  injector by round-trip instead of by eye.
 
 Current known-issue state (e.g. which `?levels=N` combinations are physics-
 validated) drifts with active work — see `main-cylinder-amr.js`'s own
