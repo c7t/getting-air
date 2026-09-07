@@ -18,20 +18,32 @@
 //    force there would double-count against whichever cell actually OWNS
 //    that physical point. Only isInterior cells contribute.
 //
-// 2. Area weighting. Fx/Fy here are a per-CELL momentum exchange, not
-//    normalized by cell size -- summing raw per-cell values unweighted
-//    across levels would make a refined region report ~4x the coarse
-//    level's total force per doubling of resolution (a 2x2 patch of fine
-//    cells replacing 1 coarse cell, each of comparable magnitude, summed
-//    without correction). To integrate to the SAME total regardless of
-//    which level currently owns a region (the exact invariance this
-//    milestone's own validation checks), each level's contribution must be
-//    weighted by its own dx_L^2 relative to L0's dx_L0=1. L1's dx is a
-//    fixed 0.5 (footprint-preserving with L0, same reasoning as
-//    amr_step1.wgsl's literal epsilon), so AREA_WEIGHT=0.25 is a literal
-//    here, not a runtime lookup (contrast amr_force1_pool.wgsl, whose
-//    shared pipeline serves multiple levels and needs it from
-//    levelParams.dxL instead).
+// 2. Cross-level weighting. Fx/Fy here are a per-CELL momentum exchange,
+//    not normalized by cell size or by this level's own timestep, so a
+//    raw unweighted sum would not integrate to the same total regardless
+//    of which level owns a region (the exact invariance Milestone 8's own
+//    validation checks). The weight is dx_L^1, and BOTH factors matter:
+//
+//      cell mass  ~ rho * dx_L^2   (2D volume measure)
+//      timestep     dt_L = dx_L    (acoustic scaling: dx and dt halve together)
+//      force = mass * du / dt   ->  dx_L^2 / dx_L  =  dx_L
+//
+//    An earlier version used dx_L^2, applying only the volume measure and
+//    silently dropping the 1/dt_L factor -- level L runs 2^L substeps per
+//    L0 macro-step, but this pass runs ONCE per macro-step and reads one
+//    substep's momentum exchange, so the missing factor is exactly 2^L =
+//    1/dx_L. Measured on the cylinder harness at Re=100: that bug cost 2x
+//    at L1 and 4x at L2 (Cd 0.943 -> 1.430 at N=2, and the N=3 case went
+//    from unusable to inside the literature band). This is the same dx^1
+//    the bounce-back branch below already used -- for the same reason, not
+//    (as its old comment claimed) because one is a perimeter integral and
+//    the other a volume integral: the mass and timestep factors combine to
+//    dx^1 either way.
+//
+//    L1's dx is a fixed 0.5 (footprint-preserving with L0, same reasoning
+//    as amr_step1.wgsl's literal epsilon), so this is a literal here, not
+//    a runtime lookup (contrast amr_force1_pool.wgsl, whose shared
+//    pipeline serves multiple levels and needs it from levelParams.dxL).
 //
 // Finest-wins masking (see amr_force.wgsl's header for the general
 // rationale): whether THIS tile is superseded by an active level-2 child
@@ -60,15 +72,17 @@ override HAS_CHILD : u32 = 0u;
 override USE_BOUNCEBACK : u32 = 0u;
 const GHOST = 2u;
 const BLOCK = 8u;
-const FSCALE = 10000f;
+// FSCALE: see shaders/amr_force1_pool.wgsl's FSCALE comment for why this
+// is 1e7 and not 1e4 (per-workgroup truncation in the atomic reduction).
+const FSCALE = 10000000f;
 const K_EPS = 1.5f;
-const AREA_WEIGHT = 0.25f; // dx_L1^2 = 0.5^2 -- see header
+const AREA_WEIGHT = 0.5f; // dx_L1^1 -- see header point 2
 // Bounce-back's MEM sum is a PERIMETER (line) integral over boundary
 // links, not the diffuse method's VOLUME integral over penalized cells --
 // a finer grid has MORE boundary links along the SAME physical perimeter
 // (density ~ 1/dx), but each link's own population-based contribution
 // doesn't shrink with dx the way a volume-density penalty force does, so
-// the cross-level correction is dx^1 here, not AREA_WEIGHT's dx^2.
+// dx^1, the same weight AREA_WEIGHT now carries -- see header point 2.
 // Live-verified: dx^2 gave Cd=0.631 (target 1.35) on the N=2 (L1-only)
 // cylinder case; dx^1 gives Cd=1.262, matching within tolerance.
 const LINE_WEIGHT = 0.5f; // dx_L1 -- see above

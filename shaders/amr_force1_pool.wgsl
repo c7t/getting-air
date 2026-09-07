@@ -48,7 +48,19 @@ override W : u32;
 override H : u32;
 override RB : u32;
 const GHOST = 2u;
-const FSCALE = 10000f;
+// FSCALE: fixed-point scale for the atomic force accumulation. Raised from
+// 1e4 to 1e7 because the reduction below atomicAdds ONE TRUNCATED i32 PER
+// WORKGROUP (safeFixed's i32() cast truncates toward zero), so any workgroup
+// whose partial sum falls below one fixed-point unit contributes exactly
+// zero -- a systematic, one-directional loss, not rounding noise. Per-cell
+// contributions shrink with the level's own dx weight, so deeper levels hit
+// that floor hardest: measured on the cylinder harness at Re=100, at 1e4 the
+// truncation cost ~10% of the force at L1 and ~32% at L2 (Cd 1.430 -> 1.593
+// at N=2, 0.943 -> 1.390 at N=3). i32 max ~2.1e9 against the +/-2e9 clamp
+// still bounds |force| < 200, ~1000x the largest force either scenario
+// produces. A deeper hierarchy would eventually need a real fix (float
+// atomics via CAS, or a two-stage reduction) rather than more scale.
+const FSCALE = 10000000f;
 override K_EPS : f32 = 1.5f;
 // Optional sharp momentum-exchange bounce-back force -- see
 // amr_step1_pool.wgsl's USE_BOUNCEBACK header for the shared rationale.
@@ -132,10 +144,13 @@ fn main(
         let phi = get_phi(p, state);
         let poolPlaneStride = arrayLength(&f_in) / 9u;
         let cell = slot * (FB * FB) + fy * FB + fx;
-        let areaWeight = levelParams.dxL * levelParams.dxL;
-        // Bounce-back's MEM sum is a PERIMETER integral, not the diffuse
-        // method's VOLUME integral -- dx^1, not dx^2. See amr_force1.wgsl's
-        // LINE_WEIGHT comment for the full rationale and live measurement.
+        // dx_L^1 for BOTH branches: a cell's mass scales as dx_L^2 but this
+        // level's timestep is dt_L = dx_L (acoustic scaling), and force is
+        // mass*du/dt, so the two factors combine to dx_L^1. See
+        // amr_force1.wgsl's header point 2 -- the diffuse branch previously
+        // used dx_L^2, applying the volume measure but dropping 1/dt_L,
+        // which cost a factor of 2^L (4x at level 2).
+        let areaWeight = levelParams.dxL;
         let lineWeight = levelParams.dxL;
 
         if (USE_BOUNCEBACK != 0u) {
