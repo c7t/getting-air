@@ -235,15 +235,36 @@ async function runBootSmoke(Runtime) {
   const first = await readStatus();
   if (first == null) return { ok: false, reason: 'no #status element found' };
   if (/^error:/i.test(first)) return { ok: false, reason: `status shows an error: "${first}"` };
-  // A few seconds is enough for a healthy page to get well past its first
-  // status write (typically several frames/macro-steps in); capped well
-  // under opts.physicsTimeout since this check doesn't need a real run.
-  await new Promise(r => setTimeout(r, 4000));
-  const second = await readStatus();
-  if (second == null) return { ok: false, reason: 'no #status element found (second read)' };
-  if (/^error:/i.test(second)) return { ok: false, reason: `status shows an error: "${second}"` };
-  if (second === first) return { ok: false, reason: `status never advanced past "${first}" -- page may be stuck` };
-  return { ok: true, first, second };
+  // POLL until the status advances, rather than sampling once after a fixed
+  // sleep. The fixed-4s version this replaces was flaky on a COLD run: a
+  // freshly-launched Chrome with an empty profile has no pipeline cache, and
+  // index-amr.html creates its pipelines from ~16 WGSL modules before it
+  // writes its first real status line, which can exceed 4s on the first load
+  // of a session while comfortably fitting in it on every subsequent (warm)
+  // load. That produced a "page may be stuck" FAIL for a page that was in
+  // fact healthy and several thousand steps in moments later -- precisely
+  // the sort of false red that trains people to stop believing the suite.
+  //
+  // Polling also makes the check STRICTLY stronger, not just slower: an
+  // `error:` status is caught the moment it appears (the old version could
+  // sleep straight through a transient one), and a genuinely stuck page now
+  // costs the full BOOT_SMOKE_TIMEOUT_MS instead of being reported after 4s
+  // -- the right trade, since the failure path is the rare one.
+  const BOOT_SMOKE_TIMEOUT_MS = 30000;
+  const POLL_INTERVAL_MS = 250;
+  const deadline = Date.now() + BOOT_SMOKE_TIMEOUT_MS;
+  let second = first;
+  while (Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+    second = await readStatus();
+    if (second == null) return { ok: false, reason: 'no #status element found (second read)' };
+    if (/^error:/i.test(second)) return { ok: false, reason: `status shows an error: "${second}"` };
+    if (second !== first) return { ok: true, first, second };
+  }
+  return {
+    ok: false,
+    reason: `status never advanced past "${first}" in ${BOOT_SMOKE_TIMEOUT_MS}ms -- page may be stuck`,
+  };
 }
 
 async function runPhysics(Runtime, opts) {
