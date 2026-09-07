@@ -177,6 +177,41 @@ if (N_LEVELS < 2) throw new Error(`?levels=${N_LEVELS} invalid -- must be >= 2 (
 // N_LEVELS>=4 is untested against this fix (paramsForChildLevel's
 // childLevel>=3 scaling is deliberately left untouched -- see its own
 // comment) -- ?forceBounceback still bypasses the guard below for that.
+//
+// ── DIFFUSE (default, non-bounce-back) coupling: current state ─────────────
+// Two real force bugs found and fixed (see shaders/amr_force1.wgsl's header
+// point 2 and amr_force1_pool.wgsl's FSCALE comment for the mechanisms and
+// the per-fix measurements). Before: Cd 0.650 at N=2 and 0.085 at N=3
+// against a 1.35 target -- i.e. the finest level was contributing ~5% of
+// the body's drag. After: amr-N3-diffuse PASSES tools/validate-all.js at
+// its res=9 default for the first time.
+//
+// STILL FAILING, and NOT a bug -- do not go looking for one:
+//   dense-reference (eps=1.5)  Cd 1.951  St 0.126  FAIL
+//   amr-N2-diffuse  (eps=0.75) Cd 1.620  St 0.149  FAIL
+//   amr-N3-diffuse  (eps=0.375)                    PASS
+// This is the diffuse INTERFACE WIDTH, not the AMR machinery. get_phi is an
+// exact Euclidean distance in lattice units for a circle, and epsilon is a
+// fixed 1.5 (K_EPS * dx_L at level>=2), so the chi transition band is a
+// roughly resolution-independent ~+-4 cells wide however large the body is.
+// The effective hydrodynamic radius therefore exceeds the nominal one by
+// ~2.5-4.5 lattice cells whatever the resolution, which reads as Cd too
+// HIGH and St too LOW together -- the signature of a body that is simply
+// too fat. Verified by convergence rather than argument: dense Re=100 goes
+// Cd 1.908 -> 1.597 and St 0.126 -> 0.148 from ?res=9 to ?res=10, both
+// monotonically toward the 1.35/0.165 literature values, with the excess
+// radius near-CONSTANT in cells while R doubles. The three rows above are
+// the same effect ordered by their own epsilon; N=3 passes because its
+// interface is the sharpest. Bounce-back passes everywhere because it is
+// sharp at exactly R.
+//
+// So: a diffuse Cd/St failure at res=9 is EXPECTED for dense and N=2 today.
+// Treat a diffuse regression as real only if it breaks the monotonic
+// ordering above, or if a level's own force stops scaling with its dx (use
+// debugForceBreakdown, which isolates each level's contribution -- that is
+// what localized both fixed bugs). Closing the remaining gap needs either a
+// calibrated effective-radius offset (standard practice for volume
+// penalization / IBM) or a sharper epsilon; neither is attempted here.
 if (USE_BOUNCEBACK && N_LEVELS > 3 && !urlParams.has('forceBounceback')) {
   throw new Error('?bounceback with ?levels>3 is untested against the N=3 bounce-back fix -- see this file\'s own comment above N_LEVELS. Use ?levels<=3 for a validated bounce-back run, or ?forceBounceback to bypass for investigation.');
 }
