@@ -2432,7 +2432,10 @@ async function init() {
       readBuf.unmap();
       for (const { label, i } of profiler.labels) {
         const ms = Number(ts[i + 1] - ts[i]) / 1e6;
-        if (!Number.isFinite(ms) || ms < 0) continue; // a disjoint query reads back as 0/garbage
+        // A disjoint or unresolved query reads back as 0 (or negative). Drop
+        // it rather than recording a pass as free -- a zero here means "not
+        // measured", which is a very different claim from "costs nothing".
+        if (!Number.isFinite(ms) || ms <= 0) continue;
         if (!byLabel.has(label)) byLabel.set(label, []);
         byLabel.get(label).push(ms);
       }
@@ -2463,7 +2466,18 @@ async function init() {
   // endpoint (GitHub Pages, say) must not break because a beacon 404s.
   const TELEMETRY = urlParams.get('telemetry') === '1';
   const TELEMETRY_EVERY_MS = 5000;
+  // ?profile=1 additionally attaches a per-pass GPU breakdown, so a device
+  // that cannot be attached to over CDP (a phone) can still report WHERE its
+  // frame time goes, not just how much of it there is. Rate-limited hard --
+  // the profile serializes one macro-step per rep, so it is far more
+  // disruptive than a plain sample.
+  const TELEMETRY_PROFILE = urlParams.get('profile') === '1';
+  const TELEMETRY_PROFILE_EVERY_MS = 20000;
   let telemetryLast = 0;
+  // -Infinity so the FIRST sample carries a profile; the rate limit applies
+  // only to subsequent ones. Waiting 20s for the first breakdown makes a
+  // short phone session report nothing useful.
+  let telemetryProfileLast = -Infinity;
   let telemetryInfo = null;
   async function telemetrySample(gpuMs, syncMs, stepNow) {
     if (!TELEMETRY) return;
@@ -2503,6 +2517,29 @@ async function init() {
       // L0-cell throughput only -- see the mlups comment in the frame loop.
       l0Mlups: gpuMs > 0 ? +((NCELLS * STEPS_PER_FRAME) / (gpuMs * 1e3)).toFixed(1) : null,
     };
+    if (TELEMETRY_PROFILE && hasTimestamp && now - telemetryProfileLast > TELEMETRY_PROFILE_EVERY_MS) {
+      telemetryProfileLast = now;
+      // Pause stepping across the profile. Timestamps taken while the frame
+      // loop is still submitting come back disjoint (several passes read
+      // exactly 0.0000), because the profiler's own submissions interleave
+      // with the live loop's. Restored in the finally below.
+      const wasLive = liveMode;
+      try {
+        liveMode = false;
+        await device.queue.onSubmittedWorkDone();
+        const p = await debugProfileMacroStep(6);
+        body.profile = { totalMs: +p.totalMs.toFixed(4), reps: p.reps,
+          passes: p.passes.map(x => ({ label: x.label, ms: +x.ms.toFixed(4), n: x.samples })) };
+        body.activeByLevel = {};
+        for (let m = 1; m < N_LEVELS; m++) {
+          try { body.activeByLevel[m] = (await debugListActiveBlocks(m)).length; } catch { /* best-effort */ }
+        }
+      } catch (e) {
+        body.profileError = String(e && e.message || e);
+      } finally {
+        liveMode = wasLive;
+      }
+    }
     try {
       await fetch('/_telemetry', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
