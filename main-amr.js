@@ -823,11 +823,12 @@ async function init() {
     };
   }
 
-  const [stepSM, frcSM, phySM, renSM, interpDenseSM, interpPoolSM, step1SM, step1PoolSM, avgSM, avgPoolSM, criterionSM, manageSM, force1SM, force1PoolSM, criterionPoolSM, managePoolSM] = await Promise.all([
+  const [stepSM, frcSM, phySM, renSM, digestSM, interpDenseSM, interpPoolSM, step1SM, step1PoolSM, avgSM, avgPoolSM, criterionSM, manageSM, force1SM, force1PoolSM, criterionPoolSM, managePoolSM] = await Promise.all([
     loadShader(device, 'shaders/amr_step.wgsl'),
     loadShader(device, 'shaders/amr_force.wgsl'),
     loadShader(device, 'shaders/amr_physics.wgsl'),
     loadShader(device, 'shaders/amr_render.wgsl'),
+    loadShader(device, 'shaders/amr_digest.wgsl'),
     loadShader(device, 'shaders/amr_interp_dense_parent.wgsl'),
     // Milestone 6: sibling shader for every L(m)->L(m+1) hop with m>=1 --
     // see shaders/amr_interp_pool_parent.wgsl's header for the addressing
@@ -1222,6 +1223,24 @@ async function init() {
   // uniform from overlayOpacityBuf's fill).
   const outlineOpacityBuf = device.createBuffer({ size: 4, usage: U.UNIFORM | U.COPY_DST });
   device.queue.writeBuffer(outlineOpacityBuf, 0, new Float32Array([0.0]));
+  // Field digest (see shaders/amr_digest.wgsl): one dispatch per rendered
+  // frame that fingerprints the L0 velocity field, so the watchdog can tell
+  // whether a frame ever reproduces an EARLIER frame's field -- which
+  // ordinary dynamics never does, but showing a stale buffer would.
+  const digestBuf = device.createBuffer({ size: 16, usage: U.STORAGE | U.COPY_SRC });
+  const digestBGL = device.createBindGroupLayout({ entries: [
+    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+  ]});
+  const digestBG = device.createBindGroup({ layout: digestBGL, entries: [
+    { binding: 0, resource: { buffer: velBuf } },
+    { binding: 1, resource: { buffer: digestBuf } },
+  ]});
+  const digestPL = device.createComputePipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [digestBGL] }),
+    compute: { module: digestSM, entryPoint: 'main', constants: { NCELLS } },
+  });
+
   const renBG = device.createBindGroup({ layout: renBGL, entries: [{ binding: 0, resource: { buffer: velBuf } }, { binding: 1, resource: { buffer: cardStateBuf } }, { binding: 2, resource: { buffer: pools[1].finePoolVel } }, { binding: 3, resource: { buffer: pools[1].blockSlotBuf } }, { binding: 4, resource: { buffer: overlayOpacityBuf } }, { binding: 5, resource: { buffer: N_LEVELS > 2 ? pools[2].finePoolVel : pools[1].finePoolVel } }, { binding: 6, resource: { buffer: N_LEVELS > 2 ? pools[2].blockSlotBuf : dummyBlockSlotBuf } }, { binding: 7, resource: { buffer: outlineOpacityBuf } }]});
 
   // Milestone 4 bind groups (pool-aware, superseding M2's single-region ones).
@@ -1437,7 +1456,8 @@ async function init() {
   // Triple-buffering for readbacks to avoid CPU-GPU stalls
   const STAGES = 3;
   const stages = Array.from({ length: STAGES }, () => ({
-    card: device.createBuffer({ size: 104, usage: U.MAP_READ | U.COPY_DST }),
+    // 104 bytes of CardState + 16 bytes of field digest, read back together
+    card: device.createBuffer({ size: 120, usage: U.MAP_READ | U.COPY_DST }),
     query: hasTimestamp ? device.createBuffer({ size: 16, usage: U.MAP_READ | U.COPY_DST }) : null,
     inFlight: false,
     step: 0
@@ -2656,6 +2676,7 @@ async function init() {
         stepBack: readbackWatch.stepBack,
         worstStepBack: readbackWatch.worstStepBack,
         posJump: readbackWatch.posJump,
+        fieldRepeat: readbackWatch.fieldRepeat,
         samples: readbackWatch.samples,
         diverged: readbackWatch.diverged,
         divergedAtStep: readbackWatch.divergedAtStep,
@@ -2750,7 +2771,7 @@ async function init() {
     return { activeByLevel, results };
   }
   const readbackWatch = { lastStep: null, lastY: null, n: 0, stepBack: 0, worstStepBack: 0,
-                          posJump: 0, samples: [], ring: [], diverged: false, divergedAtStep: null, history: null };
+                          posJump: 0, fieldRepeat: 0, digests: [], samples: [], ring: [], diverged: false, divergedAtStep: null, history: null };
 
   let benchSamples = [];
   let benchCollecting = false;
@@ -2840,7 +2861,12 @@ async function init() {
       const rp = enc.beginRenderPass({ colorAttachments: [{ view: ctx.getCurrentTexture().createView(), clearValue: { r:0.07, g:0.07, b:0.1, a:1 }, loadOp: 'clear', storeOp: 'store' }]});
       rp.setPipeline(renPL); rp.setBindGroup(0, renBG); rp.draw(6); rp.end();
 
+      {
+        const dg = beginPass(enc, 'field digest');
+        dg.setPipeline(digestPL); dg.setBindGroup(0, digestBG); dg.dispatchWorkgroups(1); dg.end();
+      }
       enc.copyBufferToBuffer(cardStateBuf, 0, stage.card, 0, 104);
+      enc.copyBufferToBuffer(digestBuf, 0, stage.card, 104, 16);
 
       const tSubmit = performance.now();
       device.queue.submit([enc.finish()]);
@@ -2922,6 +2948,27 @@ async function init() {
           });
           if (readbackWatch.ring.length > 24) readbackWatch.ring.shift();
         }
+        // Field-repeat detection. `dig` fingerprints the whole L0 velocity
+        // field; ordinary dynamics never reproduces an earlier frame's field
+        // exactly, so an exact match against a recent frame means the
+        // display went back in time rather than forward.
+        // `d` already maps the WHOLE staging buffer; a second getMappedRange
+        // for the digest would overlap it and throw. CardState occupies
+        // floats 0..25 (104 bytes), the digest floats 26..29.
+        const key = `${d[26]}|${d[27]}|${d[28]}`;
+        const prevIdx = readbackWatch.digests.indexOf(key);
+        if (prevIdx !== -1) {
+          readbackWatch.fieldRepeat++;
+          if (readbackWatch.samples.length < 12) {
+            readbackWatch.samples.push({
+              kind: 'fieldRepeat', atStep: st.step,
+              framesBack: readbackWatch.digests.length - prevIdx,
+            });
+          }
+        }
+        readbackWatch.digests.push(key);
+        if (readbackWatch.digests.length > 16) readbackWatch.digests.shift();
+
         readbackWatch.lastStep = st.step;
         readbackWatch.lastY = d[20];
         readbackWatch.n++;
