@@ -333,7 +333,10 @@ function allocLevelPool(device, U, m, NBX_m, NBY_m, maxFineBlocks) {
     fSizePool: fSizePool_m,
     finePoolF_a: device.createBuffer({ size: fSizePool_m, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC }),
     finePoolF_b: device.createBuffer({ size: fSizePool_m, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC }),
-    finePoolVel: device.createBuffer({ size: maxFineBlocks * NCELLS1 * 2 * 4, usage: U.STORAGE | U.COPY_SRC }),
+    // COPY_DST is load-bearing, not boilerplate: debugSnapshotLoad writes
+    // this buffer via queue.writeBuffer, which is a validation error --
+    // silently discarded -- without it. See velBuf's own note below.
+    finePoolVel: device.createBuffer({ size: maxFineBlocks * NCELLS1 * 2 * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC }),
     blockSlotBuf: device.createBuffer({ size: NBLOCKS_m * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC }),
     slotToBlockBuf: device.createBuffer({ size: maxFineBlocks * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC }),
     blockCriterionBuf: device.createBuffer({ size: NBLOCKS_m * 4, usage: U.STORAGE | U.COPY_DST }),
@@ -515,7 +518,14 @@ async function init() {
   // already bit the vpm branch once (commit 83d3c8c).
   const f_a     = device.createBuffer({ size: fSize, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
   const f_b     = device.createBuffer({ size: fSize, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
-  const velBuf  = device.createBuffer({ size: NCELLS * 2 * 4, usage: U.STORAGE | U.COPY_SRC });
+  // COPY_DST: debugSnapshotLoad restores this with queue.writeBuffer.
+  // Without the flag that write is a validation error and is silently
+  // dropped, so a loaded snapshot keeps whatever ux/uy were already there.
+  // The load path's own comment already describes this exact symptom
+  // ("rho round-tripped exactly, but ux/uy didn't -- the asymmetry was the
+  // tell") -- the writeBuffer call was added then, but the usage flag was
+  // not, so the fix never actually took effect.
+  const velBuf  = device.createBuffer({ size: NCELLS * 2 * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
   const forceBuf = device.createBuffer({ size: 16, usage: U.STORAGE | U.COPY_SRC | U.COPY_DST });
   // Milestone 8: harmless placeholder for a "child level's blockSlot"
   // binding when no such level actually exists in this configuration (the
