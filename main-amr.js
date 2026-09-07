@@ -90,11 +90,49 @@ const COARSEN_THRESH = urlParams.has('coarsenThresh') ? parseFloat(urlParams.get
 // coarsened, independent of the vorticity criterion above. Fixes the
 // "blunting" gap where a lagging vorticity signal leaves the card's own
 // sharp geometry on the coarse grid (e.g. the whole startup transient,
-// before any wake vorticity exists). Margin default (8 = one BLOCK) and
-// lookahead default (matches REFINE_EVERY, the re-evaluation cadence it's
-// meant to bridge) are starting points, not measured -- retune alongside
-// REFINE_THRESH/COARSEN_THRESH once exercised against a live run.
-const FORCE_REFINE_MARGIN = urlParams.has('forceRefineMargin') ? parseFloat(urlParams.get('forceRefineMargin')) : 8;
+// before any wake vorticity exists).
+//
+// MARGIN: 16, retuned from the original 8 (which its own comment flagged as
+// "a starting point, not measured"). This is the measured value; two things
+// make 8 too small.
+//
+// 1. isNearBody tests the block's CENTRE, not its nearest point. A BLOCK=8
+//    block's centre is up to 4*sqrt(2) ~ 5.66 cells from its own nearest
+//    corner, so a margin of M only GUARANTEES refinement out to M - 5.66.
+//    At M=8 that is 2.3 cells; measured coverage was indeed 100% only to
+//    phi ~ 2.5, decaying to 52% at phi=8 and 5% by phi=12.
+// 2. The boundary layer is thicker than that. Binning the field by distance
+//    from the surface at page defaults (Re=1067, A=32), the body-relative
+//    speed does not plateau until phi ~ 12-15 L0 cells, and |grad u| is
+//    still ~21% of its peak where coverage has already fallen to half.
+//
+// So the coarse/fine interface sat INSIDE the boundary layer, and blocks
+// flipped refined/coarse as the card translated past them -- the periodic
+// artifacts visible at block boundaries. Measured directly, as the ratio of
+// |d.omega| across level transitions to |d.omega| between same-level
+// neighbours at the same distance from the body:
+//
+//   margin=8   437 seam pairs inside phi<8, ratio 1.39x-1.86x at phi 5-8
+//   margin=16   38 seam pairs inside phi<8, ratio 1.02x  (artifact gone)
+//
+// The vorticity criterion cannot cover this gap on its own: measured BL
+// vorticity is ~2.7e-3 = 2^-8.5, well under REFINE_THRESH=-6 (2^-6), so it
+// never fires there and refinement near the body rests entirely on this
+// margin.
+//
+// Cost is ~nil today: active L1 blocks go 54 -> ~92 (median), still inside
+// the 128-slot default pool (max observed 100), and frame time is unchanged
+// (median 7.2ms -> 6.0-7.0ms across repeats) because every pool pass already
+// dispatches MAX_FINE_BLOCKS slots regardless of how many are active --
+// inactive slots early-out, so the work was already being paid for. Raising
+// MAX_FINE_BLOCKS *would* cost real time; raising this margin does not.
+//
+// Deliberately NOT applied to main-cylinder-amr.js, which has its own copy
+// of this constant, a different geometry/regime, and currently-passing
+// physics validation -- retuning it needs its own measurement. amr_manage.
+// wgsl's isNearBody is shared by both pages, so the centre-vs-corner
+// semantics are left alone rather than changed underneath the harness.
+const FORCE_REFINE_MARGIN = urlParams.has('forceRefineMargin') ? parseFloat(urlParams.get('forceRefineMargin')) : 16;
 const FORCE_REFINE_LOOKAHEAD = urlParams.has('forceRefineLookahead') ? parseFloat(urlParams.get('forceRefineLookahead')) : REFINE_EVERY;
 // L0 window-space edge band (coarse cells) excluded from vorticity-driven
 // refinement -- keeps fine blocks out of the ALBC sponge (amr_step.wgsl
