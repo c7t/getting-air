@@ -89,6 +89,24 @@ if (N_LEVELS < 2) throw new Error(`?levels=${N_LEVELS} invalid -- must be >= 2 (
 // -6/-7 reliably triggers refinement tracking the wake. Still expect to
 // retune as later milestones (larger domains, different A/B/tau) shift the
 // sim's operating range.
+// Readback pipeline depth. Each stage is one frame in flight, so this also
+// sets how many frames the app runs AHEAD of the readback -- at 250ms/frame
+// on mobile, STAGES=3 means ~750ms of submit-to-readback latency (measured
+// sync/gpu ~2.8-2.9, matching the depth) and three swapchain textures
+// outstanding at once.
+//
+// Exposed because it is the remaining in-app lever on the "view twitches
+// backward" report. Every simulation-side signal is clean -- step monotonic,
+// field digest never repeating, window offset smooth -- which leaves
+// PRESENTATION, and fewer frames in flight is less opportunity for the
+// compositor to present them out of order or drop them. It is also a large
+// latency win on a GPU-bound device, where the queue is full regardless, so
+// shallower staging may cost little throughput.
+//   ?stages=1  lowest latency, CPU waits on each readback
+//   ?stages=2  compromise
+//   ?stages=3  default, deepest pipeline
+const STAGES_CFG = Math.max(1, Math.min(4, urlParams.has('stages') ? parseInt(urlParams.get('stages')) : 3));
+
 const REFINE_EVERY = urlParams.has('refineEvery') ? parseInt(urlParams.get('refineEvery')) : 16;
 // Vorticity refinement thresholds, log2|omega| per L0 block (see
 // amr_criterion.wgsl, which reduces max|omega| per block, and
@@ -1469,7 +1487,7 @@ async function init() {
   };
 
   // Triple-buffering for readbacks to avoid CPU-GPU stalls
-  const STAGES = 3;
+  const STAGES = STAGES_CFG;
   const stages = Array.from({ length: STAGES }, () => ({
     // 104 bytes of CardState + 16 bytes of field digest, read back together
     card: device.createBuffer({ size: 120, usage: U.MAP_READ | U.COPY_DST }),
@@ -2695,6 +2713,8 @@ async function init() {
         offReversals: readbackWatch.offReversals,
         worstOffReversal: readbackWatch.worstOffReversal,
         offMaxStep: readbackWatch.offMaxStep,
+        offBackFrames: readbackWatch.offBackFrames,
+        offTrace: readbackWatch.offTrace,
         samples: readbackWatch.samples,
         diverged: readbackWatch.diverged,
         divergedAtStep: readbackWatch.divergedAtStep,
@@ -2791,7 +2811,7 @@ async function init() {
   const readbackWatch = { lastStep: null, lastY: null, n: 0, stepBack: 0, worstStepBack: 0,
                           posJump: 0, fieldRepeat: 0, digests: [], samples: [],
                           lastOffX: null, lastOffY: null, offDirX: 0, offDirY: 0,
-                          offReversals: 0, worstOffReversal: 0, offMaxStep: 0, ring: [], diverged: false, divergedAtStep: null, history: null };
+                          offReversals: 0, worstOffReversal: 0, offMaxStep: 0, offBackFrames: 0, offTrace: [], ring: [], diverged: false, divergedAtStep: null, history: null };
 
   let benchSamples = [];
   let benchCollecting = false;
@@ -3004,6 +3024,16 @@ async function init() {
               readbackWatch.offDirY = Math.sign(dyo);
             }
             readbackWatch.offMaxStep = Math.max(readbackWatch.offMaxStep, Math.abs(dxo), Math.abs(dyo));
+            // Counting REVERSALS alone was the wrong measure: between two
+            // reversals the offset can travel one way for dozens of frames,
+            // and the viewer sees the scene translate backward on EVERY
+            // frame with a negative delta, not just on the frame the
+            // direction flips. Count those directly, and keep a short trace
+            // so an observed twitch can be matched against what the window
+            // actually did around that moment.
+            if (dxo < 0 || dyo < 0) readbackWatch.offBackFrames++;
+            readbackWatch.offTrace.push({ s: st.step, dx: dxo, dy: dyo });
+            if (readbackWatch.offTrace.length > 32) readbackWatch.offTrace.shift();
           }
           readbackWatch.lastOffX = d[22];
           readbackWatch.lastOffY = d[23];
