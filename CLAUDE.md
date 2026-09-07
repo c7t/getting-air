@@ -115,6 +115,29 @@ invariants the AMR machinery depends on:
   recursion — which is what lets `tools/test-dense-to-amr.js` validate the
   injector by round-trip instead of by eye.
 
+## Performance work
+Read `plans/perf-characterization.md` BEFORE optimizing anything here. The
+two target devices have **opposite** bottlenecks — the desktop is
+pass-count/latency bound, the mobile PowerVR is memory-bandwidth bound — and
+the obvious optimization (indirect dispatch off the active block count) was
+measured to help neither. It also records the trap that produced a confident
+wrong conclusion: per-pass GPU timestamps are unusable on that mobile part
+(65536 ns counter granularity vs sub-tick passes), so attribution has to be
+done at frame scale via `?bench=1`.
+
+Timing/measurement entry points:
+- `?telemetry=1` — POSTs periodic samples (device, adapter, config, frame
+  GPU/sync ms) to the dev server's `/_telemetry`, appended to
+  `telemetry.log`. The only way to see a device that has no CDP endpoint,
+  e.g. a phone on the LAN. Opt-in, same-origin, local-only.
+- `?profile=1` — attaches `debugProfileMacroStep`'s per-pass breakdown to
+  those samples. Trustworthy only where the timestamp counter is
+  fine-grained; check the values are not all multiples of one number first.
+- `?bench=1` — runs the frame-scale pass-group attribution sweep and posts
+  one summary. `?benchSkip=force,ghost` applies a skip by hand. Freezes
+  refinement so every configuration sees identical topology; the physics is
+  deliberately wrong while it runs.
+
 Current known-issue state (e.g. which `?levels=N` combinations are physics-
 validated) drifts with active work — see `main-cylinder-amr.js`'s own
 comment above `N_LEVELS`, not this file, for what's current.
