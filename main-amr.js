@@ -17,6 +17,7 @@ import {
 } from './card-params.mjs';
 
 const canvas   = document.getElementById('c');
+let deviceLost = false;
 const statusEl = document.getElementById('status');
 
 const urlParams = new URLSearchParams(window.location.search);
@@ -563,15 +564,51 @@ async function init() {
     usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC
   }) : null;
 
+  // A backgrounded tab on mobile is a common way to lose the GPU device, and
+  // nothing here was watching for it: on loss every subsequent submit is
+  // silently ignored, the frame loop keeps spinning, and the page just stops
+  // advancing with no indication why. Surface it instead. `reason ===
+  // 'destroyed'` is our own teardown and is not an error.
+  device.lost.then((info) => {
+    if (info.reason === 'destroyed') return;
+    deviceLost = true;
+    statusEl.textContent = `error: GPU device lost (${info.reason}) -- ${info.message || 'no message'}. Reload to restart.`;
+    statusEl.style.color = '#f77';
+    console.error('WebGPU device lost:', info);
+  });
+
   device.pushErrorScope('validation');
 
   const ctx = canvas.getContext('webgpu');
   const fmt = navigator.gpu.getPreferredCanvasFormat();
 
+  // Reconfigure ONLY on a real size change. This used to run unconditionally
+  // on every `resize` event, and both halves of it are destructive:
+  // assigning canvas.width/height resets the drawing buffer even when the
+  // value is unchanged, and ctx.configure() replaces the swapchain,
+  // invalidating textures that in-flight command buffers still reference
+  // (this page keeps up to STAGES frames in flight).
+  //
+  // On desktop `resize` fires when you resize the window, so the cost was
+  // invisible. On a PHONE it fires constantly -- the URL bar hides and shows
+  // on any scroll or drag, which includes touching the control sliders --
+  // so the swapchain was being torn down and rebuilt underneath frames that
+  // were already submitted. Reported symptom: the view "twitches back" a few
+  // frames, correlated with moving sliders or switching away and back.
+  //
+  // Also guards the degenerate case: clientWidth/Height read 0 during some
+  // layout transitions (and while hidden), and a 0-sized canvas is not a
+  // valid configuration.
+  let cfgW = 0, cfgH = 0;
   function resize() {
     const dpr = window.devicePixelRatio || 1;
-    canvas.width  = Math.round(canvas.clientWidth * dpr);
-    canvas.height = Math.round(canvas.clientHeight * dpr);
+    const w = Math.round(canvas.clientWidth * dpr);
+    const h = Math.round(canvas.clientHeight * dpr);
+    if (w <= 0 || h <= 0) return;      // mid-layout / hidden: nothing to configure
+    if (w === cfgW && h === cfgH) return; // same size: reconfiguring is pure damage
+    cfgW = w; cfgH = h;
+    canvas.width = w;
+    canvas.height = h;
     ctx.configure({ device, format: fmt, alphaMode: 'opaque' });
   }
   window.addEventListener('resize', resize);
@@ -2593,6 +2630,9 @@ async function init() {
         worstStepBack: readbackWatch.worstStepBack,
         posJump: readbackWatch.posJump,
         samples: readbackWatch.samples,
+        diverged: readbackWatch.diverged,
+        divergedAtStep: readbackWatch.divergedAtStep,
+        runUp: readbackWatch.history,
       },
     };
     if (BENCH && !benchDone && !benchRunning) {
@@ -2682,7 +2722,8 @@ async function init() {
     }
     return { activeByLevel, results };
   }
-  const readbackWatch = { lastStep: null, lastY: null, n: 0, stepBack: 0, worstStepBack: 0, posJump: 0, samples: [] };
+  const readbackWatch = { lastStep: null, lastY: null, n: 0, stepBack: 0, worstStepBack: 0,
+                          posJump: 0, samples: [], ring: [], diverged: false, divergedAtStep: null, history: null };
 
   let benchSamples = [];
   let benchCollecting = false;
@@ -2724,6 +2765,7 @@ async function init() {
 
   async function frame() {
     try {
+      if (deviceLost) return; // stop the rAF chain; every submit would be a no-op
       // Flush pending slider changes BEFORE the liveMode early-return.
       // With this after it, a parameter changed while the sim was paused was
       // silently dropped, and debugStepSync (which never goes through this
@@ -2822,13 +2864,36 @@ async function init() {
           // y_total/x_total are accumulated displacement: a physical
           // quantity that cannot jump discontinuously in one frame. A large
           // jump means we are looking at a stale readback, not new physics.
-          const dy = Math.abs(d[20] - readbackWatch.lastY);
-          if (readbackWatch.lastY !== null && dy > 50) {
-            readbackWatch.posJump++;
-            if (readbackWatch.samples.length < 12) {
-              readbackWatch.samples.push({ kind: 'y', from: +readbackWatch.lastY.toFixed(2), to: +d[20].toFixed(2), atStep: st.step });
+          //
+          // The finiteness test is FIRST and separate on purpose. Every
+          // comparison with NaN is false, so `dy > 50` silently passes a
+          // solver that has already diverged -- which is exactly what
+          // happened: a phone run blew up while this watchdog reported
+          // frames=1127, stepBack=0, posJump=0. A NaN check cannot be
+          // expressed as a magnitude threshold.
+          if (!Number.isFinite(d[20]) || !Number.isFinite(d[4]) || !Number.isFinite(d[7])) {
+            if (!readbackWatch.diverged) {
+              readbackWatch.diverged = true;
+              readbackWatch.divergedAtStep = st.step;
+              // The run-up is the diagnostic, not the NaN itself.
+              readbackWatch.history = readbackWatch.ring.slice();
+            }
+          } else {
+            const dy = Math.abs(d[20] - readbackWatch.lastY);
+            if (readbackWatch.lastY !== null && dy > 50) {
+              readbackWatch.posJump++;
+              if (readbackWatch.samples.length < 12) {
+                readbackWatch.samples.push({ kind: 'y', from: +readbackWatch.lastY.toFixed(2), to: +d[20].toFixed(2), atStep: st.step });
+              }
             }
           }
+          // Rolling run-up buffer, kept regardless, so a divergence report
+          // carries the frames BEFORE it rather than just the moment of.
+          readbackWatch.ring.push({
+            s: st.step, y: +Number(d[20]).toFixed(2), vy: +Number(d[4]).toFixed(5),
+            om: +Number(d[5]).toFixed(6), fy: +Number(d[7]).toPrecision(4), th: +Number(d[2]).toFixed(3),
+          });
+          if (readbackWatch.ring.length > 24) readbackWatch.ring.shift();
         }
         readbackWatch.lastStep = st.step;
         readbackWatch.lastY = d[20];
