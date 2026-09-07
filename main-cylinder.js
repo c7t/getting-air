@@ -32,6 +32,12 @@ if (resLog2 > 11) resLog2 = 11;
 // sets this at all, so the falling-card scenario is untouched either way.
 const USE_BOUNCEBACK = urlParams.has('bounceback') ? 1 : 0;
 
+// ?quantF16=1|2 -- emulate fp16 storage precision for f (see lbm_step.wgsl's
+// QUANT_F16). Measurement only: it costs bandwidth rather than saving it,
+// and exists to answer whether a real packed-half implementation would keep
+// the physics before anyone writes one.
+const QUANT_F16 = urlParams.has('quantF16') ? parseInt(urlParams.get('quantF16')) : 0;
+
 let W = 1 << resLog2;
 let H = W;
 let NCELLS = W * H;
@@ -283,7 +289,7 @@ async function init() {
 
   const stepPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [stepBGL] }),
-    compute: { module: stepSM, entryPoint: 'main', constants: stepConstants }
+    compute: { module: stepSM, entryPoint: 'main', constants: { ...stepConstants, QUANT_F16 } }
   });
   const frcPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [frcBGL] }),

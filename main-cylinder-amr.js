@@ -43,6 +43,13 @@ let NCELLS = W * H;
 // pairs with. Default off (0) reproduces today's exact behavior.
 const USE_BOUNCEBACK = urlParams.has('bounceback') ? 1 : 0;
 
+// ?quantF16=1|2|3 -- emulate fp16 storage precision for f at every level (see
+// shaders/lbm_step.wgsl's QUANT_F16). Measurement only. The AMR path is the
+// one that matters: fneq = f - feq is a small difference of large numbers,
+// and amr_interp_*/amr_average_* rescale it by 2^k across levels, so any
+// quantisation noise in f is amplified at every coarse/fine interface.
+const QUANT_F16 = urlParams.has('quantF16') ? parseInt(urlParams.get('quantF16')) : 0;
+
 // ── Milestone 4 (plans/AMR.md): dynamic refinement via a fixed-capacity ───
 // fine-block pool. Supersedes Milestone 2's single hardcoded fine region:
 // refinement now happens at M1's own 8x8 coarse-block granularity, and any
@@ -1086,7 +1093,7 @@ async function init() {
 
   const stepPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [stepBGL] }),
-    compute: { module: stepSM, entryPoint: 'main', constants: stepConstants }
+    compute: { module: stepSM, entryPoint: 'main', constants: { ...stepConstants, QUANT_F16 } }
   });
   const frcPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [frcBGL] }),
@@ -1143,7 +1150,7 @@ async function init() {
   });
   const step1PL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [step1BGL] }),
-    compute: { module: step1SM, entryPoint: 'main', constants: step1Constants }
+    compute: { module: step1SM, entryPoint: 'main', constants: { ...step1Constants, QUANT_F16 } }
   });
   const avgPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [avgBGL] }),
@@ -1156,7 +1163,7 @@ async function init() {
   // interpPoolParentPL).
   const step1PoolPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [step1PoolBGL] }),
-    compute: { module: step1PoolSM, entryPoint: 'main', constants: { ...step1Constants, K_EPS: K_EPS_POOL } }
+    compute: { module: step1PoolSM, entryPoint: 'main', constants: { ...step1Constants, K_EPS: K_EPS_POOL, QUANT_F16 } }
   });
   const avgPoolPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [avgPoolBGL] }),

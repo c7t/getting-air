@@ -57,6 +57,25 @@ override WALL_U1 : f32 = 0.0f;
 // Uniform body-force density (e.g. Poiseuille's driving force), added to
 // every cell's Guo forcing source term unconditionally -- not gated by
 // chi, unlike the near-body penalty force. Default (0,0) is a no-op.
+// EXPERIMENT (measurement only, default off): emulate fp16 STORAGE precision
+// for f without changing any buffer layout, by rounding each value through
+// half precision as it is written. pack2x16float/unpack2x16float are core
+// WGSL builtins -- no `shader-f16` feature needed, which matters because
+// neither the desktop adapter here nor necessarily the phone exposes it.
+// (A real implementation would store packed halves in a u32 array and get
+// the bandwidth back; this only reproduces the PRECISION so the accuracy
+// question can be answered before writing that.)
+//   0 = off
+//   1 = quantise f directly
+//   2 = quantise the deviation (f - w_i), which keeps ~6.7x more resolution
+//       on the part that carries information -- see common_lattice.wgsl's
+//       weights and plans/perf-characterization.md
+override QUANT_F16 : u32 = 0u;
+
+fn q16(x: f32) -> f32 {
+  return unpack2x16float(pack2x16float(vec2<f32>(x, 0.0f))).x;
+}
+
 override FORCE_X : f32 = 0.0f;
 override FORCE_Y : f32 = 0.0f;
 
@@ -177,6 +196,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let eu_far = exf*SPONGE_UX + eyf*SPONGE_UY;
     let f_target = wt[i] * (1.0f + 3.0f*eu_far + 4.5f*eu_far*eu_far - 1.5f*(SPONGE_UX*SPONGE_UX + SPONGE_UY*SPONGE_UY)); // rho=1.0, u=(SPONGE_UX,SPONGE_UY) equilibrium
 
-    f_out[i * (W * H) + cell] = mix(f_collide, f_target, sponge_weight);
+    var f_store = mix(f_collide, f_target, sponge_weight);
+    if (QUANT_F16 == 1u) {
+      f_store = q16(f_store);
+    } else if (QUANT_F16 == 2u) {
+      // Round only the deviation from the lattice weight, then restore it.
+      f_store = wt[i] + q16(f_store - wt[i]);
+    } else if (QUANT_F16 == 3u) {
+      // CANARY, not a candidate: ~8-bit mantissa, far coarser than fp16.
+      // If this does NOT move Cd/St then the override is not reaching the
+      // shader and modes 1/2 proved nothing. Control for the null result.
+      f_store = round(f_store * 256.0f) / 256.0f;
+    }
+    f_out[i * (W * H) + cell] = f_store;
   }
 }

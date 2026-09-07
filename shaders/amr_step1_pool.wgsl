@@ -36,6 +36,26 @@
 // @include "common_sponge.wgsl"
 // @include "common_walls.wgsl"
 
+// EXPERIMENT (measurement only, default off): emulate fp16 STORAGE precision
+// for f without changing any buffer layout. pack2x16float/unpack2x16float are
+// core WGSL builtins, so this needs no `shader-f16` feature. See
+// shaders/lbm_step.wgsl's QUANT_F16 for the full rationale, and mode 3 for
+// the canary that proves the override actually reaches the shader.
+//   0 = off   1 = quantise f   2 = quantise (f - w_i)   3 = 8-bit canary
+override QUANT_F16 : u32 = 0u;
+
+fn q16(x: f32) -> f32 {
+  return unpack2x16float(pack2x16float(vec2<f32>(x, 0.0f))).x;
+}
+
+fn qstore(x: f32, i: u32) -> f32 {
+  if (QUANT_F16 == 1u) { return q16(x); }
+  if (QUANT_F16 == 2u) { return wt[i] + q16(x - wt[i]); }
+  if (QUANT_F16 == 3u) { return round(x * 256.0f) / 256.0f; }
+  return x;
+}
+
+
 struct LevelParams {
   nbx: u32,        // unused here (no cellIndex()/blockID-derived origin at this level -- see header) -- kept so this level's ONE uniform buffer is shared verbatim with amr_interp_pool_parent.wgsl/amr_average_pool_parent.wgsl, not a third near-duplicate.
   nby: u32,        // unused here, same reason.
@@ -244,6 +264,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let f_collide = f[i] - omg * (f[i] - feq) + Si;
     let eu_far = exf*SPONGE_UX + eyf*SPONGE_UY;
     let f_target = wt[i] * (1.0f + 3.0f*eu_far + 4.5f*eu_far*eu_far - 1.5f*(SPONGE_UX*SPONGE_UX + SPONGE_UY*SPONGE_UY));
-    f_out[i * poolPlaneStride + cell] = mix(f_collide, f_target, sponge_weight);
+    f_out[i * poolPlaneStride + cell] = qstore(mix(f_collide, f_target, sponge_weight), i);
   }
 }
