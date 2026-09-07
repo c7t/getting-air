@@ -205,9 +205,36 @@ function paramsForChildLevel(childLevel) {
     return { REFINE_THRESH, COARSEN_THRESH, FORCE_REFINE_MARGIN, FORCE_REFINE_LOOKAHEAD };
   }
   const get = (name, base) => urlParams.has(`${name}${childLevel}`) ? parseFloat(urlParams.get(`${name}${childLevel}`)) : base;
+  // LEVEL-CONSISTENT VORTICITY THRESHOLD.
+  //
+  // amr_criterion.wgsl and amr_criterion_pool.wgsl both reduce a raw
+  // lattice-cell velocity DIFFERENCE (`(u[x+1]-u[x-1])*0.5`) with no division
+  // by the cell size. AGAL, which this criterion is derived from, divides by
+  // the level's own dx (solver_lbm_criterion.cu: `.../(2.0*dx_L)`), making
+  // the criterion a physical velocity gradient that means the same thing at
+  // every level.
+  //
+  // Without that division, a level-m cell is 2^-m the size of an L0 cell, so
+  // the same PHYSICAL vorticity produces an omega 2^-m as large -- yet every
+  // level was compared against the same absolute threshold. Deeper levels
+  // were therefore systematically under-refined by 2^m: a level-1 block
+  // needed 2x the physical vorticity of an L0 block to earn level-2
+  // children, a level-2 block 4x. A vortex became LESS likely to keep its
+  // refinement the moment it got refined, which is the compounding form of
+  // the "shed vortices go missing" symptom.
+  //
+  // Correcting the threshold instead of the shader is exact, not an
+  // approximation: the comparison is log2(omega) >= THRESH, and
+  //   log2(omega_physical) = log2(omega_lattice / dx_m) = log2(omega_lattice) + m
+  // so requiring log2(omega_lattice) >= THRESH - m is identical to dividing
+  // by dx_m. m is the level the criterion is EVALUATED on, which for a
+  // decision about creating childLevel tiles is childLevel-1. childLevel===1
+  // is evaluated on L0 (m=0, dx=1) and is returned unchanged above, so the
+  // measured L0 tuning is untouched.
+  const levelShift = childLevel - 1;
   return {
-    REFINE_THRESH: get('refineThresh', REFINE_THRESH),
-    COARSEN_THRESH: get('coarsenThresh', COARSEN_THRESH),
+    REFINE_THRESH: get('refineThresh', REFINE_THRESH - levelShift),
+    COARSEN_THRESH: get('coarsenThresh', COARSEN_THRESH - levelShift),
     FORCE_REFINE_MARGIN: get('forceRefineMargin', FORCE_REFINE_MARGIN * cellSizeL0AtLevel(childLevel - 1)),
     FORCE_REFINE_LOOKAHEAD: get('forceRefineLookahead', FORCE_REFINE_LOOKAHEAD),
   };
