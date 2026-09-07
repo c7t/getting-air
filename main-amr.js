@@ -2426,6 +2426,13 @@ async function init() {
 
   async function debugStepSync(n) {
     liveMode = false;
+    // This path bypasses frame() entirely, so it has to flush pending
+    // parameter changes itself -- otherwise a headless driver that sets a
+    // slider and then steps would silently run the old values.
+    if (paramsDirty) {
+      updateGPUParams();
+      paramsDirty = false;
+    }
     for (let k = 0; k < n; k += STEPS_PER_FRAME) {
       const enc = device.createCommandEncoder();
       for (let s = 0; s < STEPS_PER_FRAME; s++) dispatchMacroStep(enc);
@@ -2717,13 +2724,20 @@ async function init() {
 
   async function frame() {
     try {
-      if (!liveMode) {
-        requestAnimationFrame(() => frame().catch(handleErr));
-        return;
-      }
+      // Flush pending slider changes BEFORE the liveMode early-return.
+      // With this after it, a parameter changed while the sim was paused was
+      // silently dropped, and debugStepSync (which never goes through this
+      // function) would then advance the sim with the OLD values while the
+      // control panel showed the new ones. Found while testing a mid-run
+      // Blockage drag: A stayed at 38.8 for 16000 steps after the slider and
+      // its readout had both moved to 20.3.
       if (paramsDirty) {
         updateGPUParams();
         paramsDirty = false;
+      }
+      if (!liveMode) {
+        requestAnimationFrame(() => frame().catch(handleErr));
+        return;
       }
 
       const stage = stages[currentStageIdx];
