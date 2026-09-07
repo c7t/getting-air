@@ -2,6 +2,7 @@
 
 // @include "common_geometry.wgsl"
 // @include "common_lattice.wgsl"
+// @include "common_reduce.wgsl"
 
 @group(0) @binding(0) var<storage, read>       state  : CardState;
 @group(0) @binding(1) var<storage, read>       f_in   : array<f32>;
@@ -139,15 +140,14 @@ fn main(
   workgroupBarrier();
 
   // Simple reduction tree or linear sum for 64 elements
+  // Parallel tree reduction (common_reduce.wgsl) -- replaces a 64-step
+  // serial sum that lane 0 used to run alone. See that file for the
+  // on-device measurement that motivated it.
+  wgReduceSum3(lid);
   if (lid == 0u) {
-    var sum_fx = 0.0f;
-    var sum_fy = 0.0f;
-    var sum_tz = 0.0f;
-    for (var i = 0u; i < 64u; i++) {
-      sum_fx += wg_fx[i];
-      sum_fy += wg_fy[i];
-      sum_tz += wg_tz[i];
-    }
+    let sum_fx = wg_fx[0];
+    let sum_fy = wg_fy[0];
+    let sum_tz = wg_tz[0];
     atomicAdd(&forces[0], safeFixed(sum_fx * FSCALE));
     atomicAdd(&forces[1], safeFixed(sum_fy * FSCALE));
     atomicAdd(&forces[2], safeFixed(sum_tz * FSCALE));
