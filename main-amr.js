@@ -2580,6 +2580,13 @@ async function init() {
       syncMs: Number.isFinite(syncMs) ? +syncMs.toFixed(3) : null,
       // L0-cell throughput only -- see the mlups comment in the frame loop.
       l0Mlups: gpuMs > 0 ? +((NCELLS * STEPS_PER_FRAME) / (gpuMs * 1e3)).toFixed(1) : null,
+      watch: {
+        frames: readbackWatch.n,
+        stepBack: readbackWatch.stepBack,
+        worstStepBack: readbackWatch.worstStepBack,
+        posJump: readbackWatch.posJump,
+        samples: readbackWatch.samples,
+      },
     };
     if (BENCH && !benchDone && !benchRunning) {
       benchRunning = true;
@@ -2668,6 +2675,8 @@ async function init() {
     }
     return { activeByLevel, results };
   }
+  const readbackWatch = { lastStep: null, lastY: null, n: 0, stepBack: 0, worstStepBack: 0, posJump: 0, samples: [] };
+
   let benchSamples = [];
   let benchCollecting = false;
   let benchRunning = false;
@@ -2757,6 +2766,19 @@ async function init() {
       stage.inFlight = true;
       stage.step = step;
 
+      // ── Ordering watchdog ────────────────────────────────────────────
+      // Reported symptom: on a slow device the display appears to jump
+      // BACKWARD a few frames now and then. The step counter itself is
+      // monotonic (verified in telemetry), so any regression has to be in
+      // what gets displayed -- which is read back per stage, and three
+      // stages are in flight at once. If two readbacks are ever processed
+      // out of order, the older one overwrites the newer one's status and
+      // trajectory row, and the display goes back in time.
+      //
+      // Desktop cannot reproduce it (monotonic over hundreds of updates even
+      // at sync/gpu = 3.3), so this records the evidence on whatever device
+      // actually shows it, rather than guessing from here. Cheap enough to
+      // leave on: two comparisons per frame.
       const processReadback = async (st) => {
         const pCard = st.card.mapAsync(GPUMapMode.READ);
         const pQuery = hasTimestamp ? st.query.mapAsync(GPUMapMode.READ) : Promise.resolve();
@@ -2772,6 +2794,31 @@ async function init() {
         } else {
           gpuTime = performance.now() - tSubmit;
         }
+
+        // Out-of-order / regression detection on the ACTUAL readback
+        // sequence, not the 250ms-throttled status line.
+        if (readbackWatch.lastStep !== null) {
+          if (st.step < readbackWatch.lastStep) {
+            readbackWatch.stepBack++;
+            readbackWatch.worstStepBack = Math.max(readbackWatch.worstStepBack, readbackWatch.lastStep - st.step);
+            if (readbackWatch.samples.length < 12) {
+              readbackWatch.samples.push({ kind: 'step', from: readbackWatch.lastStep, to: st.step });
+            }
+          }
+          // y_total/x_total are accumulated displacement: a physical
+          // quantity that cannot jump discontinuously in one frame. A large
+          // jump means we are looking at a stale readback, not new physics.
+          const dy = Math.abs(d[20] - readbackWatch.lastY);
+          if (readbackWatch.lastY !== null && dy > 50) {
+            readbackWatch.posJump++;
+            if (readbackWatch.samples.length < 12) {
+              readbackWatch.samples.push({ kind: 'y', from: +readbackWatch.lastY.toFixed(2), to: +d[20].toFixed(2), atStep: st.step });
+            }
+          }
+        }
+        readbackWatch.lastStep = st.step;
+        readbackWatch.lastY = d[20];
+        readbackWatch.n++;
 
         if (st.step < 100000) {
           trajectory.push([st.step, d[0], d[20], d[21], d[2], d[3], d[4], d[5], d[6], d[7], d[8]]);
