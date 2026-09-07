@@ -177,6 +177,16 @@ const COARSEN_THRESH = urlParams.has('coarsenThresh') ? parseFloat(urlParams.get
 // physics validation -- retuning it needs its own measurement. amr_manage.
 // wgsl's isNearBody is shared by both pages, so the centre-vs-corner
 // semantics are left alone rather than changed underneath the harness.
+// Refinement LADDER (shaders/common_refine.wgsl, AGAL Algorithm 3).
+// REFINE_THRESH above is the base rung -- the physical log2|omega| at which a
+// region earns its FIRST level of refinement. Each further level costs
+// N_REFINE_INC more octaves, so
+//     desired >= k   <=>   log2|omega|_physical >= REFINE_THRESH + INC*(k-1)
+// AGAL's own default INC is 1.0 (input/input.txt), i.e. one octave per level.
+// N_REFINE_MAX clamps the criterion from above, as AGAL does.
+const N_REFINE_INC = urlParams.has('refineInc') ? parseFloat(urlParams.get('refineInc')) : 1.0;
+const N_REFINE_MAX = urlParams.has('refineMax') ? parseFloat(urlParams.get('refineMax')) : 1.0;
+
 const FORCE_REFINE_MARGIN = urlParams.has('forceRefineMargin') ? parseFloat(urlParams.get('forceRefineMargin')) : 16;
 const FORCE_REFINE_LOOKAHEAD = urlParams.has('forceRefineLookahead') ? parseFloat(urlParams.get('forceRefineLookahead')) : REFINE_EVERY;
 // L0 window-space edge band (coarse cells) excluded from vorticity-driven
@@ -231,10 +241,13 @@ function paramsForChildLevel(childLevel) {
   // decision about creating childLevel tiles is childLevel-1. childLevel===1
   // is evaluated on L0 (m=0, dx=1) and is returned unchanged above, so the
   // measured L0 tuning is untouched.
-  const levelShift = childLevel - 1;
+  // NOTE: the per-level shift that used to live here is gone. The ladder in
+  // common_refine.wgsl now converts the criterion to physical units itself
+  // (amr_manage_pool.wgsl's toPhysical, from PARENT_CELL_SIZE_L0), so
+  // applying a shift here as well would correct it twice.
   return {
-    REFINE_THRESH: get('refineThresh', REFINE_THRESH - levelShift),
-    COARSEN_THRESH: get('coarsenThresh', COARSEN_THRESH - levelShift),
+    REFINE_THRESH: get('refineThresh', REFINE_THRESH),
+    COARSEN_THRESH: get('coarsenThresh', COARSEN_THRESH),
     FORCE_REFINE_MARGIN: get('forceRefineMargin', FORCE_REFINE_MARGIN * cellSizeL0AtLevel(childLevel - 1)),
     FORCE_REFINE_LOOKAHEAD: get('forceRefineLookahead', FORCE_REFINE_LOOKAHEAD),
   };
@@ -1052,7 +1065,8 @@ async function init() {
   const interpFFConstants = { W, H, RB, GHOST_ONLY: 1, FINE_FINE_ONLY: 1 };
   const step1Constants = { W, H, RB };
   const criterionConstants = { W, H };
-  const manageConstants = { W, H, REFINE_THRESH, COARSEN_THRESH, FORCE_REFINE_MARGIN, FORCE_REFINE_LOOKAHEAD, SPONGE_EXCLUDE_W, HAS_LEVEL2: N_LEVELS > 2 ? 1 : 0 };
+  const manageConstants = { W, H, REFINE_THRESH, COARSEN_THRESH, FORCE_REFINE_MARGIN, FORCE_REFINE_LOOKAHEAD, SPONGE_EXCLUDE_W, HAS_LEVEL2: N_LEVELS > 2 ? 1 : 0,
+    N_REFINE_INC, N_REFINE_MAX, MAX_LEVEL: N_LEVELS - 1 };
 
   const stepPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [stepBGL] }),
@@ -1193,6 +1207,7 @@ async function init() {
       PARENT_HAS_CACHED_ORIGIN: parentIsDense ? 0 : 1,
       SPONGE_EXCLUDE_W,
       ...childParams,
+      N_REFINE_INC, N_REFINE_MAX, MAX_LEVEL: N_LEVELS - 1,
       HAS_GRANDCHILD: hasGrandchild ? 1 : 0,
     };
     criterionPoolPLs[m] = device.createComputePipeline({
@@ -2677,6 +2692,9 @@ async function init() {
         worstStepBack: readbackWatch.worstStepBack,
         posJump: readbackWatch.posJump,
         fieldRepeat: readbackWatch.fieldRepeat,
+        offReversals: readbackWatch.offReversals,
+        worstOffReversal: readbackWatch.worstOffReversal,
+        offMaxStep: readbackWatch.offMaxStep,
         samples: readbackWatch.samples,
         diverged: readbackWatch.diverged,
         divergedAtStep: readbackWatch.divergedAtStep,
@@ -2771,7 +2789,9 @@ async function init() {
     return { activeByLevel, results };
   }
   const readbackWatch = { lastStep: null, lastY: null, n: 0, stepBack: 0, worstStepBack: 0,
-                          posJump: 0, fieldRepeat: 0, digests: [], samples: [], ring: [], diverged: false, divergedAtStep: null, history: null };
+                          posJump: 0, fieldRepeat: 0, digests: [], samples: [],
+                          lastOffX: null, lastOffY: null, offDirX: 0, offDirY: 0,
+                          offReversals: 0, worstOffReversal: 0, offMaxStep: 0, ring: [], diverged: false, divergedAtStep: null, history: null };
 
   let benchSamples = [];
   let benchCollecting = false;
@@ -2940,6 +2960,54 @@ async function init() {
               }
             }
           }
+          // MOVING-WINDOW OFFSET TRACKING.
+          // The render translates the ENTIRE field by state.off_x/off_y
+          // (amr_render.wgsl's get_ux/get_uy and its bufX/bufY), while the
+          // card is drawn at cx/cy which absorb the sub-cell remainder. So a
+          // twitching offset moves the whole VIEW back and forth while the
+          // card's orientation and the field's content stay unperturbed --
+          // which is exactly the reported symptom, and is invisible to every
+          // other signal here: y_total/x_total are accumulated displacement
+          // and stay smooth across an offset reversal by construction
+          // (amr_physics.wgsl splits position into floor -> off and
+          // fraction -> cx).
+          //
+          // off wraps modulo W/H, so take the SIGNED SHORTEST delta -- a
+          // 255 -> 0 step is +1, not -255.
+          const wrapDelta = (cur, prev, n) => {
+            let dd = (cur - prev) % n;
+            if (dd > n / 2) dd -= n;
+            if (dd < -n / 2) dd += n;
+            return dd;
+          };
+          if (readbackWatch.lastOffX !== null) {
+            const dxo = wrapDelta(d[22], readbackWatch.lastOffX, W);
+            const dyo = wrapDelta(d[23], readbackWatch.lastOffY, H);
+            // A reversal is a sign flip against the recent trend, not merely
+            // a negative step: the card genuinely flutters, so sustained
+            // motion in either direction is physical and expected.
+            if (dxo !== 0) {
+              if (readbackWatch.offDirX !== 0 && Math.sign(dxo) !== readbackWatch.offDirX) {
+                readbackWatch.offReversals++;
+                readbackWatch.worstOffReversal = Math.max(readbackWatch.worstOffReversal, Math.abs(dxo));
+                if (readbackWatch.samples.length < 12) {
+                  readbackWatch.samples.push({ kind: 'offX', atStep: st.step, delta: dxo, prevDir: readbackWatch.offDirX });
+                }
+              }
+              readbackWatch.offDirX = Math.sign(dxo);
+            }
+            if (dyo !== 0) {
+              if (readbackWatch.offDirY !== 0 && Math.sign(dyo) !== readbackWatch.offDirY) {
+                readbackWatch.offReversals++;
+                readbackWatch.worstOffReversal = Math.max(readbackWatch.worstOffReversal, Math.abs(dyo));
+              }
+              readbackWatch.offDirY = Math.sign(dyo);
+            }
+            readbackWatch.offMaxStep = Math.max(readbackWatch.offMaxStep, Math.abs(dxo), Math.abs(dyo));
+          }
+          readbackWatch.lastOffX = d[22];
+          readbackWatch.lastOffY = d[23];
+
           // Rolling run-up buffer, kept regardless, so a divergence report
           // carries the frames BEFORE it rather than just the moment of.
           readbackWatch.ring.push({

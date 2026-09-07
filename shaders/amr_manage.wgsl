@@ -76,6 +76,7 @@
 // once this is exercised against a live run.
 
 // @include "common_geometry.wgsl"
+// @include "common_refine.wgsl"
 
 @group(0) @binding(0) var<storage, read>       blockCriterion  : array<f32>;
 @group(0) @binding(1) var<storage, read_write> blockSlot       : array<i32>;
@@ -97,6 +98,13 @@ override W : u32;
 override H : u32;
 override REFINE_THRESH : f32;
 override COARSEN_THRESH : f32;
+// Ladder parameters -- see common_refine.wgsl. MAX_LEVEL is the finest
+// configured level (N_LEVELS-1); this shader evaluates LEVEL 0 blocks, whose
+// dx is 1, so their lattice-unit criterion is already the physical one and
+// needs no shift.
+override N_REFINE_INC : f32 = 1.0f;
+override N_REFINE_MAX : f32 = 1.0f;
+override MAX_LEVEL : i32 = 1;
 override FORCE_REFINE_MARGIN : f32;
 override FORCE_REFINE_LOOKAHEAD : f32;
 override HAS_LEVEL2 : u32 = 0u;
@@ -201,7 +209,10 @@ fn coarsen(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (blockID >= nblocks) { return; }
 
   let currentSlot = blockSlot[blockID];
-  if ((epsFor(blockID) < COARSEN_THRESH || inSpongeBand(blockID)) && currentSlot >= 0 && !isNearBody(blockID)) {
+  // Ladder: release this block's level-1 tile only if its own flow no longer
+  // asks for ANY refinement (desired < 1), hysteresis-shifted. Level 0's dx
+  // is 1, so epsFor is already the physical log2|omega|.
+  if ((desiredLevelCoarsen(epsFor(blockID)) < 1 || inSpongeBand(blockID)) && currentSlot >= 0 && !isNearBody(blockID)) {
     // Milestone 9: can't release a tile that's still a parent, or whose
     // release would leave a neighbor's level-2 child directly adjacent to
     // a level-0-only region -- see this file's header.
@@ -241,7 +252,7 @@ fn refine(@builtin(global_invocation_id) gid: vec3<u32>) {
       if (blockSlot[neighbors[i]] >= 0 && hasLevel2Child(neighbors[i])) { cascadeWanted = true; }
     }
   }
-  if (((epsFor(blockID) >= REFINE_THRESH && !inSpongeBand(blockID)) || isNearBody(blockID) || cascadeWanted) && currentSlot < 0) {
+  if (((desiredLevel(epsFor(blockID)) >= 1 && !inSpongeBand(blockID)) || isNearBody(blockID) || cascadeWanted) && currentSlot < 0) {
     let oldCount = atomicSub(&freeCount, 1);
     if (oldCount > 0) {
       let slot = freeList[u32(oldCount - 1)];
