@@ -10,14 +10,23 @@
 // discovering that kind of bug from wrong-looking output.
 
 import { assembleShader } from './shader-loader.mjs';
+import {
+  deriveCardParams, parseCardParams, parseResLog2, reynoldsFromTau,
+  AMR_DEFAULT_RES_LOG2, AMR_DEFAULT_LEVELS,
+  tauAtLevel as tauAtLevelOf,
+} from './card-params.mjs';
 
 const canvas   = document.getElementById('c');
 const statusEl = document.getElementById('status');
 
 const urlParams = new URLSearchParams(window.location.search);
-let resLog2 = parseInt(urlParams.get('res')) || 8;
-if (resLog2 < 6) resLog2 = 6;
-if (resLog2 > 11) resLog2 = 11;
+// Default is one step below main.js's own default (resLog2=8, W=256) --
+// with the default levels=2, this reproduces the "lower far-field
+// resolution, the fine level recovers the body's resolution" AMR win via
+// the general BLOCKAGE/ASPECT/RE mechanism below (see the comment above
+// `let BLOCKAGE`), generalizing what used to be a hardcoded A=32,B=4 "half
+// of main.js's dense reference" special case.
+let resLog2 = parseResLog2(urlParams, AMR_DEFAULT_RES_LOG2);
 
 let W = 1 << resLog2;
 let H = W;
@@ -57,7 +66,7 @@ const NBX = W / BLOCK, NBY = H / BLOCK, NBLOCKS = NBX * NBY; // coarse block gri
 // to today's single-fine-level build (validated against a pre-M5
 // baseline -- see the sub-plan). N_LEVELS>=3 allocates additional
 // quadtree pool levels that no shader/dispatch reads yet (Milestone 6/7).
-const N_LEVELS = urlParams.has('levels') ? parseInt(urlParams.get('levels')) : 2;
+const N_LEVELS = urlParams.has('levels') ? parseInt(urlParams.get('levels')) : AMR_DEFAULT_LEVELS;
 if (N_LEVELS < 2) throw new Error(`?levels=${N_LEVELS} invalid -- must be >= 2 (L0 + at least one fine level)`);
 
 // ── Milestone 4b (plans/AMR.md): automatic vorticity-driven refinement ────
@@ -135,45 +144,40 @@ resSlider.oninput = () => {
 };
 
 // ── Pesavento & Wang (2004) physical parameters ───────────────────────────────
-// These constants define the "regime" of the simulation (Falling Paper).
-//
-// A/B are in COARSE-grid units, and are deliberately HALF of main.js's dense-
-// reference values (64,8) -- this is the AMR resource-savings fix: the card
-// is defined as a fine-level body (64,8-equivalent), and only appears at
-// that size where the refinement halo (see amr_manage.wgsl's isNearBody)
-// actually resolves it at 2x. Everywhere else, the same W x H coarse buffer
-// now spans a domain 2x wider (4x the area) in body-lengths for identical
-// coarse-grid memory, vs. always running the card at dense-equivalent size.
-let A = 32, B = 4;
-let I_STAR = 0.34;
-let TAU = 0.509;
-let U_T = 0.05;
+// Shared verbatim with main.js via card-params.mjs -- see that module's
+// header for why these live in one place rather than two, and for what each
+// quantity means. The property this page depends on specifically: because
+// card size and flow regime are resolution-independent (BLOCKAGE/ASPECT/RE)
+// rather than raw lattice-cell counts, pasting the same
+// ?blockage=&aspect=&re=&ut= onto this page and main.js's reproduces the
+// identical physical system. The AMR resource win is then purely a matter of
+// choosing a LOWER `res` here than on the dense page, with `levels`
+// recovering the missing resolution at the body -- generalizing what used to
+// be a hardcoded A=32,B=4 "half of main.js's dense reference" special case.
+// tools/test-card-params.js asserts that equivalence directly.
+let { BLOCKAGE, ASPECT, I_STAR, RE, U_T } = parseCardParams(urlParams);
 
-let RHO_B, MASS, I_BODY, G_LU, G_EFF;
+// Derived in recalculate() below. TAU here is this page's L0 (coarsest) tau;
+// every finer level's own tau follows from it via tauAtLevel().
+let A, B, TAU, RHO_B, MASS, I_BODY, G_LU, G_EFF;
 
 function recalculate() {
-  RHO_B  = I_STAR * 2 * A**3 / (B * (A**2 + B**2));
-  RHO_B  = Math.max(1.05, RHO_B);
-  MASS   = RHO_B * Math.PI * A * B;
-  I_BODY = RHO_B * Math.PI * A * B * (A**2 + B**2) / 4;
-  G_LU   = U_T**2 / (Math.PI * B * (RHO_B - 1));
-  G_EFF  = G_LU * (1 - 1 / RHO_B);
+  ({ A, B, TAU, RHO_B, MASS, I_BODY, G_LU, G_EFF } =
+    deriveCardParams({ W, BLOCKAGE, ASPECT, I_STAR, RE, U_T }));
 }
 recalculate();
 
-// ── Milestone 6 (plans/AMR-multilevel.md): recursive fine tau. L0's own
-// tau is TAU (the slider value, read live off CardState by the dense
-// shader). Every deeper level's tau is the same Dupuis-Chopard relation
-// amr_interp_dense_parent.wgsl already applies once (tau_fine =
-// 2*tau_coarse - 0.5), just walked m times -- tauAtLevel(0) is L0's own
-// tau, tauAtLevel(1) is L1's (what amr_interp_pool_parent.wgsl needs as
-// `parentTau` when interpolating L1->L2), etc. Plain JS, not a GPU
-// readback -- TAU is already a live JS variable the slider mutates
-// directly, so this needs no round-trip.
+// ── Milestone 6 (plans/AMR-multilevel.md): recursive fine tau. L0's own tau
+// is TAU (read live off CardState by the dense shader); every deeper level
+// applies the Dupuis-Chopard relation amr_interp_dense_parent.wgsl already
+// uses once (tau_fine = 2*tau_coarse - 0.5), walked m times. tauAtLevel(0)
+// is L0's own tau, tauAtLevel(1) is L1's (what amr_interp_pool_parent.wgsl
+// needs as `parentTau` when interpolating L1->L2), etc. Plain JS, not a GPU
+// readback -- TAU is already a live JS variable the slider mutates directly.
+// Thin wrapper over card-params.mjs's pure tauAtLevelOf(tau0, m) so callers
+// here keep the existing one-argument form against the live TAU.
 function tauAtLevel(m) {
-  let t = TAU;
-  for (let i = 0; i < m; i++) t = 2 * t - 0.5;
-  return t;
+  return tauAtLevelOf(TAU, m);
 }
 
 const FSCALE  = 1e4;
@@ -577,23 +581,49 @@ async function init() {
     updateLevelParams(); // TAU changed -- every level's recursive tau shifts too
   };
 
-  const sliders = [
-    { id: 'A', setter: v => A = v, dp: 0 },
-    { id: 'B', setter: v => B = v, dp: 0 },
-    { id: 'I_STAR', setter: v => I_STAR = v, dp: 2 },
-    { id: 'TAU', setter: v => TAU = v, dp: 3 },
-    { id: 'U_T', setter: v => U_T = v, dp: 3 },
-  ];
-  sliders.forEach(s => {
-    const el = document.getElementById(`slider-${s.id}`);
-    const valEl = document.getElementById(`val-${s.id}`);
-    el.oninput = () => {
-      s.setter(parseFloat(el.value));
-      valEl.textContent = el.value;
-      recalculate();
-      paramsDirty = true;
-    };
-  });
+  // See main.js's identical block for the full rationale: RE is the
+  // canonical flow-regime state, TAU is the one control that goes the other
+  // way (dragging it back-solves RE first).
+  const blockageEl = document.getElementById('slider-BLOCKAGE');
+  const aspectEl   = document.getElementById('slider-ASPECT');
+  const iStarEl    = document.getElementById('slider-I_STAR');
+  const reEl       = document.getElementById('slider-RE');
+  const tauEl      = document.getElementById('slider-TAU');
+  const utEl       = document.getElementById('slider-U_T');
+
+  // Show the control's OWN value first, then the lattice-unit quantity it
+  // derives -- see main.js's identical block for why the derived-only form
+  // this replaces was actively misleading.
+  const refreshDerivedReadouts = () => {
+    document.getElementById('val-BLOCKAGE').textContent = `${BLOCKAGE.toFixed(1)} (A=${A.toFixed(1)})`;
+    document.getElementById('val-ASPECT').textContent = `${ASPECT.toFixed(3)} (B=${B.toFixed(1)})`;
+    document.getElementById('val-I_STAR').textContent = I_STAR.toFixed(2);
+    document.getElementById('val-RE').textContent = Math.round(RE);
+    document.getElementById('val-TAU').textContent = TAU.toFixed(4);
+    document.getElementById('val-U_T').textContent = U_T.toFixed(3);
+  };
+
+  blockageEl.oninput = () => { BLOCKAGE = parseFloat(blockageEl.value); recalculate(); refreshDerivedReadouts(); paramsDirty = true; };
+  aspectEl.oninput   = () => { ASPECT   = parseFloat(aspectEl.value);   recalculate(); refreshDerivedReadouts(); paramsDirty = true; };
+  iStarEl.oninput    = () => { I_STAR   = parseFloat(iStarEl.value);    recalculate(); refreshDerivedReadouts(); paramsDirty = true; };
+  utEl.oninput       = () => { U_T      = parseFloat(utEl.value);       recalculate(); refreshDerivedReadouts(); paramsDirty = true; };
+  reEl.oninput       = () => { RE       = parseFloat(reEl.value);       recalculate(); refreshDerivedReadouts(); paramsDirty = true; };
+  tauEl.oninput      = () => {
+    const tau = parseFloat(tauEl.value);
+    RE = reynoldsFromTau(tau, A, U_T);
+    reEl.value = RE;
+    recalculate();
+    refreshDerivedReadouts();
+    paramsDirty = true;
+  };
+
+  blockageEl.value = BLOCKAGE;
+  aspectEl.value   = ASPECT;
+  iStarEl.value    = I_STAR;
+  reEl.value       = RE;
+  tauEl.value      = TAU;
+  utEl.value       = U_T;
+  refreshDerivedReadouts();
 
   // Refinement-coverage (green) overlay opacity. Render-only; does not affect
   // the simulation. Writing the uniform takes effect on the next frame.
@@ -1364,7 +1394,7 @@ async function init() {
       cardState: card,
       fB64: bytesToB64(new Uint8Array(f.buffer, f.byteOffset, f.byteLength)),
       velB64: bytesToB64(new Uint8Array(vel.buffer, vel.byteOffset, vel.byteLength)),
-      params: { A, B, I_STAR, TAU, U_T, resLog2 },
+      params: { A, B, BLOCKAGE, ASPECT, RE, I_STAR, TAU, U_T, resLog2 },
       numLevels: N_LEVELS,
       pools: poolsOut,
     };

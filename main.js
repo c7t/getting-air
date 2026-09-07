@@ -1,12 +1,14 @@
 import { assembleShader } from './shader-loader.mjs';
+import {
+  deriveCardParams, parseCardParams, parseResLog2, reynoldsFromTau,
+  DENSE_DEFAULT_RES_LOG2,
+} from './card-params.mjs';
 
 const canvas   = document.getElementById('c');
 const statusEl = document.getElementById('status');
 
 const urlParams = new URLSearchParams(window.location.search);
-let resLog2 = parseInt(urlParams.get('res')) || 8;
-if (resLog2 < 6) resLog2 = 6;
-if (resLog2 > 11) resLog2 = 11;
+let resLog2 = parseResLog2(urlParams, DENSE_DEFAULT_RES_LOG2);
 
 let W = 1 << resLog2;
 let H = W;
@@ -26,57 +28,22 @@ resSlider.oninput = () => {
 };
 
 // ── Pesavento & Wang (2004) physical parameters ───────────────────────────────
-// These constants define the "regime" of the simulation (Falling Paper).
+// Paper: "Falling Paper: Navigating the Trade-Off between Density and Aspect
+// Ratio". The parameterization and all the derived-quantity arithmetic live
+// in card-params.mjs, shared verbatim with main-amr.js -- see that module's
+// header for why it is shared rather than copied, and for the meaning of
+// each quantity. The short version: card size and flow regime are stored as
+// resolution-independent physical quantities (BLOCKAGE/ASPECT/RE), not raw
+// lattice-cell counts, so pasting the same ?blockage=&aspect=&re=&ut= onto
+// this page and index-amr.html reproduces the identical physical system.
+let { BLOCKAGE, ASPECT, I_STAR, RE, U_T } = parseCardParams(urlParams);
 
-// Paper: "Falling Paper: Navigating the Trade-Off between Density and Aspect Ratio"
-// Semi-axes: a=32, b=4 [lu].  Aspect ratio e = b/a = 0.125.
-// Geometry: Semi-major (A) and semi-minor (B) axes of the ellipse in lattice units.
-// The card is 2*A long and 2*B thick.
-let A = 64, B = 8;
-
-// Dimensionless moment of inertia: I* = b(a²+b²)ρ_b / (2a³ρ_f)  = 0.17
-// → ρ_b/ρ_f = I* · 2a³ / (b·(a²+b²)) ≈ 2.678
-// This characterizes the rotation dynamics. A value of 0.17 is typical for 
-// a card whose mass distribution allows for stable tumbling.
-let I_STAR = 0.34;
-
-// TAU: LBM Relaxation Time. 
-// Related to Kinematic Viscosity (ν) by: ν = (TAU - 0.5) / 3.
-// TAU = 0.5 corresponds to zero viscosity (unstable). 
-// TAU = 0.52 is "thin" fluid (high Reynolds number, e.g., Re ≈ 1100).
-// Target Re = 1100 requires τ ≈ 0.509; we start at 0.52 for stability.
-let TAU = 0.509;
-
-// U_T: Target Terminal Velocity (in lattice units per step).
-// Target u_t small enough to keep Ma < 0.1 during free-fall transient.
-// We aim for 0.05 so that even during fast tumbles, the tip velocity
-// stays well below the Mach limit (Ma < 0.3) where LBM becomes inaccurate.
-let U_T = 0.05;
-
-let RHO_B, MASS, I_BODY, G_LU, G_EFF;
+// Derived in recalculate() below, from the physical parameters above plus W.
+let A, B, TAU, RHO_B, MASS, I_BODY, G_LU, G_EFF;
 
 function recalculate() {
-  // RHO_B: Solid-to-fluid density ratio (ρ_body / ρ_fluid).
-  // Calculated to satisfy the I_STAR requirement. In LBM, fluid density is 1.0.
-  // Higher RHO_B makes the card "heavier" and less affected by small fluid gusts.
-  RHO_B  = I_STAR * 2 * A**3 / (B * (A**2 + B**2));
-  RHO_B  = Math.max(1.05, RHO_B);
-
-  // MASS: Total mass of the 2D ellipse (Area * Density).
-  MASS   = RHO_B * Math.PI * A * B;
-
-  // I_BODY: Moment of inertia for a 2D ellipse. 
-  // Determines how much torque is needed to change the card's rotation speed.
-  I_BODY = RHO_B * Math.PI * A * B * (A**2 + B**2) / 4;
-
-  // G_LU: Raw Gravity. 
-  // The gravitational constant needed to reach U_T against viscous drag.
-  G_LU   = U_T**2 / (Math.PI * B * (RHO_B - 1));
-
-  // G_EFF: Effective Gravity (Buoyancy-corrected).
-  // In a coupled simulation, the fluid pushes up on the card. 
-  // G_EFF accounts for the weight of the card minus the weight of the displaced fluid.
-  G_EFF  = G_LU * (1 - 1 / RHO_B);
+  ({ A, B, TAU, RHO_B, MASS, I_BODY, G_LU, G_EFF } =
+    deriveCardParams({ W, BLOCKAGE, ASPECT, I_STAR, RE, U_T }));
 }
 recalculate();
 
@@ -190,23 +157,56 @@ async function init() {
     device.queue.writeBuffer(cardStateBuf, 19 * 4, new Float32Array([TAU]));
   };
 
-  const sliders = [
-    { id: 'A', setter: v => A = v, dp: 0 },
-    { id: 'B', setter: v => B = v, dp: 0 },
-    { id: 'I_STAR', setter: v => I_STAR = v, dp: 2 },
-    { id: 'TAU', setter: v => TAU = v, dp: 3 },
-    { id: 'U_T', setter: v => U_T = v, dp: 3 },
-  ];
-  sliders.forEach(s => {
-    const el = document.getElementById(`slider-${s.id}`);
-    const valEl = document.getElementById(`val-${s.id}`);
-    el.oninput = () => {
-      s.setter(parseFloat(el.value));
-      valEl.textContent = el.value;
-      recalculate();
-      paramsDirty = true;
-    };
-  });
+  // BLOCKAGE/ASPECT/I_STAR/U_T all move the physical inputs to recalculate();
+  // RE is the canonical flow-regime state (recalculate() always re-derives
+  // TAU = tauFromReynolds(RE, A, U_T) from it), and TAU is the one exception
+  // that goes the other way: dragging it back-solves RE first, so the two
+  // stay mutually consistent regardless of which one the user drags.
+  const blockageEl = document.getElementById('slider-BLOCKAGE');
+  const aspectEl   = document.getElementById('slider-ASPECT');
+  const iStarEl    = document.getElementById('slider-I_STAR');
+  const reEl       = document.getElementById('slider-RE');
+  const tauEl      = document.getElementById('slider-TAU');
+  const utEl       = document.getElementById('slider-U_T');
+
+  // Each readout shows the control's OWN value first, then the lattice-unit
+  // quantity it derives, e.g. "2.0 (A=64.0)". An earlier revision showed only
+  // the derived A/B under labels reading "Blockage"/"e (aspect)", so the
+  // panel actively misreported what the slider was set to -- worth avoiding
+  // in a project where a lot of debugging happens by reading this panel.
+  const refreshDerivedReadouts = () => {
+    document.getElementById('val-BLOCKAGE').textContent = `${BLOCKAGE.toFixed(1)} (A=${A.toFixed(1)})`;
+    document.getElementById('val-ASPECT').textContent = `${ASPECT.toFixed(3)} (B=${B.toFixed(1)})`;
+    document.getElementById('val-I_STAR').textContent = I_STAR.toFixed(2);
+    document.getElementById('val-RE').textContent = Math.round(RE);
+    document.getElementById('val-TAU').textContent = TAU.toFixed(4);
+    document.getElementById('val-U_T').textContent = U_T.toFixed(3);
+  };
+
+  blockageEl.oninput = () => { BLOCKAGE = parseFloat(blockageEl.value); recalculate(); refreshDerivedReadouts(); paramsDirty = true; };
+  aspectEl.oninput   = () => { ASPECT   = parseFloat(aspectEl.value);   recalculate(); refreshDerivedReadouts(); paramsDirty = true; };
+  iStarEl.oninput    = () => { I_STAR   = parseFloat(iStarEl.value);    recalculate(); refreshDerivedReadouts(); paramsDirty = true; };
+  utEl.oninput       = () => { U_T      = parseFloat(utEl.value);       recalculate(); refreshDerivedReadouts(); paramsDirty = true; };
+  reEl.oninput       = () => { RE       = parseFloat(reEl.value);       recalculate(); refreshDerivedReadouts(); paramsDirty = true; };
+  tauEl.oninput      = () => {
+    const tau = parseFloat(tauEl.value);
+    RE = reynoldsFromTau(tau, A, U_T);
+    reEl.value = RE;
+    recalculate(); // re-derives TAU from the just-updated RE (reproduces `tau`, mod float noise)
+    refreshDerivedReadouts();
+    paramsDirty = true;
+  };
+
+  // Sync widget positions to the actual initial state (fixes a pre-existing
+  // bug where the HTML's hardcoded slider defaults didn't match the real
+  // initial JS values) and show the initial derived readouts.
+  blockageEl.value = BLOCKAGE;
+  aspectEl.value   = ASPECT;
+  iStarEl.value    = I_STAR;
+  reEl.value       = RE;
+  tauEl.value      = TAU;
+  utEl.value       = U_T;
+  refreshDerivedReadouts();
 
   const [stepSM, frcSM, phySM, renSM] = await Promise.all([
     loadShader(device, 'shaders/lbm_step.wgsl'),

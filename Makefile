@@ -4,15 +4,23 @@
 # changes before loading the sim in a browser. There is no build step for the
 # app itself (it is a static page); these targets only VALIDATE.
 #
-#   make check   run all static checks (JS always; WGSL if naga is available)
+#   make check   run all static checks (JS + unit tests always; WGSL if naga is)
+#   make test     run the GPU-free unit tests (tools/test-*.js)
 #   make wgsl     validate every WGSL shader with naga (needs Rust-built naga)
 #   make js       syntax-check every JS module with `node --check`
 #   make tools    install the validation tools (naga-cli via cargo; needs Rust)
 #   make help     list targets
 #
-# JS validation only needs Node; WGSL validation needs `naga` (a Rust tool).
-# `make check` runs JS unconditionally and skips WGSL with a note if naga is
-# not installed, so it is useful even without a Rust toolchain.
+# JS validation and the unit tests only need Node; WGSL validation needs `naga`
+# (a Rust tool). `make check` runs JS and the unit tests unconditionally and
+# skips WGSL with a note if naga is not installed, so it is useful even without
+# a Rust toolchain.
+#
+# NOTE what `make check` still does NOT prove: that anything renders, or that
+# the physics is right. `node --check` is syntax only, and `make test` covers
+# just the pure-arithmetic/pure-data code paths that can run without a GPU.
+# The GPU suites under tools/ (validate-all.js and friends, see CLAUDE.md) are
+# the ones that actually exercise the solvers.
 
 # Prefer a cargo-installed naga if present, without clobbering an existing one
 # elsewhere on PATH (respects CARGO_HOME; falls back to ~/.cargo).
@@ -28,6 +36,12 @@ SHADERS := $(wildcard shaders/*.wgsl)
 # sub-repo) are excluded -- neither is this project's own JS source.
 JS      := $(shell find . -name '*.js' -not -path './node_modules/*' -not -path './.git/*' -not -path './venv/*' -not -path './AGAL/*')
 
+# GPU-free unit tests. Every tools/test-*.js is expected to be runnable as
+# `node tools/test-foo.js` with no server, no browser and no GPU, and to exit
+# nonzero on failure -- that contract is what lets this be a plain wildcard
+# rather than a hand-maintained list.
+TESTS   := $(sort $(wildcard tools/test-*.js))
+
 .DEFAULT_GOAL := help
 
 .PHONY: help
@@ -36,13 +50,24 @@ help: ## list targets
 	  | awk 'BEGIN{FS=":.*## "}{printf "  make %-10s %s\n", $$1, $$2}'
 
 .PHONY: check
-check: js ## run all static checks (JS always; WGSL if naga is available)
+check: js test ## run all static checks (JS + unit tests always; WGSL if naga is available)
 	@if command -v naga >/dev/null 2>&1; then \
 	  $(MAKE) --no-print-directory wgsl; \
 	else \
 	  echo "note: naga not installed -- skipping WGSL validation (run 'make tools')"; \
 	fi
 	@echo "OK: static checks passed"
+
+.PHONY: test
+test: ## run the GPU-free unit tests (tools/test-*.js)
+	@command -v node >/dev/null 2>&1 || { echo "node not found -- install Node.js"; exit 1; }
+	@test -n "$(strip $(TESTS))" || { echo "no tests found matching tools/test-*.js (run from repo root?)"; exit 1; }
+	@rc=0; for t in $(TESTS); do \
+	  echo "== $$t"; \
+	  if node "$$t"; then :; else rc=1; fi; \
+	done; \
+	if [ $$rc -eq 0 ]; then echo "test: $(words $(TESTS)) suite(s) passed"; else echo "test: FAILED"; fi; \
+	exit $$rc
 
 .PHONY: wgsl
 wgsl: ## validate every WGSL shader with naga (needs Rust-built naga)

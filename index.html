@@ -83,14 +83,14 @@
       <span id="val-RES">1024</span>
     </div>
     <div class="control-row">
-      <label>A (semi-major)</label>
-      <input type="range" id="slider-A" min="10" max="128" step="1" value="32">
-      <span id="val-A">32</span>
+      <label>Blockage (H/chord)</label>
+      <input type="range" id="slider-BLOCKAGE" min="1.0" max="16" step="0.1" value="2.0">
+      <span id="val-BLOCKAGE">64.0</span>
     </div>
     <div class="control-row">
-      <label>B (semi-minor)</label>
-      <input type="range" id="slider-B" min="2" max="32" step="1" value="4">
-      <span id="val-B">4</span>
+      <label>e (aspect B/A)</label>
+      <input type="range" id="slider-ASPECT" min="0.02" max="0.5" step="0.005" value="0.125">
+      <span id="val-ASPECT">8.0</span>
     </div>
     <div class="control-row">
       <label>I* (inertia)</label>
@@ -98,8 +98,13 @@
       <span id="val-I_STAR">0.34</span>
     </div>
     <div class="control-row">
+      <label>Re (Reynolds)</label>
+      <input type="range" id="slider-RE" min="50" max="3000" step="10" value="1067">
+      <span id="val-RE">1067</span>
+    </div>
+    <div class="control-row">
       <label>τ (viscosity)</label>
-      <input type="range" id="slider-TAU" min="0.501" max="0.6" step="0.001" value="0.509">
+      <input type="range" id="slider-TAU" min="0.5005" max="0.6" step="0.0005" value="0.509">
       <span id="val-TAU">0.509</span>
     </div>
     <div class="control-row">
