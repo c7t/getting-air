@@ -53,6 +53,7 @@
 // {step}, debugCheck21Balance, debugCheckGeometryCoverage -- trivially
 // {ok:true}, no body to check coverage against -- debugReadCardState).
 
+import { reportFatal, reportNoWebGPU, reportNoAdapter } from './error-overlay.mjs';
 import { assembleShader } from './shader-loader.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
 
@@ -250,16 +251,16 @@ function initCardState() {
 async function loadShader(device, path) {
   const code = await assembleShader(path, async (p) => {
     const r = await fetch(p + '?v=' + Date.now());
-    if (!r.ok) throw new Error(`failed to load ${p}`);
+    if (!r.ok) throw new Error(`failed to load ${p} (HTTP ${r.status} ${r.statusText})`);
     return r.text();
   });
   return device.createShaderModule({ code });
 }
 
 function handleErr(e) {
-  statusEl.textContent = `error: ${e.message}`;
-  statusEl.style.color = '#f77';
-  console.error('WebGPU Error:', e);
+  // Status line AND a legible on-page overlay -- see error-overlay.mjs for why
+  // the 12px status line alone was not enough.
+  reportFatal(statusEl, e);
 }
 
 // Milestone 5 (plans/AMR-multilevel.md)-shaped level-generic pool
@@ -321,9 +322,9 @@ function cellIndexJS(cx, cy) {
 }
 
 async function init() {
-  if (!navigator.gpu) { statusEl.textContent = 'WebGPU not available'; return; }
+  if (!navigator.gpu) { reportNoWebGPU(statusEl); return; }
   const adapter = await navigator.gpu.requestAdapter();
-  if (!adapter) { statusEl.textContent = 'No adapter'; return; }
+  if (!adapter) { reportNoAdapter(statusEl); return; }
 
   const DEFAULT_MAX_STORAGE_BINDING = 128 * 1024 * 1024;
   const DEFAULT_MAX_BUFFER_SIZE = 256 * 1024 * 1024;

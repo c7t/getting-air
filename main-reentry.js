@@ -24,6 +24,7 @@
 // own (debugSnapshotSave produces the same layout:'flat' shape
 // tools/lib/field-reconstruct.js's loadDenseFields already decodes).
 
+import { reportFatal, reportNoWebGPU, reportNoAdapter } from './error-overlay.mjs';
 import { assembleShader } from './shader-loader.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
 
@@ -99,16 +100,16 @@ function initF() {
 async function loadShader(device, path) {
   const code = await assembleShader(path, async (p) => {
     const r = await fetch(p + '?v=' + Date.now());
-    if (!r.ok) throw new Error(`failed to load ${p}`);
+    if (!r.ok) throw new Error(`failed to load ${p} (HTTP ${r.status} ${r.statusText})`);
     return r.text();
   });
   return device.createShaderModule({ code });
 }
 
 function handleErr(e) {
-  statusEl.textContent = `error: ${e.message}`;
-  statusEl.style.color = '#f77';
-  console.error('WebGPU Error:', e);
+  // Status line AND a legible on-page overlay -- see error-overlay.mjs for why
+  // the 12px status line alone was not enough.
+  reportFatal(statusEl, e);
 }
 
 // base64 chunked in 8192-byte pieces -- a single huge String.fromCharCode
@@ -126,9 +127,9 @@ function bytesToB64(bytes) {
 }
 
 async function init() {
-  if (!navigator.gpu) { statusEl.textContent = 'WebGPU not available'; return; }
+  if (!navigator.gpu) { reportNoWebGPU(statusEl); return; }
   const adapter = await navigator.gpu.requestAdapter();
-  if (!adapter) { statusEl.textContent = 'No adapter'; return; }
+  if (!adapter) { reportNoAdapter(statusEl); return; }
   const device = await adapter.requestDevice();
 
   device.pushErrorScope('validation');
