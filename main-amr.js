@@ -2911,7 +2911,11 @@ async function init() {
       const rp = enc.beginRenderPass({ colorAttachments: [{ view: ctx.getCurrentTexture().createView(), clearValue: { r:0.07, g:0.07, b:0.1, a:1 }, loadOp: 'clear', storeOp: 'store' }]});
       rp.setPipeline(renPL); rp.setBindGroup(0, renBG); rp.draw(6); rp.end();
 
-      {
+      // Only run when telemetry is on. It exists to answer a diagnostic
+      // question, and a normal run should not pay for an instrument -- least
+      // of all one whose cost cannot be measured on the machine it is
+      // suspected on.
+      if (TELEMETRY && !skipGroup('digest')) {
         const dg = beginPass(enc, 'field digest');
         dg.setPipeline(digestPL); dg.setBindGroup(0, digestBG); dg.dispatchWorkgroups(1); dg.end();
       }

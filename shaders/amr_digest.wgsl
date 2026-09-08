@@ -16,9 +16,9 @@
 // One dispatch per rendered FRAME, not per macro-step (64 of those), so at
 // ~9 passes per macro-step this is under 0.2% of the frame's pass count.
 //
-// Strided rather than exhaustive: a full reduction would need a second pass
-// to combine workgroups. One workgroup walking the field with a large stride
-// is enough to fingerprint it, and keeps this to a single dispatch with no
+// Sampled rather than exhaustive: a full reduction would need a second pass
+// to combine workgroups. 512 coalesced samples are ample to fingerprint a
+// field for an exact-repeat test, and keep this to a single dispatch with no
 // inter-workgroup dependency.
 
 @group(0) @binding(0) var<storage, read>       vel    : array<f32>;
@@ -35,18 +35,25 @@ fn main(@builtin(local_invocation_index) lid: u32) {
   var s = 0f;      // sum of ux (sign-sensitive: catches a shifted field)
   var q = 0f;      // sum of squares (energy-like)
   var m = 0f;      // max |u|
-  // Stride so consecutive threads read consecutive cells (coalesced) while
-  // the workgroup as a whole samples the whole domain.
-  var i = lid;
-  loop {
-    if (i >= NCELLS) { break; }
-    let ux = vel[i * 2u];
-    let uy = vel[i * 2u + 1u];
-    s += ux + 2f * uy;              // asymmetric weight so ux/uy cannot cancel
-    q += ux * ux + uy * uy;
-    m = max(m, max(abs(ux), abs(uy)));
-    i += 64u * 37u;                 // 37: coprime with the block sizes, so the
-                                    // walk does not alias onto one block column
+  // 8 CONTIGUOUS cells per thread at 8 evenly spaced anchors = 512 samples,
+  // mostly coalesced. The first version had each thread stride by 64*37 and
+  // take ~27 scattered samples: fine on desktop (measured free), but a
+  // single-workgroup pass doing scattered global reads is close to the worst
+  // case for a mobile tile-based GPU, and this instrument must not be a
+  // suspect in the performance it is being used to investigate. 512 samples
+  // is far more fingerprint than an exact-repeat test needs.
+  let anchors = 8u;
+  let per = 8u;
+  for (var a: u32 = 0u; a < anchors; a = a + 1u) {
+    let base = (NCELLS / anchors) * a + lid * per;
+    for (var j: u32 = 0u; j < per; j = j + 1u) {
+      let i = (base + j) % NCELLS;
+      let ux = vel[i * 2u];
+      let uy = vel[i * 2u + 1u];
+      s += ux + 2f * uy;            // asymmetric weight so ux/uy cannot cancel
+      q += ux * ux + uy * uy;
+      m = max(m, max(abs(ux), abs(uy)));
+    }
   }
   wg_a[lid] = s; wg_b[lid] = q; wg_m[lid] = m;
   workgroupBarrier();
