@@ -44,10 +44,11 @@
 
 // @include "common_geometry.wgsl"
 // @include "common_lattice.wgsl"
+// @include "common_fpack.wgsl"
 
 @group(0) @binding(0) var<storage, read>       state       : CardState;
-@group(0) @binding(1) var<storage, read>       f_coarse       : array<f32>;
-@group(0) @binding(2) var<storage, read_write> f_pool         : array<f32>;
+@group(0) @binding(1) var<storage, read>       f_coarse       : array<u32>;
+@group(0) @binding(2) var<storage, read_write> f_pool         : array<u32>;
 @group(0) @binding(3) var<storage, read>       slotToBlock    : array<i32>;
 // Milestone 4b: which slots were JUST assigned this refine/coarsen round --
 // only read when GHOST_ONLY=0 (the one-time full-slot-fill pipeline), to
@@ -121,7 +122,7 @@ fn sampleCoarse(bx_in: i32, by_in: i32) -> CoarseSample {
   var f: array<f32, 9>;
   var rho = 0f; var ux = 0f; var uy = 0f;
   for (var i = 0u; i < 9u; i++) {
-    f[i] = f_coarse[i * (W * H) + cell];
+    f[i] = fUnpack(f_coarse[fIdx(i, (W * H), cell)], i);
     rho += f[i];
     ux  += f[i] * f32(ex[i]);
     uy  += f[i] * f32(ey[i]);
@@ -225,8 +226,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       let poolPlaneStride = arrayLength(&f_pool) / 9u;
       let poolCellBase = slot * (FB * FB) + fy * FB + fx;
       let neighborCellBase = u32(neighborSlot) * (FB * FB) + nfy * FB + nfx;
-      for (var i = 0u; i < 9u; i++) {
-        f_pool[i * poolPlaneStride + poolCellBase] = f_pool[i * poolPlaneStride + neighborCellBase];
+      // Word-for-word copy: valid in both layouts, and under F16 it moves
+      // 5 words per cell instead of 9.
+      let nw = fWords();
+      for (var wi = 0u; wi < nw; wi++) {
+        f_pool[wi * poolPlaneStride + poolCellBase] = f_pool[wi * poolPlaneStride + neighborCellBase];
       }
       return;
     }
@@ -278,8 +282,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   // already encodes it).
   let poolPlaneStride = arrayLength(&f_pool) / 9u;
   let poolCellBase = slot * (FB * FB) + fy * FB + fx;
+  var fo: array<f32,9>;
   for (var i = 0u; i < 9u; i++) {
     let fneq = w00*s00.fneq[i] + w10*s10.fneq[i] + w01*s01.fneq[i] + w11*s11.fneq[i];
-    f_pool[i * poolPlaneStride + poolCellBase] = feqD2Q9(rho, ux, uy, i) + rescale * fneq;
+    fo[i] = feqD2Q9(rho, ux, uy, i) + rescale * fneq;
+  }
+  let nw = fWords();
+  for (var wi = 0u; wi < nw; wi++) {
+    f_pool[wi * poolPlaneStride + poolCellBase] = fPack(fo[fLo(wi)], fo[fHi(wi)], wi);
   }
 }

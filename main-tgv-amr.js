@@ -54,11 +54,20 @@
 // {ok:true}, no body to check coverage against -- debugReadCardState).
 
 import { assembleShader } from './shader-loader.mjs';
+import { packF, unpackF, fWords } from './f-pack.mjs';
 
 const canvas   = document.getElementById('c');
 const statusEl = document.getElementById('status');
 
 const urlParams = new URLSearchParams(window.location.search);
+// ?f16=1 / ?f16=2: real packed-half storage for `f` -- see shaders/common_fpack.wgsl
+// and f-pack.mjs. Wired on EVERY page that consumes those shaders, including
+// the ones with no accuracy check of their own: a page that quietly ignored
+// ?f16= would make a green `validate-all --extra=f16=1` sweep look like it
+// covered ground it never touched, which is the kind of false confidence
+// this repo has been bitten by before.
+const F16 = urlParams.has('f16') ? (parseInt(urlParams.get('f16')) || 0) : 0;
+
 let resLog2 = parseInt(urlParams.get('res')) || 6;
 // Floor of 5 (N=32, NBX=4) -- same structural minimum as main-channel-
 // amr.js (more than one coarse block per axis), not the cylinder
@@ -374,6 +383,16 @@ async function init() {
   const dummyCriterionBuf = device.createBuffer({ size: 4, usage: U.STORAGE | U.COPY_DST });
   device.queue.writeBuffer(dummyCriterionBuf, 0, new Float32Array([0]));
 
+  // See main-amr.js's copy for the rationale: the GPU buffer holds packed
+  // half pairs under F16, everything else speaks f32 plane-major, and these
+  // two are the only places the two meet.
+  const writeF = (buf, f32, ncells) => {
+    const src = packF(f32, ncells, F16);
+    device.queue.writeBuffer(buf, 0, src.buffer, src.byteOffset, ncells * fWords(F16) * 4);
+  };
+  const readF = (mapped, ncells) =>
+    F16 ? unpackF(new Uint32Array(mapped), ncells, true) : new Float32Array(mapped).slice();
+
   const cardStateBuf = device.createBuffer({ size: 104, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
 
   const pools = [undefined];
@@ -384,14 +403,14 @@ async function init() {
         ? MAX_FINE_BLOCKS
         : (urlParams.has(`maxFineBlocks${m}`) ? parseInt(urlParams.get(`maxFineBlocks${m}`)) : 128);
       const pool = allocLevelPool(device, U, m, curNBX, curNBY, maxFineBlocks);
-      device.queue.writeBuffer(pool.finePoolF_a, 0, initFPool(maxFineBlocks));
+      writeF(pool.finePoolF_a, initFPool(maxFineBlocks), maxFineBlocks * NCELLS1);
       pools.push(pool);
       curNBX *= 2; curNBY *= 2;
     }
   }
 
   device.queue.writeBuffer(cardStateBuf, 0, initCardState());
-  device.queue.writeBuffer(f_a, 0, initF());
+  writeF(f_a, initF(), NCELLS);
   device.queue.writeBuffer(pools[1].freeListBuf, 0, new Int32Array(MAX_FINE_BLOCKS).map((_, i) => i));
   device.queue.writeBuffer(pools[1].freeCountBuf, 0, new Int32Array([MAX_FINE_BLOCKS]));
 
@@ -538,12 +557,15 @@ async function init() {
   const constants = { W, H };
 
   // Fully periodic, no body, no walls, no force -- see this file's header.
-  const stepConstants = { W, H, HAS_BODY: 0, SPONGE_W: 0 };
+  const stepConstants = { W, H, HAS_BODY: 0, SPONGE_W: 0, F16 };
   const fineConstants = { W, H, RB };
+  // Split from fineConstants, which also drives the render fragment --
+  // render.wgsl has no F16 override and WebGPU rejects an undeclared one.
+  const avgConstants = { W, H, RB, F16 };
 
-  const interpConstants = { W, H, RB, GHOST_ONLY: 1 };
-  const interpInitConstants = { W, H, RB, GHOST_ONLY: 0 };
-  const interpFFConstants = { W, H, RB, GHOST_ONLY: 1, FINE_FINE_ONLY: 1 };
+  const interpConstants = { W, H, RB, GHOST_ONLY: 1, F16 };
+  const interpInitConstants = { W, H, RB, GHOST_ONLY: 0, F16 };
+  const interpFFConstants = { W, H, RB, GHOST_ONLY: 1, FINE_FINE_ONLY: 1, F16 };
   const step1Constants = { ...stepConstants, RB };
   const criterionConstants = { W, H };
   const manageConstants = { W, H, REFINE_THRESH, COARSEN_THRESH, FORCE_REFINE_MARGIN, FORCE_REFINE_LOOKAHEAD, HAS_LEVEL2: N_LEVELS > 2 ? 1 : 0, HAS_BODY: 0 };
@@ -558,7 +580,7 @@ async function init() {
   });
   const step1PoolPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [step1PoolBGL] }),
-    compute: { module: step1PoolSM, entryPoint: 'main', constants: { ...step1Constants, K_EPS: 1.5 } }
+    compute: { module: step1PoolSM, entryPoint: 'main', constants: { ...step1Constants, K_EPS: 1.5, F16 } }
   });
 
   const renPL = device.createRenderPipeline({
@@ -579,9 +601,9 @@ async function init() {
     layout: device.createPipelineLayout({ bindGroupLayouts: [interpBGL] }),
     compute: { module: interpDenseSM, entryPoint: 'main', constants: interpFFConstants }
   });
-  const interpPoolConstants = { RB, GHOST_ONLY: 1 };
-  const interpPoolInitConstants = { RB, GHOST_ONLY: 0 };
-  const interpPoolFFConstants = { RB, GHOST_ONLY: 1, FINE_FINE_ONLY: 1 };
+  const interpPoolConstants = { RB, GHOST_ONLY: 1, F16 };
+  const interpPoolInitConstants = { RB, GHOST_ONLY: 0, F16 };
+  const interpPoolFFConstants = { RB, GHOST_ONLY: 1, FINE_FINE_ONLY: 1, F16 };
   const interpPoolParentPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [interpPoolParentBGL] }),
     compute: { module: interpPoolSM, entryPoint: 'main', constants: interpPoolConstants }
@@ -596,11 +618,11 @@ async function init() {
   });
   const avgPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [avgBGL] }),
-    compute: { module: avgSM, entryPoint: 'main', constants: fineConstants }
+    compute: { module: avgSM, entryPoint: 'main', constants: avgConstants }
   });
   const avgPoolPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [avgPoolBGL] }),
-    compute: { module: avgPoolSM, entryPoint: 'main', constants: { RB } }
+    compute: { module: avgPoolSM, entryPoint: 'main', constants: { RB, F16 } }
   });
   const criterionPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [criterionBGL] }),
@@ -901,8 +923,8 @@ async function init() {
   }
 
   function resetSim() {
-    device.queue.writeBuffer(f_a, 0, initF());
-    device.queue.writeBuffer(pools[1].finePoolF_a, 0, initFPool());
+    writeF(f_a, initF(), NCELLS);
+    writeF(pools[1].finePoolF_a, initFPool(), MAX_FINE_BLOCKS * NCELLS1);
     device.queue.writeBuffer(cardStateBuf, 0, initCardState());
     device.queue.writeBuffer(pools[1].blockSlotBuf, 0, new Int32Array(NBLOCKS).fill(-1));
     device.queue.writeBuffer(pools[1].slotToBlockBuf, 0, new Int32Array(MAX_FINE_BLOCKS).fill(-1));
@@ -910,7 +932,7 @@ async function init() {
     device.queue.writeBuffer(pools[1].freeCountBuf, 0, new Int32Array([MAX_FINE_BLOCKS]));
     for (let c = 2; c < N_LEVELS; c++) {
       const pool = pools[c];
-      device.queue.writeBuffer(pool.finePoolF_a, 0, initFPool(pool.MAX_FINE_BLOCKS));
+      writeF(pool.finePoolF_a, initFPool(pool.MAX_FINE_BLOCKS), pool.MAX_FINE_BLOCKS * NCELLS1);
       device.queue.writeBuffer(pool.blockSlotBuf, 0, new Int32Array(pool.NBLOCKS).fill(-1));
       device.queue.writeBuffer(pool.slotToBlockBuf, 0, new Int32Array(pool.MAX_FINE_BLOCKS).fill(-1));
       const freeQuads = Array.from({ length: pool.MAX_FINE_BLOCKS / 4 }, (_, i) => i);

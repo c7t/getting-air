@@ -33,27 +33,12 @@
 
 // @include "common_geometry.wgsl"
 // @include "common_lattice.wgsl"
+// @include "common_fpack.wgsl"
 // @include "common_sponge.wgsl"
 // @include "common_walls.wgsl"
 
-// EXPERIMENT (measurement only, default off): emulate fp16 STORAGE precision
-// for f without changing any buffer layout. pack2x16float/unpack2x16float are
-// core WGSL builtins, so this needs no `shader-f16` feature. See
-// shaders/lbm_step.wgsl's QUANT_F16 for the full rationale, and mode 3 for
-// the canary that proves the override actually reaches the shader.
-//   0 = off   1 = quantise f   2 = quantise (f - w_i)   3 = 8-bit canary
-override QUANT_F16 : u32 = 0u;
 
-fn q16(x: f32) -> f32 {
-  return unpack2x16float(pack2x16float(vec2<f32>(x, 0.0f))).x;
-}
 
-fn qstore(x: f32, i: u32) -> f32 {
-  if (QUANT_F16 == 1u) { return q16(x); }
-  if (QUANT_F16 == 2u) { return wt[i] + q16(x - wt[i]); }
-  if (QUANT_F16 == 3u) { return round(x * 256.0f) / 256.0f; }
-  return x;
-}
 
 
 struct LevelParams {
@@ -65,8 +50,8 @@ struct LevelParams {
 }
 
 @group(0) @binding(0) var<storage, read>       state       : CardState;
-@group(0) @binding(1) var<storage, read>       f_in        : array<f32>;
-@group(0) @binding(2) var<storage, read_write> f_out       : array<f32>;
+@group(0) @binding(1) var<storage, read>       f_in        : array<u32>;
+@group(0) @binding(2) var<storage, read_write> f_out       : array<u32>;
 @group(0) @binding(3) var<storage, read_write> vel_pool    : array<f32>;
 @group(0) @binding(4) var<storage, read>       slotToBlock : array<i32>;
 @group(0) @binding(5) var<storage, read>       originX     : array<f32>;
@@ -198,7 +183,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       let srcWy = wrapf(srcBufY - state.off_y, f32(H));
       if (get_phi(vec2<f32>(srcWx, srcWy), state) < 0f) {
         let corr = 2f * wt[i] * (f32(ex[i]) * usx + f32(ey[i]) * usy) / CS2;
-        f[i] = f_in[opp[i] * poolPlaneStride + cell] + corr;
+        f[i] = fUnpack(f_in[fIdx(opp[i], poolPlaneStride, cell)], opp[i]) + corr;
         continue;
       }
     }
@@ -209,14 +194,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       if (wallSourceOutsideF(srcBufYUnwrapped)) {
         let wallUx = wallVelocityXF(srcBufYUnwrapped, WALL_U0, WALL_U1);
         let corr = 2f * wt[i] * f32(ex[i]) * wallUx / CS2;
-        f[i] = f_in[opp[i] * poolPlaneStride + cell] + corr;
+        f[i] = fUnpack(f_in[fIdx(opp[i], poolPlaneStride, cell)], opp[i]) + corr;
         continue;
       }
     }
     let srcX = clamp(i32(fx) - ex[i], 0, i32(FB) - 1);
     let srcY = clamp(i32(fy) - ey[i], 0, i32(FB) - 1);
     let srcCell = slot * (FB * FB) + u32(srcY) * FB + u32(srcX);
-    f[i] = f_in[i * poolPlaneStride + srcCell];
+    f[i] = fUnpack(f_in[fIdx(i, poolPlaneStride, srcCell)], i);
   }
 
   // 2. Local Macroscopic Variables
@@ -251,6 +236,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let tau_coarse = levelParams.parentTau;
   let tau_fine = 2.0f * tau_coarse - 0.5f;
   let omg = 1.0f / tau_fine;
+  // Gathered, then stored a whole cell at a time: under F16 two planes share
+  // a word, so a per-plane store would be a read-modify-write race. See
+  // common_fpack.wgsl.
+  var fo: array<f32,9>;
   for (var i = 0u; i < 9u; i++) {
     let exf = f32(ex[i]); let eyf = f32(ey[i]);
     let eu  = exf*ux + eyf*uy;
@@ -264,6 +253,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let f_collide = f[i] - omg * (f[i] - feq) + Si;
     let eu_far = exf*SPONGE_UX + eyf*SPONGE_UY;
     let f_target = wt[i] * (1.0f + 3.0f*eu_far + 4.5f*eu_far*eu_far - 1.5f*(SPONGE_UX*SPONGE_UX + SPONGE_UY*SPONGE_UY));
-    f_out[i * poolPlaneStride + cell] = qstore(mix(f_collide, f_target, sponge_weight), i);
+    fo[i] = mix(f_collide, f_target, sponge_weight);
+  }
+  let nw = fWords();
+  for (var wi = 0u; wi < nw; wi++) {
+    f_out[wi * poolPlaneStride + cell] = fPack(fo[fLo(wi)], fo[fHi(wi)], wi);
   }
 }

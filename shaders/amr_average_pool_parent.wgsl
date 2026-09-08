@@ -16,6 +16,7 @@
 // thread per coarse-equivalent cell of THIS level's own footprint.
 
 // @include "common_lattice.wgsl"
+// @include "common_fpack.wgsl"
 
 struct LevelParams {
   nbx: u32,        // unused here (destination is parentSlot+quadrant, not a
@@ -28,8 +29,8 @@ struct LevelParams {
 }
 
 @group(0) @binding(0) var<uniform>             levelParams   : LevelParams;
-@group(0) @binding(1) var<storage, read>       f_pool        : array<f32>;
-@group(0) @binding(2) var<storage, read_write> f_parent_pool : array<f32>;
+@group(0) @binding(1) var<storage, read>       f_pool        : array<u32>;
+@group(0) @binding(2) var<storage, read_write> f_parent_pool : array<u32>;
 @group(0) @binding(3) var<storage, read>       slotToBlock   : array<i32>;
 @group(0) @binding(4) var<storage, read>       parentSlot    : array<i32>;
 @group(0) @binding(5) var<storage, read>       quadrant      : array<u32>;
@@ -67,7 +68,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wgi
     var rho = 0f; var ux = 0f; var uy = 0f;
     var f: array<f32, 9>;
     for (var i = 0u; i < 9u; i++) {
-      f[i] = f_pool[i * poolPlaneStride + cell];
+      f[i] = fUnpack(f_pool[fIdx(i, poolPlaneStride, cell)], i);
       rho += f[i];
       ux  += f[i] * f32(ex[i]);
       uy  += f[i] * f32(ey[i]);
@@ -111,7 +112,12 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wgi
   let parentPlaneStride = arrayLength(&f_parent_pool) / 9u;
   let parentCell = pSlot * (FB * FB) + (ply + GHOST) * FB + (plx + GHOST);
 
+  var fo: array<f32,9>;
   for (var i = 0u; i < 9u; i++) {
-    f_parent_pool[i * parentPlaneStride + parentCell] = feqD2Q9(rho_avg, ux_avg, uy_avg, i) + rescale * fneq_avg[i];
+    fo[i] = feqD2Q9(rho_avg, ux_avg, uy_avg, i) + rescale * fneq_avg[i];
+  }
+  let nw = fWords();
+  for (var wi = 0u; wi < nw; wi++) {
+    f_parent_pool[wi * parentPlaneStride + parentCell] = fPack(fo[fLo(wi)], fo[fHi(wi)], wi);
   }
 }

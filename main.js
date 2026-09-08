@@ -1,4 +1,5 @@
 import { assembleShader } from './shader-loader.mjs';
+import { packF, unpackF, fWords } from './f-pack.mjs';
 import {
   deriveCardParams, parseCardParams, parseResLog2, reynoldsFromTau,
   DENSE_DEFAULT_RES_LOG2,
@@ -8,6 +9,14 @@ const canvas   = document.getElementById('c');
 const statusEl = document.getElementById('status');
 
 const urlParams = new URLSearchParams(window.location.search);
+// ?f16=1 / ?f16=2: real packed-half storage for `f` -- see shaders/common_fpack.wgsl
+// and f-pack.mjs. Wired on EVERY page that consumes those shaders, including
+// the ones with no accuracy check of their own: a page that quietly ignored
+// ?f16= would make a green `validate-all --extra=f16=1` sweep look like it
+// covered ground it never touched, which is the kind of false confidence
+// this repo has been bitten by before.
+const F16 = urlParams.has('f16') ? (parseInt(urlParams.get('f16')) || 0) : 0;
+
 let resLog2 = parseResLog2(urlParams, DENSE_DEFAULT_RES_LOG2);
 
 let W = 1 << resLog2;
@@ -150,6 +159,17 @@ async function init() {
 
   const U = GPUBufferUsage;
   const fSize   = NCELLS * 9 * 4;
+
+  // See main-amr.js's copy for the rationale: the GPU buffer holds packed
+  // half pairs under F16, everything else speaks f32 plane-major, and these
+  // two are the only places the two meet.
+  const writeF = (buf, f32, ncells) => {
+    const src = packF(f32, ncells, F16);
+    device.queue.writeBuffer(buf, 0, src.buffer, src.byteOffset, ncells * fWords(F16) * 4);
+  };
+  const readF = (mapped, ncells) =>
+    F16 ? unpackF(new Uint32Array(mapped), ncells, true) : new Float32Array(mapped).slice();
+
   const f_a     = device.createBuffer({ size: fSize, usage: U.STORAGE | U.COPY_DST });
   const f_b     = device.createBuffer({ size: fSize, usage: U.STORAGE });
   const velBuf  = device.createBuffer({ size: NCELLS * 2 * 4, usage: U.STORAGE });
@@ -171,7 +191,7 @@ async function init() {
     0, 0, 0, 0       // off_x, off_y, off_x_old, off_y_old
   ]);
   device.queue.writeBuffer(cardStateBuf, 0, cardInit);
-  device.queue.writeBuffer(f_a, 0, initF());
+  writeF(f_a, initF(), NCELLS);
 
   let paramsDirty = false;
   const updateGPUParams = () => {
@@ -259,14 +279,17 @@ async function init() {
   ]});
 
   const constants = { W, H };
+  // Separate dict for the pipelines whose shaders @include common_fpack.wgsl;
+  // phy/render don't declare F16 and WebGPU makes that a hard error.
+  const fConstants = { W, H, F16 };
 
   const stepPL = device.createComputePipeline({ 
     layout: device.createPipelineLayout({ bindGroupLayouts: [stepBGL] }), 
-    compute: { module: stepSM, entryPoint: 'main', constants } 
+    compute: { module: stepSM, entryPoint: 'main', constants: fConstants } 
   });
   const frcPL = device.createComputePipeline({ 
     layout: device.createPipelineLayout({ bindGroupLayouts: [frcBGL] }), 
-    compute: { module: frcSM, entryPoint: 'main', constants } 
+    compute: { module: frcSM, entryPoint: 'main', constants: fConstants } 
   });
   const phyPL = device.createComputePipeline({ 
     layout: device.createPipelineLayout({ bindGroupLayouts: [phyBGL] }), 

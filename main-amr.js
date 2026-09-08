@@ -15,6 +15,7 @@ import {
   AMR_DEFAULT_RES_LOG2, AMR_DEFAULT_LEVELS,
   tauAtLevel as tauAtLevelOf,
 } from './card-params.mjs';
+import { packF, unpackF, fWords } from './f-pack.mjs';
 
 const canvas   = document.getElementById('c');
 let deviceLost = false;
@@ -223,6 +224,23 @@ const FORCE_REFINE_MARGIN = urlParams.has('forceRefineMargin') ? parseFloat(urlP
 // shaders/common_geometry.wgsl). A very large value disables the early-out
 // entirely, which is the A/B for whether it helps or hurts on a given GPU.
 const SDF_FAR = urlParams.has('sdfFar') ? parseFloat(urlParams.get('sdfFar')) : 64;
+// ?f16=1 / ?f16=2: store `f` as packed half pairs (5 u32 words/cell instead of 9
+// f32s), cutting its traffic 1.80x. plans/perf-characterization.md measures
+// the phone as bandwidth bound with `f` as essentially all the traffic, and
+// settles the accuracy question by experiment -- see shaders/common_fpack.wgsl
+// for the layout and f-pack.mjs for the host side.
+//
+// DEFAULT OFF while it earns its place on real devices. Off is not merely
+// "the old numbers": F16=0 makes the shaders bitcast one f32 per u32, which
+// is byte-for-byte the previous layout, so it is the same computation and not
+// a second code path to keep honest.
+//
+// Buffer ALLOCATION is deliberately unchanged (still 9 words/cell) -- this is
+// a bandwidth change, not yet a footprint one. That keeps every
+// arrayLength(&f)/9u stride derivation in the shaders correct as-is and every
+// page's buffer sizing untouched; shrinking the allocation is a separate step
+// once this is proven.
+const F16 = urlParams.has('f16') ? (parseInt(urlParams.get('f16')) || 0) : 0;
 
 if (FORCE_REFINE_MARGIN >= SDF_FAR) {
   throw new Error(`?forceRefineMargin=${FORCE_REFINE_MARGIN} is at or above get_phi's SDF_FAR cutoff (${SDF_FAR}) -- ` +
@@ -741,6 +759,23 @@ async function init() {
   // that, per plans/AMR-multilevel-M5.md's explicit non-goal, only ever
   // handles level 1 until Milestone 10.
   const fSizePool = MAX_FINE_BLOCKS * NCELLS1 * 9 * 4;
+
+  // The ONLY two places the GPU's `f` layout and everyone else's meet.
+  // Everything outside the GPU -- the initial equilibrium, the snapshot
+  // format, the diagnostics below, and every tool under tools/ -- speaks f32
+  // plane-major, unconditionally. Under F16 the GPU buffer holds packed half
+  // pairs instead, so it is converted here on the way in and back on the way
+  // out, and nothing downstream has to know. See f-pack.mjs for why that is
+  // the boundary rather than teaching every consumer a second format.
+  //
+  // With F16 off both are the identity plus the copy the old code already
+  // did, so this is not a new cost on the default path.
+  const writeF = (buf, f32, ncells) => {
+    const src = packF(f32, ncells, F16);
+    device.queue.writeBuffer(buf, 0, src.buffer, src.byteOffset, ncells * fWords(F16) * 4);
+  };
+  const readF = (mapped, ncells) =>
+    F16 ? unpackF(new Uint32Array(mapped), ncells, true) : new Float32Array(mapped).slice();
   const pools = [undefined]; // pools[0] unused -- L0 is the dense grid, not a pool level
   {
     let curNBX = NBX, curNBY = NBY; // level 1's logical grid = today's coarse block grid
@@ -753,14 +788,14 @@ async function init() {
         // why exhaustion here shows up as horizontal bands.
         : (urlParams.has(`maxFineBlocks${m}`) ? parseInt(urlParams.get(`maxFineBlocks${m}`)) : 256);
       const pool = allocLevelPool(device, U, m, curNBX, curNBY, maxFineBlocks);
-      device.queue.writeBuffer(pool.finePoolF_a, 0, initFPool(maxFineBlocks));
+      writeF(pool.finePoolF_a, initFPool(maxFineBlocks), maxFineBlocks * NCELLS1);
       pools.push(pool);
       curNBX *= 2; curNBY *= 2; // next level's logical grid extent (quadtree doubling per axis)
     }
   }
 
   device.queue.writeBuffer(cardStateBuf, 0, initCardState());
-  device.queue.writeBuffer(f_a, 0, initF());
+  writeF(f_a, initF(), NCELLS);
   // pools[1].finePoolF_a's equilibrium pre-fill, and blockSlotBuf/
   // slotToBlockBuf's -1 fill, already happened above in allocLevelPool
   // (uniformly for every level, not just level 1 -- see its own comment).
@@ -1093,30 +1128,36 @@ async function init() {
   ]});
 
   const constants = { W, H, SDF_FAR };
-  const fineConstants = { W, H, RB };
+  // Same, plus the packed-f layout selector. Separate object because
+  // `constants` is also fed to phy/render, whose modules don't declare F16 --
+  // and WebGPU makes passing an undeclared override a pipeline-creation
+  // error, not a warning. Every pipeline whose shader @includes
+  // common_fpack.wgsl must get F16; no other pipeline may.
+  const fConstants = { ...constants, F16 };
+  const fineConstants = { W, H, RB, F16 };
   // Render fragment needs HAS_LEVEL2 to gate the level-2 override; keep it
   // separate from fineConstants, which is also fed to the avg compute
   // pipeline (whose shader has no HAS_LEVEL2 override).
   const renderConstants = { W, H, RB, HAS_LEVEL2: N_LEVELS > 2 ? 1 : 0 };
   // GHOST_ONLY=1: steady-state ghost-only reinterpolation (every macro-step).
   // GHOST_ONLY=0: full-slot fill, used once on block activation (see debugActivateBlock).
-  const interpConstants = { W, H, RB, GHOST_ONLY: 1 };
-  const interpInitConstants = { W, H, RB, GHOST_ONLY: 0 };
+  const interpConstants = { W, H, RB, GHOST_ONLY: 1, F16 };
+  const interpInitConstants = { W, H, RB, GHOST_ONLY: 0, F16 };
   // Between-substep fine-fine-only ghost re-exchange (see amr_interp_c2f.wgsl's
   // FINE_FINE_ONLY note and the dispatch between f1a/f1b below).
-  const interpFFConstants = { W, H, RB, GHOST_ONLY: 1, FINE_FINE_ONLY: 1 };
-  const step1Constants = { W, H, RB, SDF_FAR };
+  const interpFFConstants = { W, H, RB, GHOST_ONLY: 1, FINE_FINE_ONLY: 1, F16 };
+  const step1Constants = { W, H, RB, SDF_FAR, F16 };
   const criterionConstants = { W, H };
   const manageConstants = { W, H, SDF_FAR, REFINE_THRESH, COARSEN_THRESH, FORCE_REFINE_MARGIN, FORCE_REFINE_LOOKAHEAD, SPONGE_EXCLUDE_W, HAS_LEVEL2: N_LEVELS > 2 ? 1 : 0,
     N_REFINE_INC, N_REFINE_MAX, MAX_LEVEL: N_LEVELS - 1 };
 
   const stepPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [stepBGL] }),
-    compute: { module: stepSM, entryPoint: 'main', constants }
+    compute: { module: stepSM, entryPoint: 'main', constants: fConstants }
   });
   const frcPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [frcBGL] }),
-    compute: { module: frcSM, entryPoint: 'main', constants }
+    compute: { module: frcSM, entryPoint: 'main', constants: fConstants }
   });
   const phyPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [phyBGL] }),
@@ -1152,9 +1193,9 @@ async function init() {
   // runtime uniform (levelParams), not baked into the pipeline, precisely
   // so ONE compiled pipeline object is reusable across every L(m)->L(m+1)
   // pair (see shaders/amr_interp_pool_parent.wgsl's header).
-  const interpPoolConstants = { RB, GHOST_ONLY: 1 };
-  const interpPoolInitConstants = { RB, GHOST_ONLY: 0 };
-  const interpPoolFFConstants = { RB, GHOST_ONLY: 1, FINE_FINE_ONLY: 1 };
+  const interpPoolConstants = { RB, GHOST_ONLY: 1, F16 };
+  const interpPoolInitConstants = { RB, GHOST_ONLY: 0, F16 };
+  const interpPoolFFConstants = { RB, GHOST_ONLY: 1, FINE_FINE_ONLY: 1, F16 };
   const interpPoolParentPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [interpPoolParentBGL] }),
     compute: { module: interpPoolSM, entryPoint: 'main', constants: interpPoolConstants }
@@ -1186,7 +1227,7 @@ async function init() {
   });
   const avgPoolPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [avgPoolBGL] }),
-    compute: { module: avgPoolSM, entryPoint: 'main', constants: { RB } }
+    compute: { module: avgPoolSM, entryPoint: 'main', constants: { RB, F16 } }
   });
   // Milestone 8: level 1's own force pass. HAS_CHILD is baked in at
   // pipeline-creation time -- level 1 has exactly one dedicated pipeline
@@ -1194,14 +1235,14 @@ async function init() {
   // whole session (see amr_force1.wgsl's header).
   const force1PL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [force1BGL] }),
-    compute: { module: force1SM, entryPoint: 'main', constants: { W, H, RB, HAS_CHILD: N_LEVELS > 2 ? 1 : 0 } }
+    compute: { module: force1SM, entryPoint: 'main', constants: { W, H, RB, HAS_CHILD: N_LEVELS > 2 ? 1 : 0, F16 } }
   });
   // Milestone 8: level>=2's own force pass, one pipeline reused across
   // every such level (no per-level overrides -- hasChild/dxL are runtime
   // LevelParams reads, see amr_force1_pool.wgsl's header).
   const force1PoolPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [force1PoolBGL] }),
-    compute: { module: force1PoolSM, entryPoint: 'main', constants: { W, H, RB } }
+    compute: { module: force1PoolSM, entryPoint: 'main', constants: { W, H, RB, F16 } }
   });
   const criterionPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [criterionBGL] }),
@@ -1587,10 +1628,10 @@ async function init() {
     for (const st of levelStaging) allBuffers.push(st.f, st.vel, st.blockSlot, st.slotToBlock, st.parentSlot, st.quadrant, st.originX, st.originY);
     await Promise.all(allBuffers.map(b => b.mapAsync(GPUMapMode.READ)));
 
-    const f = new Float32Array(stagingF.getMappedRange()).slice();
+    const f = readF(stagingF.getMappedRange(), NCELLS);
     const vel = new Float32Array(stagingVel.getMappedRange()).slice();
     const card = Array.from(new Float32Array(stagingCard.getMappedRange()).slice());
-    const fPool = new Float32Array(stagingFPool.getMappedRange()).slice();
+    const fPool = readF(stagingFPool.getMappedRange(), MAX_FINE_BLOCKS * NCELLS1);
     const velPool = new Float32Array(stagingVelPool.getMappedRange()).slice();
     const blockSlotArr = Array.from(new Int32Array(stagingBlockSlot.getMappedRange()).slice());
     const slotToBlockArr = Array.from(new Int32Array(stagingSlotToBlock.getMappedRange()).slice());
@@ -1615,7 +1656,7 @@ async function init() {
       const m = i + 2;
       const pool = pools[m];
       const st = levelStaging[i];
-      const fPool_m = new Float32Array(st.f.getMappedRange()).slice();
+      const fPool_m = readF(st.f.getMappedRange(), pool.MAX_FINE_BLOCKS * NCELLS1);
       const velPool_m = new Float32Array(st.vel.getMappedRange()).slice();
       const blockSlotArr_m = Array.from(new Int32Array(st.blockSlot.getMappedRange()).slice());
       const slotToBlockArr_m = Array.from(new Int32Array(st.slotToBlock.getMappedRange()).slice());
@@ -1677,7 +1718,7 @@ async function init() {
     }
     const f = b64ToFloat32(snapshot.fB64, NCELLS * 9);
     const vel = b64ToFloat32(snapshot.velB64, NCELLS * 2);
-    device.queue.writeBuffer(f_a, 0, f.buffer, f.byteOffset, fSize);
+    writeF(f_a, f, NCELLS);
     // velBuf is a separate GPU buffer, not derived from f_a by anything
     // debugSnapshotLoad itself runs -- omitting this write left it holding
     // whatever was there before the load (stale ux/uy from a prior run)
@@ -1696,7 +1737,7 @@ async function init() {
       }
       const fPool_m = b64ToFloat32(snapPool.fB64, pool.MAX_FINE_BLOCKS * NCELLS1 * 9);
       const velPool_m = b64ToFloat32(snapPool.velB64, pool.MAX_FINE_BLOCKS * NCELLS1 * 2);
-      device.queue.writeBuffer(pool.finePoolF_a, 0, fPool_m.buffer, fPool_m.byteOffset, pool.fSizePool);
+      writeF(pool.finePoolF_a, fPool_m, pool.MAX_FINE_BLOCKS * NCELLS1);
       device.queue.writeBuffer(pool.finePoolVel, 0, velPool_m.buffer, velPool_m.byteOffset, pool.MAX_FINE_BLOCKS * NCELLS1 * 2 * 4);
       device.queue.writeBuffer(pool.blockSlotBuf, 0, new Int32Array(snapPool.blockSlot));
       device.queue.writeBuffer(pool.slotToBlockBuf, 0, new Int32Array(snapPool.slotToBlock));
@@ -2065,8 +2106,8 @@ async function init() {
   }
 
   function resetSim() {
-    device.queue.writeBuffer(f_a, 0, initF());
-    device.queue.writeBuffer(pools[1].finePoolF_a, 0, initFPool());
+    writeF(f_a, initF(), NCELLS);
+    writeF(pools[1].finePoolF_a, initFPool(), MAX_FINE_BLOCKS * NCELLS1);
     device.queue.writeBuffer(cardStateBuf, 0, initCardState());
     device.queue.writeBuffer(forceBuf, 0, new Int32Array([0, 0, 0, 0]));
     blockSlotCPU.fill(-1);
@@ -2080,7 +2121,7 @@ async function init() {
     for (let c = 2; c < N_LEVELS; c++) {
       const pool = pools[c];
       const qc = quadCPU[c];
-      device.queue.writeBuffer(pool.finePoolF_a, 0, initFPool(pool.MAX_FINE_BLOCKS));
+      writeF(pool.finePoolF_a, initFPool(pool.MAX_FINE_BLOCKS), pool.MAX_FINE_BLOCKS * NCELLS1);
       qc.blockSlotCPU.fill(-1);
       qc.slotToBlockCPU.fill(-1);
       device.queue.writeBuffer(pool.blockSlotBuf, 0, qc.blockSlotCPU);
@@ -2364,7 +2405,7 @@ async function init() {
         }
       }
     }
-    device.queue.writeBuffer(pools[1].finePoolF_a, 0, marker);
+    writeF(pools[1].finePoolF_a, marker, NPOOL);
 
     const enc = device.createCommandEncoder();
     const ipl = enc.beginComputePass();
@@ -2379,7 +2420,7 @@ async function init() {
     enc2.copyBufferToBuffer(pools[1].finePoolF_a, 0, stagingFPool, 0, fSizePool);
     device.queue.submit([enc2.finish()]);
     await stagingFPool.mapAsync(GPUMapMode.READ);
-    const result = new Float32Array(stagingFPool.getMappedRange()).slice();
+    const result = readF(stagingFPool.getMappedRange(), NPOOL);
     stagingFPool.unmap();
     return Array.from(result.subarray(0, NPOOL));
   }
@@ -2420,7 +2461,7 @@ async function init() {
     enc.copyBufferToBuffer(pool.finePoolF_a, 0, stage, 0, pool.fSizePool);
     device.queue.submit([enc.finish()]);
     await stage.mapAsync(GPUMapMode.READ);
-    const f = new Float32Array(stage.getMappedRange()).slice();
+    const f = readF(stage.getMappedRange(), pool.MAX_FINE_BLOCKS * NCELLS1);
     stage.unmap();
     stage.destroy();
     return Array.from(f);
@@ -2452,7 +2493,7 @@ async function init() {
         }
       }
     }
-    device.queue.writeBuffer(f_a, 0, f);
+    writeF(f_a, f, NCELLS);
   }
 
   // Always reads GPU state directly (not the CPU mirror, which goes stale
@@ -2871,6 +2912,7 @@ async function init() {
       perLevel: Array.from({ length: N_LEVELS - 1 }, (_, i) => ({ childLevel: i + 1, ...paramsForChildLevel(i + 1) })),
     }),
     getNumLevels: () => N_LEVELS,
+    getF16: () => F16,
     getLevelPoolSizes,
     tauAtLevel,
   };
