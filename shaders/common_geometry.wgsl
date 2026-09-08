@@ -84,7 +84,12 @@ struct CardState {
 // Distance beyond which the cheap algebraic lower bound is returned as-is;
 // see the FAR-FIELD EARLY-OUT note in get_phi. Every phi threshold any
 // caller uses must stay below this.
-const SDF_FAR = 64.0f;
+// An OVERRIDE, not a const, so it can be A/B'd at runtime: set it very large
+// and the early-out never fires, restoring the always-Newton behaviour. That
+// matters because the branch is a clear win on desktop but unmeasurable from
+// here on the mobile part this project targets, where a divergent branch has
+// a different cost profile.
+override SDF_FAR : f32 = 64.0f;
 
 fn get_phi(p: vec2<f32>, state: CardState) -> f32 {
     let ca = cos(state.theta);
