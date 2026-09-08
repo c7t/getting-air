@@ -81,6 +81,11 @@ struct CardState {
 // long before that error appears (tanh clamps), isNearBody only needs
 // phi < margin, and the bounce-back branch only needs the sign. The SIGN is
 // always exact -- it comes from the algebraic test, not from the iteration.
+// Distance beyond which the cheap algebraic lower bound is returned as-is;
+// see the FAR-FIELD EARLY-OUT note in get_phi. Every phi threshold any
+// caller uses must stay below this.
+const SDF_FAR = 64.0f;
+
 fn get_phi(p: vec2<f32>, state: CardState) -> f32 {
     let ca = cos(state.theta);
     let sa = sin(state.theta);
@@ -101,9 +106,32 @@ fn get_phi(p: vec2<f32>, state: CardState) -> f32 {
 
     let x = abs(lx);
     let y = abs(ly);
+
+    // FAR-FIELD EARLY-OUT. The old algebraic form `(r-1)*b` is a provable
+    // LOWER BOUND on the true distance outside the body: d = (r-1)/|grad r|
+    // and |grad r| ranges over [1/a, 1/b], so dividing by the largest
+    // possible gradient (1/b, since b <= a) can only under-estimate. Measured
+    // against brute force it is 0% to -88% -- never over.
+    //
+    // So when the bound alone already exceeds SDF_FAR, the true distance does
+    // too, and no caller can tell the difference: every consumer compares phi
+    // against a threshold well under SDF_FAR (chi saturates to 0 within a few
+    // epsilon, isNearBody tests against FORCE_REFINE_MARGIN), and the sign is
+    // unambiguous out there. Returning the bound skips the Newton iteration
+    // for the overwhelming majority of cells -- which matters because
+    // get_phi is called once per cell in BOTH the step and force kernels,
+    // and the force passes measured 40% of the desktop frame.
+    //
+    // Callers must keep every phi threshold below SDF_FAR. At 64 that is ~4x
+    // the default FORCE_REFINE_MARGIN and ~40x the chi band, with room to
+    // spare.
+    let r = sqrt((x*x)/(a*a) + (y*y)/(b*b));
+    let algebraic = (r - 1.0f) * b;
+    if (algebraic > SDF_FAR) { return algebraic; }
+
     // Sign from the algebraic test -- exact, and independent of the
     // iteration below (see INTERIOR CAVEAT above).
-    let inside = (x*x)/(a*a) + (y*y)/(b*b) < 1.0f;
+    let inside = r < 1.0f;
 
     var t = atan2(y * a, x * b); // == atan2(y/b, x/a), without the divides
     for (var i = 0u; i < 3u; i++) {

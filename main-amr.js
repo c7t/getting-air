@@ -206,6 +206,16 @@ const N_REFINE_INC = urlParams.has('refineInc') ? parseFloat(urlParams.get('refi
 const N_REFINE_MAX = urlParams.has('refineMax') ? parseFloat(urlParams.get('refineMax')) : 1.0;
 
 const FORCE_REFINE_MARGIN = urlParams.has('forceRefineMargin') ? parseFloat(urlParams.get('forceRefineMargin')) : 16;
+// get_phi returns a cheap LOWER BOUND once it exceeds SDF_FAR=64 (see
+// shaders/common_geometry.wgsl). That is exact for every consumer only while
+// all phi thresholds stay below it, and FORCE_REFINE_MARGIN is URL-settable,
+// so check rather than trust.
+if (FORCE_REFINE_MARGIN >= 64) {
+  throw new Error(`?forceRefineMargin=${FORCE_REFINE_MARGIN} is at or above get_phi's SDF_FAR cutoff (64) -- ` +
+    `beyond that the far-field early-out in shaders/common_geometry.wgsl returns a lower bound and isNearBody ` +
+    `would silently under-refine. Raise SDF_FAR together with it if you really need a margin this large.`);
+}
+
 const FORCE_REFINE_LOOKAHEAD = urlParams.has('forceRefineLookahead') ? parseFloat(urlParams.get('forceRefineLookahead')) : REFINE_EVERY;
 // L0 window-space edge band (coarse cells) excluded from vorticity-driven
 // refinement -- keeps fine blocks out of the ALBC sponge (amr_step.wgsl
@@ -1976,7 +1986,7 @@ async function init() {
     // once per macro-step, outside the fluid recursion entirely (same as
     // AGAL's own S_ComputeForces* calls, handled alongside S_Advance, not
     // inside it).
-    if (!skipGroup('force')) { const frc = beginPass(enc, 'force L0'); frc.setPipeline(frcPL); frc.setBindGroup(0, frcBG); frc.dispatchWorkgroups(WGX, WGY); frc.end(); }
+    if (!skipGroup('force') && !skipGroup('force0')) { const frc = beginPass(enc, 'force L0'); frc.setPipeline(frcPL); frc.setBindGroup(0, frcBG); frc.dispatchWorkgroups(WGX, WGY); frc.end(); }
     // Milestone 8: every level's own force contribution, all before `phy`
     // drains+resets the shared atomic forces[] buffer. Order among these
     // (and vs. frc above) doesn't matter -- each reads only its own
