@@ -10,10 +10,11 @@
 // derivation amr_step.wgsl's coarse kernel uses, just applied to a
 // continuous fine-cell position instead of an integer coarse-cell one.
 //
-// Streaming clamps at the slot's own buffer edge (2-cell ghost border
-// degrades over the 2 fine substeps by design -- see
-// amr_interp_c2f.wgsl's header); force integration stays coarse-only this
-// milestone (same scope cut as Milestone 2).
+// Streaming resolves a source cell that falls outside this tile's interior
+// against the OWNING same-level tile directly (blockSlot, binding 5) and only
+// falls back to clamping at the slot's own buffer edge where no such neighbour
+// exists -- see the DIRECT_GHOST override. Force integration stays coarse-only
+// this milestone (same scope cut as Milestone 2).
 
 // @include "common_geometry.wgsl"
 // @include "common_lattice.wgsl"
@@ -30,6 +31,11 @@
 @group(0) @binding(2) var<storage, read_write> f_out       : array<u32>;
 @group(0) @binding(3) var<storage, read_write> vel_pool    : array<f32>;
 @group(0) @binding(4) var<storage, read>       slotToBlock : array<i32>;
+// This level's own logical block grid -> pool slot, indexed by
+// blockID = by*(W/BLOCK)+bx. Read-only, and the ONLY new input
+// neighbour-addressed streaming needs (see DIRECT_GHOST) -- the neighbour
+// tile's f data is already in scope, because f_in is the whole pool.
+@group(0) @binding(5) var<storage, read>       blockSlot   : array<i32>;
 
 override W : u32; // coarse grid dims, needed for the off_x/off_y window wrap
 override H : u32;
@@ -56,6 +62,27 @@ override RB : u32;
 // differ. Guard placed after the slot lookup so the number stays comparable
 // with the desktop figure above.
 override SKIP_GHOST : u32 = 0u;
+
+// ── Neighbour-addressed streaming (AGAL) ─────────────────────────────────────
+// 1 (default): a pull whose source cell falls in this tile's ghost ring is
+// resolved against the OWNING same-level tile's own interior, via blockSlot,
+// instead of reading a materialized ghost cell. 0: the legacy path -- clamp at
+// the slot's own buffer edge and rely on a separate fine-fine copy pass having
+// filled the ring (?ghostcopy=1 restores it, for A/B).
+//
+// This is what lets the between-substep fine-fine ghost pass go away entirely
+// (plans/perf-characterization.md's "the one lead left": 15.3% of frame on the
+// phone, 13.3-18.5% on the desktop). It is not just cheaper, it is fresher:
+// substep B now sees the neighbour's post-`average` interior directly, where
+// the copy pass ran BEFORE the child's average landed, and a depth-2 ring cell
+// -- which the copy path leaves clamp-degraded after substep A, and which the
+// child's own bilinear parent sampling does read -- now streams correctly too.
+//
+// The ring is still materialized, and interp still fills it: a tile at the
+// coarse/fine interface has no same-level neighbour there, so blockSlot is < 0
+// and this falls back to the clamped read of a parent-interpolated ghost --
+// exactly the legacy path, for exactly the cells that need it.
+override DIRECT_GHOST : u32 = 1u;
 
 const BLOCK = 8u;
 const GHOST = 2u;
@@ -139,8 +166,38 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   }
 
   let nbx = W / BLOCK;
-  let originX = (u32(blockID) % nbx) * RB;
-  let originY = (u32(blockID) / nbx) * RB;
+  let nby = H / BLOCK;
+  let bx = u32(blockID) % nbx;
+  let by = u32(blockID) / nbx;
+  let originX = bx * RB;
+  let originY = by * RB;
+  // Wrapped neighbour columns/rows, hoisted out of the 9-direction gather
+  // below (the block grid is periodic, matching amr_interp_dense_parent.wgsl's
+  // own fine-fine consultation exactly). Dead code under DIRECT_GHOST=0.
+  let RB2 = RB * 2u;
+  let bxm = (bx + nbx - 1u) % nbx;
+  let bxp = (bx + 1u) % nbx;
+  let bym = (by + nby - 1u) % nby;
+  let byp = (by + 1u) % nby;
+
+  // Neighbour-slot resolution, hoisted out of the 9-direction gather below.
+  // A source cell is at most one cell away and a tile's interior is RB2 >= 2
+  // wide, so at most ONE non-zero neighbour offset is reachable per axis --
+  // which means the whole gather needs at most THREE neighbour slots (the
+  // x-, y- and diagonal tiles), resolved once here instead of re-resolved,
+  // with a fresh blockSlot load, on every one of the nine directions. A
+  // fully-interior thread loads nothing at all.
+  var offX = 0; var offY = 0;
+  var nbrX = -1; var nbrY = -1; var nbrXY = -1;
+  if (DIRECT_GHOST != 0u) {
+    offX = select(select(0, 1, fx + 1u >= GHOST + RB2), -1, fx <= GHOST);
+    offY = select(select(0, 1, fy + 1u >= GHOST + RB2), -1, fy <= GHOST);
+    let cx = select(select(bx, bxp, offX > 0), bxm, offX < 0);
+    let cy = select(select(by, byp, offY > 0), bym, offY < 0);
+    if (offX != 0) { nbrX = blockSlot[by * nbx + cx]; }
+    if (offY != 0) { nbrY = blockSlot[cy * nbx + bx]; }
+    if (offX != 0 && offY != 0) { nbrXY = blockSlot[cy * nbx + cx]; }
+  }
 
   let poolPlaneStride = arrayLength(&f_in) / 9u;
   let cell = slot * (FB * FB) + fy * FB + fx;
@@ -195,9 +252,33 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         continue;
       }
     }
-    let srcX = clamp(i32(fx) - ex[i], 0, i32(FB) - 1);
-    let srcY = clamp(i32(fy) - ey[i], 0, i32(FB) - 1);
-    let srcCell = slot * (FB * FB) + u32(srcY) * FB + u32(srcX);
+    var sx = i32(fx) - ex[i];
+    var sy = i32(fy) - ey[i];
+    var srcSlot = slot;
+    if (DIRECT_GHOST != 0u) {
+      // Does this source cell leave the interior, and on which axes? If so
+      // the offset can only be offX/offY (see the hoist above), so this is
+      // pure register work -- no second blockSlot load.
+      let ox = select(0, offX, sx < i32(GHOST) || sx >= i32(GHOST + RB2));
+      let oy = select(0, offY, sy < i32(GHOST) || sy >= i32(GHOST + RB2));
+      let ns = select(select(select(-1, nbrY, oy != 0), nbrX, ox != 0),
+                      nbrXY, ox != 0 && oy != 0);
+      if (ns >= 0) {
+        // Re-express the source in the neighbour's own local coordinates. It
+        // always lands in ITS interior -- sx in [-1, GHOST-1] maps to
+        // [RB2-1, RB2+1], sx in [GHOST+RB2, FB] maps to [GHOST, GHOST+2] --
+        // so the clamp below is a no-op on this path.
+        srcSlot = u32(ns);
+        sx -= ox * i32(RB2);
+        sy -= oy * i32(RB2);
+      }
+    }
+    // No same-level neighbour (or DIRECT_GHOST=0): clamp at the slot's own
+    // buffer edge and read this tile's own ghost cell, which the interp pass
+    // filled from the parent.
+    let srcCell = srcSlot * (FB * FB)
+                + u32(clamp(sy, 0, i32(FB) - 1)) * FB
+                + u32(clamp(sx, 0, i32(FB) - 1));
     f[i] = fUnpack(f_in[fIdx(i, poolPlaneStride, srcCell)], i);
   }
 

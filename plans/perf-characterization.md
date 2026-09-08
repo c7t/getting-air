@@ -48,7 +48,7 @@ submitting work and reading its result.
 ## How to measure (and how not to)
 
 `?bench=1` runs a frame-scale differential sweep: skip a group of passes,
-measure the change in median frame GPU time, repeat. `?benchSkip=force,ghost`
+measure the change in median frame GPU time, repeat. `?benchSkip=force,interp`
 applies a skip manually. Results post over the telemetry channel
 (`?telemetry=1`), which is the only way to see a phone.
 
@@ -92,13 +92,38 @@ gets its GPU work deprioritised and its timers throttled, so whichever
 configurations were current while it was hidden are timed against a different
 machine. A phone run was lost to exactly that, silently. The sweep watches
 `visibilitychange` and returns `interrupted: true`; discard those numbers. The
-full 13-config list is ~4.5 min at the default 3 rounds; `?benchConfigs=` trims
+full 12-config list is ~4.2 min at the default 3 rounds; `?benchConfigs=` trims
 it (7 configs is ~2.7 min on the phone) and `?benchMeasureMs=` sets the target
 per-run wall-clock. Progress goes to the `#status` line, which the frame loop
 leaves alone while a sweep owns it. An unknown group name is rejected up front
 rather than silently reporting ~0% -- a mistyped entry used to be
 indistinguishable from a real measurement, which is unrecoverable on a device
 that gets one sweep per session.
+
+**The phone DOES have a CDP endpoint, over adb -- and it is still not the way
+to measure it (2026-09-08).** `adb forward tcp:9222
+localabstract:chrome_devtools_remote` exposes Chrome for Android's DevTools
+endpoint, so `tools/`-style CDP driving is possible in principle. Two things
+found the hard way:
+
+- it answers **only while Chrome is in the foreground**. Background Chrome and
+  `/json/list` stops responding and any attached socket drops, which surfaces
+  as a bare `socket hang up` with no other clue.
+- driving `debugStepSync` through it **killed Chrome outright**, twice
+  (`pidof com.android.chrome` empty afterwards, socket refused). NOT isolated:
+  three WebGPU tabs were alive at the time, so memory pressure is as good a
+  candidate as the long synchronous call. Not worth chasing, because the
+  in-page `?bench=1` sweep worked first time on the same device and is
+  purpose-built for it.
+
+So adb is genuinely useful here -- for launching a parameterised URL
+(`am start -a android.intent.action.VIEW -d '<url>'`), for keeping the screen
+on (`svc power stayon usb`), and for confirming Chrome stayed foregrounded for
+the whole sweep -- but the measurement itself should still be `?bench=1` +
+`?telemetry=1`, read out of `telemetry.log` locally. Earlier text in this
+document saying the phone "has no CDP endpoint" is what this corrects; what it
+was really saying, and what is still true, is that the phone cannot be driven
+the way `tools/bench-amr.js` drives the desktop.
 
 **Do not trust per-pass timestamps on mobile.** The PowerVR part's timestamp
 counter ticks at 65536 ns. A macro-step is ~1125 µs — about 17 ticks spread
@@ -278,6 +303,12 @@ blockage=3.3` throughout.
 | **interp+avg+ghost together** | **42.4%** | **40.5-49.1%** |
 | step1 (fine LBM) | 32.5% | 27.5-32.7% |
 
+**The `ghost` and `ghost-noop` bench groups no longer exist** -- the pass they
+named was removed on 2026-09-08 (see "The one lead left" below), and a group
+that skips a pass nobody encodes would report ~0% and read as a measurement.
+`ghostcopy` asks the same question from the other side: it puts the pass back.
+The rows above are kept as the record of what that pass cost.
+
 Phone: one `?bench=1` sweep, spreads 0.5-6.1%, `interrupted: false`. Desktop:
 six `tools/bench-amr.js --skip` runs plus one validated in-page sweep; the
 range is across runs with different frozen topologies, not measurement error.
@@ -335,28 +366,102 @@ class to test coalescing (~0%). Replacing the pool shader's runtime integer
 Halving `avg`'s live register footprint with a bit-identical single-pass
 accumulator (~0%). Indirect dispatch was already ruled out twice.
 
-### The one lead left
+### The one lead left -- IMPLEMENTED 2026-09-08, 9.9% desktop / 13.1% phone
 
 **Stop materializing same-level ghost cells.** `amr_interp_pool_parent.wgsl`'s
-own header names it: AGAL "addresses neighbor blocks directly during streaming
-instead of materializing ghost cells in a padded buffer". That removes the
-ghost pass outright (15.3% phone / 13.3-18.5% desktop) and interp's fine-fine
-branch, which is nearly all of interp (~15% on both) -- an envelope around
-**30% of frame on both devices**, minus whatever the neighbour lookup costs
-step1's gather.
+own header named it: AGAL "addresses neighbor blocks directly during streaming
+instead of materializing ghost cells in a padded buffer". Shipped as the
+`DIRECT_GHOST` override in `shaders/amr_step1.wgsl` /
+`shaders/amr_step1_pool.wgsl` (one new read-only `blockSlot` binding each, no
+new data buffers -- `f_in` was already the whole pool, so the neighbour tile's
+data was always in scope). The between-substep fine-fine ghost COPY pass is no
+longer encoded at all. `?ghostcopy=1` restores the old path on every AMR page,
+and `?benchSkip=ghostcopy` switches it inside one `?bench=1` sweep.
 
-Tractable because `step1` already binds the whole pool as `f_in`, so a
-neighbour tile's data is in scope; the only new input is `blockSlot` as one
-read-only binding. No new data buffers.
+**Measured on BOTH devices**, `res=8&levels=3&blockage=3.3`, four
+configurations so the net splits into its two halves. Desktop RTX 4080 via
+`tools/bench-amr.js`-style interleaving, frozen at L1=125/L2=144, competing GPU
+clients stopped, 10 reps of 4000 macro-steps. Phone (img-tec/PowerVR) via one
+in-page `?bench=1` sweep, frozen at L1=166/L2=140, 640 macro-steps per run,
+`interrupted: false`, spreads 1.2-2.3%.
 
-Do NOT justify it by the `FB` 20 -> 16 shrink it would also allow -- that was
-measured at ~1% (see the struck-out ghost-cell-fraction lead above).
+| configuration | desktop median ms | phone median ms |
+|---|---|---|
+| none (direct) | 616.5 | 2793.1 |
+| step1 skipped (direct) | 367 | 1620.3 |
+| ghostcopy (legacy) | 684.5 | 3212.5 |
+| ghostcopy + step1 skipped | 486.5 | 2156.3 |
 
-Gates: it touches shaders shared by five AMR pages and changes bind groups,
-which is the 238e48c failure mode `validate-all.js`'s boot smoke exists for.
-It is physics-affecting, so the analytic `channel-*`/`tgv-*` checks are the
-gate, then Cd/St, then AMR invariants, then `validate-divergence` (whose
-`fullrefine` leg is the interface-error noise floor and should be unchanged).
+| | desktop | phone |
+|---|---|---|
+| fine-fine ghost pass removed | 119.5 ms = **17.5%** of the legacy frame | 536.0 ms = **16.7%** |
+| fine step got more expensive | 198 -> 249.5 ms = **+7.5%** of frame | 1056.2 -> 1172.8 ms = **+3.6%** |
+| **net saving** | **68 ms = 9.9%** of the legacy frame | **419.4 ms = 13.1%** |
+
+- the pass itself cost 16.7-17.5% on both, squarely inside the 13.3-18.5% this
+  document predicted for it. The prediction was right, and it is the same size
+  on two devices with opposite bottlenecks -- the same pattern the coupling
+  measurement above already found.
+- the fine step got more expensive on both, because half the threads in a tile
+  now pull from a different slot's memory instead of an adjacent ghost cell.
+  **The phone gives back half as much as the desktop does** (3.6% against
+  7.5%), which is the bottleneck model predicting correctly for once: this
+  trades bytes for locality, and the bandwidth-bound device is the one that
+  wants that trade. The phone therefore ends up with the LARGER win, 13.1%
+  against 9.9%, despite the pass costing it slightly less.
+- desktop net repeated as a two-configuration paired A/B on two other frozen
+  topologies: 9.3% and 7.0%. Phone net repeated on a second sweep at a
+  different frozen topology (L1=167/L2=124): 13.8%.
+
+**So the ~30% envelope this section used to claim was wrong, and wrong in a way
+worth remembering.** It assumed interp's fine-fine branch would go too, on the
+grounds that `interp - ghost` is within noise, so interp's parent math must be
+nearly free, so nearly all of interp must be fine-fine plumbing. But this
+document's OWN measurement
+two sections up says the copy is the cheap part (1.8-3.9% of a 15.5-18.5%
+pass) and the per-thread prologue and neighbour resolution are the expensive
+part -- and interp still has to run that prologue for every ring cell, because
+a tile at the coarse/fine interface still needs its ghosts filled from the
+parent. Removing the copy from interp buys the 1.8-3.9%, not the 15%. Two
+measurements in the same document contradicted each other and the optimistic
+one got quoted. interp's fine-fine branch is therefore KEPT: it costs almost
+nothing and it keeps the ring exact for the one consumer that still reads it
+(the child's own bilinear parent sampling reaches into its parent's ring).
+
+It is also more accurate, not just faster, for two reasons that cost nothing:
+substep B now reaches the neighbour's post-`average` interior, where the copy
+pass ran BEFORE the child's average landed; and a depth-2 ring cell -- which
+the copy path leaves clamp-degraded after substep A -- now streams correctly.
+Measured as unchanged rather than assumed: `validate-divergence --res=9
+--levels=3 --re=20` gives interface excess 1.12x and `edge` 0.95-0.96 on BOTH
+paths, adaptive final relL2(ux) 7.74e-3 direct against 7.76e-3 legacy,
+fullrefine 6.91e-3 against 6.92e-3.
+
+Gates, all run: `make check`; the analytic `channel-*`/`tgv-*` checks (the gate
+for anything physics-affecting) PASS; boot smoke on all four pages PASS, which
+is the 238e48c failure mode this touches by changing bind groups on shaders
+five AMR pages share; Cd/St and AMR invariants unchanged against the documented
+baseline (`dense-reference` Cd 1.950 and `amr-N2-diffuse` Cd 1.620, both
+exactly the numbers this document already records, and both still the open
+diffuse-interface-width failure rather than anything this change did);
+`validate-divergence` as above.
+
+Not done, and the next thing to try if this is revisited: the +7.5% the fine
+step gave back. It is a locality cost, not an ALU cost -- hoisting the
+neighbour-slot resolution out of the 9-direction gather (at most three
+`blockSlot` loads per thread, none for an interior thread, which is what the
+shipped code does) did not move it measurably.
+
+Do NOT justify any of this by the `FB` 20 -> 16 shrink it would also allow --
+that was measured at ~1% (see the struck-out ghost-cell-fraction lead above),
+and the ring is still materialized regardless, for the interface tiles.
+
+`?bench=1` with `ghostcopy` in the configuration list is how the phone column
+above was taken -- it is in the default sweep, and it interleaves
+configurations within one session, which is what makes it immune to the
+thermal ramp (24-57%) that makes that device's cross-session medians worthless.
+The ramp is plainly visible in the same telemetry: gpuMs went 200 -> 258 across
+the warm-up before the sweep started, and back to ~230 after.
 
 `avg` is not worth attacking: it is near its traffic floor (4 reads + 1 write
 per coarse cell), the register rewrite did nothing, and it is *cheaper* on the

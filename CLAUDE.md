@@ -153,16 +153,31 @@ the driver optimized away, with a control that could not detect that.
 layout. Measured NOT viable as a default; kept for re-measurement, not for
 shipping.
 
+`?ghostcopy=1` — restores the legacy materialized same-level ghost cells on
+every AMR page. Default 0: the fine step addresses neighbour tiles directly
+during streaming (`DIRECT_GHOST` in `shaders/amr_step1*.wgsl`), so the
+between-substep fine-fine ghost COPY pass is not encoded at all. Worth ~10% of frame GPU time on the
+desktop and ~13% on the phone — see `plans/perf-characterization.md`'s "The one
+lead left" for the per-device decomposition and for why the ~30% it originally
+predicted was wrong. Both
+paths are live in one build, so they can be A/B'd for speed
+(`?benchSkip=ghostcopy`, also in the `?bench=1` default sweep) and for physics
+(`node tools/validate-all.js --extra=ghostcopy=1`).
+
 Timing/measurement entry points:
 - `?telemetry=1` — POSTs periodic samples (device, adapter, config, frame
   GPU/sync ms) to the dev server's `/_telemetry`, appended to
-  `telemetry.log`. The only way to see a device that has no CDP endpoint,
-  e.g. a phone on the LAN. Opt-in, same-origin, local-only.
+  `telemetry.log`. The way to see a device `tools/bench-amr.js` cannot drive,
+  e.g. a phone on the LAN. (A phone on USB does expose CDP via `adb forward
+  tcp:9222 localabstract:chrome_devtools_remote`, but only while Chrome is
+  foregrounded, and driving `debugStepSync` over it killed Chrome — see
+  `plans/perf-characterization.md`. Use `?bench=1` + this.) Opt-in,
+  same-origin, local-only.
 - `?profile=1` — attaches `debugProfileMacroStep`'s per-pass breakdown to
   those samples. Trustworthy only where the timestamp counter is
   fine-grained; check the values are not all multiples of one number first.
 - `?bench=1` — runs the frame-scale pass-group attribution sweep and posts
-  one summary. `?benchSkip=force,ghost` applies a skip by hand. Freezes
+  one summary. `?benchSkip=force,interp` applies a skip by hand. Freezes
   refinement so every configuration sees identical topology; the physics is
   deliberately wrong while it runs.
 

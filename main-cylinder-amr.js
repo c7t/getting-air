@@ -57,6 +57,22 @@ const USE_BOUNCEBACK = urlParams.has('bounceback') ? 1 : 0;
 // analytic channel/tgv field checks are.
 const F16 = urlParams.has('f16') ? (parseInt(urlParams.get('f16')) || 0) : 0;
 
+// ── ?ghostcopy=1 -- legacy materialized same-level ghost cells ───────────────
+// Default 0: the fine step resolves a source cell that falls outside its tile
+// against the owning same-level tile directly (blockSlot), so the
+// between-substep fine-fine ghost COPY pass is not encoded at all. Measured
+// worth 9.9% of frame GPU time on the desktop and 13.1% on the phone (the pass
+// itself was 16.7-17.5%; the fine step gives 3.6-7.5% of that back, since half
+// a tile's threads now pull from another slot's memory) -- see
+// plans/perf-characterization.md's "The one lead left" for the full
+// decomposition on both devices.
+//
+// 1 restores the old path exactly (clamp at the slot's own buffer edge, plus
+// the copy pass), so the two can be A/B'd for both speed and physics on one
+// build: `node tools/validate-all.js --extra=ghostcopy=1` runs the whole
+// validation sweep against the legacy path.
+const GHOST_COPY = urlParams.has('ghostcopy') ? (parseInt(urlParams.get('ghostcopy')) || 0) : 0;
+
 // ── Milestone 4 (plans/AMR.md): dynamic refinement via a fixed-capacity ───
 // fine-block pool. Supersedes Milestone 2's single hardcoded fine region:
 // refinement now happens at M1's own 8x8 coarse-block granularity, and any
@@ -1051,7 +1067,11 @@ async function init() {
     { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
     { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-    { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }
+    { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    // binding 5: blockSlot -- neighbour-addressed streaming (see the
+    // DIRECT_GHOST override in shaders/amr_step1.wgsl). Present in the layout
+    // even under ?ghostcopy=1, where the shader simply never reads it.
+    { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }
   ]});
   const avgBGL = device.createBindGroupLayout({ label: 'avgBGL', entries: [
     { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
@@ -1072,7 +1092,9 @@ async function init() {
     { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } }
+    { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+    // binding 8: blockSlot -- see step1BGL's binding 5.
+    { binding: 8, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }
   ]});
   // Milestone 7: level>=2 average, writing into a parent POOL tile via
   // parentSlot/quadrant instead of cellIndex() -- see
@@ -1132,7 +1154,7 @@ async function init() {
   // Fine step(s) also need the freestream sponge target (see amr_step1*.wgsl's
   // SPONGE_UX/UY -- both L1's dedicated file and the level>=2 shared one have
   // their own copy of the sponge, not shared with the coarse kernel).
-  const step1Constants = { W, H, RB, SPONGE_UX: U0, SPONGE_UY: 0, USE_BOUNCEBACK, F16 };
+  const step1Constants = { W, H, RB, SPONGE_UX: U0, SPONGE_UY: 0, USE_BOUNCEBACK, F16, DIRECT_GHOST: GHOST_COPY ? 0 : 1 };
   const criterionConstants = { W, H };
   const manageConstants = { W, H, REFINE_THRESH, COARSEN_THRESH, FORCE_REFINE_MARGIN, FORCE_REFINE_LOOKAHEAD, HAS_LEVEL2: N_LEVELS > 2 ? 1 : 0 };
 
@@ -1318,8 +1340,8 @@ async function init() {
   // Fine ping-pong within a macro-step is a fixed 2-call sequence (ab then
   // ba), not a persistent toggle like the coarse useB -- always call both,
   // in order, every macro-step.
-  const step1BG_ab = device.createBindGroup({ layout: step1BGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: pools[1].finePoolF_a } }, { binding: 2, resource: { buffer: pools[1].finePoolF_b } }, { binding: 3, resource: { buffer: pools[1].finePoolVel } }, { binding: 4, resource: { buffer: pools[1].slotToBlockBuf } }]});
-  const step1BG_ba = device.createBindGroup({ layout: step1BGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: pools[1].finePoolF_b } }, { binding: 2, resource: { buffer: pools[1].finePoolF_a } }, { binding: 3, resource: { buffer: pools[1].finePoolVel } }, { binding: 4, resource: { buffer: pools[1].slotToBlockBuf } }]});
+  const step1BG_ab = device.createBindGroup({ layout: step1BGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: pools[1].finePoolF_a } }, { binding: 2, resource: { buffer: pools[1].finePoolF_b } }, { binding: 3, resource: { buffer: pools[1].finePoolVel } }, { binding: 4, resource: { buffer: pools[1].slotToBlockBuf } }, { binding: 5, resource: { buffer: pools[1].blockSlotBuf } }]});
+  const step1BG_ba = device.createBindGroup({ layout: step1BGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: pools[1].finePoolF_b } }, { binding: 2, resource: { buffer: pools[1].finePoolF_a } }, { binding: 3, resource: { buffer: pools[1].finePoolVel } }, { binding: 4, resource: { buffer: pools[1].slotToBlockBuf } }, { binding: 5, resource: { buffer: pools[1].blockSlotBuf } }]});
   // Fine-fine-only ghost re-exchange, run BETWEEN f1a and f1b. f1a writes the
   // post-substep-1 pool into pools[1].finePoolF_b (the buffer f1b then reads), so this
   // refreshes each block's fine-fine seam ghosts IN PLACE in pools[1].finePoolF_b from
@@ -1430,6 +1452,7 @@ async function init() {
       { binding: 5, resource: { buffer: childPool.originXBuf } },
       { binding: 6, resource: { buffer: childPool.originYBuf } },
       { binding: 7, resource: { buffer: childPool.levelParamsBuf } },
+      { binding: 8, resource: { buffer: childPool.blockSlotBuf } },
     ]});
     childPool.step1PoolBG_ba = device.createBindGroup({ layout: step1PoolBGL, entries: [
       { binding: 0, resource: { buffer: cardStateBuf } },
@@ -1440,6 +1463,7 @@ async function init() {
       { binding: 5, resource: { buffer: childPool.originXBuf } },
       { binding: 6, resource: { buffer: childPool.originYBuf } },
       { binding: 7, resource: { buffer: childPool.levelParamsBuf } },
+      { binding: 8, resource: { buffer: childPool.blockSlotBuf } },
     ]});
 
     const avgEntries = (parentBuf) => [
@@ -1784,13 +1808,15 @@ async function init() {
   //   CURRENT state, this level's OWN substep A, then -- if level+1 exists
   //   -- recurse into level+1 ONCE, average level+1 back into THIS level,
   //   and re-interpolate INTO level+1 (using this level's just-averaged-
-  //   into state) so level+1's NEXT cycle sees fresh ghosts. Then this
-  //   level's own same-level fine-fine ghost refresh (a project-specific
-  //   stand-in for AGAL's own neighbor-aware streaming -- see
-  //   amr_interp_dense_parent.wgsl's FINE_FINE_ONLY note; AGAL's mesh
-  //   doesn't need this pass because it addresses neighbor blocks directly
-  //   during streaming instead of materializing ghost cells in a padded
-  //   buffer). Then this level's OWN substep B, and -- again if level+1
+  //   into state) so level+1's NEXT cycle sees fresh ghosts. Then, under
+  //   ?ghostcopy=1 ONLY, this level's own same-level fine-fine ghost
+  //   refresh -- the pass this project used to need in place of AGAL's own
+  //   neighbor-aware streaming. The default build now does what AGAL does
+  //   (addresses neighbor blocks directly during streaming rather than
+  //   materializing same-level ghost cells), so there is no pass here at
+  //   all: see DIRECT_GHOST in shaders/amr_step1.wgsl, and
+  //   plans/perf-characterization.md for what removing it measured.
+  //   Then this level's OWN substep B, and -- again if level+1
   //   exists -- recurse into level+1 a SECOND time and average again.
   //   Every non-root level therefore does exactly 2 of its own substeps
   //   per call, and drives its child through exactly 2 full cycles (one
@@ -1875,9 +1901,12 @@ async function init() {
       averageFromChild(cur);  // level+1's full cycle #1 lands in level's CURRENT ('b')
       interpIntoChild(cur);   // re-interpolate level+1's ghosts from level's just-updated state
     }
-    // Same-level fine-fine refresh, after any sibling's own average might
-    // have just landed (see header) and before substep B reads it.
-    fineFineRefresh();
+    // Legacy same-level fine-fine refresh (?ghostcopy=1 only). The default
+    // path needs no pass here: substep B's own gather reaches into the
+    // neighbour tile directly, so it reads the neighbour's post-`average`
+    // interior rather than a copy taken before that average landed. See the
+    // DIRECT_GHOST override in shaders/amr_step1.wgsl.
+    if (GHOST_COPY) fineFineRefresh();
     substep(cur);           // reads 'b', writes 'a'
     cur = 'a';
     if (hasChild) {
