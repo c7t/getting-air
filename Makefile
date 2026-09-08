@@ -112,12 +112,15 @@ tools: ## install validation tools (naga-cli via cargo; needs Rust)
 	cargo install naga-cli --version '^$(NAGA_VERSION)' --locked
 
 # --- Publishing / release --------------------------------------------------
-# These targets talk to GitHub via `gh` and ALWAYS act on your own `origin`
+# `make status` talks to GitHub via `gh` and ALWAYS acts on your own `origin`
 # remote -- derived from the remote URL, NOT `gh repo view` (which resolves a
-# fork to its PARENT and would make you operate on the wrong repo). So `make
-# publish` publishes whichever repo you cloned from: run by the maintainer it
-# publishes the canonical site; run by a fork owner it publishes their fork.
-# The validation targets above need no network and no gh; only these do.
+# fork to its PARENT and would make you report on the wrong repo). So it shows
+# whichever repo you cloned from: the maintainer sees the canonical site, a
+# fork owner sees their own. The validation targets above need no network and
+# no gh; only this one does.
+#
+# There is no release step any more: Pages serves `main` directly, so merging
+# to main publishes. See the `publish` target below for why it still exists.
 
 # Minimum major version of gh we rely on (Pages API + `gh auth status`).
 MIN_GH_MAJOR := 2
@@ -128,7 +131,7 @@ ORIGIN_SLUG := $(shell git remote get-url origin 2>/dev/null | sed -E 's#(git@|h
 .PHONY: require-gh
 require-gh: ## check GitHub CLI (gh) is installed, current, and authenticated
 	@command -v gh >/dev/null 2>&1 || { \
-	  echo "gh (GitHub CLI) is not installed -- needed for 'make publish'/'make status'."; \
+	  echo "gh (GitHub CLI) is not installed -- needed for 'make status'."; \
 	  echo "  install: https://github.com/cli/cli#installation"; \
 	  echo "           (e.g. 'brew install gh', 'sudo apt install gh', 'sudo dnf install gh')"; \
 	  exit 1; }
@@ -156,28 +159,20 @@ status: ## show origin repo, current branch, and what is published (Pages)
 	  echo "pages:   (install & sign in to gh to show what's published -- 'make require-gh')"; \
 	fi
 
+# Pages serves `main` directly (changed 2026-09-08), so publishing IS merging:
+# every push to main rebuilds the site. This target used to fast-forward a
+# separate `gh-pages` branch to the current commit; kept as a guarded no-op
+# rather than deleted, because the old muscle memory is dangerous now -- it
+# pushed HEAD to the Pages branch, and with the Pages branch being `main` that
+# would push whatever branch you happen to be on straight to main, bypassing
+# the PR flow entirely.
 .PHONY: publish
-publish: require-gh check ## publish current branch to origin's Pages branch (release)
-	@slug="$(ORIGIN_SLUG)"; \
-	pb=$$(gh api "repos/$$slug/pages" --jq .source.branch 2>/dev/null); \
-	pu=$$(gh api "repos/$$slug/pages" --jq .html_url 2>/dev/null); \
+publish: ## (no-op) Pages serves main directly -- merging to main publishes
+	@pb=$$(gh api "repos/$(ORIGIN_SLUG)/pages" --jq .source.branch 2>/dev/null); \
+	pu=$$(gh api "repos/$(ORIGIN_SLUG)/pages" --jq .html_url 2>/dev/null); \
 	cur=$$(git rev-parse --abbrev-ref HEAD); \
-	if [ -z "$$pb" ]; then echo "no GitHub Pages configured for $$slug -- set Settings > Pages first"; exit 1; fi; \
-	if [ "$$pb" = "$$cur" ]; then \
-	  echo "Pages serves the current branch ('$$pb') directly -- every push is already live; nothing to publish."; exit 0; fi; \
-	if [ -n "$$(git status --porcelain)" ]; then echo "working tree not clean -- commit or stash first"; exit 1; fi; \
-	src=$$(git rev-parse HEAD); short=$$(git rev-parse --short HEAD); \
-	remote_pb=$$(git ls-remote origin "refs/heads/$$pb" 2>/dev/null | cut -f1); \
-	if [ "$$remote_pb" = "$$src" ]; then echo "already published: $$slug@$$pb is at $$short"; exit 0; fi; \
-	force=""; \
-	if [ -n "$$remote_pb" ] && ! git merge-base --is-ancestor "$$remote_pb" "$$src" 2>/dev/null; then \
-	  if [ "$$FORCE" != "1" ]; then \
-	    echo "'$$pb' has commits not contained in $$cur (diverged)."; \
-	    echo "  reconcile, or re-run with FORCE=1 to overwrite."; exit 1; fi; \
-	  force="--force"; fi; \
-	echo "publish $$short ($$(git log -1 --format=%s))  ->  $$slug@$$pb"; \
-	echo "        live at: $$pu"; \
-	if [ "$$DRYRUN" = "1" ]; then echo "DRYRUN: would run 'git push $$force origin HEAD:refs/heads/$$pb'"; exit 0; fi; \
-	if [ "$$CONFIRM" != "1" ]; then printf "proceed? [y/N] "; read -r ans; case "$$ans" in y|Y) ;; *) echo "aborted."; exit 1;; esac; fi; \
-	git push $$force origin "HEAD:refs/heads/$$pb"; \
-	echo "published $$short -> $$slug@$$pb ; Pages rebuilds in ~1 min: $$pu"
+	echo "nothing to publish: Pages serves '$${pb:-main}' directly, so every push to it is already live."; \
+	if [ -n "$$pu" ]; then echo "  live at: $$pu"; fi; \
+	if [ "$$cur" != "$${pb:-main}" ]; then \
+	  echo "  you are on '$$cur' -- open a PR into '$${pb:-main}'; merging is what publishes."; \
+	fi

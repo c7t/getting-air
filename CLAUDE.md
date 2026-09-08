@@ -186,37 +186,43 @@ validated) drifts with active work — see `main-cylinder-amr.js`'s own
 comment above `N_LEVELS`, not this file, for what's current.
 
 ## Branch model
-- **`main`** — canonical, always-buildable, default branch. All PRs land here.
-- **`gh-pages`** — the *published* snapshot; the GitHub Pages source. **Never edit
-  or commit to it directly** — it is only ever advanced by a release (below).
+- **`main`** — canonical, always-buildable, default branch, **and the published
+  site**: GitHub Pages serves `main` directly, so anything merged is live within
+  a minute. All PRs land here.
 - **feature branches** — short-lived, off `main`, PR back into `main`, deleted on
   merge. (Fork contributors use `user/<handle>/<topic>`.)
+- `gh-pages` and `pub` are **gone** (deleted 2026-09-08). `gh-pages` was a
+  separate published snapshot advanced by a release step; `pub` was an earlier
+  attempt at the same idea that in practice was either immediately stale or
+  ahead of `main`. Both are replaced by "Pages serves `main`".
 
-## Releasing (publishing the live site)
-Publishing is a deliberate step, separate from merging to `main`:
+## Publishing
+There is no release step. **Merging to `main` publishes** — Pages rebuilds from
+it automatically. `make publish` is a guarded no-op kept only because the old
+muscle memory is now dangerous: it used to push `HEAD` to the Pages branch, and
+with the Pages branch being `main` that would push whatever branch you are on
+straight to main, bypassing the PR flow.
 
-    make publish        # fast-forward origin's Pages branch to the current commit
+    make status         # origin repo, current branch, and what Pages serves
 
-`make publish` and `make status` talk to GitHub via `gh` and always act on **your
-own `origin`** (derived from the remote URL, never `gh repo view`, which resolves
-a fork to its parent). So the maintainer publishes the canonical site; a fork
-owner publishes their own fork. `publish` is guarded: it runs `make check` first,
-requires a clean tree, is fast-forward-only (needs `FORCE=1` to overwrite a
-diverged Pages branch), no-ops if already published, and prompts for confirmation
-(`CONFIRM=1` to skip, `DRYRUN=1` to preview). Never push `gh-pages` by hand.
-
-`gh` is required only for `status`/`publish`; run `make require-gh` to check it is
+`make status` talks to GitHub via `gh` and always acts on **your own `origin`**
+(derived from the remote URL, never `gh repo view`, which resolves a fork to its
+parent). `gh` is required only for `status`; run `make require-gh` to check it is
 installed, current, and signed in.
 
-### First-time Pages setup (one-time, if `gh-pages` doesn't exist yet)
+Because merging is publishing, `make check` (and, for anything physics-affecting,
+the GPU validation above) matters *before the merge*, not before a separate
+release.
+
+### If Pages ever needs re-pointing
 Derive `OWNER/REPO` from `origin` (`git remote get-url origin`), then:
 
-    git push origin main:refs/heads/gh-pages                 # seed the published branch
-    gh api --method PUT "repos/OWNER/REPO/pages" --input - <<< '{"source":{"branch":"gh-pages","path":"/"}}'
+    gh api --method PUT "repos/OWNER/REPO/pages" --input - <<< '{"source":{"branch":"main","path":"/"}}'
+    gh api --method POST "repos/OWNER/REPO/pages/builds"   # force a rebuild now
 
-After that the Pages source is `gh-pages` and `make publish` maintains it. (If the
-repo currently serves Pages from another branch, this PUT repoints it; do it
-before retiring the old branch so the site never unpublishes.)
+Repoint **before** deleting whatever branch Pages currently serves, so the site
+never unpublishes, and confirm `gh api repos/OWNER/REPO/pages/builds/latest`
+reports `built` at the expected commit before removing the old branch.
 
 ## Conventions
 - Never hardcode the repo owner/name — derive identity from `origin`.

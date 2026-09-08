@@ -15,7 +15,7 @@ checks and a release helper (`make help` lists everything).
 - **`naga`** (optional) — for `make wgsl` (WGSL validation). `make tools`
   installs it via cargo (needs Rust). Without it, `make check` still runs the
   JS checks and skips WGSL.
-- **`gh`** (GitHub CLI) — only for `make status` / `make publish`.
+- **`gh`** (GitHub CLI) — only for `make status`.
   `make require-gh` checks it is installed, current, and signed in.
 
 ### Validate before committing
@@ -26,21 +26,21 @@ This is static validation only. To confirm the app actually renders, run it in
 a real GPU browser (see `.claude/skills/webgpu-verify/`).
 
 ### Branches
-- **`main`** — the canonical branch; always buildable; where PRs land.
-- **`gh-pages`** — the published snapshot that GitHub Pages serves. Updated only
-  by a release; never edited directly.
+- **`main`** — the canonical branch; always buildable; where PRs land; **and the
+  published site** (GitHub Pages serves it directly).
 - **feature branches** — short-lived, off `main`, merged back via PR.
 
-### Publishing a release
-Merging to `main` does **not** change the live site; publishing is deliberate:
+### Publishing
+There is no release step: **merging to `main` publishes**, and Pages rebuilds
+within about a minute. So run `make check` (and the GPU validation, for anything
+physics-affecting) *before the merge*.
 ```
-make publish    # fast-forward your origin's Pages branch to the current commit
+make status     # origin repo, current branch, and what Pages serves
 ```
-`make publish` / `make status` act on your own `origin`, so a fork owner
-publishes their fork and the maintainer publishes the canonical site. `publish`
-runs `make check` first, requires a clean tree, is fast-forward-only
-(`FORCE=1` to override), and confirms before pushing (`DRYRUN=1` to preview).
+`make status` acts on your own `origin`, so a fork owner sees their fork and the
+maintainer sees the canonical site. `make publish` remains only as a no-op that
+explains this; it no longer pushes anything.
 
 ### Contributing
-Fork, branch off `main`, open a PR against `main`. You can preview your own copy
-live with `make publish` against your fork.
+Fork, branch off `main`, open a PR against `main`. To preview your own copy live,
+enable Pages on your fork's `main` (Settings → Pages).
