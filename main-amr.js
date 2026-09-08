@@ -2786,10 +2786,13 @@ async function init() {
         runUp: readbackWatch.history,
       },
     };
-    if (BENCH && !benchDone && !benchRunning) {
+    if (BENCH && !benchDone && !benchRunning && step >= BENCH_WARM) {
       benchRunning = true;
       try {
+        const benchStartStep = step;
         body.bench = await runBenchSweep();
+        body.bench.startedAtStep = benchStartStep;
+        body.bench.endedAtStep = step;
         benchDone = true;
         statusEl.textContent = '[AMR-dev] benchmark sweep complete -- results sent';
       } catch (e) { body.benchError = String(e && e.message || e); benchDone = true; }
@@ -2841,6 +2844,13 @@ async function init() {
   // The physics is deliberately wrong while this runs. It is a stopwatch,
   // not a simulation.
   const BENCH = urlParams.get('bench') === '1';
+  // Sweep does not start until the flow and the refinement have developed.
+  // The sweep used to begin on the first telemetry tick, ~5s after load --
+  // about 1350 steps on the phone, where measured L1 demand is still climbing
+  // and does not peak until 6k-12k. That measured an unrepresentative
+  // topology and every published phone attribution inherited it.
+  const BENCH_WARM = urlParams.has('benchWarm') ? parseInt(urlParams.get('benchWarm')) : 12000;
+  const BENCH_ROUNDS = urlParams.has('benchRounds') ? parseInt(urlParams.get('benchRounds')) : 3;
   const BENCH_CONFIGS = ['none', 'force', 'phy', 'force+phy', 'interp', 'avg', 'ghost', 'step1', 'interp+avg+ghost'];
   async function runBenchSweep() {
     const wasAuto = autoRefine;
@@ -2849,21 +2859,71 @@ async function init() {
     for (let m = 1; m < N_LEVELS; m++) {
       try { activeByLevel[m] = (await debugListActiveBlocks(m)).length; } catch { /* best-effort */ }
     }
-    const results = [];
-    for (const cfg of BENCH_CONFIGS) {
-      benchSkip.clear();
-      if (cfg !== 'none') for (const g of cfg.split('+')) benchSkip.add(g);
+    // ROUND-ROBIN over several rounds with the order rotated, not each
+    // configuration measured to completion in turn. This device throttles
+    // 24-57% within a session (see plans/perf-characterization.md), so a
+    // sequential sweep measures the first configuration coldest and the last
+    // hottest -- which lands entirely on the 'none' baseline, understating
+    // every share. Interleaving spreads the ramp evenly instead. Same
+    // reasoning, and the same fix, as tools/bench-amr.js --skip.
+    // Backgrounding the tab suspends requestAnimationFrame, so the frame loop
+    // stops feeding benchSamples while this setTimeout-paced sweep keeps
+    // marching through its configurations. The result is not merely noisy, it
+    // is silently wrong: whichever configurations happened to be current
+    // while the tab was hidden get few or no samples, and the rest look fine.
+    // A phone run was lost to exactly this -- switching away mid-sweep
+    // produced zero usable output and no error. Record it and refuse to
+    // report a sweep that was interrupted.
+    let benchHidden = document.visibilityState === 'hidden';
+    const onVis = () => { if (document.visibilityState === 'hidden') benchHidden = true; };
+    document.addEventListener('visibilitychange', onVis);
+
+    const measure = async () => {
       benchSamples = [];
       benchCollecting = true;
-      // ~40 frames of settling then ~40 of measurement, paced by the frame loop.
-      await new Promise(r => setTimeout(r, 3000));
+      await new Promise(r => setTimeout(r, 2000));   // settle
       benchSamples = [];
-      await new Promise(r => setTimeout(r, 5000));
+      await new Promise(r => setTimeout(r, 3000));   // measure
       benchCollecting = false;
       const xs = benchSamples.slice().sort((a, b) => a - b);
-      results.push({ cfg, n: xs.length, medianGpuMs: xs.length ? +xs[Math.floor(xs.length / 2)].toFixed(3) : null });
+      return xs.length ? xs[Math.floor(xs.length / 2)] : null;
+    };
+    const applySkip = (cfg) => {
+      benchSkip.clear();
+      if (cfg !== 'none') for (const g of cfg.split('+')) benchSkip.add(g);
+    };
+    // Discard a whole settling round -- one discarded run was measurably not
+    // enough on the desktop (44-85% spread on the early rows).
+    const totalSteps = (BENCH_ROUNDS + 1) * BENCH_CONFIGS.length;
+    let doneSteps = 0;
+    const progress = (label) => {
+      const pct = Math.round((doneSteps / totalSteps) * 100);
+      statusEl.textContent = `[AMR-dev] benchmark ${pct}% -- ${label} (do not switch away)`;
+    };
+    progress('settling');
+    for (const cfg of BENCH_CONFIGS) { applySkip(cfg); await measure(); doneSteps++; progress('settling ' + cfg); }
+
+    const samples = new Map(BENCH_CONFIGS.map(c => [c, []]));
+    for (let r = 0; r < BENCH_ROUNDS; r++) {
+      for (let i = 0; i < BENCH_CONFIGS.length; i++) {
+        const cfg = BENCH_CONFIGS[(i + r) % BENCH_CONFIGS.length];
+        applySkip(cfg);
+        const m = await measure();
+        if (m != null) samples.get(cfg).push(m);
+        doneSteps++;
+        progress(`round ${r + 1}/${BENCH_ROUNDS}, ${cfg}`);
+      }
     }
+    const results = BENCH_CONFIGS.map(cfg => {
+      const xs = samples.get(cfg).slice().sort((a, b) => a - b);
+      return {
+        cfg, n: xs.length,
+        medianGpuMs: xs.length ? +xs[Math.floor(xs.length / 2)].toFixed(3) : null,
+        spreadPct: xs.length > 1 ? +(((xs[xs.length - 1] - xs[0]) / xs[Math.floor(xs.length / 2)]) * 100).toFixed(1) : null,
+      };
+    });
     benchSkip.clear();
+    document.removeEventListener('visibilitychange', onVis);
     if (wasAuto) await setAutoRefine(true);
     const base = results.find(r => r.cfg === 'none');
     for (const r of results) {
@@ -2871,7 +2931,19 @@ async function init() {
         ? +(base.medianGpuMs - r.medianGpuMs).toFixed(3) : null;
       r.sharePct = (base && base.medianGpuMs) ? +((r.deltaMs / base.medianGpuMs) * 100).toFixed(1) : null;
     }
-    return { activeByLevel, results };
+    return {
+      activeByLevel, results,
+      // Reported, not silently dropped: a caller who sees interrupted=true
+      // should discard the numbers rather than wonder why they look odd.
+      interrupted: benchHidden,
+      // This sweep measures ~12 frames of a LIVE rAF loop per configuration,
+      // so it carries compositor and vsync jitter that tools/bench-amr.js
+      // avoids by stopping the frame loop entirely. Measured noise floor is
+      // about +/-10%: a desktop run of this code reported phy at -10.1%, and
+      // a negative share is impossible. Trust it for the large groups
+      // (step1/interp/avg/ghost/force, 10-30%); it cannot resolve phy.
+      noiseFloorPct: 10,
+    };
   }
   const readbackWatch = { lastStep: null, lastY: null, n: 0, stepBack: 0, worstStepBack: 0,
                           posJump: 0, fieldRepeat: 0, digests: [], samples: [],
@@ -3167,7 +3239,13 @@ async function init() {
           gpuMsEl.textContent = gpuTime.toFixed(2);
           syncMsEl.textContent = (performance.now() - tSubmit).toFixed(2);
           telemetrySample(gpuTime, performance.now() - tSubmit, st.step);
-          statusEl.textContent = `[AMR-dev] step ${st.step}  y=${d[20].toFixed(1)}  x=${d[21].toFixed(1)}  vy=${d[4].toFixed(4)}  Fy=${d[7].toExponential(2)}  θ=${d[2].toFixed(2)}`;
+          // Not while a benchmark sweep owns the status line: this runs on
+          // every readback and silently overwrote the sweep's own progress
+          // messages within a frame, so "benchmark round 2/3" was never
+          // actually visible to anyone asked to watch for it.
+          if (!benchRunning) {
+            statusEl.textContent = `[AMR-dev] step ${st.step}  y=${d[20].toFixed(1)}  x=${d[21].toFixed(1)}  vy=${d[4].toFixed(4)}  Fy=${d[7].toExponential(2)}  θ=${d[2].toFixed(2)}`;
+          }
           lastT = performance.now();
         }
 
