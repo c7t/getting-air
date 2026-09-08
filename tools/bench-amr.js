@@ -27,8 +27,23 @@
 //     differs materially between configurations, the timings are not
 //     comparable and no amount of repetition inside a run will fix that.
 //   - For a cross-config A/B, run each several times and compare
-//     distributions, or use ?bench=1's in-page pass-skip sweep instead,
-//     which varies only the dispatch list within a single frozen topology.
+//     distributions, or use --skip below.
+//
+// DO NOT PUT ?benchSkip= IN A CONFIG STRING. It is applied from page load, so
+// the WARM-UP runs with the modified physics: skipping the force pass stops
+// the card moving, the flow goes somewhere else entirely, and refinement
+// settles on a different topology. Measured: warming up with force skipped
+// gave 73 active L1 blocks against the baseline's 123, and the resulting
+// "-15.9%" was two different simulations, not a saving. This script now
+// refuses such a config string.
+//
+// --skip is the correct instrument: one page load, one warm-up with real
+// physics, refinement frozen, and then the skip set changed between timed
+// runs via setBenchSkip so the ONLY thing that varies is the dispatch list.
+//
+// Usage:
+//   node tools/bench-amr.js --steps=8000 --skip=none,force,phy,force+phy \
+//        'res=8&levels=3&blockage=3.3'
 //
 // Also reports honest cell-updates/s: L0 cells plus, per level, active
 // blocks x FB^2 x 2^m substeps. The overlay's own MLUPS counts L0 cells
@@ -47,18 +62,26 @@ const BASE_URL = 'https://localhost:4444';
 const PORT = 9333;
 
 function parseArgs(argv) {
-  const o = { warm: 20000, steps: 20000, reps: 5, page: 'index-amr.html', configs: [], keepOpen: false };
+  const o = { warm: 20000, steps: 20000, reps: 5, page: 'index-amr.html', configs: [], keepOpen: false, skip: null };
   for (const a of argv) {
     if (a.startsWith('--warm=')) o.warm = Number(a.slice(7));
     else if (a.startsWith('--steps=')) o.steps = Number(a.slice(8));
     else if (a.startsWith('--reps=')) o.reps = Number(a.slice(7));
     else if (a.startsWith('--page=')) o.page = a.slice(7);
+    else if (a.startsWith('--skip=')) o.skip = a.slice(7).split(',').filter(Boolean);
     else if (a === '--keepOpen') o.keepOpen = true;
     else if (a === '--help' || a === '-h') { printHelp(); process.exit(0); }
     else if (a.startsWith('--')) { console.error(`unknown flag ${a}`); process.exit(2); }
     else o.configs.push(a);
   }
   if (!o.configs.length) { printHelp(); process.exit(2); }
+  for (const c of o.configs) {
+    if (/benchSkip/.test(c)) {
+      console.error(`refusing config "${c}": ?benchSkip= in a config string applies from page load, so\n` +
+                    `the warm-up runs with altered physics and the runs are not comparable. Use --skip=`);
+      process.exit(2);
+    }
+  }
   return o;
 }
 
@@ -98,12 +121,59 @@ async function main() {
         active[m] = await ev(`(async()=>{ return (await window.__AMR.debugListActiveBlocks(${m})).length; })()`);
       }
 
-      const ts = [];
-      for (let r = 0; r < opts.reps; r++) {
-        ts.push(await ev(`(async()=>{ const t0 = performance.now();
+      const timeOnce = async () => ev(`(async()=>{ const t0 = performance.now();
           await window.__AMR.debugStepSync(${opts.steps});
-          return performance.now() - t0; })()`));
+          return performance.now() - t0; })()`);
+
+      // --skip: vary ONLY the dispatch list, inside this one frozen topology.
+      if (opts.skip) {
+        // ROUND-ROBIN, not config-at-a-time, and the order rotates each round.
+        // Measuring all reps of one configuration before moving to the next
+        // confounds the configuration with TIME, and this GPU drifts: the
+        // first arrangement of this sweep reported interp, avg and ghost as
+        // NEGATIVE savings (-6%, -12%, -9%) with 33-73% spread on the early
+        // rows collapsing to 4-10% on the late ones. Skipping a pass cannot
+        // make a frame slower, so that was clock/thermal ramp, not signal.
+        // Interleaving spreads any monotonic drift evenly across every
+        // configuration instead of loading it onto whichever ran first.
+        const apply = async (cfg) => {
+          const groups = cfg === 'none' ? [] : cfg.split('+');
+          await ev(`JSON.stringify(window.__AMR.setBenchSkip(${JSON.stringify(groups)}))`);
+        };
+        // Discard a settling run: the very first timed pass after warm-up is
+        // consistently the slowest, whatever it is measuring.
+        await apply('none');
+        await timeOnce();
+
+        const samples = new Map(opts.skip.map(c => [c, []]));
+        for (let r = 0; r < opts.reps; r++) {
+          const order = opts.skip.map((_, i) => opts.skip[(i + r) % opts.skip.length]);
+          for (const cfg of order) {
+            await apply(cfg);
+            samples.get(cfg).push(await timeOnce());
+          }
+        }
+        const base = opts.skip.map(cfg => {
+          const xs = samples.get(cfg).slice().sort((a, b) => a - b);
+          const med = xs[Math.floor(xs.length / 2)];
+          return { cfg, med, spread: (xs[xs.length - 1] - xs[0]) / med };
+        });
+        await ev(`JSON.stringify(window.__AMR.setBenchSkip([]))`);
+        const b0 = base.find(r => r.cfg === 'none') || base[0];
+        console.log(`?${cfg}`);
+        console.log(`   activeByLevel=${JSON.stringify(active)}  (frozen; identical for every row below)`);
+        console.log(`   ${'skipped'.padEnd(20)}${'median ms'.padStart(12)}${'delta'.padStart(10)}${'share'.padStart(9)}${'spread'.padStart(9)}`);
+        for (const r of base) {
+          const d = b0.med - r.med;
+          console.log(`   ${r.cfg.padEnd(20)}${r.med.toFixed(0).padStart(12)}` +
+                      `${d.toFixed(0).padStart(10)}${(d / b0.med * 100).toFixed(1).padStart(8)}%` +
+                      `${(r.spread * 100).toFixed(1).padStart(8)}%`);
+        }
+        continue;
       }
+
+      const ts = [];
+      for (let r = 0; r < opts.reps; r++) ts.push(await timeOnce());
       ts.sort((a, b) => a - b);
       const med = ts[Math.floor(ts.length / 2)];
 

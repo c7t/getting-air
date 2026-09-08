@@ -86,7 +86,59 @@ blocks) desktop frame time went 2.78 ms at `maxFineBlocks=128` and 4.24 ms at
 256, so dispatch width is not free — but it is second-order next to pass
 count.
 
-## What to do instead
+## RE-MEASURED at current defaults (2026-09-07) -- the fusion case is gone
+
+The table above is levels=2, 66 active L1 blocks, `MAX_FINE_BLOCKS=128`, and
+predates the threshold retune, the pool resize to 384/256, the true-SDF
+`get_phi` and the FSCALE fix. Re-run at today's defaults
+(`res=8&levels=3&blockage=3.3`, frozen at L1=113 / L2=140) with
+`tools/bench-amr.js --skip`:
+
+| skipped group | share (levels=3, now) | share (levels=2, old table) |
+|---|---|---|
+| step1 (fine LBM) | **29.3%** | 34.9% |
+| interp (coarse->fine ghosts) | 15.0% | 28.2% |
+| ghost (fine-fine) | 12.5% | 32.4% |
+| avg (fine->coarse) | 11.8% | 19.6% |
+| force (all levels) | **11.4%** | 28.7% |
+| force0 (L0 only) | 3.3% | -- |
+| phy (body integration) | **3.5%** | 25.4% |
+
+**`phy` collapsing from 25.4% to 3.5% is the headline.** That single
+`dispatchWorkgroups(1)` was the entire evidence for "passes themselves are
+expensive, so the lever is fewer passes". At levels=3 there is enough real
+work per macro-step (253 active tiles against 66) to amortize the fixed
+per-pass cost, and the pass-count argument largely dissolves with it.
+
+So **do not fuse the force pass.** All force work is now 11.4%, of which the
+L0 pass is 3.3%; fusion does not remove all of that (the step kernel still
+does the workgroup reduction and the atomics), so the realistic prize is
+5-8% -- barely outside this measurement's own 4-15% spread. Against that:
+bind-group layout changes to three shaders shared by five AMR pages (the
+238e48c failure mode), a pipeline variant or a redefinition of the body force
+to deal with level m stepping 2^m times per macro-step against one force pass,
+and a one-macro-step shift in the body update needing full Cd/St
+revalidation. That is a bad trade at 5-8%.
+
+**The AMR coupling overhead is the target instead.** interp + ghost + avg =
+**39.3%** of the frame is spent moving data between levels, which is more than
+the fine solve it exists to serve (29.3%). That is the direct, measured form
+of the complaint that started this work -- that the hierarchical version does
+not beat the flat one. Two concrete leads, neither yet measured:
+
+- **Ghost-cell fraction in the fine step.** A tile is FB=20 square with only
+  2*RB=16 square of interior, so 36% of every fine-level step is ghost cells
+  -- about 10.5% of the whole frame, inside step1's 29.3%. `RB` is welded to
+  `BLOCK=8` by the L0<->L1 footprint-preserving scheme, so this is not a knob
+  today, but it is the single largest identified piece of pure overhead.
+- **Dispatch shape of the three coupling passes.** interp and ghost dispatch
+  the full FB*FB tile while only the GHOST ring does work (144 of 400 cells);
+  avg dispatches MAX_FINE_BLOCKS slots while ~113 of 384 are active. Indirect
+  dispatch was ruled out once, but that was measured at levels=2 under the
+  pass-count model that `phy` has just falsified -- worth re-testing under the
+  numbers above rather than inheriting the old conclusion.
+
+## Superseded: what the levels=2 numbers said to do instead
 
 **Fuse the force accumulation into the step kernels.** It is the one change
 that attacks both bottlenecks with the same edit:

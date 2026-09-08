@@ -2913,6 +2913,18 @@ async function init() {
     }),
     getNumLevels: () => N_LEVELS,
     getF16: () => F16,
+    // Set the pass-skip set AFTER warm-up, which is the only way a skip A/B
+    // is valid: passing ?benchSkip= in the URL means the warm-up itself runs
+    // with the modified physics, so the card follows a different trajectory
+    // and refinement settles on a different topology. Measured -- warming up
+    // with force skipped gave 73 active L1 blocks against 123 for the
+    // baseline, so the two runs were not doing comparable work at all. See
+    // tools/bench-amr.js --skip.
+    setBenchSkip: (groups) => {
+      benchSkip.clear();
+      for (const g of (groups || [])) if (g) benchSkip.add(g);
+      return [...benchSkip];
+    },
     getLevelPoolSizes,
     tauAtLevel,
   };
