@@ -242,6 +242,22 @@ const SDF_FAR = urlParams.has('sdfFar') ? parseFloat(urlParams.get('sdfFar')) : 
 // once this is proven.
 const F16 = urlParams.has('f16') ? (parseInt(urlParams.get('f16')) || 0) : 0;
 
+// ── ?ghostcopy=1 -- legacy materialized same-level ghost cells ───────────────
+// Default 0: the fine step resolves a source cell that falls outside its tile
+// against the owning same-level tile directly (blockSlot), so the
+// between-substep fine-fine ghost COPY pass is not encoded at all. Measured
+// worth 9.9% of frame GPU time on the desktop and 13.1% on the phone (the pass
+// itself was 16.7-17.5%; the fine step gives 3.6-7.5% of that back, since half
+// a tile's threads now pull from another slot's memory) -- see
+// plans/perf-characterization.md's "The one lead left" for the full
+// decomposition on both devices.
+//
+// 1 restores the old path exactly (clamp at the slot's own buffer edge, plus
+// the copy pass), so the two can be A/B'd for both speed and physics on one
+// build: `node tools/validate-all.js --extra=ghostcopy=1` runs the whole
+// validation sweep against the legacy path.
+const GHOST_COPY = urlParams.has('ghostcopy') ? (parseInt(urlParams.get('ghostcopy')) || 0) : 0;
+
 if (FORCE_REFINE_MARGIN >= SDF_FAR) {
   throw new Error(`?forceRefineMargin=${FORCE_REFINE_MARGIN} is at or above get_phi's SDF_FAR cutoff (${SDF_FAR}) -- ` +
     `beyond that the far-field early-out in shaders/common_geometry.wgsl returns a lower bound and isNearBody ` +
@@ -1066,7 +1082,11 @@ async function init() {
     { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
     { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-    { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }
+    { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    // binding 5: blockSlot -- neighbour-addressed streaming (see the
+    // DIRECT_GHOST override in shaders/amr_step1.wgsl). Present in the layout
+    // even under ?ghostcopy=1, where the shader simply never reads it.
+    { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }
   ]});
   const avgBGL = device.createBindGroupLayout({ label: 'avgBGL', entries: [
     { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
@@ -1087,7 +1107,9 @@ async function init() {
     { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } }
+    { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+    // binding 8: blockSlot -- see step1BGL's binding 5.
+    { binding: 8, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }
   ]});
   // Milestone 7: level>=2 average, writing into a parent POOL tile via
   // parentSlot/quadrant instead of cellIndex() -- see
@@ -1146,7 +1168,7 @@ async function init() {
   // Between-substep fine-fine-only ghost re-exchange (see amr_interp_c2f.wgsl's
   // FINE_FINE_ONLY note and the dispatch between f1a/f1b below).
   const interpFFConstants = { W, H, RB, GHOST_ONLY: 1, FINE_FINE_ONLY: 1, F16 };
-  const step1Constants = { W, H, RB, SDF_FAR, F16 };
+  const step1Constants = { W, H, RB, SDF_FAR, F16, DIRECT_GHOST: GHOST_COPY ? 0 : 1 };
   const criterionConstants = { W, H };
   const manageConstants = { W, H, SDF_FAR, REFINE_THRESH, COARSEN_THRESH, FORCE_REFINE_MARGIN, FORCE_REFINE_LOOKAHEAD, SPONGE_EXCLUDE_W, HAS_LEVEL2: N_LEVELS > 2 ? 1 : 0,
     N_REFINE_INC, N_REFINE_MAX, MAX_LEVEL: N_LEVELS - 1 };
@@ -1243,9 +1265,7 @@ async function init() {
   // shaders/amr_interp_*.wgsl / amr_average_*.wgsl for the measured split.
   const noopPLs = {
     interpDense:  device.createComputePipeline({ layout: device.createPipelineLayout({ bindGroupLayouts: [interpBGL] }),           compute: { module: interpDenseSM, entryPoint: 'main', constants: { ...interpConstants,       NOOP: 1 } } }),
-    interpDenseFF:device.createComputePipeline({ layout: device.createPipelineLayout({ bindGroupLayouts: [interpBGL] }),           compute: { module: interpDenseSM, entryPoint: 'main', constants: { ...interpFFConstants,     NOOP: 1 } } }),
     interpPool:   device.createComputePipeline({ layout: device.createPipelineLayout({ bindGroupLayouts: [interpPoolParentBGL] }), compute: { module: interpPoolSM,  entryPoint: 'main', constants: { ...interpPoolConstants,   NOOP: 1 } } }),
-    interpPoolFF: device.createComputePipeline({ layout: device.createPipelineLayout({ bindGroupLayouts: [interpPoolParentBGL] }), compute: { module: interpPoolSM,  entryPoint: 'main', constants: { ...interpPoolFFConstants, NOOP: 1 } } }),
     avg:          device.createComputePipeline({ layout: device.createPipelineLayout({ bindGroupLayouts: [avgBGL] }),              compute: { module: avgSM,         entryPoint: 'main', constants: { ...fineConstants,        NOOP: 1 } } }),
     avgPool:      device.createComputePipeline({ layout: device.createPipelineLayout({ bindGroupLayouts: [avgPoolBGL] }),          compute: { module: avgPoolSM,     entryPoint: 'main', constants: { RB, F16,                 NOOP: 1 } } }),
   };
@@ -1255,6 +1275,20 @@ async function init() {
   const ringPLs = {
     step1:     device.createComputePipeline({ layout: device.createPipelineLayout({ bindGroupLayouts: [step1BGL] }),     compute: { module: step1SM,     entryPoint: 'main', constants: { ...step1Constants, SKIP_GHOST: 1 } } }),
     step1Pool: device.createComputePipeline({ layout: device.createPipelineLayout({ bindGroupLayouts: [step1PoolBGL] }), compute: { module: step1PoolSM, entryPoint: 'main', constants: { ...step1Constants, SKIP_GHOST: 1 } } }),
+  };
+  // ghostcopy: the legacy materialized-same-level-ghost path (DIRECT_GHOST=0
+  // plus the fine-fine copy pass re-encoded), as a bench CONFIGURATION rather
+  // than only a page-load flag. That matters on the phone, which gets one
+  // sweep per session and whose medians are worthless across sessions because
+  // it thermally ramps 24-57% -- ?bench=1 interleaves its configurations
+  // within one run, so this is the only way to A/B the change there at all.
+  // Note the sign: this config is SLOWER than the baseline, so its reported
+  // share is negative, and the magnitude is what neighbour-addressed streaming
+  // buys. Same module, one override flipped -- see the noopPLs comment on why
+  // a variant compiled from different source would not be honest.
+  const legacyGhostPLs = {
+    step1:     device.createComputePipeline({ layout: device.createPipelineLayout({ bindGroupLayouts: [step1BGL] }),     compute: { module: step1SM,     entryPoint: 'main', constants: { ...step1Constants, DIRECT_GHOST: 0 } } }),
+    step1Pool: device.createComputePipeline({ layout: device.createPipelineLayout({ bindGroupLayouts: [step1PoolBGL] }), compute: { module: step1PoolSM, entryPoint: 'main', constants: { ...step1Constants, DIRECT_GHOST: 0 } } }),
   };
   // Milestone 8: level 1's own force pass. HAS_CHILD is baked in at
   // pipeline-creation time -- level 1 has exactly one dedicated pipeline
@@ -1378,8 +1412,8 @@ async function init() {
   // Fine ping-pong within a macro-step is a fixed 2-call sequence (ab then
   // ba), not a persistent toggle like the coarse useB -- always call both,
   // in order, every macro-step.
-  const step1BG_ab = device.createBindGroup({ layout: step1BGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: pools[1].finePoolF_a } }, { binding: 2, resource: { buffer: pools[1].finePoolF_b } }, { binding: 3, resource: { buffer: pools[1].finePoolVel } }, { binding: 4, resource: { buffer: pools[1].slotToBlockBuf } }]});
-  const step1BG_ba = device.createBindGroup({ layout: step1BGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: pools[1].finePoolF_b } }, { binding: 2, resource: { buffer: pools[1].finePoolF_a } }, { binding: 3, resource: { buffer: pools[1].finePoolVel } }, { binding: 4, resource: { buffer: pools[1].slotToBlockBuf } }]});
+  const step1BG_ab = device.createBindGroup({ layout: step1BGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: pools[1].finePoolF_a } }, { binding: 2, resource: { buffer: pools[1].finePoolF_b } }, { binding: 3, resource: { buffer: pools[1].finePoolVel } }, { binding: 4, resource: { buffer: pools[1].slotToBlockBuf } }, { binding: 5, resource: { buffer: pools[1].blockSlotBuf } }]});
+  const step1BG_ba = device.createBindGroup({ layout: step1BGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: pools[1].finePoolF_b } }, { binding: 2, resource: { buffer: pools[1].finePoolF_a } }, { binding: 3, resource: { buffer: pools[1].finePoolVel } }, { binding: 4, resource: { buffer: pools[1].slotToBlockBuf } }, { binding: 5, resource: { buffer: pools[1].blockSlotBuf } }]});
   // Fine-fine-only ghost re-exchange, run BETWEEN f1a and f1b. f1a writes the
   // post-substep-1 pool into pools[1].finePoolF_b (the buffer f1b then reads), so this
   // refreshes each block's fine-fine seam ghosts IN PLACE in pools[1].finePoolF_b from
@@ -1490,6 +1524,7 @@ async function init() {
       { binding: 5, resource: { buffer: childPool.originXBuf } },
       { binding: 6, resource: { buffer: childPool.originYBuf } },
       { binding: 7, resource: { buffer: childPool.levelParamsBuf } },
+      { binding: 8, resource: { buffer: childPool.blockSlotBuf } },
     ]});
     childPool.step1PoolBG_ba = device.createBindGroup({ layout: step1PoolBGL, entries: [
       { binding: 0, resource: { buffer: cardStateBuf } },
@@ -1500,6 +1535,7 @@ async function init() {
       { binding: 5, resource: { buffer: childPool.originXBuf } },
       { binding: 6, resource: { buffer: childPool.originYBuf } },
       { binding: 7, resource: { buffer: childPool.levelParamsBuf } },
+      { binding: 8, resource: { buffer: childPool.blockSlotBuf } },
     ]});
 
     const avgEntries = (parentBuf) => [
@@ -1844,13 +1880,15 @@ async function init() {
   //   CURRENT state, this level's OWN substep A, then -- if level+1 exists
   //   -- recurse into level+1 ONCE, average level+1 back into THIS level,
   //   and re-interpolate INTO level+1 (using this level's just-averaged-
-  //   into state) so level+1's NEXT cycle sees fresh ghosts. Then this
-  //   level's own same-level fine-fine ghost refresh (a project-specific
-  //   stand-in for AGAL's own neighbor-aware streaming -- see
-  //   amr_interp_dense_parent.wgsl's FINE_FINE_ONLY note; AGAL's mesh
-  //   doesn't need this pass because it addresses neighbor blocks directly
-  //   during streaming instead of materializing ghost cells in a padded
-  //   buffer). Then this level's OWN substep B, and -- again if level+1
+  //   into state) so level+1's NEXT cycle sees fresh ghosts. Then, under
+  //   ?ghostcopy=1 ONLY, this level's own same-level fine-fine ghost
+  //   refresh -- the pass this project used to need in place of AGAL's own
+  //   neighbor-aware streaming. The default build now does what AGAL does
+  //   (addresses neighbor blocks directly during streaming rather than
+  //   materializing same-level ghost cells), so there is no pass here at
+  //   all: see DIRECT_GHOST in shaders/amr_step1.wgsl, and
+  //   plans/perf-characterization.md for what removing it measured.
+  //   Then this level's OWN substep B, and -- again if level+1
   //   exists -- recurse into level+1 a SECOND time and average again.
   //   Every non-root level therefore does exactly 2 of its own substeps
   //   per call, and drives its child through exactly 2 full cycles (one
@@ -1896,6 +1934,9 @@ async function init() {
 
     const pool = pools[level];
     const isL1 = level === 1;
+    // Legacy materialized-ghost path: the page-load flag, or the in-session
+    // bench configuration (see legacyGhostPLs).
+    const legacyGhost = GHOST_COPY !== 0 || skipGroup('ghostcopy');
     let cur = 'a'; // THIS level's own current buffer, local to this call (see header)
 
     const interpIntoChild = (readCur) => {
@@ -1913,17 +1954,19 @@ async function init() {
     const substep = (readCur) => {
       if (isL1) {
         const bg = readCur === 'a' ? step1BG_ab : step1BG_ba;
-        if (skipGroup('step1')) return; const p = beginPass(enc, 'L1 step'); p.setPipeline(skipGroup('step1-ring') ? ringPLs.step1 : step1PL); p.setBindGroup(0, bg); p.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); p.end();
+        const pl = skipGroup('step1-ring') ? ringPLs.step1 : (legacyGhost ? legacyGhostPLs.step1 : step1PL);
+        if (skipGroup('step1')) return; const p = beginPass(enc, 'L1 step'); p.setPipeline(pl); p.setBindGroup(0, bg); p.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); p.end();
       } else {
         const bg = readCur === 'a' ? pool.step1PoolBG_ab : pool.step1PoolBG_ba;
-        if (skipGroup('step1')) return; const p = beginPass(enc, `L${level} step`); p.setPipeline(skipGroup('step1-ring') ? ringPLs.step1Pool : step1PoolPL); p.setBindGroup(0, bg); p.dispatchWorkgroups(WGX1, WGY1, pool.MAX_FINE_BLOCKS); p.end();
+        const pl = skipGroup('step1-ring') ? ringPLs.step1Pool : (legacyGhost ? legacyGhostPLs.step1Pool : step1PoolPL);
+        if (skipGroup('step1')) return; const p = beginPass(enc, `L${level} step`); p.setPipeline(pl); p.setBindGroup(0, bg); p.dispatchWorkgroups(WGX1, WGY1, pool.MAX_FINE_BLOCKS); p.end();
       }
     };
     const fineFineRefresh = () => {
       if (isL1) {
-        if (skipGroup('ghost')) return; const p = beginPass(enc, 'L1 fine-fine ghost'); p.setPipeline(skipGroup('ghost-noop') ? noopPLs.interpDenseFF : interpFFPL); p.setBindGroup(0, interpFFBG_b); p.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); p.end();
+        const p = beginPass(enc, 'L1 fine-fine ghost'); p.setPipeline(interpFFPL); p.setBindGroup(0, interpFFBG_b); p.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); p.end();
       } else {
-        if (skipGroup('ghost')) return; const p = beginPass(enc, `L${level} fine-fine ghost`); p.setPipeline(skipGroup('ghost-noop') ? noopPLs.interpPoolFF : interpPoolParentFFPL); p.setBindGroup(0, pool.interpPoolParentFFBG_b); p.dispatchWorkgroups(WGX1, WGY1, pool.MAX_FINE_BLOCKS); p.end();
+        const p = beginPass(enc, `L${level} fine-fine ghost`); p.setPipeline(interpPoolParentFFPL); p.setBindGroup(0, pool.interpPoolParentFFBG_b); p.dispatchWorkgroups(WGX1, WGY1, pool.MAX_FINE_BLOCKS); p.end();
       }
     };
 
@@ -1935,9 +1978,12 @@ async function init() {
       averageFromChild(cur);  // level+1's full cycle #1 lands in level's CURRENT ('b')
       interpIntoChild(cur);   // re-interpolate level+1's ghosts from level's just-updated state
     }
-    // Same-level fine-fine refresh, after any sibling's own average might
-    // have just landed (see header) and before substep B reads it.
-    fineFineRefresh();
+    // Legacy same-level fine-fine refresh (?ghostcopy=1 only). The default
+    // path needs no pass here: substep B's own gather reaches into the
+    // neighbour tile directly, so it reads the neighbour's post-`average`
+    // interior rather than a copy taken before that average landed. See the
+    // DIRECT_GHOST override in shaders/amr_step1.wgsl.
+    if (legacyGhost) fineFineRefresh();
     substep(cur);           // reads 'b', writes 'a'
     cur = 'a';
     if (hasChild) {
@@ -1966,17 +2012,28 @@ async function init() {
   //
   // So attribute at FRAME scale instead: skip a group of passes, measure the
   // change in frame GPU time, and the difference is that group's real cost.
-  // ?benchSkip=force,ghost etc. This is a MEASUREMENT MODE -- skipping
+  // ?benchSkip=force,interp etc. This is a MEASUREMENT MODE -- skipping
   // passes makes the physics wrong by construction. It exists to answer
   // "what does this group cost", nothing else.
   // Groups. The first set REMOVE a pass; the rest are instrument variants that
   // keep the pass but change what it does, so a share can be split further:
   //
-  //   force, phy, step1, interp, avg, ghost   -- pass not encoded at all
-  //   interp-noop, avg-noop, ghost-noop       -- pass encoded and dispatched at
-  //                                              full width, returns immediately
-  //   step1-ring                              -- fine step over tile interior
-  //                                              only (proxy for FB 20 -> 16)
+  //   force, phy, step1, interp, avg   -- pass not encoded at all
+  //   interp-noop, avg-noop            -- pass encoded and dispatched at full
+  //                                       width, returns immediately
+  //   step1-ring                       -- fine step over tile interior only
+  //                                       (proxy for FB 20 -> 16)
+  //   ghostcopy                        -- ADDS the legacy fine-fine ghost copy
+  //                                       pass back and reverts the fine step
+  //                                       to clamped streaming, so its share is
+  //                                       NEGATIVE and its magnitude is what
+  //                                       neighbour-addressed streaming buys
+  //
+  // The `ghost` and `ghost-noop` groups are gone with the pass they named --
+  // measuring "skip the fine-fine copy" is meaningless now that the default
+  // build never encodes it. `ghostcopy` asks the same question from the other
+  // side. An old ?benchSkip=ghost is now REJECTED rather than silently
+  // reporting ~0%, which is the whole point of enumerating these names.
   //
   // Why the -noop variants exist: removing a pass removes its fixed per-pass
   // cost AND its work at the same time, so a plain skip cannot tell you which
@@ -1993,12 +2050,13 @@ async function init() {
   // unrecognised name is otherwise INVISIBLE: it just never matches a
   // skipGroup() call, the passes all run, and the configuration reports a ~0%
   // share that reads as a real measurement. That is unrecoverable on the phone,
-  // which has no CDP endpoint and gets one sweep per session -- the same class
+  // which tools/bench-amr.js cannot drive and which gets one sweep per
+  // session (see plans/perf-characterization.md on adb) -- the same class
   // of silent-failure trap as a sweep interrupted by backgrounding, which this
   // file already refuses to report quietly.
   const BENCH_GROUPS = new Set([
-    'force', 'phy', 'step1', 'interp', 'avg', 'ghost',
-    'interp-noop', 'avg-noop', 'ghost-noop', 'step1-ring',
+    'force', 'phy', 'step1', 'interp', 'avg',
+    'interp-noop', 'avg-noop', 'step1-ring', 'ghostcopy',
   ]);
   function validateSkipGroups(groups, where) {
     const bad = [...groups].filter(g => !BENCH_GROUPS.has(g));
@@ -2926,15 +2984,17 @@ async function init() {
   // top of the warm-up, so budget ~5 min of foregrounded, screen-on device.
   // The -noop and step1-ring entries are the instrument variants documented
   // at benchSkip above; they are here rather than desktop-only because the
-  // phone has no CDP endpoint, so tools/bench-amr.js cannot reach it and this
-  // sweep is the only way to ask that device the same questions.
-  // ?benchConfigs=none,interp,avg,ghost,interp+avg+ghost trims the list. Worth
+  // phone cannot be driven the way tools/bench-amr.js drives the desktop (adb
+  // does expose CDP, but debugStepSync over it killed Chrome -- see
+  // plans/perf-characterization.md), so this sweep is the way to ask that
+  // device the same questions.
+  // ?benchConfigs=none,interp,avg,ghostcopy,interp+avg trims the list. Worth
   // using on a device you have to hold in your hand: every configuration costs
   // (BENCH_ROUNDS+1) * BENCH_MEASURE_MS, and a shorter sweep also spends less
   // of itself inside this device's own thermal ramp. 'none' is always kept --
   // every share is relative to it.
-  const BENCH_CONFIGS_DEFAULT = ['none', 'force', 'phy', 'force+phy', 'interp', 'avg', 'ghost', 'step1', 'interp+avg+ghost',
-                                 'interp-noop', 'avg-noop', 'ghost-noop', 'step1-ring'];
+  const BENCH_CONFIGS_DEFAULT = ['none', 'force', 'phy', 'force+phy', 'interp', 'avg', 'ghostcopy', 'step1', 'interp+avg',
+                                 'interp-noop', 'avg-noop', 'step1-ring'];
   const BENCH_CONFIGS = urlParams.has('benchConfigs')
     // URLSearchParams decodes '+' as a space, and '+' is this list's own
     // combine operator, so an unencoded ?benchConfigs=interp+avg+ghost arrives
@@ -3068,16 +3128,23 @@ async function init() {
       //   step1             32.7%        27.5-31.7%
       //   interp+avg+ghost  40.5%        43.9-49.1%
       //
+      // (`ghost` and `interp+avg+ghost` no longer exist as configurations --
+      // the pass they skipped is gone; `ghostcopy` measures the same boundary
+      // from the other side. The rows are kept because they are the only
+      // published cross-check of this sweep against bench-amr.js.)
+      //
       // The small rows do NOT resolve, on any run: interp-noop/avg-noop/
-      // ghost-noop/step1-ring are 0.2-5% effects by bench-amr and came back as
-      // 7.9%, -3.6%, -0.9% and -12.2% here. The baseline itself carries ~15%
-      // spread because the card keeps falling through the sweep while
-      // refinement is frozen, so the workload drifts under every row equally.
-      // Read anything under ~10% as "below the floor", not as a measurement --
-      // and a NEGATIVE share means exactly that, since skipping work cannot
-      // make a run slower. Use tools/bench-amr.js for the small effects on any
-      // device that has a CDP endpoint; this sweep exists for the one that
-      // does not.
+      // step1-ring are 0.2-5% effects by bench-amr and came back as 7.9%,
+      // -3.6% and -12.2% here. The baseline itself carries ~15% spread because
+      // the card keeps falling through the sweep while refinement is frozen,
+      // so the workload drifts under every row equally. Read anything under
+      // ~10% as "below the floor", not as a measurement -- and, for the
+      // pass-REMOVING groups, a NEGATIVE share means exactly that, since
+      // skipping work cannot make a run slower. `ghostcopy` is the one
+      // configuration whose share is negative BY DESIGN (it adds work back),
+      // so read its magnitude, not its sign, against the same ~10% floor. Use
+      // tools/bench-amr.js for the small effects on any device that has a CDP
+      // endpoint; this sweep exists for the one that does not.
       noiseFloorPct: 10,
     };
   }

@@ -78,6 +78,20 @@ override GHOST_ONLY : u32;
 // behavior (correct multi-rate coupling; coarse is quasi-static), so this mode
 // leaves them alone. Default 0u so the existing interp/interpInit pipelines,
 // which don't set it, still compile.
+// LEGACY (?ghostcopy=1) as of 2026-09-08. This MODE builds the between-substep
+// fine-fine ghost COPY pass, and the default build no longer encodes it -- the
+// fine step reaches into the neighbour tile itself during streaming instead
+// (DIRECT_GHOST in shaders/amr_step1.wgsl), which is both cheaper and fresher.
+// Kept so the two paths can be A/B'd for speed and physics in one build; see
+// plans/perf-characterization.md's "The one lead left".
+//
+// NOTE this is the mode, not the branch. The same-level consultation inside
+// the ordinary GHOST_ONLY pass below still runs in the default build, and must:
+// a fine tile's ghost ring is still read by its OWN child's bilinear parent
+// sampling (see this file's header on the stencil reaching [-GHOST, ...]), so
+// it still has to hold the exact neighbour value there rather than a coarse
+// guess. Removing that branch was measured at 1.8-3.9%, not the ~15% an
+// earlier reading of plans/perf-characterization.md claimed.
 override FINE_FINE_ONLY : u32 = 0u;
 // ── Measurement instrument: ?benchSkip=<group>-noop ──────────────────────────
 // Returns before touching any buffer, so the pass is still encoded and

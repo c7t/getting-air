@@ -42,8 +42,8 @@
 
 
 struct LevelParams {
-  nbx: u32,        // unused here (no cellIndex()/blockID-derived origin at this level -- see header) -- kept so this level's ONE uniform buffer is shared verbatim with amr_interp_pool_parent.wgsl/amr_average_pool_parent.wgsl, not a third near-duplicate.
-  nby: u32,        // unused here, same reason.
+  nbx: u32,        // this level's own logical block-grid extent, used ONLY to name same-level neighbours for DIRECT_GHOST streaming (the tile's physical origin still comes from originX/originY -- see header). Shared verbatim with amr_interp_pool_parent.wgsl/amr_average_pool_parent.wgsl, not a third near-duplicate.
+  nby: u32,        // same.
   parentTau: f32,
   dxL: f32,        // Milestone 8: this level's own grid spacing in L0-buffer-
                    // space units, used below to scale epsilon (get_chi).
@@ -57,6 +57,11 @@ struct LevelParams {
 @group(0) @binding(5) var<storage, read>       originX     : array<f32>;
 @group(0) @binding(6) var<storage, read>       originY     : array<f32>;
 @group(0) @binding(7) var<uniform>             levelParams : LevelParams;
+// This level's own logical block grid -> pool slot, indexed by
+// blockID = by*levelParams.nbx+bx -- the one new input neighbour-addressed
+// streaming needs (see DIRECT_GHOST), the same buffer and the same indexing
+// amr_interp_pool_parent.wgsl's fine-fine consultation already uses.
+@group(0) @binding(8) var<storage, read>       blockSlot   : array<i32>;
 
 override W : u32; // GLOBAL domain dims (window periodicity), same at every level -- not level-specific, see header.
 override H : u32;
@@ -83,6 +88,12 @@ override RB : u32;
 // differ. Guard placed after the slot lookup so the number stays comparable
 // with the desktop figure above.
 override SKIP_GHOST : u32 = 0u;
+
+// ── Neighbour-addressed streaming (AGAL) ─────────────────────────────────────
+// See shaders/amr_step1.wgsl's identical override for the full rationale --
+// this is the level>=2 half of the same change, and the only difference is
+// where nbx/nby come from (levelParams, not W/BLOCK).
+override DIRECT_GHOST : u32 = 1u;
 
 const GHOST = 2u;
 
@@ -178,6 +189,39 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let originX_L0 = originX[slot];
   let originY_L0 = originY[slot];
 
+  // Logical (bx,by) within THIS level's own block grid, derived from blockID
+  // exactly as amr_interp_pool_parent.wgsl derives it -- needed only to name
+  // this tile's same-level neighbours, not to place it physically (that is
+  // what the cached origin above is for). Dead code under DIRECT_GHOST=0.
+  let nbx = levelParams.nbx;
+  let nby = levelParams.nby;
+  let bx = u32(blockID) % nbx;
+  let by = u32(blockID) / nbx;
+  let RB2 = RB * 2u;
+  let bxm = (bx + nbx - 1u) % nbx;
+  let bxp = (bx + 1u) % nbx;
+  let bym = (by + nby - 1u) % nby;
+  let byp = (by + 1u) % nby;
+
+  // Neighbour-slot resolution, hoisted out of the 9-direction gather below.
+  // A source cell is at most one cell away and a tile's interior is RB2 >= 2
+  // wide, so at most ONE non-zero neighbour offset is reachable per axis --
+  // which means the whole gather needs at most THREE neighbour slots (the
+  // x-, y- and diagonal tiles), resolved once here instead of re-resolved,
+  // with a fresh blockSlot load, on every one of the nine directions. A
+  // fully-interior thread loads nothing at all.
+  var offX = 0; var offY = 0;
+  var nbrX = -1; var nbrY = -1; var nbrXY = -1;
+  if (DIRECT_GHOST != 0u) {
+    offX = select(select(0, 1, fx + 1u >= GHOST + RB2), -1, fx <= GHOST);
+    offY = select(select(0, 1, fy + 1u >= GHOST + RB2), -1, fy <= GHOST);
+    let cx = select(select(bx, bxp, offX > 0), bxm, offX < 0);
+    let cy = select(select(by, byp, offY > 0), bym, offY < 0);
+    if (offX != 0) { nbrX = blockSlot[by * nbx + cx]; }
+    if (offY != 0) { nbrY = blockSlot[cy * nbx + bx]; }
+    if (offX != 0 && offY != 0) { nbrXY = blockSlot[cy * nbx + cx]; }
+  }
+
   let poolPlaneStride = arrayLength(&f_in) / 9u;
   let cell = slot * (FB * FB) + fy * FB + fx;
 
@@ -226,9 +270,34 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         continue;
       }
     }
-    let srcX = clamp(i32(fx) - ex[i], 0, i32(FB) - 1);
-    let srcY = clamp(i32(fy) - ey[i], 0, i32(FB) - 1);
-    let srcCell = slot * (FB * FB) + u32(srcY) * FB + u32(srcX);
+    // Neighbour-addressed pull -- see amr_step1.wgsl's identical block.
+    var sx = i32(fx) - ex[i];
+    var sy = i32(fy) - ey[i];
+    var srcSlot = slot;
+    if (DIRECT_GHOST != 0u) {
+      // Does this source cell leave the interior, and on which axes? If so
+      // the offset can only be offX/offY (see the hoist above), so this is
+      // pure register work -- no second blockSlot load.
+      let ox = select(0, offX, sx < i32(GHOST) || sx >= i32(GHOST + RB2));
+      let oy = select(0, offY, sy < i32(GHOST) || sy >= i32(GHOST + RB2));
+      let ns = select(select(select(-1, nbrY, oy != 0), nbrX, ox != 0),
+                      nbrXY, ox != 0 && oy != 0);
+      if (ns >= 0) {
+        // Re-express the source in the neighbour's own local coordinates. It
+        // always lands in ITS interior -- sx in [-1, GHOST-1] maps to
+        // [RB2-1, RB2+1], sx in [GHOST+RB2, FB] maps to [GHOST, GHOST+2] --
+        // so the clamp below is a no-op on this path.
+        srcSlot = u32(ns);
+        sx -= ox * i32(RB2);
+        sy -= oy * i32(RB2);
+      }
+    }
+    // No same-level neighbour (or DIRECT_GHOST=0): clamp at the slot's own
+    // buffer edge and read this tile's own ghost cell, which the interp pass
+    // filled from the parent.
+    let srcCell = srcSlot * (FB * FB)
+                + u32(clamp(sy, 0, i32(FB) - 1)) * FB
+                + u32(clamp(sx, 0, i32(FB) - 1));
     f[i] = fUnpack(f_in[fIdx(i, poolPlaneStride, srcCell)], i);
   }
 
