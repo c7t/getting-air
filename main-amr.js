@@ -10,6 +10,7 @@
 // discovering that kind of bug from wrong-looking output.
 
 import { reportFatal, reportNoWebGPU, reportNoAdapter } from './error-overlay.mjs';
+import { installChromeToggle } from './ui-chrome.mjs';
 import { assembleShader } from './shader-loader.mjs';
 import {
   deriveCardParams, parseCardParams, parseResLog2, reynoldsFromTau,
@@ -21,6 +22,15 @@ import { packF, unpackF, fWords } from './f-pack.mjs';
 const canvas   = document.getElementById('c');
 let deviceLost = false;
 const statusEl = document.getElementById('status');
+
+// The page ships with its chrome collapsed (index-amr.html's `class="ui-hidden"`);
+// this is the single button that brings it back. Wired HERE, at module top
+// level, rather than inside init() alongside the other controls: if WebGPU
+// setup throws, init()'s remaining statements never run, and a toggle wired
+// there would strand the page with no way to expand the UI. It needs nothing
+// from the GPU. (error-overlay.mjs also force-reveals on any fatal, so the
+// two paths are independent -- neither relies on the other having run.)
+installChromeToggle(document.getElementById('ui-toggle'));
 
 const urlParams = new URLSearchParams(window.location.search);
 // Default resLog2=8 (W=256) with levels=3: two octaves of refinement give
@@ -916,9 +926,16 @@ async function init() {
 
   // Refinement-coverage (green) overlay opacity. Render-only; does not affect
   // the simulation. Writing the uniform takes effect on the next frame.
+  //
+  // The shipped default is the slider's own `value` in index-amr.html (0, i.e.
+  // off) -- read back out by opacityFromSlider() where the uniform is created,
+  // so the number lives in exactly one place. It used to be written here as a
+  // literal 1.0 AND as a separate literal in the markup, which is two things
+  // to keep in step for no reason.
   const overlaySlider = document.getElementById('slider-overlay');
   const overlayValEl = document.getElementById('val-overlay');
   if (overlaySlider) {
+    if (overlayValEl) overlayValEl.textContent = parseFloat(overlaySlider.value).toFixed(2);
     overlaySlider.oninput = () => {
       const v = parseFloat(overlaySlider.value);
       overlayValEl.textContent = v.toFixed(2);
@@ -932,6 +949,7 @@ async function init() {
   const outlineSlider = document.getElementById('slider-outline');
   const outlineValEl = document.getElementById('val-outline');
   if (outlineSlider) {
+    if (outlineValEl) outlineValEl.textContent = parseFloat(outlineSlider.value).toFixed(2);
     outlineSlider.oninput = () => {
       const v = parseFloat(outlineSlider.value);
       outlineValEl.textContent = v.toFixed(2);
@@ -1385,13 +1403,23 @@ async function init() {
   const frcBG_b = device.createBindGroup({ layout: frcBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_b } }, { binding: 2, resource: { buffer: forceBuf } }, { binding: 3, resource: { buffer: pools[1].blockSlotBuf } }]});
 
   const phyBG = device.createBindGroup({ layout: phyBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: forceBuf } }]});
+  // Both opacity uniforms are seeded from their slider's shipped `value`, so
+  // the default lives only in index-amr.html and the uniform cannot start out
+  // disagreeing with the control that owns it. `fallback` covers a page that
+  // has no such slider at all (the harness pages reuse parts of this file).
+  const opacityFromSlider = (el, fallback) => {
+    const v = el ? parseFloat(el.value) : NaN;
+    return Number.isFinite(v) ? v : fallback;
+  };
   const overlayOpacityBuf = device.createBuffer({ size: 4, usage: U.UNIFORM | U.COPY_DST });
-  device.queue.writeBuffer(overlayOpacityBuf, 0, new Float32Array([1.0])); // overlay fully on by default
+  device.queue.writeBuffer(overlayOpacityBuf, 0,
+    new Float32Array([opacityFromSlider(overlaySlider, 0.0)]));
   // Quadtree outline opacity -- optional, off by default (see
   // shaders/amr_render.wgsl's own comment on why this is a separate
   // uniform from overlayOpacityBuf's fill).
   const outlineOpacityBuf = device.createBuffer({ size: 4, usage: U.UNIFORM | U.COPY_DST });
-  device.queue.writeBuffer(outlineOpacityBuf, 0, new Float32Array([0.0]));
+  device.queue.writeBuffer(outlineOpacityBuf, 0,
+    new Float32Array([opacityFromSlider(outlineSlider, 0.0)]));
   // Field digest (see shaders/amr_digest.wgsl): one dispatch per rendered
   // frame that fingerprints the L0 velocity field, so the watchdog can tell
   // whether a frame ever reproduces an EARLIER frame's field -- which

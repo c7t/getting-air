@@ -13,7 +13,8 @@ step** — the source *is* the artifact; GitHub Pages serves it directly.
 
 ## Validate before committing (no GPU needed)
 Run `make check` and make it pass before committing shader/JS changes:
-- `make js` — `node --check` every `*.js` (needs Node).
+- `make js` — `node --check` every `*.js` and `*.mjs` (needs Node). The
+  shared `.mjs` modules were outside this glob until 2026-09-08.
 - `make test` — the GPU-free unit tests (`tools/test-*.js`): the shared
   card/regime parameterization, the AMR field reconstructor, the dense→AMR
   injector, and the packed-`f` host/shader layout agreement. Add a `tools/test-<name>.js` and it is picked up

@@ -49,6 +49,25 @@
       cursor: pointer; font-family: monospace;
     }
     #download:hover { background: rgba(50,50,50,0.8); }
+    /* The one control that is never hidden -- it is the way back. Bottom
+       right, clear of #status/#perf (top left) and #download (top right). */
+    #ui-toggle {
+      position: absolute; bottom: 8px; right: 8px;
+      font-size: 12px; color: #bbb; background: rgba(0,0,0,0.55);
+      padding: 4px 10px; border: 1px solid #444; border-radius: 3px;
+      cursor: pointer; font-family: monospace; opacity: 0.55;
+      transition: opacity 0.15s ease;
+    }
+    #ui-toggle:hover, #ui-toggle:focus-visible { opacity: 1; background: rgba(50,50,50,0.8); }
+    /* Collapsed chrome. One class on the body element, set in the markup so the page
+       comes up hidden rather than flashing the full UI for a frame -- see
+       ui-chrome.mjs. #canvas-container and #fatal-overlay are deliberately
+       NOT in this list: a fatal error must stay visible, and showFatal()
+       clears this class outright. */
+    body.ui-hidden #controls,
+    body.ui-hidden #status,
+    body.ui-hidden #perf,
+    body.ui-hidden #download { display: none; }
     #controls {
       flex-shrink: 0;
       background: rgba(0,0,0,0.85);
@@ -64,7 +83,7 @@
     .control-row span { width: 50px; text-align: right; font-size: 11px; color: #fff; }
   </style>
 </head>
-<body>
+<body class="ui-hidden">
   <div id="canvas-container">
     <canvas id="c"></canvas>
     <div id="status">initializing...</div>
@@ -74,6 +93,7 @@
       <div><span class="perf-label">SYNC:</span> <span id="val-sync-ms">0.0</span> ms</div>
     </div>
     <button id="download">Download CSV</button>
+    <button id="ui-toggle" aria-expanded="false" aria-controls="controls">controls</button>
   </div>
 
   <div id="controls">
@@ -114,8 +134,8 @@
     </div>
     <div class="control-row">
       <label>Refinement overlay</label>
-      <input type="range" id="slider-overlay" min="0" max="1" step="0.05" value="1">
-      <span id="val-overlay">1.00</span>
+      <input type="range" id="slider-overlay" min="0" max="1" step="0.05" value="0">
+      <span id="val-overlay">0.00</span>
     </div>
     <div class="control-row">
       <label>Quad outlines</label>

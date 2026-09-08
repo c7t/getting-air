@@ -34,7 +34,11 @@ SHADERS := $(wildcard shaders/*.wgsl)
 # silently skipping tools/ and tools/lib/ (real, actively-used JS, not just
 # root main*.js). venv/ (Python virtualenv) and AGAL/ (vendored C++/CUDA
 # sub-repo) are excluded -- neither is this project's own JS source.
-JS      := $(shell find . -name '*.js' -not -path './node_modules/*' -not -path './.git/*' -not -path './venv/*' -not -path './AGAL/*')
+# *.mjs as well as *.js: the shared modules (card-params, error-overlay,
+# f-pack, shader-loader, ui-chrome) are all .mjs, and they are precisely the
+# files whose breakage takes down every page at once -- exactly what this
+# target exists to catch. They were silently outside it until 2026-09-08.
+JS      := $(shell find . \( -name '*.js' -o -name '*.mjs' \) -not -path './node_modules/*' -not -path './.git/*' -not -path './venv/*' -not -path './AGAL/*')
 
 # GPU-free unit tests. Every tools/test-*.js is expected to be runnable as
 # `node tools/test-foo.js` with no server, no browser and no GPU, and to exit
@@ -96,9 +100,9 @@ wgsl: ## validate every WGSL shader with naga (needs Rust-built naga)
 	exit $$rc
 
 .PHONY: js
-js: ## syntax-check every JS module with `node --check`
+js: ## syntax-check every JS/MJS module with `node --check`
 	@command -v node >/dev/null 2>&1 || { echo "node not found -- install Node.js"; exit 1; }
-	@test -n "$(strip $(JS))" || { echo "no JS modules found matching *.js (run from repo root?)"; exit 1; }
+	@test -n "$(strip $(JS))" || { echo "no JS modules found matching *.js or *.mjs (run from repo root?)"; exit 1; }
 	@rc=0; for f in $(JS); do \
 	  if out=$$(node --check "$$f" 2>&1); then echo "  ok    $$f"; \
 	  else echo "  FAIL  $$f"; echo "$$out" | sed 's/^/        /'; rc=1; fi; \
