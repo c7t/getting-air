@@ -62,10 +62,17 @@ function parseArgs(argv) {
     else if (a.startsWith('--steps=')) opts.invariantSteps = parseInt(a.slice(8));
     else if (a.startsWith('--checkEvery=')) opts.invariantCheckEvery = parseInt(a.slice(13));
     else if (a.startsWith('--configs=')) opts.configs = a.slice(10).split(',');
+    else if (a.startsWith('--extra=')) opts.extra = a.slice(8).replace(/^[?&]/, '');
     else if (a === '--keepOpen') opts.keepOpen = true;
   }
   return opts;
 }
+
+// Extra query params from --extra=, as a suffix for a URL that already has a
+// '?'. The channel and TGV harnesses build their own URLs per case rather
+// than using config.url, so they call this directly; everything else gets it
+// appended to config.url in main().
+function extraParam(opts) { return opts.extra ? `&${opts.extra}` : ''; }
 
 function defaultConfigs(baseUrl) {
   return [
@@ -94,6 +101,23 @@ function defaultConfigs(baseUrl) {
     {
       name: 'amr-dev-boot',
       url: `${baseUrl}/index-amr.html`,
+      checkBoots: true,
+    },
+    // The reentry pages are the last consumers of shaders/lbm_*.wgsl and
+    // shaders/amr_*.wgsl with no other coverage here -- they have no
+    // analytic check of their own (prescribed kinematics, not a validated
+    // benchmark), but they DO have their own bind groups over the shared
+    // shaders, which is the thing that has actually broken before. A boot
+    // smoke is the whole of what's checkable and exactly the gap that let
+    // 238e48c ship.
+    {
+      name: 'reentry-boot',
+      url: `${baseUrl}/index-reentry.html`,
+      checkBoots: true,
+    },
+    {
+      name: 'reentry-amr-boot',
+      url: `${baseUrl}/index-reentry-amr.html`,
       checkBoots: true,
     },
     {
@@ -308,7 +332,7 @@ async function runChannelPhysics(Page, Runtime, opts, config) {
     // benchmarks/channel.json's own `res` field is always H -- convert for
     // AMR pages here rather than making the benchmark data page-shape-aware.
     const resParam = config.chanPage === 'index-channel-amr.html' ? Math.log2(res) : res;
-    const url = `${opts.baseUrl}/${config.chanPage}?mode=${config.chanMode}&res=${resParam}${levelsParam}`;
+    const url = `${opts.baseUrl}/${config.chanPage}?mode=${config.chanMode}&res=${resParam}${levelsParam}${extraParam(opts)}`;
     await navigateTo(Page, url);
     await waitForGlobal(Runtime, 'window.__CYL', 15000);
     await evalExprChan(Runtime, `window.__CYL.setLive(false)`);
@@ -336,9 +360,9 @@ async function runTgvPhysics(Page, Runtime, opts, config) {
   for (const c of cases) {
     // main-tgv-amr.js's ?res= is log2(N), matching every other AMR page's
     // convention -- see runChannelPhysics's identical note.
-    const url = c.levels
+    const url = (c.levels
       ? `${opts.baseUrl}/index-tgv-amr.html?res=${Math.log2(c.N)}&u0=${c.u0}&tau=${c.tau}&levels=${c.levels}`
-      : `${opts.baseUrl}/index-tgv.html?res=${c.N}&u0=${c.u0}&tau=${c.tau}`;
+      : `${opts.baseUrl}/index-tgv.html?res=${c.N}&u0=${c.u0}&tau=${c.tau}`) + extraParam(opts);
     await navigateTo(Page, url);
     await waitForGlobal(Runtime, 'window.__CYL', 15000);
     await evalExprTgv(Runtime, `window.__CYL.setLive(false)`);
@@ -364,6 +388,13 @@ async function runInvariants(Runtime, opts) {
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
   const allConfigs = defaultConfigs(opts.baseUrl);
+  // --extra=f16=1 (say) appends to every config's URL, including the ones
+  // that build their own URLs per case (channel/tgv), so an override can be
+  // swept across the whole suite without a second copy of the table.
+  if (opts.extra) {
+    for (const c of allConfigs) c.url += (c.url.includes('?') ? '&' : '?') + opts.extra;
+    console.log(`(appending "${opts.extra}" to every config URL)`);
+  }
   const configs = opts.configs ? allConfigs.filter(c => opts.configs.includes(c.name)) : allConfigs;
   if (configs.length === 0) { console.error('No matching configs (check --configs= names against the default list in this file).'); process.exit(1); }
 

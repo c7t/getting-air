@@ -56,10 +56,11 @@
 
 // @include "common_geometry.wgsl"
 // @include "common_lattice.wgsl"
+// @include "common_fpack.wgsl"
 // @include "common_reduce.wgsl"
 
 @group(0) @binding(0) var<storage, read>       state          : CardState;
-@group(0) @binding(1) var<storage, read>       f_in           : array<f32>;
+@group(0) @binding(1) var<storage, read>       f_in           : array<u32>;
 @group(0) @binding(2) var<storage, read_write> forces         : array<atomic<i32>, 4>;
 @group(0) @binding(3) var<storage, read>       slotToBlock    : array<i32>;
 @group(0) @binding(4) var<storage, read>       childBlockSlot : array<i32>; // level 2's blockSlot, or a harmless dummy if HAS_CHILD=0 -- see header
@@ -179,7 +180,7 @@ fn main(
               let srcWx = wrapf(srcBufX - state.off_x, f32(W));
               let srcWy = wrapf(srcBufY - state.off_y, f32(H));
               if (get_phi(vec2<f32>(srcWx, srcWy), state) < 0f) {
-                let f_opp = f_in[opp[i] * poolPlaneStride + cell];
+                let f_opp = fUnpack(f_in[fIdx(opp[i], poolPlaneStride, cell)], opp[i]);
                 let corr = 2f * wt[i] * (f32(ex[i]) * usx + f32(ey[i]) * usy) / CS2;
                 fx_body += -f32(ex[i]) * (2f * f_opp + corr) * LINE_WEIGHT;
                 fy_body += -f32(ey[i]) * (2f * f_opp + corr) * LINE_WEIGHT;
@@ -198,7 +199,7 @@ fn main(
               let srcX = clamp(i32(fx) - ex[i], 0, i32(FB) - 1);
               let srcY = clamp(i32(fy) - ey[i], 0, i32(FB) - 1);
               let srcCell = slot * (FB * FB) + u32(srcY) * FB + u32(srcX);
-              let fi = f_in[i * poolPlaneStride + srcCell];
+              let fi = fUnpack(f_in[fIdx(i, poolPlaneStride, srcCell)], i);
               rho     += fi;
               ux_star += fi * f32(ex[i]);
               uy_star += fi * f32(ey[i]);

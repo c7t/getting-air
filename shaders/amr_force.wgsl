@@ -17,10 +17,11 @@
 
 // @include "common_geometry.wgsl"
 // @include "common_lattice.wgsl"
+// @include "common_fpack.wgsl"
 // @include "common_reduce.wgsl"
 
 @group(0) @binding(0) var<storage, read>       state      : CardState;
-@group(0) @binding(1) var<storage, read>       f_in       : array<f32>;
+@group(0) @binding(1) var<storage, read>       f_in       : array<u32>;
 @group(0) @binding(2) var<storage, read_write> forces     : array<atomic<i32>, 4>;
 @group(0) @binding(3) var<storage, read>       blockSlot1 : array<i32>; // level 1's own blockSlot -- see header
 
@@ -105,7 +106,7 @@ fn main(
             let wx_src = (wx + W - u32(ex[i])) % W;
             let wy_src = (wy + H - u32(ey[i])) % H;
             if (get_phi(vec2<f32>(f32(wx_src), f32(wy_src)), state) < 0f) {
-              let f_opp = f_in[opp[i] * (W * H) + cell];
+              let f_opp = fUnpack(f_in[fIdx(opp[i], (W * H), cell)], opp[i]);
               let corr = 2f * wt[i] * (f32(ex[i]) * usx + f32(ey[i]) * usy) / CS2;
               fx_body += -f32(ex[i]) * (2f * f_opp + corr);
               fy_body += -f32(ey[i]) * (2f * f_opp + corr);
@@ -126,7 +127,7 @@ fn main(
         for (var i = 0u; i < 9u; i++) {
           let bx_src = (cx + W - u32(ex[i])) % W;
           let by_src = (cy + H - u32(ey[i])) % H;
-          let fi = f_in[i * (W * H) + cellIndex(bx_src, by_src)];
+          let fi = fUnpack(f_in[fIdx(i, (W * H), cellIndex(bx_src, by_src))], i);
           rho     += fi;
           ux_star += fi * f32(ex[i]);
           uy_star += fi * f32(ey[i]);

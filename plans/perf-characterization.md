@@ -115,64 +115,103 @@ dispatch width, which is the thing that does not matter on either device, and
 it removes the headroom that stops the pool exhausting (see
 `main-cylinder-amr.js`'s note on the banding failure that caused).
 
-## fp16 storage for `f`: measured feasibility (2026-09-07)
+## fp16 storage for `f`: IMPLEMENTED, and it does NOT hold (2026-09-07)
 
-The phone is bandwidth bound and `f` (9 x f32 = 36 B/cell) is essentially all
-the traffic, so halving its width is worth far more than any pass-level
-change. Two questions: how much does it buy, and does the physics survive.
+**Superseded section.** What stood here claimed fp16 storage was measured safe.
+It was not measured at all. The claim came from `?quantF16=`, which emulated
+half precision by rounding each stored value through
+`unpack2x16float(pack2x16float(x))` while keeping f32 storage. That round trip
+is a no-op the driver is free to fold away, and it does: with the real packed
+implementation now in the tree for comparison,
 
-**It does not need the `shader-f16` feature.** `pack2x16float` /
-`unpack2x16float` are core WGSL builtins. Storage becomes packed halves in a
-`u32` array; arithmetic stays f32. Worth knowing because the desktop adapter
-here does NOT expose `shader-f16` at all.
+    dense-reference Re=100, f32 baseline      Cd 1.950 / St 0.1258
+    dense-reference Re=100, ?quantF16=1       Cd 1.950 / St 0.1258
+    dense-reference Re=100, ?f16=1 (real)     Cd 2.282 / St 0.3080
 
-### Accuracy: measured, not argued
+Four significant figures of agreement between the f32 run and the "quantised"
+one, across a 48512-step shedding measurement, is not a null result -- it is
+proof that nothing was being quantised. The canary (mode 3,
+`round(x*256)/256`) DID move Cd, and that was read as proving the override
+reached the shader and therefore that modes 1 and 2 were live. It proves only
+the first half: mode 3 is arithmetic the compiler cannot fold, modes 1 and 2
+are not. **A control has to be the same KIND of operation as the thing it
+controls for.** `QUANT_F16` has been deleted rather than fixed, so its numbers
+cannot be read again.
 
-`fneq = f - feq` is the viscous stress and is a small difference of large
-numbers, so it is what quantisation eats first. Scaling `fneq/f ~ 3*tau*|grad u|`
-against fp16's 4.88e-4 relative precision:
+### What the real implementation measures
 
-| region | \|grad u\|/cell | fneq/f | vs fp16 noise |
-|---|---|---|---|
-| peak shear at the body | 8.75e-3 | 1.31e-2 | 26.9x |
-| mid boundary layer | 2.70e-3 | 4.05e-3 | 8.3x |
-| outer BL / near wake | 1.20e-3 | 1.80e-3 | 3.7x |
-| quiescent far field | 1.0e-4 | 1.5e-4 | **0.3x** |
+`shaders/common_fpack.wgsl` + `f-pack.mjs`, `?f16=1` (pack `f_i`) and `?f16=2`
+(pack the deviation `f_i - w_i`, ~8x more resolution on the part that carries
+the flow, since f_i sits close to its lattice weight). `?f16=0` is the default
+and is byte-identical to the previous `array<f32>` layout -- verified by the
+full 14-config sweep coming back unchanged.
 
-So the prediction was: fine near the body, far-field viscous stress lost in
-noise. Tested rather than trusted, by emulating fp16 STORAGE precision inside
-the existing f32 pipeline (`?quantF16=`, `QUANT_F16` override in
-lbm_step.wgsl / amr_step*.wgsl) and running the real Cd/St harness:
+Against the analytic benchmarks, which is where this had to be tested and
+never was:
 
-| config | mode 0 (f32) | mode 1 (fp16 precision) |
+| check | tol | f32 | ?f16=1 | ?f16=2 |
+|---|---|---|---|---|
+| poiseuille res=16 Re=10 | 0.01  | PASS | -     | 3.40e-2 |
+| poiseuille res=32 Re=10 | 0.005 | PASS | 9.995e-1 | 1.087e-1 |
+| couette res=16 Re=10    | 0.01  | PASS | 1.692e-1 | 2.09e-2 |
+| couette res=32 Re=10    | 0.005 | PASS | 6.709e-1 | 7.31e-2 |
+| tgv N=32 field          | 0.01  | PASS | 5.765e-2 | PASS |
+| tgv N=64 field          | 0.01  | PASS | 3.964e-1 | PASS |
+| tgv N=128 field         | 0.01  | PASS | 1.138e+0 | 2.59e-2 |
+
+And against the bulk force metrics, which is where it WOULD have been signed
+off:
+
+| config | f32 | ?f16=2 |
 |---|---|---|
-| dense, Re=100, bounceback | Cd 1.327 / St 0.1605 | Cd 1.327 / St 0.1605 |
-| AMR levels=2 | Cd 1.284 / St 0.1642 | Cd 1.284 / St 0.1642 |
-| AMR levels=3 | Cd 1.323 / St 0.1656 | Cd 1.322 / St 0.1655 |
+| amr-N2-bounceback Re=100 | PASS | **PASS** |
+| amr-N3-diffuse Re=100    | PASS | **PASS** |
+| dense-reference Re=100   | Cd 1.950 | Cd 2.008 |
 
-A null result needs a control, so `QUANT_F16=3` is a deliberately coarse
-8-bit canary: it gives Cd 2.298 / St 1.842, both FAIL. The override reaches
-the shader, and modes 1/2 really are indistinguishable.
+That contrast is the reusable part. Mode 2 passes the Cd/St harness outright
+on both AMR configs and is within 3% on the dense one, while being 5-20x
+outside tolerance on every channel and TGV field check. Cd and St are
+time-averaged integrals over the body surface; they are dominated by the
+near-body region, which is exactly where `fneq` is largest and quantisation
+hurts least, and they average away the far-field noise rather than reporting
+it. The superseded section above even said so in its own last paragraph --
+"Cd/St are bulk time-averaged quantities and would not necessarily reveal
+far-field quantisation noise... before shipping this, look at a vorticity
+render in the quiescent region, or diff fields" -- and then the ship/no-ship
+call was made on Cd/St anyway. **For anything that changes precision or
+storage, the analytic field checks (`channel-*`, `tgv-*`) are the gate and
+Cd/St is not.**
 
-The only movement anywhere is at levels=3 (0.08% on Cd), which is exactly
-where `amr_interp_*`/`amr_average_*` rescale `fneq` by 2^k across levels and
-would amplify quantisation noise. Consistent with the mechanism, far inside
+Mode 2 is worth 10-40x over mode 1 and rescues the coarser TGV cases, but
+**neither mode meets these tolerances**, and the error GROWS WITH RESOLUTION
+in both. That scaling is the whole story: a finer grid resolves the same
+physical gradient over more cells, so the per-cell `fneq` -- the entire
+information content of the distribution beyond equilibrium -- shrinks toward
+the quantum. Refining the grid is exactly what this project does for a living,
+so the format gets worse precisely where the work is going.
+
+Poiseuille under mode 1 is the clearest single number: `L2rel = 0.9995`, i.e.
+the velocity is essentially zero. It is body-force driven, and the per-step
+force increment is smaller than an ulp of `f_i`, so the flow never develops at
+all. Mode 2 fixes the mechanism (the increment is representable against the
+deviation, not against the weight) and the error drops by 30x -- but not below
 tolerance.
 
-Mode 2 (store `f - w_i`, ~6.7x more resolution on the informative part) turns
-out to be unnecessary — mode 1 is already indistinguishable. Keep mode 2 in
-mind only if a future regime pushes closer to the floor.
+### What this does and does not rule out
 
-Cd/St are bulk time-averaged quantities and would not necessarily reveal
-far-field quantisation noise that the table above predicts. Before shipping
-this, look at a vorticity render in the quiescent region, or diff fields with
-tools/validate-divergence.js, rather than treating Cd/St as the whole story.
+It rules out fp16 as a DEFAULT. It does not rule out the machinery, which is
+why it is staying in the tree at `?f16=0`: the layout is proven correct (the
+failure signature is resolution-dependent precision loss, not the
+direction-transposition a layout bug would give, and `tools/test-f-pack.js`
+asserts host/shader addressing agreement per plane), and it is one URL
+parameter away from being re-measured on a device or a format that changes the
+answer. Worth revisiting only with something that actually addresses the
+signal-to-quantum ratio -- bf16 is worse, not better; a per-cell shared
+exponent or storing `fneq` separately from a low-order equilibrium would be
+real changes, not a flag.
 
-### Gain
-
-9 halves is an odd count; the practical layout is 5 `u32` planes (four packed
-pairs plus one half-used) with each thread owning a whole cell, so there is no
-read-modify-write hazard:
+The traffic arithmetic below was never in question and still holds, if a
+format is ever found that keeps the physics:
 
 | layout | B/cell | traffic reduction |
 |---|---|---|
@@ -180,21 +219,14 @@ read-modify-write hazard:
 | 5 u32 planes | 20 | 1.80x |
 | ideal tight 9 x f16 | 18 | 2.00x |
 
-Phone projection (frame time scales with `f` traffic):
+### The lesson worth keeping
 
-| config | now | at 1.80x | conservative 1.55x |
-|---|---|---|---|
-| res=8 N=2 (finest 512-equiv) | 14.4 fps | 25.9 | 22.3 |
-| res=8 N=3 (finest 1024-equiv) | 6.2 fps | 11.2 | 9.6 |
-| res=9 N=3 (finest 2048-equiv) | 2.2 fps | 4.0 | 3.4 |
-
-The conservative column allows for `velBuf`, indirection and atomics staying
-f32, and for some passes becoming latency-bound once their traffic halves.
-
-Versus ~15-20% for fusing the force pass into the step: fp16 is worth roughly
-**four times more** on this device, and the two are independent — fusion
-removes a redundant read, fp16 halves every read. On the DESKTOP the ranking
-reverses, since it is pass-count bound and fp16 does not remove passes.
+The accuracy question was asked, an experiment was designed, a control was
+run, and the answer was still wrong -- because the experiment measured f32
+storage the whole time and the control could not detect that. The cheap
+insurance would have been to check `?quantF16=1` against `?quantF16=0` for ANY
+difference at all, at any step count. Identical output from a perturbed solver
+is a bug report, not a pass.
 
 ## What the refinement overlay is actually showing (2026-09-07)
 

@@ -17,11 +17,20 @@
 // instead of a Cd/St time series -- there's no body here to drag/shed.
 
 import { assembleShader } from './shader-loader.mjs';
+import { packF, unpackF, fWords } from './f-pack.mjs';
 
 const canvas   = document.getElementById('c');
 const statusEl = document.getElementById('status');
 
 const urlParams = new URLSearchParams(window.location.search);
+// ?f16=1 / ?f16=2: real packed-half storage for `f` -- see shaders/common_fpack.wgsl
+// and f-pack.mjs. Wired on EVERY page that consumes those shaders, including
+// the ones with no accuracy check of their own: a page that quietly ignored
+// ?f16= would make a green `validate-all --extra=f16=1` sweep look like it
+// covered ground it never touched, which is the kind of false confidence
+// this repo has been bitten by before.
+const F16 = urlParams.has('f16') ? (parseInt(urlParams.get('f16')) || 0) : 0;
+
 
 // MODE picks which driving mechanism is active -- FORCE_X (Poiseuille) or
 // WALL_U1 (Couette), never both. Reload-only (like BLOCKAGE/UPSTREAM in
@@ -166,6 +175,17 @@ async function init() {
   // binding (fixed at pipeline-creation time). a=b=1 only avoids a
   // divide-by-zero in get_phi/render.wgsl's visualization shading --
   // irrelevant to the physics either way.
+
+  // See main-amr.js's copy for the rationale: the GPU buffer holds packed
+  // half pairs under F16, everything else speaks f32 plane-major, and these
+  // two are the only places the two meet.
+  const writeF = (buf, f32, ncells) => {
+    const src = packF(f32, ncells, F16);
+    device.queue.writeBuffer(buf, 0, src.buffer, src.byteOffset, ncells * fWords(F16) * 4);
+  };
+  const readF = (mapped, ncells) =>
+    F16 ? unpackF(new Uint32Array(mapped), ncells, true) : new Float32Array(mapped).slice();
+
   const cardStateBuf = device.createBuffer({ size: 104, usage: U.STORAGE | U.COPY_DST });
   function cardInit() {
     const card = new Float32Array(26);
@@ -174,7 +194,7 @@ async function init() {
     return card;
   }
   device.queue.writeBuffer(cardStateBuf, 0, cardInit());
-  device.queue.writeBuffer(f_a, 0, initF());
+  writeF(f_a, initF(), NCELLS);
 
   const [stepSM, renSM] = await Promise.all([
     loadShader(device, 'shaders/lbm_step.wgsl'),
@@ -208,7 +228,7 @@ async function init() {
     };
     return device.createComputePipeline({
       layout: device.createPipelineLayout({ bindGroupLayouts: [stepBGL] }),
-      compute: { module: stepSM, entryPoint: 'main', constants: stepConstants }
+      compute: { module: stepSM, entryPoint: 'main', constants: { ...stepConstants, F16 } }
     });
   }
   let stepPL = makeStepPipeline();
@@ -262,7 +282,7 @@ async function init() {
   };
 
   function resetSim() {
-    device.queue.writeBuffer(f_a, 0, initF());
+    writeF(f_a, initF(), NCELLS);
     step = 0;
     useB = false;
   }

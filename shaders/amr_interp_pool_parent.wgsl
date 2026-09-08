@@ -46,6 +46,7 @@
 // this one compiled pipeline is reused across all of them (decision 2).
 
 // @include "common_lattice.wgsl"
+// @include "common_fpack.wgsl"
 
 struct LevelParams {
   nbx: u32,
@@ -58,8 +59,8 @@ struct LevelParams {
 }
 
 @group(0) @binding(0) var<uniform>             levelParams    : LevelParams;
-@group(0) @binding(1) var<storage, read>       f_parent_pool  : array<f32>;
-@group(0) @binding(2) var<storage, read_write> f_pool         : array<f32>;
+@group(0) @binding(1) var<storage, read>       f_parent_pool  : array<u32>;
+@group(0) @binding(2) var<storage, read_write> f_pool         : array<u32>;
 @group(0) @binding(3) var<storage, read>       slotToBlock    : array<i32>;
 @group(0) @binding(4) var<storage, read>       newlyActivated : array<u32>;
 @group(0) @binding(5) var<storage, read>       blockSlot      : array<i32>;
@@ -113,7 +114,7 @@ fn sampleParentPool(pSlot: u32, ix: i32, iy: i32) -> CoarseSample {
   var f: array<f32, 9>;
   var rho = 0f; var ux = 0f; var uy = 0f;
   for (var i = 0u; i < 9u; i++) {
-    f[i] = f_parent_pool[i * parentPlaneStride + cell];
+    f[i] = fUnpack(f_parent_pool[fIdx(i, parentPlaneStride, cell)], i);
     rho += f[i];
     ux  += f[i] * f32(ex[i]);
     uy  += f[i] * f32(ey[i]);
@@ -192,8 +193,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       let poolPlaneStride = arrayLength(&f_pool) / 9u;
       let poolCellBase = slot * (FB * FB) + fy * FB + fx;
       let neighborCellBase = u32(neighborSlot) * (FB * FB) + nfy * FB + nfx;
-      for (var i = 0u; i < 9u; i++) {
-        f_pool[i * poolPlaneStride + poolCellBase] = f_pool[i * poolPlaneStride + neighborCellBase];
+      let nw = fWords();
+      for (var wi = 0u; wi < nw; wi++) {
+        f_pool[wi * poolPlaneStride + poolCellBase] = f_pool[wi * poolPlaneStride + neighborCellBase];
       }
       return;
     }
@@ -240,8 +242,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   let poolPlaneStride = arrayLength(&f_pool) / 9u;
   let poolCellBase = slot * (FB * FB) + fy * FB + fx;
+  var fo: array<f32,9>;
   for (var i = 0u; i < 9u; i++) {
     let fneq = w00*s00.fneq[i] + w10*s10.fneq[i] + w01*s01.fneq[i] + w11*s11.fneq[i];
-    f_pool[i * poolPlaneStride + poolCellBase] = feqD2Q9(rho, ux, uy, i) + rescale * fneq;
+    fo[i] = feqD2Q9(rho, ux, uy, i) + rescale * fneq;
+  }
+  let nw = fWords();
+  for (var wi = 0u; wi < nw; wi++) {
+    f_pool[wi * poolPlaneStride + poolCellBase] = fPack(fo[fLo(wi)], fo[fHi(wi)], wi);
   }
 }

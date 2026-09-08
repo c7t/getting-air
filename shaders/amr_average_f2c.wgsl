@@ -15,10 +15,11 @@
 
 // @include "common_geometry.wgsl"
 // @include "common_lattice.wgsl"
+// @include "common_fpack.wgsl"
 
 @group(0) @binding(0) var<storage, read>       state       : CardState;
-@group(0) @binding(1) var<storage, read>       f_pool      : array<f32>;
-@group(0) @binding(2) var<storage, read_write> f_coarse    : array<f32>;
+@group(0) @binding(1) var<storage, read>       f_pool      : array<u32>;
+@group(0) @binding(2) var<storage, read_write> f_coarse    : array<u32>;
 @group(0) @binding(3) var<storage, read>       slotToBlock : array<i32>;
 
 override W : u32;
@@ -66,7 +67,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wgi
     var rho = 0f; var ux = 0f; var uy = 0f;
     var f: array<f32, 9>;
     for (var i = 0u; i < 9u; i++) {
-      f[i] = f_pool[i * poolPlaneStride + cell];
+      f[i] = fUnpack(f_pool[fIdx(i, poolPlaneStride, cell)], i);
       rho += f[i];
       ux  += f[i] * f32(ex[i]);
       uy  += f[i] * f32(ey[i]);
@@ -106,7 +107,12 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wgi
   let cby = (u32(blockID) / nbx) * RB + lcy;
   let coarseCell = cellIndex(cbx, cby);
 
+  var fo: array<f32,9>;
   for (var i = 0u; i < 9u; i++) {
-    f_coarse[i * (W * H) + coarseCell] = feqD2Q9(rho_avg, ux_avg, uy_avg, i) + rescale * fneq_avg[i];
+    fo[i] = feqD2Q9(rho_avg, ux_avg, uy_avg, i) + rescale * fneq_avg[i];
+  }
+  let nw = fWords();
+  for (var wi = 0u; wi < nw; wi++) {
+    f_coarse[wi * (W * H) + coarseCell] = fPack(fo[fLo(wi)], fo[fHi(wi)], wi);
   }
 }

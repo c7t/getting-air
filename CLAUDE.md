@@ -15,8 +15,8 @@ step** — the source *is* the artifact; GitHub Pages serves it directly.
 Run `make check` and make it pass before committing shader/JS changes:
 - `make js` — `node --check` every `*.js` (needs Node).
 - `make test` — the GPU-free unit tests (`tools/test-*.js`): the shared
-  card/regime parameterization, the AMR field reconstructor, and the
-  dense→AMR injector. Add a `tools/test-<name>.js` and it is picked up
+  card/regime parameterization, the AMR field reconstructor, the dense→AMR
+  injector, and the packed-`f` host/shader layout agreement. Add a `tools/test-<name>.js` and it is picked up
   automatically; each must run with no server/browser/GPU and exit nonzero
   on failure.
 - `make wgsl` — validate every `shaders/*.wgsl` with `naga` (needs `naga`;
@@ -39,10 +39,11 @@ invariants the AMR machinery depends on:
   once). Runs both checks below across the dense reference and every AMR
   levels/bounce-back combination (`dense-reference`, `amr-N2-diffuse`,
   `amr-N2-bounceback`, `amr-N3-diffuse`, `amr-N3-bounceback`), plus a cheap
-  boot smoke check (`index-boot`, `amr-dev-boot`) against `index.html` and
-  `index-amr.html` — the two dev pages with no `window.__CYL`, so the Cd/St
-  and invariant checks don't apply, but that used to mean this suite never
-  loaded them at all. Added after a shared-shader/JS-bind-group mismatch
+  boot smoke check (`index-boot`, `amr-dev-boot`, `reentry-boot`,
+  `reentry-amr-boot`) against `index.html`, `index-amr.html` and the two
+  reentry pages — pages with no `window.__CYL`, so the Cd/St and invariant
+  checks don't apply, but that used to mean this suite never loaded them at
+  all. Added after a shared-shader/JS-bind-group mismatch
   broke `index-amr.html` in production (a WGSL binding count change was
   mirrored into `main-cylinder-amr.js`'s own bind group but not
   `main-amr.js`'s separate copy of the same one) without failing anything
@@ -56,6 +57,19 @@ invariants the AMR machinery depends on:
       node tools/validate-all.js --configs=amr-N2-bounceback
       node tools/validate-all.js --configs=index-boot,amr-dev-boot
       node tools/validate-all.js --re=20,40,100,200 --steps=20000
+      node tools/validate-all.js --extra=f16=2      # append to every config's URL
+  `--extra=` appends query parameters to every config, including the channel
+  and TGV harnesses that build their own per-case URLs, so a pipeline override
+  can be swept across the whole suite without a second copy of the table.
+
+  **The default sweep is not currently all-green on `main`.**
+  `dense-reference` and `amr-N2-diffuse` fail at Re=100 (Cd 1.950 and 1.620
+  against 1.35±0.15). That is the open diffuse-interface-width issue, not a
+  regression: the chi band is ~±4 cells regardless of resolution, so the
+  effective body radius exceeds the nominal one and Cd converges from above
+  (1.908 at res=9 → 1.597 at res=10). The bounce-back variants of the same
+  configs pass, which is consistent. Re-baseline against these numbers rather
+  than assuming a red cell is yours.
 - **`tools/validate-cylinder.js`** — physics: pinned cylinder in uniform
   crossflow, time-averaged Cd/Strouhal vs. literature values in
   `benchmarks/cylinder.json`. Assumes a Chrome + page are already up (see
@@ -124,6 +138,20 @@ measured to help neither. It also records the trap that produced a confident
 wrong conclusion: per-pass GPU timestamps are unusable on that mobile part
 (65536 ns counter granularity vs sub-tick passes), so attribution has to be
 done at frame scale via `?bench=1`.
+
+**For any change to precision or storage layout, the analytic field checks
+(`channel-*`, `tgv-*`) are the gate — Cd/St is not.** Cd and St are
+time-averaged surface integrals dominated by the near-body region where
+`fneq` is largest; they average far-field noise away instead of reporting it.
+Measured directly: packed-fp16 mode 2 PASSES the Cd/St harness on both AMR
+cylinder configs while missing every channel tolerance by 5-20x. The same
+document records how the previous fp16 answer came out wrong — an emulation
+the driver optimized away, with a control that could not detect that.
+
+`?f16=1|2` — real packed-half storage for `f` (`shaders/common_fpack.wgsl`,
+`f-pack.mjs`). Default 0 and byte-identical to the previous `array<f32>`
+layout. Measured NOT viable as a default; kept for re-measurement, not for
+shipping.
 
 Timing/measurement entry points:
 - `?telemetry=1` — POSTs periodic samples (device, adapter, config, frame
