@@ -9,6 +9,42 @@ active block count, so the pool passes stop dispatching 128 slots when only
 three wrong turns to establish that. Read this before optimizing anything
 here.
 
+## The phone throttles, and it invalidates every median (2026-09-07)
+
+Three `?telemetry=1` sessions from the phone (img-tec / PowerVR, Android,
+`index-amr.html`), 774 watched frames:
+
+| config | cold | hot | ramp | fps cold -> hot | syncMs/gpuMs |
+|---|---|---|---|---|---|
+| res=9 N=2 | 174 ms @step 640 | 272 ms @step 17344 | **+57%** | 5.8 -> 3.7 | 2.95x |
+| res=8 N=3 | 235 ms @step 320 | 308 ms @step 10368 | **+31%** | 4.3 -> 3.2 | 2.97x |
+| res=8 N=2 | 87 ms @step 1280 | 108 ms @step 4736 | +24% | 11.5 -> 9.3 | 2.94x |
+
+The ramp is monotonic from the first sample and plateaus after a few thousand
+steps; res=9 N=2 partially recovers late (272 -> 245 ms), consistent with the
+device cooling. **This is larger than any optimization on the table.** Force
+fusion was worth 5-8%; the thermal state of the phone is worth 24-57%.
+
+Consequences, which apply to everything measured on this device:
+
+- **A median is meaningless without the thermal state.** An earlier session
+  concluded the phone had got slower between builds, from min 166 / median
+  222 ms against min 226 / median 377 ms. Those are not comparable: the second
+  run may simply have been hotter for longer. That conclusion should not be
+  relied on.
+- **Only the COLD minimum is a build comparison**, and only if the device
+  starts from a similar temperature and the sample is taken in the first few
+  hundred steps. Take the first telemetry sample, not the median.
+- **A phone A/B needs a cooldown between arms**, or interleaving, which
+  `?bench=1` gets right for free -- it sweeps configurations within one
+  session, so drift hits every arm rather than only the later ones. The same
+  reasoning that forced round-robin into `tools/bench-amr.js --skip`.
+
+`syncMs/gpuMs = 2.95x` in every config, to within 1%. That is the 3-deep
+submit->readback pipeline showing up exactly as designed, not a hitch -- but
+note the absolute number: at 280 ms frames it is ~850 ms of latency between
+submitting work and reading its result.
+
 ## How to measure (and how not to)
 
 `?bench=1` runs a frame-scale differential sweep: skip a group of passes,
