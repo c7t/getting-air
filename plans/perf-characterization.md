@@ -131,12 +131,31 @@ not beat the flat one. Two concrete leads, neither yet measured:
   -- about 10.5% of the whole frame, inside step1's 29.3%. `RB` is welded to
   `BLOCK=8` by the L0<->L1 footprint-preserving scheme, so this is not a knob
   today, but it is the single largest identified piece of pure overhead.
-- **Dispatch shape of the three coupling passes.** interp and ghost dispatch
-  the full FB*FB tile while only the GHOST ring does work (144 of 400 cells);
-  avg dispatches MAX_FINE_BLOCKS slots while ~113 of 384 are active. Indirect
-  dispatch was ruled out once, but that was measured at levels=2 under the
-  pass-count model that `phy` has just falsified -- worth re-testing under the
-  numbers above rather than inheriting the old conclusion.
+- ~~**Dispatch shape of the three coupling passes.**~~ TESTED, and it is not
+  a lead. Doubling the pool allocation doubles every pool pass's dispatch
+  width; if width cost anything, their shares would rise. Measured at
+  `maxFineBlocks` 384/256 vs 768/512, comparing SHARES within each run (the
+  frozen topologies differ, L1 116/L2 148 vs L1 104/L2 132, so absolute times
+  are not comparable -- see tools/bench-amr.js's header):
+
+  | skipped | 384/256 | 768/512 |
+  |---|---|---|
+  | interp | 13.8% | 13.7% |
+  | avg | 12.0% | 11.8% |
+  | ghost | 16.6% | 10.4% |
+  | step1 | 29.2% | 27.2% |
+  | force | 12.5% | 11.4% |
+
+  Flat, or slightly lower in line with the ~10% fewer active tiles. An
+  inactive slot reads `slotToBlock[slot] < 0` and returns, and that really is
+  free. So indirect dispatch buys nothing -- the same conclusion the levels=2
+  sweep reached, but now established on the current build and WITHOUT relying
+  on the pass-count model `phy` falsified, which is what made it worth
+  re-deriving rather than inheriting.
+
+  Note what this also means: the coupling cost is proportional to ACTIVE
+  tiles, so it does not shrink by dispatching more cleverly. It shrinks only
+  by moving less per tile, or by needing fewer tiles.
 
 ## Superseded: what the levels=2 numbers said to do instead
 

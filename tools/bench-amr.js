@@ -140,10 +140,15 @@ async function main() {
           const groups = cfg === 'none' ? [] : cfg.split('+');
           await ev(`JSON.stringify(window.__AMR.setBenchSkip(${JSON.stringify(groups)}))`);
         };
-        // Discard a settling run: the very first timed pass after warm-up is
-        // consistently the slowest, whatever it is measuring.
-        await apply('none');
-        await timeOnce();
+        // Discard a whole settling ROUND, not one run. One was not enough: a
+        // sweep whose later rows were clean at 5-11% spread still produced
+        // 44-85% on its first rows, with `avg` again coming out NEGATIVE.
+        // Touching every configuration once before any of them counts gets
+        // each one's first-touch cost out of the measured set.
+        for (const cfg of opts.skip) {
+          await apply(cfg === 'none' ? 'none' : cfg);
+          await timeOnce();
+        }
 
         const samples = new Map(opts.skip.map(c => [c, []]));
         for (let r = 0; r < opts.reps; r++) {
