@@ -67,7 +67,16 @@ const NCELLS1 = FB * FB; // cells per pool slot
 // and the denied blocks form horizontal BANDS across the refined region (see
 // the same failure diagnosed at 256^2 in the SDF commit). 256 gives ~1.5x
 // headroom over the measured peak.
-const MAX_FINE_BLOCKS = urlParams.has('maxFineBlocks') ? parseInt(urlParams.get('maxFineBlocks')) : 256;
+// 384, not 256. The 256 was sized from LATE-run demand (max 168 over 84k
+// steps), but the early transient is the peak: with caps effectively removed,
+// L1 demand rises to 182 around step 6k-12k before settling to ~110-130, and
+// one measured run reached 229. 256 left only ~1.1x headroom over that, and
+// running out is not graceful -- blocks are granted in blockID order, so the
+// free list dries up part-way through a row and the denied blocks form
+// horizontal BANDS across the refined region, which is the artifact this
+// whole thread started from. Level 2's demand is stable at 132-140 (verified
+// by varying its cap independently), so 256 there is ~1.8x and stays.
+const MAX_FINE_BLOCKS = urlParams.has('maxFineBlocks') ? parseInt(urlParams.get('maxFineBlocks')) : 384;
 const NBX = W / BLOCK, NBY = H / BLOCK, NBLOCKS = NBX * NBY; // coarse block grid
 
 // ── Milestone 5 (plans/AMR-multilevel.md, plans/AMR-multilevel-M5.md):
@@ -210,8 +219,13 @@ const FORCE_REFINE_MARGIN = urlParams.has('forceRefineMargin') ? parseFloat(urlP
 // shaders/common_geometry.wgsl). That is exact for every consumer only while
 // all phi thresholds stay below it, and FORCE_REFINE_MARGIN is URL-settable,
 // so check rather than trust.
-if (FORCE_REFINE_MARGIN >= 64) {
-  throw new Error(`?forceRefineMargin=${FORCE_REFINE_MARGIN} is at or above get_phi's SDF_FAR cutoff (64) -- ` +
+// ?sdfFar= overrides get_phi's far-field early-out cutoff (see
+// shaders/common_geometry.wgsl). A very large value disables the early-out
+// entirely, which is the A/B for whether it helps or hurts on a given GPU.
+const SDF_FAR = urlParams.has('sdfFar') ? parseFloat(urlParams.get('sdfFar')) : 64;
+
+if (FORCE_REFINE_MARGIN >= SDF_FAR) {
+  throw new Error(`?forceRefineMargin=${FORCE_REFINE_MARGIN} is at or above get_phi's SDF_FAR cutoff (${SDF_FAR}) -- ` +
     `beyond that the far-field early-out in shaders/common_geometry.wgsl returns a lower bound and isNearBody ` +
     `would silently under-refine. Raise SDF_FAR together with it if you really need a margin this large.`);
 }
@@ -1078,7 +1092,7 @@ async function init() {
     { binding: 8, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }
   ]});
 
-  const constants = { W, H };
+  const constants = { W, H, SDF_FAR };
   const fineConstants = { W, H, RB };
   // Render fragment needs HAS_LEVEL2 to gate the level-2 override; keep it
   // separate from fineConstants, which is also fed to the avg compute
@@ -1091,9 +1105,9 @@ async function init() {
   // Between-substep fine-fine-only ghost re-exchange (see amr_interp_c2f.wgsl's
   // FINE_FINE_ONLY note and the dispatch between f1a/f1b below).
   const interpFFConstants = { W, H, RB, GHOST_ONLY: 1, FINE_FINE_ONLY: 1 };
-  const step1Constants = { W, H, RB };
+  const step1Constants = { W, H, RB, SDF_FAR };
   const criterionConstants = { W, H };
-  const manageConstants = { W, H, REFINE_THRESH, COARSEN_THRESH, FORCE_REFINE_MARGIN, FORCE_REFINE_LOOKAHEAD, SPONGE_EXCLUDE_W, HAS_LEVEL2: N_LEVELS > 2 ? 1 : 0,
+  const manageConstants = { W, H, SDF_FAR, REFINE_THRESH, COARSEN_THRESH, FORCE_REFINE_MARGIN, FORCE_REFINE_LOOKAHEAD, SPONGE_EXCLUDE_W, HAS_LEVEL2: N_LEVELS > 2 ? 1 : 0,
     N_REFINE_INC, N_REFINE_MAX, MAX_LEVEL: N_LEVELS - 1 };
 
   const stepPL = device.createComputePipeline({
@@ -1229,7 +1243,7 @@ async function init() {
     // are needed here -- just whether that level exists at all.
     const hasGrandchild = (m + 2) < N_LEVELS;
     const poolConstants = {
-      W, H, RB,
+      W, H, RB, SDF_FAR,
       NBX_PARENT: parentPool.NBX, NBY_PARENT: parentPool.NBY,
       PARENT_CELL_SIZE_L0: cellSizeL0AtLevel(m),
       PARENT_HAS_CACHED_ORIGIN: parentIsDense ? 0 : 1,
