@@ -23,12 +23,21 @@ let deviceLost = false;
 const statusEl = document.getElementById('status');
 
 const urlParams = new URLSearchParams(window.location.search);
-// Default is one step below main.js's own default (resLog2=8, W=256) --
-// with the default levels=2, this reproduces the "lower far-field
-// resolution, the fine level recovers the body's resolution" AMR win via
-// the general BLOCKAGE/ASPECT/RE mechanism below (see the comment above
-// `let BLOCKAGE`), generalizing what used to be a hardcoded A=32,B=4 "half
-// of main.js's dense reference" special case.
+// Default resLog2=8 (W=256) with levels=3: two octaves of refinement give
+// the "lower far-field resolution, the fine levels recover the body's
+// resolution" AMR win via the general BLOCKAGE/ASPECT/RE mechanism below
+// (see the comment above `let BLOCKAGE`), generalizing what used to be a
+// hardcoded A=32,B=4 "half of main.js's dense reference" special case. At
+// the shipped BLOCKAGE=8 the card is A=16,B=2 here, A=32,B=4 at L1 --
+// Pesavento & Wang's Fig. 2 ellipse in lattice units -- and A=64,B=8 at L2.
+// Two octaves rather than one because B=2 at L0 leaves the card's thin
+// dimension badly under-resolved.
+//
+// NOTE main.js now defaults to this SAME resLog2=8, not to the res 10 this
+// page's L2 is equivalent to -- that grid does not fit on the mobile target.
+// So a bare index.html is this page's L0, not its matched dense comparison;
+// that run is `index.html?res=10` (card-params.mjs's
+// AMR_EQUIVALENT_DENSE_RES_LOG2, and see DENSE_DEFAULT_RES_LOG2's comment).
 let resLog2 = parseResLog2(urlParams, AMR_DEFAULT_RES_LOG2);
 
 let W = 1 << resLog2;

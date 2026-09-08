@@ -48,7 +48,7 @@ async function main() {
   const CP = await import(path.join(__dirname, '..', 'card-params.mjs'));
   const {
     CARD_PARAM_DEFAULTS, DENSE_DEFAULT_RES_LOG2, AMR_DEFAULT_RES_LOG2,
-    AMR_DEFAULT_LEVELS, RES_LOG2_MIN, RES_LOG2_MAX,
+    AMR_DEFAULT_LEVELS, AMR_EQUIVALENT_DENSE_RES_LOG2, RES_LOG2_MIN, RES_LOG2_MAX,
     tauFromReynolds, reynoldsFromTau, tauAtLevel, deriveCardParams,
     parseCardParams, parseResLog2,
   } = CP;
@@ -57,27 +57,40 @@ async function main() {
   const EPS = 1e-12;   // "exact modulo IEEE754 reassociation"
   const LOOSE = 1e-9;
 
+  // main.js's pre-refactor hardcoded literals, spelled out here rather than
+  // read off CARD_PARAM_DEFAULTS. The legacy cases below exist to prove the
+  // parameterization can still EXPRESS the old system exactly; riding on the
+  // live defaults instead would make them silently re-target themselves the
+  // moment those defaults are retuned (as they were when the shipped card
+  // moved to Pesavento & Wang's Fig. 2 case), testing nothing.
+  // RE is 2133.333, not the 1066.667 that used to be stored, because Re is
+  // now the paper's chord-based 2*u_t*a/nu. Same physical system, same tau:
+  // the old number WAS this one, just expressed in the module's old half-Re
+  // units. That this still lands on TAU=0.509 is the check that the
+  // convention change was a pure relabeling and not a change of regime.
+  const LEGACY = { BLOCKAGE: 2.0, ASPECT: 0.125, I_STAR: 0.34, RE: 2133.333, U_T: 0.05 };
+
   // ── 1. Legacy constants ────────────────────────────────────────────────────
   // The parameterization was introduced as a refactor of hardcoded values, so
   // its first duty is to reproduce them. These are main.js's pre-refactor
   // literals: A=64, B=8 at W=256, and TAU=0.509 for "Re ~ 1100".
   test('legacy defaults: dense page at W=256 reproduces A=64, B=8, TAU=0.509', () => {
-    const p = deriveCardParams({ W: 256, ...D });
+    const p = deriveCardParams({ W: 256, ...LEGACY });
     close(p.A, 64, EPS, 'A');
     close(p.B, 8, EPS, 'B');
     close(p.TAU, 0.509, 1e-5, 'TAU');
   });
 
   test('legacy defaults: derived body quantities match the closed forms', () => {
-    const { A, B, RHO_B, MASS, I_BODY, G_LU, G_EFF } = deriveCardParams({ W: 256, ...D });
+    const { A, B, RHO_B, MASS, I_BODY, G_LU, G_EFF } = deriveCardParams({ W: 256, ...LEGACY });
     // Independently recomputed here from the paper's formulas rather than
     // copied from the module, so a sign/factor slip in either shows up.
-    const rho = D.I_STAR * 2 * A ** 3 / (B * (A ** 2 + B ** 2));
+    const rho = LEGACY.I_STAR * 2 * A ** 3 / (B * (A ** 2 + B ** 2));
     close(RHO_B, rho, EPS, 'RHO_B');
     assert.ok(RHO_B > 1, `RHO_B must exceed fluid density 1.0, got ${RHO_B}`);
     close(MASS, rho * Math.PI * A * B, EPS, 'MASS');
     close(I_BODY, rho * Math.PI * A * B * (A ** 2 + B ** 2) / 4, EPS, 'I_BODY');
-    close(G_LU, D.U_T ** 2 / (Math.PI * B * (rho - 1)), EPS, 'G_LU');
+    close(G_LU, LEGACY.U_T ** 2 / (Math.PI * B * (rho - 1)), EPS, 'G_LU');
     close(G_EFF, G_LU * (1 - 1 / rho), EPS, 'G_EFF');
     assert.ok(G_EFF > 0 && G_EFF < G_LU, `G_EFF should be a positive fraction of G_LU, got ${G_EFF} vs ${G_LU}`);
   });
@@ -181,25 +194,109 @@ async function main() {
     }
   });
 
-  // The two pages' shipped defaults have to BE that pairing, or a bare
-  // index.html vs a bare index-amr.html are not comparable runs -- which is
-  // the state the project was in when the AMR page was simply "the dense page
-  // plus fine levels at the same res".
-  test('shipped defaults are a valid dense/AMR pairing', () => {
+  // AMR_EQUIVALENT_DENSE_RES_LOG2 is the dense run the AMR default is a claim
+  // ABOUT, so it has to satisfy the pairing exactly.
+  test('AMR_EQUIVALENT_DENSE_RES_LOG2 is the AMR default\'s matched dense run', () => {
     assert.strictEqual(
-      AMR_DEFAULT_RES_LOG2,
-      DENSE_DEFAULT_RES_LOG2 - (AMR_DEFAULT_LEVELS - 1),
-      `AMR default res (${AMR_DEFAULT_RES_LOG2}) must be the dense default (${DENSE_DEFAULT_RES_LOG2}) ` +
-      `minus levels-1 (${AMR_DEFAULT_LEVELS - 1})`
+      AMR_EQUIVALENT_DENSE_RES_LOG2,
+      AMR_DEFAULT_RES_LOG2 + (AMR_DEFAULT_LEVELS - 1),
+      `equivalent dense res (${AMR_EQUIVALENT_DENSE_RES_LOG2}) must be the AMR default ` +
+      `(${AMR_DEFAULT_RES_LOG2}) plus levels-1 (${AMR_DEFAULT_LEVELS - 1})`
     );
-    const dense = deriveCardParams({ W: 1 << DENSE_DEFAULT_RES_LOG2, ...D });
+    assert.ok(AMR_EQUIVALENT_DENSE_RES_LOG2 <= RES_LOG2_MAX,
+      `equivalent dense res ${AMR_EQUIVALENT_DENSE_RES_LOG2} exceeds the clamp ${RES_LOG2_MAX}, ` +
+      `so index.html could not actually be run at it`);
+    const dense = deriveCardParams({ W: 1 << AMR_EQUIVALENT_DENSE_RES_LOG2, ...D });
     const amr = deriveCardParams({ W: 1 << AMR_DEFAULT_RES_LOG2, ...D });
-    close(amr.A * 2 ** (AMR_DEFAULT_LEVELS - 1), dense.A, LOOSE, 'default pairing: finest-level A');
-    close(tauAtLevel(amr.TAU, AMR_DEFAULT_LEVELS - 1), dense.TAU, LOOSE, 'default pairing: finest-level tau');
+    close(amr.A * 2 ** (AMR_DEFAULT_LEVELS - 1), dense.A, LOOSE, 'equivalent run: finest-level A');
+    close(tauAtLevel(amr.TAU, AMR_DEFAULT_LEVELS - 1), dense.TAU, LOOSE, 'equivalent run: finest-level tau');
     // Pins the concrete numbers the rest of the project's comments quote.
-    close(dense.A, 64, EPS, 'dense default A');
-    close(amr.A, 32, EPS, 'AMR default A');
-    close(amr.TAU, 0.5045, 1e-4, 'AMR default L0 tau');
+    // The AMR page's L0 card is A=16,B=2 at its W=256; one octave up is
+    // A=32,B=4 -- Pesavento & Wang's reference ellipse in lattice units --
+    // and two octaves up is A=64,B=8, the equivalent dense run at W=1024.
+    close(amr.A, 16, EPS, 'AMR default A');
+    close(amr.B, 2, EPS, 'AMR default B');
+    close(amr.TAU, 0.504364, 1e-4, 'AMR default L0 tau');
+    close(dense.A, 64, EPS, 'equivalent dense A');
+    close(dense.B, 8, EPS, 'equivalent dense B');
+    close(dense.TAU, 0.517455, 1e-4, 'equivalent dense tau');
+  });
+
+  // The shipped dense default is deliberately NOT the equivalent run -- see
+  // DENSE_DEFAULT_RES_LOG2's comment: res 10 allocates 16x the cells up
+  // front and does not fit on the mobile target, so index.html would fail to
+  // start there rather than merely run slowly. Asserted rather than left to
+  // the comment, so that "the defaults are not a matched pair" stays a stated
+  // property of the module: someone re-pairing them would have to delete this
+  // test and read why it existed, instead of quietly reintroducing a page
+  // that cannot boot on a phone.
+  test('shipped dense default is deliberately below the equivalent run', () => {
+    assert.ok(
+      DENSE_DEFAULT_RES_LOG2 < AMR_EQUIVALENT_DENSE_RES_LOG2,
+      `dense default (${DENSE_DEFAULT_RES_LOG2}) is expected to sit BELOW the AMR-equivalent ` +
+      `res (${AMR_EQUIVALENT_DENSE_RES_LOG2}) for mobile allocation headroom`
+    );
+    // It still shows the SAME physical card -- only the grid it is sampled on
+    // differs. That is what keeps it a usable coarse view rather than a
+    // different experiment.
+    const denseDefault = deriveCardParams({ W: 1 << DENSE_DEFAULT_RES_LOG2, ...D });
+    const amr = deriveCardParams({ W: 1 << AMR_DEFAULT_RES_LOG2, ...D });
+    close(denseDefault.B / denseDefault.A, D.ASPECT, LOOSE, 'dense default e');
+    close(reynoldsFromTau(denseDefault.TAU, denseDefault.A, D.U_T), D.RE, LOOSE, 'dense default Re');
+    // At the shipped defaults both pages happen to share one L0 grid, so the
+    // dense page is exactly the AMR page's coarsest level.
+    close(denseDefault.A, amr.A, EPS, 'dense default A == AMR L0 A');
+    close(denseDefault.TAU, amr.TAU, LOOSE, 'dense default tau == AMR L0 tau');
+  });
+
+  // The shipped card is meant to BE the paper's Fig. 2 case. Its two purely
+  // dimensionless quantities are stored directly, so they can be compared to
+  // the published values without any unit reasoning -- see
+  // 2004_PRL_Pesavento_Wang.pdf p.2, which gives Re=1100, I*=0.17, e=0.125
+  // with I* = b(a^2+b^2)rho_b/(2a^3 rho_f) and e = b/a.
+  //
+  test('shipped defaults are the paper Fig. 2 card (Re=1100, I*=0.17, e=0.125)', () => {
+    close(D.RE, 1100, EPS, 'Re (paper Fig. 2)');
+    close(D.I_STAR, 0.17, EPS, 'I* (paper Fig. 2)');
+    close(D.ASPECT, 0.125, EPS, 'e = b/a (paper Fig. 2)');
+    // e is a ratio of derived lengths too, at either page's default width.
+    for (const r of [DENSE_DEFAULT_RES_LOG2, AMR_DEFAULT_RES_LOG2]) {
+      const { A, B } = deriveCardParams({ W: 1 << r, ...D });
+      close(B / A, 0.125, LOOSE, `e from derived A,B at res=${r}`);
+    }
+  });
+
+  // THE CONVENTION ITSELF. reynoldsFromTau's factor of 2 is the whole content
+  // of the fix, and it is invisible in every round-trip test above (both
+  // directions carry it, so they stay inverses either way). Assert it against
+  // the paper's own definition, recomputed here from nu:
+  //   2004_PRL_Pesavento_Wang.pdf p.2: Re = 2*u_t*a/nu, keyed to the chord 2a.
+  // Without this, silently reverting to u_t*a/nu would pass the entire rest
+  // of this file -- which is exactly how the half-Re bug survived before.
+  test('Re is the paper chord-based 2*u_t*a/nu, not the semi-axis u_t*a/nu', () => {
+    for (const tau of [0.5005, 0.504364, 0.509, 0.52, 0.6]) {
+      for (const a of [4, 16, 32, 64]) {
+        for (const u of [0.02, 0.05, 0.1]) {
+          const nu = (tau - 0.5) / 3;
+          close(reynoldsFromTau(tau, a, u), 2 * u * a / nu, LOOSE,
+            `chord-based Re (tau=${tau},a=${a},u=${u})`);
+          close(tauFromReynolds(2 * u * a / nu, a, u), tau, LOOSE,
+            `chord-based tau (tau=${tau},a=${a},u=${u})`);
+        }
+      }
+    }
+  });
+
+  // The shipped card must BE Re=1100 where the paper's ellipse actually
+  // lives: the AMR page's L1, whose A=32,B=4 is the published a,b in lattice
+  // units. Re is level-invariant (asserted above), so this holds at every
+  // rung -- but pinning it at that specific one is what ties the shipped
+  // configuration to the published figure rather than to an arbitrary level.
+  test('the paper ellipse rung (A=32,B=4) runs at the paper Reynolds number', () => {
+    const amr = deriveCardParams({ W: 1 << AMR_DEFAULT_RES_LOG2, ...D });
+    close(amr.A * 2, 32, EPS, 'L1 A');
+    close(amr.B * 2, 4, EPS, 'L1 B');
+    close(reynoldsFromTau(tauAtLevel(amr.TAU, 1), amr.A * 2, D.U_T), 1100, LOOSE, 'Re at L1');
   });
 
   // ── 5. Invariance properties the parameterization exists to provide ────────
