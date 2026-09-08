@@ -52,6 +52,24 @@ measure the change in median frame GPU time, repeat. `?benchSkip=force,ghost`
 applies a skip manually. Results post over the telemetry channel
 (`?telemetry=1`), which is the only way to see a phone.
 
+**`?bench=1` has a noise floor of about +/-10%, and cannot resolve `phy`.**
+It measures ~12 frames of a LIVE rAF loop per configuration, so it carries
+compositor and vsync jitter that `tools/bench-amr.js` avoids by stopping the
+frame loop and timing thousands of macro-steps. A desktop run of it reported
+`phy` at **-10.1%**, and a negative share is impossible. Use it for the large
+groups (step1/interp/avg/ghost/force, 10-30%); use bench-amr.js for anything
+smaller. The sweep reports `noiseFloorPct` in its own payload so this does not
+have to be remembered.
+
+**Do not run `?bench=1` on a device you might switch away from.** Backgrounding
+suspends requestAnimationFrame while the setTimeout-paced sweep keeps marching
+through configurations, so whichever ones were current while the tab was
+hidden collect no samples -- and it used to fail silently, producing no
+payload and no error. A phone run was lost to exactly that. The sweep now
+watches `visibilitychange` and returns `interrupted: true`; discard those
+numbers. It also takes ~3.8 minutes at the default 3 rounds and reports
+per-configuration progress in the `#status` line (top-left of the canvas).
+
 **Do not trust per-pass timestamps on mobile.** The PowerVR part's timestamp
 counter ticks at 65536 ns. A macro-step is ~1125 µs — about 17 ticks spread
 across 9–12 passes — so every per-pass reading lands in a 1–8 tick bucket and
