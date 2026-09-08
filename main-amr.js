@@ -1229,6 +1229,33 @@ async function init() {
     layout: device.createPipelineLayout({ bindGroupLayouts: [avgPoolBGL] }),
     compute: { module: avgPoolSM, entryPoint: 'main', constants: { RB, F16 } }
   });
+  // ── Measurement-instrument pipeline twins (see benchSkip below) ──────────
+  // Built unconditionally but only ever bound when the matching ?benchSkip=
+  // group is set, so the normal dispatch path is untouched. Each is the SAME
+  // shader module as its real counterpart with one override constant flipped,
+  // which is what keeps them honest: a variant compiled from different source
+  // could differ for reasons unrelated to the thing being measured (the trap
+  // ?quantF16 fell into -- see plans/perf-characterization.md).
+  //
+  // *-noop: pass still encoded and dispatched at full width, returns before
+  // touching any buffer. Difference vs. skipping the pass outright is the
+  // fixed per-pass cost; the remainder is the work. See the NOOP override in
+  // shaders/amr_interp_*.wgsl / amr_average_*.wgsl for the measured split.
+  const noopPLs = {
+    interpDense:  device.createComputePipeline({ layout: device.createPipelineLayout({ bindGroupLayouts: [interpBGL] }),           compute: { module: interpDenseSM, entryPoint: 'main', constants: { ...interpConstants,       NOOP: 1 } } }),
+    interpDenseFF:device.createComputePipeline({ layout: device.createPipelineLayout({ bindGroupLayouts: [interpBGL] }),           compute: { module: interpDenseSM, entryPoint: 'main', constants: { ...interpFFConstants,     NOOP: 1 } } }),
+    interpPool:   device.createComputePipeline({ layout: device.createPipelineLayout({ bindGroupLayouts: [interpPoolParentBGL] }), compute: { module: interpPoolSM,  entryPoint: 'main', constants: { ...interpPoolConstants,   NOOP: 1 } } }),
+    interpPoolFF: device.createComputePipeline({ layout: device.createPipelineLayout({ bindGroupLayouts: [interpPoolParentBGL] }), compute: { module: interpPoolSM,  entryPoint: 'main', constants: { ...interpPoolFFConstants, NOOP: 1 } } }),
+    avg:          device.createComputePipeline({ layout: device.createPipelineLayout({ bindGroupLayouts: [avgBGL] }),              compute: { module: avgSM,         entryPoint: 'main', constants: { ...fineConstants,        NOOP: 1 } } }),
+    avgPool:      device.createComputePipeline({ layout: device.createPipelineLayout({ bindGroupLayouts: [avgPoolBGL] }),          compute: { module: avgPoolSM,     entryPoint: 'main', constants: { RB, F16,                 NOOP: 1 } } }),
+  };
+  // step1-ring: fine step over the tile INTERIOR only, skipping the ghost
+  // ring -- a proxy for FB 20 -> 16. See the SKIP_GHOST override in
+  // shaders/amr_step1.wgsl for what it measured and what it corrects.
+  const ringPLs = {
+    step1:     device.createComputePipeline({ layout: device.createPipelineLayout({ bindGroupLayouts: [step1BGL] }),     compute: { module: step1SM,     entryPoint: 'main', constants: { ...step1Constants, SKIP_GHOST: 1 } } }),
+    step1Pool: device.createComputePipeline({ layout: device.createPipelineLayout({ bindGroupLayouts: [step1PoolBGL] }), compute: { module: step1PoolSM, entryPoint: 'main', constants: { ...step1Constants, SKIP_GHOST: 1 } } }),
+  };
   // Milestone 8: level 1's own force pass. HAS_CHILD is baked in at
   // pipeline-creation time -- level 1 has exactly one dedicated pipeline
   // (not shared across levels), so whether level 2 exists is fixed for the
@@ -1856,13 +1883,13 @@ async function init() {
       const stepBG = useB ? stepBG_ba : stepBG_ab;
       if (hasChild) {
         const readBG = useB ? interpBG_readB : interpBG_readA;
-        if (!skipGroup('interp')) { const p = beginPass(enc, 'L0->L1 interp'); p.setPipeline(interpPL); p.setBindGroup(0, readBG); p.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); p.end(); }
+        if (!skipGroup('interp')) { const p = beginPass(enc, 'L0->L1 interp'); p.setPipeline(skipGroup('interp-noop') ? noopPLs.interpDense : interpPL); p.setBindGroup(0, readBG); p.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); p.end(); }
       }
       const s = beginPass(enc, 'L0 step'); s.setPipeline(stepPL); s.setBindGroup(0, stepBG); s.dispatchWorkgroups(WGX, WGY); s.end();
       if (hasChild) {
         S_Advance(1, enc);
         const avgBG = useB ? avgBG_targetA : avgBG_targetB;
-        if (!skipGroup('avg')) { const a = beginPass(enc, 'L1->L0 average'); a.setPipeline(avgPL); a.setBindGroup(0, avgBG); a.dispatchWorkgroups(1, 1, MAX_FINE_BLOCKS); a.end(); }
+        if (!skipGroup('avg')) { const a = beginPass(enc, 'L1->L0 average'); a.setPipeline(skipGroup('avg-noop') ? noopPLs.avg : avgPL); a.setBindGroup(0, avgBG); a.dispatchWorkgroups(1, 1, MAX_FINE_BLOCKS); a.end(); }
       }
       return;
     }
@@ -1875,28 +1902,28 @@ async function init() {
       if (!hasChild) return;
       const childPool = pools[level + 1];
       const bg = readCur === 'a' ? childPool.interpPoolParentBG_readA : childPool.interpPoolParentBG_readB;
-      if (skipGroup('interp')) return; const p = beginPass(enc, `L${level}->L${level+1} interp`); p.setPipeline(interpPoolParentPL); p.setBindGroup(0, bg); p.dispatchWorkgroups(WGX1, WGY1, childPool.MAX_FINE_BLOCKS); p.end();
+      if (skipGroup('interp')) return; const p = beginPass(enc, `L${level}->L${level+1} interp`); p.setPipeline(skipGroup('interp-noop') ? noopPLs.interpPool : interpPoolParentPL); p.setBindGroup(0, bg); p.dispatchWorkgroups(WGX1, WGY1, childPool.MAX_FINE_BLOCKS); p.end();
     };
     const averageFromChild = (writeCur) => {
       if (!hasChild) return;
       const childPool = pools[level + 1];
       const bg = writeCur === 'a' ? childPool.avgPoolBG_targetA : childPool.avgPoolBG_targetB;
-      if (skipGroup('avg')) return; const p = beginPass(enc, `L${level+1}->L${level} average`); p.setPipeline(avgPoolPL); p.setBindGroup(0, bg); p.dispatchWorkgroups(1, 1, childPool.MAX_FINE_BLOCKS); p.end();
+      if (skipGroup('avg')) return; const p = beginPass(enc, `L${level+1}->L${level} average`); p.setPipeline(skipGroup('avg-noop') ? noopPLs.avgPool : avgPoolPL); p.setBindGroup(0, bg); p.dispatchWorkgroups(1, 1, childPool.MAX_FINE_BLOCKS); p.end();
     };
     const substep = (readCur) => {
       if (isL1) {
         const bg = readCur === 'a' ? step1BG_ab : step1BG_ba;
-        if (skipGroup('step1')) return; const p = beginPass(enc, 'L1 step'); p.setPipeline(step1PL); p.setBindGroup(0, bg); p.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); p.end();
+        if (skipGroup('step1')) return; const p = beginPass(enc, 'L1 step'); p.setPipeline(skipGroup('step1-ring') ? ringPLs.step1 : step1PL); p.setBindGroup(0, bg); p.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); p.end();
       } else {
         const bg = readCur === 'a' ? pool.step1PoolBG_ab : pool.step1PoolBG_ba;
-        if (skipGroup('step1')) return; const p = beginPass(enc, `L${level} step`); p.setPipeline(step1PoolPL); p.setBindGroup(0, bg); p.dispatchWorkgroups(WGX1, WGY1, pool.MAX_FINE_BLOCKS); p.end();
+        if (skipGroup('step1')) return; const p = beginPass(enc, `L${level} step`); p.setPipeline(skipGroup('step1-ring') ? ringPLs.step1Pool : step1PoolPL); p.setBindGroup(0, bg); p.dispatchWorkgroups(WGX1, WGY1, pool.MAX_FINE_BLOCKS); p.end();
       }
     };
     const fineFineRefresh = () => {
       if (isL1) {
-        if (skipGroup('ghost')) return; const p = beginPass(enc, 'L1 fine-fine ghost'); p.setPipeline(interpFFPL); p.setBindGroup(0, interpFFBG_b); p.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); p.end();
+        if (skipGroup('ghost')) return; const p = beginPass(enc, 'L1 fine-fine ghost'); p.setPipeline(skipGroup('ghost-noop') ? noopPLs.interpDenseFF : interpFFPL); p.setBindGroup(0, interpFFBG_b); p.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); p.end();
       } else {
-        if (skipGroup('ghost')) return; const p = beginPass(enc, `L${level} fine-fine ghost`); p.setPipeline(interpPoolParentFFPL); p.setBindGroup(0, pool.interpPoolParentFFBG_b); p.dispatchWorkgroups(WGX1, WGY1, pool.MAX_FINE_BLOCKS); p.end();
+        if (skipGroup('ghost')) return; const p = beginPass(enc, `L${level} fine-fine ghost`); p.setPipeline(skipGroup('ghost-noop') ? noopPLs.interpPoolFF : interpPoolParentFFPL); p.setBindGroup(0, pool.interpPoolParentFFBG_b); p.dispatchWorkgroups(WGX1, WGY1, pool.MAX_FINE_BLOCKS); p.end();
       }
     };
 
@@ -1942,7 +1969,43 @@ async function init() {
   // ?benchSkip=force,ghost etc. This is a MEASUREMENT MODE -- skipping
   // passes makes the physics wrong by construction. It exists to answer
   // "what does this group cost", nothing else.
+  // Groups. The first set REMOVE a pass; the rest are instrument variants that
+  // keep the pass but change what it does, so a share can be split further:
+  //
+  //   force, phy, step1, interp, avg, ghost   -- pass not encoded at all
+  //   interp-noop, avg-noop, ghost-noop       -- pass encoded and dispatched at
+  //                                              full width, returns immediately
+  //   step1-ring                              -- fine step over tile interior
+  //                                              only (proxy for FB 20 -> 16)
+  //
+  // Why the -noop variants exist: removing a pass removes its fixed per-pass
+  // cost AND its work at the same time, so a plain skip cannot tell you which
+  // one you are looking at. Measured on desktop, removing a coupling pass is
+  // worth 15-19% of frame GPU time while running it as a no-op is worth 2-6%
+  // -- i.e. the AMR coupling cost is work, not pass count, so fusing coupling
+  // passes would not pay. See the NOOP override in shaders/amr_interp_*.wgsl.
+  //
+  // step1-ring exists because the two target devices should disagree about it:
+  // it measured 0.2% on the desktop (correcting a ~10.5% estimate in
+  // plans/perf-characterization.md) but the phone is bandwidth-bound and the
+  // traffic model predicts ~10% there.
+  // Every valid group name. Enumerated rather than free-form because an
+  // unrecognised name is otherwise INVISIBLE: it just never matches a
+  // skipGroup() call, the passes all run, and the configuration reports a ~0%
+  // share that reads as a real measurement. That is unrecoverable on the phone,
+  // which has no CDP endpoint and gets one sweep per session -- the same class
+  // of silent-failure trap as a sweep interrupted by backgrounding, which this
+  // file already refuses to report quietly.
+  const BENCH_GROUPS = new Set([
+    'force', 'phy', 'step1', 'interp', 'avg', 'ghost',
+    'interp-noop', 'avg-noop', 'ghost-noop', 'step1-ring',
+  ]);
+  function validateSkipGroups(groups, where) {
+    const bad = [...groups].filter(g => !BENCH_GROUPS.has(g));
+    if (bad.length) throw new Error(`${where}: unknown benchSkip group(s) ${bad.join(', ')} -- known: ${[...BENCH_GROUPS].join(', ')}`);
+  }
   const benchSkip = new Set((urlParams.get('benchSkip') || '').split(',').filter(Boolean));
+  validateSkipGroups(benchSkip, '?benchSkip=');
   function skipGroup(g) { return benchSkip.has(g); }
 
   let profiler = null;
@@ -2851,7 +2914,35 @@ async function init() {
   // topology and every published phone attribution inherited it.
   const BENCH_WARM = urlParams.has('benchWarm') ? parseInt(urlParams.get('benchWarm')) : 12000;
   const BENCH_ROUNDS = urlParams.has('benchRounds') ? parseInt(urlParams.get('benchRounds')) : 3;
-  const BENCH_CONFIGS = ['none', 'force', 'phy', 'force+phy', 'interp', 'avg', 'ghost', 'step1', 'interp+avg+ghost'];
+  // Target wall-clock per timed run. Validated on the desktop at 2500ms, which
+  // reproduced tools/bench-amr.js's headline (interp+avg+ghost 44.7% vs 44.1%)
+  // at 4.5% spread but left the small instrument rows (-noop, step1-ring, all
+  // 1-5% effects) at 13-20% spread and occasionally negative. 4000ms buys that
+  // resolution back and still fits: switching from live-rAF sampling to timed
+  // synchronous runs cut the per-configuration cost from a fixed 5s, so a
+  // 13-config sweep at 3 rounds is ~3.5 min plus warm-up rather than longer.
+  const BENCH_MEASURE_MS = urlParams.has('benchMeasureMs') ? parseInt(urlParams.get('benchMeasureMs')) : 4000;
+  // 13 configurations at BENCH_ROUNDS=3 is (3+1)*13*5s = ~4.3 min of sweep on
+  // top of the warm-up, so budget ~5 min of foregrounded, screen-on device.
+  // The -noop and step1-ring entries are the instrument variants documented
+  // at benchSkip above; they are here rather than desktop-only because the
+  // phone has no CDP endpoint, so tools/bench-amr.js cannot reach it and this
+  // sweep is the only way to ask that device the same questions.
+  // ?benchConfigs=none,interp,avg,ghost,interp+avg+ghost trims the list. Worth
+  // using on a device you have to hold in your hand: every configuration costs
+  // (BENCH_ROUNDS+1) * BENCH_MEASURE_MS, and a shorter sweep also spends less
+  // of itself inside this device's own thermal ramp. 'none' is always kept --
+  // every share is relative to it.
+  const BENCH_CONFIGS_DEFAULT = ['none', 'force', 'phy', 'force+phy', 'interp', 'avg', 'ghost', 'step1', 'interp+avg+ghost',
+                                 'interp-noop', 'avg-noop', 'ghost-noop', 'step1-ring'];
+  const BENCH_CONFIGS = urlParams.has('benchConfigs')
+    // URLSearchParams decodes '+' as a space, and '+' is this list's own
+    // combine operator, so an unencoded ?benchConfigs=interp+avg+ghost arrives
+    // as 'interp avg ghost'. Accept both rather than rejecting a URL that a
+    // reader would swear is correct -- this gets typed by hand on a phone.
+    ? [...new Set(['none', ...urlParams.get('benchConfigs').split(',')
+        .map(c => c.trim().replace(/\s+/g, '+')).filter(Boolean)])]
+    : BENCH_CONFIGS_DEFAULT;
   async function runBenchSweep() {
     const wasAuto = autoRefine;
     await setAutoRefine(false);
@@ -2866,32 +2957,47 @@ async function init() {
     // hottest -- which lands entirely on the 'none' baseline, understating
     // every share. Interleaving spreads the ramp evenly instead. Same
     // reasoning, and the same fix, as tools/bench-amr.js --skip.
-    // Backgrounding the tab suspends requestAnimationFrame, so the frame loop
-    // stops feeding benchSamples while this setTimeout-paced sweep keeps
-    // marching through its configurations. The result is not merely noisy, it
-    // is silently wrong: whichever configurations happened to be current
-    // while the tab was hidden get few or no samples, and the rest look fine.
-    // A phone run was lost to exactly this -- switching away mid-sweep
-    // produced zero usable output and no error. Record it and refuse to
-    // report a sweep that was interrupted.
+    // Backgrounding still invalidates the sweep, even now that timing no longer
+    // depends on requestAnimationFrame: a hidden tab gets its GPU work
+    // deprioritised and its timers throttled, so whichever configurations were
+    // current while it was hidden are timed against a different machine. A
+    // phone run was already lost to this once, silently. Record it and refuse
+    // to report a sweep that was interrupted.
     let benchHidden = document.visibilityState === 'hidden';
     const onVis = () => { if (document.visibilityState === 'hidden') benchHidden = true; };
     document.addEventListener('visibilitychange', onVis);
 
+    // Time a fixed number of macro-steps with the frame loop STOPPED, the same
+    // way tools/bench-amr.js does -- NOT by sampling per-frame GPU timestamps
+    // from the live rAF loop, which is what this used to do.
+    //
+    // The old method could not be trusted, and was measured failing: a desktop
+    // run of it reported spreads of 25-88% and NEGATIVE shares down to -73%
+    // (skipping work cannot make a frame slower), against a ground truth from
+    // tools/bench-amr.js of interp+avg+ghost = 44%. The reason is structural
+    // rather than statistical -- on a device that finishes its frame well
+    // inside the vsync interval the GPU sits idle most of each frame and
+    // clocks down, so per-frame timestamps scatter no matter how many are
+    // averaged. Stopping the frame loop and timing a synchronous run removes
+    // vsync, the compositor and the readback pipeline in one move; the same
+    // instrument measured 2.5-5.6% spread that way.
+    //
+    // liveMode is restored at the end of the sweep (debugStepSync clears it).
     const measure = async () => {
-      benchSamples = [];
-      benchCollecting = true;
-      await new Promise(r => setTimeout(r, 2000));   // settle
-      benchSamples = [];
-      await new Promise(r => setTimeout(r, 3000));   // measure
-      benchCollecting = false;
-      const xs = benchSamples.slice().sort((a, b) => a - b);
-      return xs.length ? xs[Math.floor(xs.length / 2)] : null;
+      const t0 = performance.now();
+      await debugStepSync(stepsPerMeasure);
+      return performance.now() - t0;
     };
     const applySkip = (cfg) => {
       benchSkip.clear();
       if (cfg !== 'none') for (const g of cfg.split('+')) benchSkip.add(g);
     };
+    // Fail before the sweep, not silently during it: a mistyped entry in
+    // BENCH_CONFIGS would otherwise cost a whole ~5 min device session and
+    // report a plausible-looking 0% share for that row.
+    for (const cfg of BENCH_CONFIGS) {
+      if (cfg !== 'none') validateSkipGroups(cfg.split('+'), `BENCH_CONFIGS entry "${cfg}"`);
+    }
     // Discard a whole settling round -- one discarded run was measurably not
     // enough on the desktop (44-85% spread on the early rows).
     const totalSteps = (BENCH_ROUNDS + 1) * BENCH_CONFIGS.length;
@@ -2900,6 +3006,18 @@ async function init() {
       const pct = Math.round((doneSteps / totalSteps) * 100);
       statusEl.textContent = `[AMR-dev] benchmark ${pct}% -- ${label} (do not switch away)`;
     };
+    // How many macro-steps is ~BENCH_MEASURE_MS on THIS device? The two target
+    // devices differ by ~40x in frame time, so a fixed step count would be
+    // either far too short to time on the desktop or minutes per configuration
+    // on the phone. Calibrated from a short probe instead, and reported in the
+    // payload so a reader knows what the medians are medians OF.
+    const probeSteps = 4 * STEPS_PER_FRAME;
+    const probeT0 = performance.now();
+    await debugStepSync(probeSteps);
+    const msPerStep = (performance.now() - probeT0) / probeSteps;
+    let stepsPerMeasure = Math.round(BENCH_MEASURE_MS / msPerStep / STEPS_PER_FRAME) * STEPS_PER_FRAME;
+    stepsPerMeasure = Math.max(STEPS_PER_FRAME, Math.min(stepsPerMeasure, 200 * STEPS_PER_FRAME));
+
     progress('settling');
     for (const cfg of BENCH_CONFIGS) { applySkip(cfg); await measure(); doneSteps++; progress('settling ' + cfg); }
 
@@ -2918,30 +3036,48 @@ async function init() {
       const xs = samples.get(cfg).slice().sort((a, b) => a - b);
       return {
         cfg, n: xs.length,
-        medianGpuMs: xs.length ? +xs[Math.floor(xs.length / 2)].toFixed(3) : null,
+        // Wall-clock ms for stepsPerMeasure macro-steps, not per-frame GPU ms.
+        medianMs: xs.length ? +xs[Math.floor(xs.length / 2)].toFixed(1) : null,
         spreadPct: xs.length > 1 ? +(((xs[xs.length - 1] - xs[0]) / xs[Math.floor(xs.length / 2)]) * 100).toFixed(1) : null,
       };
     });
     benchSkip.clear();
     document.removeEventListener('visibilitychange', onVis);
     if (wasAuto) await setAutoRefine(true);
+    liveMode = true; // debugStepSync cleared it; the page must resume after the sweep
     const base = results.find(r => r.cfg === 'none');
     for (const r of results) {
-      r.deltaMs = (base && base.medianGpuMs != null && r.medianGpuMs != null)
-        ? +(base.medianGpuMs - r.medianGpuMs).toFixed(3) : null;
-      r.sharePct = (base && base.medianGpuMs) ? +((r.deltaMs / base.medianGpuMs) * 100).toFixed(1) : null;
+      r.deltaMs = (base && base.medianMs != null && r.medianMs != null)
+        ? +(base.medianMs - r.medianMs).toFixed(1) : null;
+      r.sharePct = (base && base.medianMs) ? +((r.deltaMs / base.medianMs) * 100).toFixed(1) : null;
     }
     return {
       activeByLevel, results,
+      // What the medians are medians of, so a reader can sanity-check them.
+      method: 'debugStepSync', stepsPerMeasure, msPerStepProbe: +msPerStep.toFixed(4),
       // Reported, not silently dropped: a caller who sees interrupted=true
       // should discard the numbers rather than wonder why they look odd.
       interrupted: benchHidden,
-      // This sweep measures ~12 frames of a LIVE rAF loop per configuration,
-      // so it carries compositor and vsync jitter that tools/bench-amr.js
-      // avoids by stopping the frame loop entirely. Measured noise floor is
-      // about +/-10%: a desktop run of this code reported phy at -10.1%, and
-      // a negative share is impossible. Trust it for the large groups
-      // (step1/interp/avg/ghost/force, 10-30%); it cannot resolve phy.
+      // VALIDATED 2026-09-07 against tools/bench-amr.js on the same machine and
+      // config, with every competing GPU client stopped. Large groups agree:
+      //
+      //   group             this sweep   bench-amr
+      //   interp            13.8%        15.6-17.3%
+      //   avg               12.2%        12.1-15.9%
+      //   ghost             13.3%        13.7-18.5%
+      //   step1             32.7%        27.5-31.7%
+      //   interp+avg+ghost  40.5%        43.9-49.1%
+      //
+      // The small rows do NOT resolve, on any run: interp-noop/avg-noop/
+      // ghost-noop/step1-ring are 0.2-5% effects by bench-amr and came back as
+      // 7.9%, -3.6%, -0.9% and -12.2% here. The baseline itself carries ~15%
+      // spread because the card keeps falling through the sweep while
+      // refinement is frozen, so the workload drifts under every row equally.
+      // Read anything under ~10% as "below the floor", not as a measurement --
+      // and a NEGATIVE share means exactly that, since skipping work cannot
+      // make a run slower. Use tools/bench-amr.js for the small effects on any
+      // device that has a CDP endpoint; this sweep exists for the one that
+      // does not.
       noiseFloorPct: 10,
     };
   }
@@ -2950,8 +3086,6 @@ async function init() {
                           lastOffX: null, lastOffY: null, offDirX: 0, offDirY: 0,
                           offReversals: 0, worstOffReversal: 0, offMaxStep: 0, offBackFrames: 0, offTrace: [], ring: [], diverged: false, divergedAtStep: null, history: null };
 
-  let benchSamples = [];
-  let benchCollecting = false;
   let benchRunning = false;
   let benchDone = false;
 
@@ -2993,8 +3127,10 @@ async function init() {
     // baseline, so the two runs were not doing comparable work at all. See
     // tools/bench-amr.js --skip.
     setBenchSkip: (groups) => {
+      const next = (groups || []).filter(Boolean);
+      validateSkipGroups(next, 'setBenchSkip');
       benchSkip.clear();
-      for (const g of (groups || [])) if (g) benchSkip.add(g);
+      for (const g of next) benchSkip.add(g);
       return [...benchSkip];
     },
     getLevelPoolSizes,
@@ -3248,11 +3384,6 @@ async function init() {
           }
           lastT = performance.now();
         }
-
-        // The bench sweep samples EVERY frame, not the 250ms-throttled ones
-        // the overlay uses -- it needs a real sample population per
-        // configuration, not four readings.
-        if (benchCollecting && Number.isFinite(gpuTime) && gpuTime > 0) benchSamples.push(gpuTime);
 
         st.card.unmap();
         st.inFlight = false;

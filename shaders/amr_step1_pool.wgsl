@@ -61,6 +61,29 @@ struct LevelParams {
 override W : u32; // GLOBAL domain dims (window periodicity), same at every level -- not level-specific, see header.
 override H : u32;
 override RB : u32;
+// ── Measurement instrument: ?benchSkip=step1-ring ────────────────────────────
+// Skips the ghost-RING cells of each tile, leaving only the 2*RB square
+// interior. A proxy for what the fine step would cost if tiles carried no
+// ghost padding at all (FB 20 -> 16, i.e. 36% fewer cells per tile), which is
+// the second-order prize in "stop materializing same-level ghost cells".
+//
+// MEASUREMENT ONLY, and wrong by construction: substep B consumes the ring
+// values substep A wrote for any cell the fine-fine exchange does not refresh
+// (a tile at the edge of the refined region), so a run with this set is not
+// physically correct.
+//
+// Measured 2026-09-07, desktop RTX 4080, res=8 levels=3: 0.2% of frame GPU
+// time -- essentially free to skip, because ring threads share their 8x8
+// workgroups with interior threads and removing them frees no scheduling slot.
+// This CORRECTS plans/perf-characterization.md, which listed the same 36% as
+// "about 10.5% of the whole frame ... the single largest identified piece of
+// pure overhead". It is not, on this device. The phone is bandwidth-bound
+// rather than occupancy-bound and the traffic model predicts ~10% there, so
+// this knob exists to be re-read on that device, where the answer should
+// differ. Guard placed after the slot lookup so the number stays comparable
+// with the desktop figure above.
+override SKIP_GHOST : u32 = 0u;
+
 const GHOST = 2u;
 
 override SPONGE_UX : f32 = 0.0f;
@@ -143,6 +166,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   let blockID = slotToBlock[slot];
   if (blockID < 0) { return; }
+
+  if (SKIP_GHOST != 0u) {
+    let ringInterior = fx >= GHOST && fx < GHOST + RB * 2u && fy >= GHOST && fy < GHOST + RB * 2u;
+    if (!ringInterior) { return; } // see the SKIP_GHOST override above
+  }
 
   // The one structural difference vs. amr_step1.wgsl: origin comes from a
   // cached per-slot value (set at quad-activation time), not derived from

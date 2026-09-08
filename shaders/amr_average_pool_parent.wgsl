@@ -36,10 +36,34 @@ struct LevelParams {
 @group(0) @binding(5) var<storage, read>       quadrant      : array<u32>;
 
 override RB : u32;
+// ── Measurement instrument: ?benchSkip=<group>-noop ──────────────────────────
+// Returns before touching any buffer, so the pass is still encoded and
+// dispatched at full width but does no work. Skipping the pass ENTIRELY vs.
+// running this no-op variant separates the fixed per-pass cost (encode,
+// dispatch, pipeline switch, barrier) from the work the pass actually does --
+// a split the plain ?benchSkip= groups cannot make, because removing a pass
+// removes both at once.
+//
+// Measured 2026-09-07, desktop RTX 4080, res=8 levels=3 blockage=3.3, via
+// tools/bench-amr.js --skip. Share of frame GPU time recovered:
+//
+//   group    pass removed   dispatched as no-op   -> work
+//   ghost    15.5-18.5%     1.7-4.3%                 ~13%
+//   interp   17.3%          2.0%                     ~15%
+//   avg      15.9%          5.6%                     ~10%
+//
+// So AMR coupling costs its WORK, not its pass count, and fusing coupling
+// passes is not a lever -- the same verdict plans/perf-characterization.md
+// reached for the force pass by a different route. Default 0 is byte-identical
+// to having no instrument at all (an override constant, folded at pipeline
+// creation), matching how ?f16=0 is kept in the tree.
+override NOOP : u32 = 0u;
+
 const GHOST = 2u;
 
 @compute @workgroup_size(8, 8)
 fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wgid: vec3<u32>) {
+  if (NOOP != 0u) { return; } // see the NOOP override above
   let lcx = lid.x; let lcy = lid.y; // coarse-cell-local coords within this level's own footprint
   let slot = wgid.z;
 
