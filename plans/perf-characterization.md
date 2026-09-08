@@ -52,23 +52,53 @@ measure the change in median frame GPU time, repeat. `?benchSkip=force,ghost`
 applies a skip manually. Results post over the telemetry channel
 (`?telemetry=1`), which is the only way to see a phone.
 
-**`?bench=1` has a noise floor of about +/-10%, and cannot resolve `phy`.**
-It measures ~12 frames of a LIVE rAF loop per configuration, so it carries
-compositor and vsync jitter that `tools/bench-amr.js` avoids by stopping the
-frame loop and timing thousands of macro-steps. A desktop run of it reported
-`phy` at **-10.1%**, and a negative share is impossible. Use it for the large
-groups (step1/interp/avg/ghost/force, 10-30%); use bench-amr.js for anything
-smaller. The sweep reports `noiseFloorPct` in its own payload so this does not
-have to be remembered.
+**`?bench=1` was rebuilt on 2026-09-08 and the old numbers from it are void.**
+It used to sample per-frame GPU timestamps from the LIVE rAF loop. That does
+not work on a device which finishes its frame well inside the vsync interval:
+the GPU idles most of each frame and clocks down, so the timestamps scatter no
+matter how many are averaged. Measured failing on the desktop -- spreads of
+25-88% and shares as low as **-73%** (skipping work cannot make a run slower),
+with `interp+avg+ghost` reported at 2.9% against a `tools/bench-amr.js` ground
+truth of 44%. It now does what bench-amr.js does: stops the frame loop and
+times one synchronous `debugStepSync` run per configuration, with the step
+count calibrated per device from a short probe (the two targets differ ~40x in
+frame time, so no fixed count serves both). `stepsPerMeasure` and
+`msPerStepProbe` are reported in the payload.
 
-**Do not run `?bench=1` on a device you might switch away from.** Backgrounding
-suspends requestAnimationFrame while the setTimeout-paced sweep keeps marching
-through configurations, so whichever ones were current while the tab was
-hidden collect no samples -- and it used to fail silently, producing no
-payload and no error. A phone run was lost to exactly that. The sweep now
-watches `visibilitychange` and returns `interrupted: true`; discard those
-numbers. It also takes ~3.8 minutes at the default 3 rounds and reports
-per-configuration progress in the `#status` line (top-left of the canvas).
+**It is validated for the large groups and still cannot resolve small ones.**
+Against bench-amr.js on the same machine and config, competing GPU clients
+stopped: interp 13.8% vs 15.6-17.3, avg 12.2% vs 12.1-15.9, ghost 13.3% vs
+13.7-18.5, step1 32.7% vs 27.5-31.7, interp+avg+ghost 40.5% vs 43.9-49.1. But
+0.2-5% effects still come back as 7.9%, -3.6%, -0.9% and -12.2%. On the
+desktop the `none` baseline itself carries ~15% spread, because a fast device
+runs ~286k steps across the sweep and the card keeps falling while refinement
+is frozen, so the workload drifts under every row. **Read anything under ~10%
+as below the floor, and a negative share as proof of it.** The phone does far
+better (spreads 0.5-6.1%) precisely because it is slow: 16k steps across the
+whole sweep, so almost no drift. Capping `stepsPerMeasure` rather than
+targeting a fixed wall-clock would fix the desktop the same way; not done yet.
+
+**Stop every other GPU client before measuring, including your own leftovers.**
+A benchmark tab left open keeps simulating at full tilt. Three of them
+accumulated across one session and took its desktop baseline from 14.8s to
+18.9s, which was misattributed to ambient load from the user's browser before
+the real cause was found: a driver that closed its CDP client but not its tab,
+leaving one live WebGPU context per run plus a GPU process pegged at 98% CPU.
+Check `nvidia-smi` reports the SM clock near idle (a few hundred MHz) before
+trusting a run; utilization% alone is misleading.
+
+**Do not run `?bench=1` on a device you might switch away from.** A hidden tab
+gets its GPU work deprioritised and its timers throttled, so whichever
+configurations were current while it was hidden are timed against a different
+machine. A phone run was lost to exactly that, silently. The sweep watches
+`visibilitychange` and returns `interrupted: true`; discard those numbers. The
+full 13-config list is ~4.5 min at the default 3 rounds; `?benchConfigs=` trims
+it (7 configs is ~2.7 min on the phone) and `?benchMeasureMs=` sets the target
+per-run wall-clock. Progress goes to the `#status` line, which the frame loop
+leaves alone while a sweep owns it. An unknown group name is rejected up front
+rather than silently reporting ~0% -- a mistyped entry used to be
+indistinguishable from a real measurement, which is unrecoverable on a device
+that gets one sweep per session.
 
 **Do not trust per-pass timestamps on mobile.** The PowerVR part's timestamp
 counter ticks at 65536 ns. A macro-step is ~1125 µs — about 17 ticks spread
@@ -83,6 +113,14 @@ Desktop timestamps are fine-grained and per-pass profiling
 (`debugProfileMacroStep`) works there.
 
 ## The measurement
+
+**Superseded for the coupling groups on BOTH columns.** This table is
+levels=2 with `MAX_FINE_BLOCKS=128` and predates the threshold retune, the
+pool resize, the true-SDF `get_phi` and the FSCALE fix. The desktop column is
+re-measured at current defaults further down ("RE-MEASURED at current
+defaults"), and both columns are re-measured for interp/avg/ghost/step1 in
+"AMR coupling, measured on BOTH devices". Kept for the `phy` additivity
+argument below, which is what it was collected for.
 
 Percentage of frame GPU time recovered by skipping each pass group:
 
@@ -180,11 +218,25 @@ the fine solve it exists to serve (29.3%). That is the direct, measured form
 of the complaint that started this work -- that the hierarchical version does
 not beat the flat one. Two concrete leads, neither yet measured:
 
-- **Ghost-cell fraction in the fine step.** A tile is FB=20 square with only
-  2*RB=16 square of interior, so 36% of every fine-level step is ghost cells
-  -- about 10.5% of the whole frame, inside step1's 29.3%. `RB` is welded to
-  `BLOCK=8` by the L0<->L1 footprint-preserving scheme, so this is not a knob
-  today, but it is the single largest identified piece of pure overhead.
+- ~~**Ghost-cell fraction in the fine step.**~~ TESTED 2026-09-08, and it is
+  not a lead. The reasoning was: a tile is FB=20 square with only 2*RB=16
+  square of interior, so 36% of every fine-level step is ghost cells -- about
+  10.5% of the whole frame, "the single largest identified piece of pure
+  overhead". Measured with `?benchSkip=step1-ring`, which runs the fine step
+  over the interior only: **0.2% on the desktop and 0.9% on the phone.**
+  Both devices, ~1%, not 10.5%.
+
+  Two reasons the arithmetic overstated it. The ring threads share their 8x8
+  workgroups with interior threads, so removing them frees no scheduling slot
+  on either device. And skipping them does not remove the ring's *reads* --
+  interior threads still stream from those cells -- so the traffic actually
+  saved is a fraction of 36%, which is why the bandwidth-bound device did not
+  behave differently from the latency-bound one. A prediction of ~10% for the
+  phone, made from the traffic model, was wrong by 10x.
+
+  This also removes the second-order case for shrinking `FB` 20 -> 16 (which
+  is what eliminating materialized ghosts would allow): the pool would get 36%
+  smaller, but the frame would not get measurably faster.
 - ~~**Dispatch shape of the three coupling passes.**~~ TESTED, and it is not
   a lead. Doubling the pool allocation doubles every pool pass's dispatch
   width; if width cost anything, their shares would rise. Measured at
@@ -210,6 +262,105 @@ not beat the flat one. Two concrete leads, neither yet measured:
   Note what this also means: the coupling cost is proportional to ACTIVE
   tiles, so it does not shrink by dispatching more cleverly. It shrinks only
   by moving less per tile, or by needing fewer tiles.
+
+## AMR coupling, measured on BOTH devices (2026-09-08)
+
+The question was whether coarse<->fine coupling accounts for much of the
+compute time. It does, it is the largest single item in the frame, and it is
+the same size on two devices with opposite bottlenecks. `res=8&levels=3&
+blockage=3.3` throughout.
+
+| skipped group | phone (PowerVR) | desktop (RTX 4080) |
+|---|---|---|
+| interp (coarse->fine ghosts) | 19.2% | 13.8-17.3% |
+| avg (fine->coarse) | 6.0% | 12.1-15.9% |
+| ghost (fine-fine) | 15.3% | 13.3-18.5% |
+| **interp+avg+ghost together** | **42.4%** | **40.5-49.1%** |
+| step1 (fine LBM) | 32.5% | 27.5-32.7% |
+
+Phone: one `?bench=1` sweep, spreads 0.5-6.1%, `interrupted: false`. Desktop:
+six `tools/bench-amr.js --skip` runs plus one validated in-page sweep; the
+range is across runs with different frozen topologies, not measurement error.
+
+**Coupling costs more than the fine solve it exists to serve, on both.** That
+is the direct, measured form of the complaint that started this work.
+
+**It is additive now, unlike at levels=2.** Parts sum to 43.8/44.3 against
+43.9/44.1 measured together on the desktop, and 40.5 against 42.4 on the
+phone. The levels=2 desktop numbers were strongly sublinear (parts summed to
+80.2%, together 34.5%), so summing individual shares WAS invalid then and IS
+valid now. Do not carry the old caution forward without re-checking it.
+
+**Structural reason:** at levels=3 the macro-step encodes **9 coupling passes**
+(3 interp, 3 avg, 3 fine-fine ghost) against **7 solve passes** (1 L0 + 2 L1 +
+4 L2). See `S_Advance` in main-amr.js.
+
+### It is the WORK, not the pass count
+
+`?benchSkip=<group>-noop` dispatches a coupling pass at full width with a
+shader that returns before touching any buffer. Removing the pass entirely
+removes its fixed per-pass cost AND its work; the no-op variant removes only
+the work, so the difference splits them. Desktop, `tools/bench-amr.js`:
+
+| group | pass removed | dispatched as no-op | -> work |
+|---|---|---|---|
+| ghost | 15.5-18.5% | 1.7-4.3% | ~13% |
+| interp | 17.3% | 2.0% | ~15% |
+| avg | 15.9% | 5.6% | ~10% |
+
+Pass existence is ~10% of the frame in total; the work is ~41%. **So fusing
+coupling passes is not a lever** -- the same verdict the force-fusion analysis
+reached by a different route, now established for the coupling passes too.
+
+### The interpolation math is nearly free; the plumbing is not
+
+`interp` and `ghost` have identical dispatch shapes, run 3x each per
+macro-step, and share the same fine-fine copy code. `interp` only adds the
+bilinear parent sampling on top. So `interp - ghost` isolates the actual
+coarse<->fine transfer math: **+2.0, +0.4 and -1.2 points across desktop runs
+(i.e. <=2% and within noise), +3.9 points on the phone.**
+
+Nearly all of what is labelled "interp" is the same-level ghost plumbing that
+happens to live inside it, not coarse-fine transfer at all. On the desktop,
+running the ghost pass's full prologue and neighbour resolution but skipping
+the data copy recovered only 1.8-3.9% of its 15.5-18.5% -- the copy is cheap,
+the per-thread prologue and neighbour resolution are not.
+
+### Ruled out, measured, at the +/-3% level
+
+None of these moved the frame; do not re-derive them. Skipping the ghost ring
+inside step1 (0.2% desktop / 0.9% phone). Splitting the ghost copy by edge
+class to test coalescing (~0%). Replacing the pool shader's runtime integer
+`%`/`/` with mask/shift, valid because NBX is always a power of two (0.6%).
+Halving `avg`'s live register footprint with a bit-identical single-pass
+accumulator (~0%). Indirect dispatch was already ruled out twice.
+
+### The one lead left
+
+**Stop materializing same-level ghost cells.** `amr_interp_pool_parent.wgsl`'s
+own header names it: AGAL "addresses neighbor blocks directly during streaming
+instead of materializing ghost cells in a padded buffer". That removes the
+ghost pass outright (15.3% phone / 13.3-18.5% desktop) and interp's fine-fine
+branch, which is nearly all of interp (~15% on both) -- an envelope around
+**30% of frame on both devices**, minus whatever the neighbour lookup costs
+step1's gather.
+
+Tractable because `step1` already binds the whole pool as `f_in`, so a
+neighbour tile's data is in scope; the only new input is `blockSlot` as one
+read-only binding. No new data buffers.
+
+Do NOT justify it by the `FB` 20 -> 16 shrink it would also allow -- that was
+measured at ~1% (see the struck-out ghost-cell-fraction lead above).
+
+Gates: it touches shaders shared by five AMR pages and changes bind groups,
+which is the 238e48c failure mode `validate-all.js`'s boot smoke exists for.
+It is physics-affecting, so the analytic `channel-*`/`tgv-*` checks are the
+gate, then Cd/St, then AMR invariants, then `validate-divergence` (whose
+`fullrefine` leg is the interface-error noise floor and should be unchanged).
+
+`avg` is not worth attacking: it is near its traffic floor (4 reads + 1 write
+per coarse cell), the register rewrite did nothing, and it is *cheaper* on the
+phone (6.0%) than the desktop (12-16%).
 
 ## Superseded: what the levels=2 numbers said to do instead
 
