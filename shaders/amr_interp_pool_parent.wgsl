@@ -72,6 +72,29 @@ override GHOST_ONLY : u32;
 // See amr_interp_dense_parent.wgsl's header for what this mode does --
 // ported unchanged, same same-level-only early return.
 override FINE_FINE_ONLY : u32 = 0u;
+// ── Measurement instrument: ?benchSkip=<group>-noop ──────────────────────────
+// Returns before touching any buffer, so the pass is still encoded and
+// dispatched at full width but does no work. Skipping the pass ENTIRELY vs.
+// running this no-op variant separates the fixed per-pass cost (encode,
+// dispatch, pipeline switch, barrier) from the work the pass actually does --
+// a split the plain ?benchSkip= groups cannot make, because removing a pass
+// removes both at once.
+//
+// Measured 2026-09-07, desktop RTX 4080, res=8 levels=3 blockage=3.3, via
+// tools/bench-amr.js --skip. Share of frame GPU time recovered:
+//
+//   group    pass removed   dispatched as no-op   -> work
+//   ghost    15.5-18.5%     1.7-4.3%                 ~13%
+//   interp   17.3%          2.0%                     ~15%
+//   avg      15.9%          5.6%                     ~10%
+//
+// So AMR coupling costs its WORK, not its pass count, and fusing coupling
+// passes is not a lever -- the same verdict plans/perf-characterization.md
+// reached for the force pass by a different route. Default 0 is byte-identical
+// to having no instrument at all (an override constant, folded at pipeline
+// creation), matching how ?f16=0 is kept in the tree.
+override NOOP : u32 = 0u;
+
 
 const GHOST = 2u;
 
@@ -131,6 +154,7 @@ fn sampleParentPool(pSlot: u32, ix: i32, iy: i32) -> CoarseSample {
 
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  if (NOOP != 0u) { return; } // see the NOOP override above
   let fx = gid.x; let fy = gid.y;
   let slot = gid.z;
   let FB = RB * 2u + 2u * GHOST;
