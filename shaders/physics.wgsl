@@ -8,7 +8,7 @@
 
 override W : u32;
 override H : u32;
-const FSCALE = 10000.0f;
+const FSCALE = 10000000.0f;
 
 // KINEMATIC ("reentry") mode -- mirrors shaders/amr_physics.wgsl's identical
 // override byte-for-byte (see that file's own comment for the rationale).

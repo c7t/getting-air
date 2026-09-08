@@ -44,10 +44,11 @@
 
 // @include "common_geometry.wgsl"
 // @include "common_lattice.wgsl"
+// @include "common_fpack.wgsl"
 
 @group(0) @binding(0) var<storage, read>       state       : CardState;
-@group(0) @binding(1) var<storage, read>       f_coarse       : array<f32>;
-@group(0) @binding(2) var<storage, read_write> f_pool         : array<f32>;
+@group(0) @binding(1) var<storage, read>       f_coarse       : array<u32>;
+@group(0) @binding(2) var<storage, read_write> f_pool         : array<u32>;
 @group(0) @binding(3) var<storage, read>       slotToBlock    : array<i32>;
 // Milestone 4b: which slots were JUST assigned this refine/coarsen round --
 // only read when GHOST_ONLY=0 (the one-time full-slot-fill pipeline), to
@@ -77,7 +78,44 @@ override GHOST_ONLY : u32;
 // behavior (correct multi-rate coupling; coarse is quasi-static), so this mode
 // leaves them alone. Default 0u so the existing interp/interpInit pipelines,
 // which don't set it, still compile.
+// LEGACY (?ghostcopy=1) as of 2026-09-08. This MODE builds the between-substep
+// fine-fine ghost COPY pass, and the default build no longer encodes it -- the
+// fine step reaches into the neighbour tile itself during streaming instead
+// (DIRECT_GHOST in shaders/amr_step1.wgsl), which is both cheaper and fresher.
+// Kept so the two paths can be A/B'd for speed and physics in one build; see
+// plans/perf-characterization.md's "The one lead left".
+//
+// NOTE this is the mode, not the branch. The same-level consultation inside
+// the ordinary GHOST_ONLY pass below still runs in the default build, and must:
+// a fine tile's ghost ring is still read by its OWN child's bilinear parent
+// sampling (see this file's header on the stencil reaching [-GHOST, ...]), so
+// it still has to hold the exact neighbour value there rather than a coarse
+// guess. Removing that branch was measured at 1.8-3.9%, not the ~15% an
+// earlier reading of plans/perf-characterization.md claimed.
 override FINE_FINE_ONLY : u32 = 0u;
+// ── Measurement instrument: ?benchSkip=<group>-noop ──────────────────────────
+// Returns before touching any buffer, so the pass is still encoded and
+// dispatched at full width but does no work. Skipping the pass ENTIRELY vs.
+// running this no-op variant separates the fixed per-pass cost (encode,
+// dispatch, pipeline switch, barrier) from the work the pass actually does --
+// a split the plain ?benchSkip= groups cannot make, because removing a pass
+// removes both at once.
+//
+// Measured 2026-09-07, desktop RTX 4080, res=8 levels=3 blockage=3.3, via
+// tools/bench-amr.js --skip. Share of frame GPU time recovered:
+//
+//   group    pass removed   dispatched as no-op   -> work
+//   ghost    15.5-18.5%     1.7-4.3%                 ~13%
+//   interp   17.3%          2.0%                     ~15%
+//   avg      15.9%          5.6%                     ~10%
+//
+// So AMR coupling costs its WORK, not its pass count, and fusing coupling
+// passes is not a lever -- the same verdict plans/perf-characterization.md
+// reached for the force pass by a different route. Default 0 is byte-identical
+// to having no instrument at all (an override constant, folded at pipeline
+// creation), matching how ?f16=0 is kept in the tree.
+override NOOP : u32 = 0u;
+
 
 const BLOCK = 8u;
 const GHOST = 2u;
@@ -121,7 +159,7 @@ fn sampleCoarse(bx_in: i32, by_in: i32) -> CoarseSample {
   var f: array<f32, 9>;
   var rho = 0f; var ux = 0f; var uy = 0f;
   for (var i = 0u; i < 9u; i++) {
-    f[i] = f_coarse[i * (W * H) + cell];
+    f[i] = fUnpack(f_coarse[fIdx(i, (W * H), cell)], i);
     rho += f[i];
     ux  += f[i] * f32(ex[i]);
     uy  += f[i] * f32(ey[i]);
@@ -138,6 +176,7 @@ fn sampleCoarse(bx_in: i32, by_in: i32) -> CoarseSample {
 
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  if (NOOP != 0u) { return; } // see the NOOP override above
   let fx = gid.x; let fy = gid.y;
   let slot = gid.z;
   let FB = RB * 2u + 2u * GHOST;
@@ -225,8 +264,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       let poolPlaneStride = arrayLength(&f_pool) / 9u;
       let poolCellBase = slot * (FB * FB) + fy * FB + fx;
       let neighborCellBase = u32(neighborSlot) * (FB * FB) + nfy * FB + nfx;
-      for (var i = 0u; i < 9u; i++) {
-        f_pool[i * poolPlaneStride + poolCellBase] = f_pool[i * poolPlaneStride + neighborCellBase];
+      // Word-for-word copy: valid in both layouts, and under F16 it moves
+      // 5 words per cell instead of 9.
+      let nw = fWords();
+      for (var wi = 0u; wi < nw; wi++) {
+        f_pool[wi * poolPlaneStride + poolCellBase] = f_pool[wi * poolPlaneStride + neighborCellBase];
       }
       return;
     }
@@ -278,8 +320,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   // already encodes it).
   let poolPlaneStride = arrayLength(&f_pool) / 9u;
   let poolCellBase = slot * (FB * FB) + fy * FB + fx;
+  var fo: array<f32,9>;
   for (var i = 0u; i < 9u; i++) {
     let fneq = w00*s00.fneq[i] + w10*s10.fneq[i] + w01*s01.fneq[i] + w11*s11.fneq[i];
-    f_pool[i * poolPlaneStride + poolCellBase] = feqD2Q9(rho, ux, uy, i) + rescale * fneq;
+    fo[i] = feqD2Q9(rho, ux, uy, i) + rescale * fneq;
+  }
+  let nw = fWords();
+  for (var wi = 0u; wi < nw; wi++) {
+    f_pool[wi * poolPlaneStride + poolCellBase] = fPack(fo[fLo(wi)], fo[fHi(wi)], wi);
   }
 }

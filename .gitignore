@@ -2,10 +2,14 @@
 *.pdf
 AGAL/
 notes.txt
-plans/
+plans/*
+!plans/perf-characterization.md
+!plans/AMR-vs-dense-validation.md
 transcripts/
 snapshots/
 https.py
 *.pem
 *~
 *.mp4
+*.log
+telemetry.log

@@ -87,6 +87,7 @@
 //     removed from what's being decided.
 
 // @include "common_geometry.wgsl"
+// @include "common_refine.wgsl"
 
 @group(0) @binding(0)  var<storage, read>       childCriterion    : array<f32>;
 @group(0) @binding(1)  var<storage, read_write> childBlockSlot    : array<i32>;
@@ -123,6 +124,17 @@ override HAS_GRANDCHILD : u32 = 0u;
 override HAS_BODY : u32 = 1u;
 override REFINE_THRESH : f32;
 override COARSEN_THRESH : f32;
+// Ladder parameters -- see common_refine.wgsl.
+override N_REFINE_INC : f32 = 1.0f;
+override N_REFINE_MAX : f32 = 1.0f;
+override MAX_LEVEL : i32 = 2;
+
+// This shader evaluates blocks at the PARENT level m, whose cells are
+// PARENT_CELL_SIZE_L0 = 2^-m of an L0 cell. The criterion kernels reduce a
+// raw lattice-cell difference, so converting to a physical gradient means
+// dividing by that -- i.e. adding m in log2. This is AGAL's /(2.0*dx_L).
+fn myLevel() -> i32 { return i32(round(-log2(PARENT_CELL_SIZE_L0))); }
+fn toPhysical(eps: f32) -> f32 { return eps - log2(PARENT_CELL_SIZE_L0); }
 override FORCE_REFINE_MARGIN : f32;
 override FORCE_REFINE_LOOKAHEAD : f32;
 // L0 window-space edge band excluded from vorticity-driven refinement (same
@@ -283,7 +295,10 @@ fn refine(@builtin(global_invocation_id) gid: vec3<u32>) {
   // conservative gate, so criterion-driven growth alone still can't
   // outrun its own coarser neighborhood.
   let isHardRequired = isNearBodyAt(parentCenterX_L0, parentCenterY_L0) || cascadeWanted;
-  let wantsRefine = isHardRequired || (eps >= REFINE_THRESH && !inSpongeBandAt(parentCenterX_L0, parentCenterY_L0));
+  // Ladder: this parent wants children only if its own flow asks for a level
+  // DEEPER than the one it already holds.
+  let wantsRefine = isHardRequired
+    || (desiredLevel(toPhysical(eps)) > myLevel() && !inSpongeBandAt(parentCenterX_L0, parentCenterY_L0));
   if (!wantsRefine) { return; }
 
   if (!isHardRequired) {
@@ -399,7 +414,7 @@ fn coarsen(@builtin(global_invocation_id) gid: vec3<u32>) {
   let centerX_L0 = parentOriginX_L0 + f32(RB) * PARENT_CELL_SIZE_L0;
   let centerY_L0 = parentOriginY_L0 + f32(RB) * PARENT_CELL_SIZE_L0;
 
-  if ((eps < COARSEN_THRESH || inSpongeBandAt(centerX_L0, centerY_L0)) && !isNearBodyAt(centerX_L0, centerY_L0)) {
+  if ((desiredLevelCoarsen(toPhysical(eps)) < myLevel() + 1 || inSpongeBandAt(centerX_L0, centerY_L0)) && !isNearBodyAt(centerX_L0, centerY_L0)) {
     let quadIdx = slot / 4u; // slot IS quadrant 0's own slot (childQuadrant[slot]==0 checked above), so quadIdx*4u==slot
     // See header: blocked if any of the 4 children about to release has
     // an active level-(m+2) grandchild itself, or if any of their own

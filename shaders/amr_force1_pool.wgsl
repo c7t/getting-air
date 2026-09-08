@@ -17,6 +17,8 @@
 
 // @include "common_geometry.wgsl"
 // @include "common_lattice.wgsl"
+// @include "common_fpack.wgsl"
+// @include "common_reduce.wgsl"
 
 struct LevelParams {
   nbx: u32,        // THIS level's own NBX -- needed here (unlike the other
@@ -31,7 +33,7 @@ struct LevelParams {
 }
 
 @group(0) @binding(0) var<storage, read>       state          : CardState;
-@group(0) @binding(1) var<storage, read>       f_in           : array<f32>;
+@group(0) @binding(1) var<storage, read>       f_in           : array<u32>;
 @group(0) @binding(2) var<storage, read_write> forces         : array<atomic<i32>, 4>;
 @group(0) @binding(3) var<storage, read>       slotToBlock    : array<i32>;
 @group(0) @binding(4) var<storage, read>       originX        : array<f32>;
@@ -48,7 +50,19 @@ override W : u32;
 override H : u32;
 override RB : u32;
 const GHOST = 2u;
-const FSCALE = 10000f;
+// FSCALE: fixed-point scale for the atomic force accumulation. Raised from
+// 1e4 to 1e7 because the reduction below atomicAdds ONE TRUNCATED i32 PER
+// WORKGROUP (safeFixed's i32() cast truncates toward zero), so any workgroup
+// whose partial sum falls below one fixed-point unit contributes exactly
+// zero -- a systematic, one-directional loss, not rounding noise. Per-cell
+// contributions shrink with the level's own dx weight, so deeper levels hit
+// that floor hardest: measured on the cylinder harness at Re=100, at 1e4 the
+// truncation cost ~10% of the force at L1 and ~32% at L2 (Cd 1.430 -> 1.593
+// at N=2, 0.943 -> 1.390 at N=3). i32 max ~2.1e9 against the +/-2e9 clamp
+// still bounds |force| < 200, ~1000x the largest force either scenario
+// produces. A deeper hierarchy would eventually need a real fix (float
+// atomics via CAS, or a two-stage reduction) rather than more scale.
+const FSCALE = 10000000f;
 override K_EPS : f32 = 1.5f;
 // Optional sharp momentum-exchange bounce-back force -- see
 // amr_step1_pool.wgsl's USE_BOUNCEBACK header for the shared rationale.
@@ -132,10 +146,13 @@ fn main(
         let phi = get_phi(p, state);
         let poolPlaneStride = arrayLength(&f_in) / 9u;
         let cell = slot * (FB * FB) + fy * FB + fx;
-        let areaWeight = levelParams.dxL * levelParams.dxL;
-        // Bounce-back's MEM sum is a PERIMETER integral, not the diffuse
-        // method's VOLUME integral -- dx^1, not dx^2. See amr_force1.wgsl's
-        // LINE_WEIGHT comment for the full rationale and live measurement.
+        // dx_L^1 for BOTH branches: a cell's mass scales as dx_L^2 but this
+        // level's timestep is dt_L = dx_L (acoustic scaling), and force is
+        // mass*du/dt, so the two factors combine to dx_L^1. See
+        // amr_force1.wgsl's header point 2 -- the diffuse branch previously
+        // used dx_L^2, applying the volume measure but dropping 1/dt_L,
+        // which cost a factor of 2^L (4x at level 2).
+        let areaWeight = levelParams.dxL;
         let lineWeight = levelParams.dxL;
 
         if (USE_BOUNCEBACK != 0u) {
@@ -156,7 +173,7 @@ fn main(
               let srcWx = wrapf(srcBufX - state.off_x, f32(W));
               let srcWy = wrapf(srcBufY - state.off_y, f32(H));
               if (get_phi(vec2<f32>(srcWx, srcWy), state) < 0f) {
-                let f_opp = f_in[opp[i] * poolPlaneStride + cell];
+                let f_opp = fUnpack(f_in[fIdx(opp[i], poolPlaneStride, cell)], opp[i]);
                 let corr = 2f * wt[i] * (f32(ex[i]) * usx + f32(ey[i]) * usy) / CS2;
                 fx_body += -f32(ex[i]) * (2f * f_opp + corr) * lineWeight;
                 fy_body += -f32(ey[i]) * (2f * f_opp + corr) * lineWeight;
@@ -172,7 +189,7 @@ fn main(
               let srcX = clamp(i32(fx) - ex[i], 0, i32(FB) - 1);
               let srcY = clamp(i32(fy) - ey[i], 0, i32(FB) - 1);
               let srcCell = slot * (FB * FB) + u32(srcY) * FB + u32(srcX);
-              let fi = f_in[i * poolPlaneStride + srcCell];
+              let fi = fUnpack(f_in[fIdx(i, poolPlaneStride, srcCell)], i);
               rho     += fi;
               ux_star += fi * f32(ex[i]);
               uy_star += fi * f32(ey[i]);
@@ -203,15 +220,14 @@ fn main(
   wg_tz[lid] = tz_body;
   workgroupBarrier();
 
+  // Parallel tree reduction (common_reduce.wgsl) -- replaces a 64-step
+  // serial sum that lane 0 used to run alone. See that file for the
+  // on-device measurement that motivated it.
+  wgReduceSum3(lid);
   if (lid == 0u) {
-    var sum_fx = 0.0f;
-    var sum_fy = 0.0f;
-    var sum_tz = 0.0f;
-    for (var i = 0u; i < 64u; i++) {
-      sum_fx += wg_fx[i];
-      sum_fy += wg_fy[i];
-      sum_tz += wg_tz[i];
-    }
+    let sum_fx = wg_fx[0];
+    let sum_fy = wg_fy[0];
+    let sum_tz = wg_tz[0];
     atomicAdd(&forces[0], safeFixed(sum_fx * FSCALE));
     atomicAdd(&forces[1], safeFixed(sum_fy * FSCALE));
     atomicAdd(&forces[2], safeFixed(sum_tz * FSCALE));

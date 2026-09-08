@@ -2,14 +2,18 @@
 
 // @include "common_geometry.wgsl"
 // @include "common_lattice.wgsl"
+// @include "common_fpack.wgsl"
+// @include "common_reduce.wgsl"
 
 @group(0) @binding(0) var<storage, read>       state  : CardState;
-@group(0) @binding(1) var<storage, read>       f_in   : array<f32>;
+@group(0) @binding(1) var<storage, read>       f_in   : array<u32>;
 @group(0) @binding(2) var<storage, read_write> forces : array<atomic<i32>, 4>;
 
 override W : u32;
 override H : u32;
-const FSCALE = 10000f;
+// FSCALE: see shaders/amr_force1_pool.wgsl's FSCALE comment for why this
+// is 1e7 and not 1e4 (per-workgroup truncation in the atomic reduction).
+const FSCALE = 10000000f;
 
 // Optional: sharp momentum-exchange bounce-back force instead of
 // integrating the diffuse penalty force -- must match lbm_step.wgsl's own
@@ -80,7 +84,7 @@ fn main(
           let wx_src = (x + W - u32(ex[i])) % W;
           let wy_src = (y + H - u32(ey[i])) % H;
           if (get_phi(vec2<f32>(f32(wx_src), f32(wy_src)), state) < 0f) {
-            let f_opp = f_in[opp[i] * (W * H) + cell];
+            let f_opp = fUnpack(f_in[fIdx(opp[i], (W * H), cell)], opp[i]);
             let corr = 2f * wt[i] * (f32(ex[i]) * usx + f32(ey[i]) * usy) / CS2;
             fx_body += -f32(ex[i]) * (2f * f_opp + corr);
             fy_body += -f32(ey[i]) * (2f * f_opp + corr);
@@ -104,7 +108,7 @@ fn main(
         let wy_src = (y + H - u32(ey[i])) % H;
         let bx_src = (wx_src + u32(state.off_x)) % W;
         let by_src = (wy_src + u32(state.off_y)) % H;
-        let fi = f_in[i * (W * H) + (by_src * W + bx_src)];
+        let fi = fUnpack(f_in[fIdx(i, (W * H), (by_src * W + bx_src))], i);
         rho     += fi;
         ux_star += fi * f32(ex[i]);
         uy_star += fi * f32(ey[i]);
@@ -137,15 +141,14 @@ fn main(
   workgroupBarrier();
 
   // Simple reduction tree or linear sum for 64 elements
+  // Parallel tree reduction (common_reduce.wgsl) -- replaces a 64-step
+  // serial sum that lane 0 used to run alone. See that file for the
+  // on-device measurement that motivated it.
+  wgReduceSum3(lid);
   if (lid == 0u) {
-    var sum_fx = 0.0f;
-    var sum_fy = 0.0f;
-    var sum_tz = 0.0f;
-    for (var i = 0u; i < 64u; i++) {
-      sum_fx += wg_fx[i];
-      sum_fy += wg_fy[i];
-      sum_tz += wg_tz[i];
-    }
+    let sum_fx = wg_fx[0];
+    let sum_fy = wg_fy[0];
+    let sum_tz = wg_tz[0];
     atomicAdd(&forces[0], safeFixed(sum_fx * FSCALE));
     atomicAdd(&forces[1], safeFixed(sum_fy * FSCALE));
     atomicAdd(&forces[2], safeFixed(sum_tz * FSCALE));

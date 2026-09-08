@@ -17,15 +17,19 @@
 
 // @include "common_geometry.wgsl"
 // @include "common_lattice.wgsl"
+// @include "common_fpack.wgsl"
+// @include "common_reduce.wgsl"
 
 @group(0) @binding(0) var<storage, read>       state      : CardState;
-@group(0) @binding(1) var<storage, read>       f_in       : array<f32>;
+@group(0) @binding(1) var<storage, read>       f_in       : array<u32>;
 @group(0) @binding(2) var<storage, read_write> forces     : array<atomic<i32>, 4>;
 @group(0) @binding(3) var<storage, read>       blockSlot1 : array<i32>; // level 1's own blockSlot -- see header
 
 override W : u32;
 override H : u32;
-const FSCALE = 10000f;
+// FSCALE: see shaders/amr_force1_pool.wgsl's FSCALE comment for why this
+// is 1e7 and not 1e4 (per-workgroup truncation in the atomic reduction).
+const FSCALE = 10000000f;
 const BLOCK = 8u;
 
 // Optional sharp momentum-exchange bounce-back force -- mirrors
@@ -50,7 +54,8 @@ fn get_chi(phi: f32) -> f32 {
 // Sanitize NaN to 0 and clamp to the representable fixed-point range so the
 // float->i32 conversion feeding the force atomics is always well-defined
 // (WGSL leaves out-of-range and NaN float->i32 conversion implementation-
-// defined). FSCALE=10000 and i32 max ~2.1e9, so +/-2e9 bounds |force| < 2e5.
+// defined). FSCALE=1e7 and i32 max ~2.1e9, so +/-2e9 bounds |force| < 200
+// -- still ~1000x the largest force either scenario produces.
 fn safeFixed(x: f32) -> i32 {
     let s = select(x, 0.0f, x != x);
     return i32(clamp(s, -2.0e9f, 2.0e9f));
@@ -101,7 +106,7 @@ fn main(
             let wx_src = (wx + W - u32(ex[i])) % W;
             let wy_src = (wy + H - u32(ey[i])) % H;
             if (get_phi(vec2<f32>(f32(wx_src), f32(wy_src)), state) < 0f) {
-              let f_opp = f_in[opp[i] * (W * H) + cell];
+              let f_opp = fUnpack(f_in[fIdx(opp[i], (W * H), cell)], opp[i]);
               let corr = 2f * wt[i] * (f32(ex[i]) * usx + f32(ey[i]) * usy) / CS2;
               fx_body += -f32(ex[i]) * (2f * f_opp + corr);
               fy_body += -f32(ey[i]) * (2f * f_opp + corr);
@@ -122,7 +127,7 @@ fn main(
         for (var i = 0u; i < 9u; i++) {
           let bx_src = (cx + W - u32(ex[i])) % W;
           let by_src = (cy + H - u32(ey[i])) % H;
-          let fi = f_in[i * (W * H) + cellIndex(bx_src, by_src)];
+          let fi = fUnpack(f_in[fIdx(i, (W * H), cellIndex(bx_src, by_src))], i);
           rho     += fi;
           ux_star += fi * f32(ex[i]);
           uy_star += fi * f32(ey[i]);
@@ -156,15 +161,14 @@ fn main(
   workgroupBarrier();
 
   // Simple reduction tree or linear sum for 64 elements
+  // Parallel tree reduction (common_reduce.wgsl) -- replaces a 64-step
+  // serial sum that lane 0 used to run alone. See that file for the
+  // on-device measurement that motivated it.
+  wgReduceSum3(lid);
   if (lid == 0u) {
-    var sum_fx = 0.0f;
-    var sum_fy = 0.0f;
-    var sum_tz = 0.0f;
-    for (var i = 0u; i < 64u; i++) {
-      sum_fx += wg_fx[i];
-      sum_fy += wg_fy[i];
-      sum_tz += wg_tz[i];
-    }
+    let sum_fx = wg_fx[0];
+    let sum_fy = wg_fy[0];
+    let sum_tz = wg_tz[0];
     // Clamp + NaN-sanitize before float->i32: WGSL leaves out-of-range/NaN
     // float->i32 conversion implementation-defined (Intel and NVIDIA differ),
     // so an unbounded or NaN reduction here would corrupt the body force/torque

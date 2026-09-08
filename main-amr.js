@@ -10,14 +10,25 @@
 // discovering that kind of bug from wrong-looking output.
 
 import { assembleShader } from './shader-loader.mjs';
+import {
+  deriveCardParams, parseCardParams, parseResLog2, reynoldsFromTau,
+  AMR_DEFAULT_RES_LOG2, AMR_DEFAULT_LEVELS,
+  tauAtLevel as tauAtLevelOf,
+} from './card-params.mjs';
+import { packF, unpackF, fWords } from './f-pack.mjs';
 
 const canvas   = document.getElementById('c');
+let deviceLost = false;
 const statusEl = document.getElementById('status');
 
 const urlParams = new URLSearchParams(window.location.search);
-let resLog2 = parseInt(urlParams.get('res')) || 8;
-if (resLog2 < 6) resLog2 = 6;
-if (resLog2 > 11) resLog2 = 11;
+// Default is one step below main.js's own default (resLog2=8, W=256) --
+// with the default levels=2, this reproduces the "lower far-field
+// resolution, the fine level recovers the body's resolution" AMR win via
+// the general BLOCKAGE/ASPECT/RE mechanism below (see the comment above
+// `let BLOCKAGE`), generalizing what used to be a hardcoded A=32,B=4 "half
+// of main.js's dense reference" special case.
+let resLog2 = parseResLog2(urlParams, AMR_DEFAULT_RES_LOG2);
 
 let W = 1 << resLog2;
 let H = W;
@@ -49,7 +60,24 @@ const NCELLS1 = FB * FB; // cells per pool slot
 // means sharper vorticity gradients per unit length, so wake demand should
 // go up, not down) -- while still costing less fine-pool memory (~4.0 MiB)
 // than the coarse grid's own buffers (~5.24 MiB at the default W=256).
-const MAX_FINE_BLOCKS = urlParams.has('maxFineBlocks') ? parseInt(urlParams.get('maxFineBlocks')) : 128;
+// RAISED 128 -> 256 together with the REFINE_THRESH retune above, and the
+// two must move together: at -9/-10 the measured L1 demand over 84k steps
+// was min 95 / median 112 / MAX 168, so leaving the cap at 128 would put the
+// pool into permanent exhaustion. That failure is not graceful -- blocks are
+// granted in blockID order, so the free list runs dry part-way through a row
+// and the denied blocks form horizontal BANDS across the refined region (see
+// the same failure diagnosed at 256^2 in the SDF commit). 256 gives ~1.5x
+// headroom over the measured peak.
+// 384, not 256. The 256 was sized from LATE-run demand (max 168 over 84k
+// steps), but the early transient is the peak: with caps effectively removed,
+// L1 demand rises to 182 around step 6k-12k before settling to ~110-130, and
+// one measured run reached 229. 256 left only ~1.1x headroom over that, and
+// running out is not graceful -- blocks are granted in blockID order, so the
+// free list dries up part-way through a row and the denied blocks form
+// horizontal BANDS across the refined region, which is the artifact this
+// whole thread started from. Level 2's demand is stable at 132-140 (verified
+// by varying its cap independently), so 256 there is ~1.8x and stays.
+const MAX_FINE_BLOCKS = urlParams.has('maxFineBlocks') ? parseInt(urlParams.get('maxFineBlocks')) : 384;
 const NBX = W / BLOCK, NBY = H / BLOCK, NBLOCKS = NBX * NBY; // coarse block grid
 
 // ── Milestone 5 (plans/AMR-multilevel.md, plans/AMR-multilevel-M5.md):
@@ -57,7 +85,7 @@ const NBX = W / BLOCK, NBY = H / BLOCK, NBLOCKS = NBX * NBY; // coarse block gri
 // to today's single-fine-level build (validated against a pre-M5
 // baseline -- see the sub-plan). N_LEVELS>=3 allocates additional
 // quadtree pool levels that no shader/dispatch reads yet (Milestone 6/7).
-const N_LEVELS = urlParams.has('levels') ? parseInt(urlParams.get('levels')) : 2;
+const N_LEVELS = urlParams.has('levels') ? parseInt(urlParams.get('levels')) : AMR_DEFAULT_LEVELS;
 if (N_LEVELS < 2) throw new Error(`?levels=${N_LEVELS} invalid -- must be >= 2 (L0 + at least one fine level)`);
 
 // ── Milestone 4b (plans/AMR.md): automatic vorticity-driven refinement ────
@@ -71,9 +99,63 @@ if (N_LEVELS < 2) throw new Error(`?levels=${N_LEVELS} invalid -- must be >= 2 (
 // -6/-7 reliably triggers refinement tracking the wake. Still expect to
 // retune as later milestones (larger domains, different A/B/tau) shift the
 // sim's operating range.
+// Readback pipeline depth. Each stage is one frame in flight, so this also
+// sets how many frames the app runs AHEAD of the readback -- at 250ms/frame
+// on mobile, STAGES=3 means ~750ms of submit-to-readback latency (measured
+// sync/gpu ~2.8-2.9, matching the depth) and three swapchain textures
+// outstanding at once.
+//
+// Exposed because it is the remaining in-app lever on the "view twitches
+// backward" report. Every simulation-side signal is clean -- step monotonic,
+// field digest never repeating, window offset smooth -- which leaves
+// PRESENTATION, and fewer frames in flight is less opportunity for the
+// compositor to present them out of order or drop them. It is also a large
+// latency win on a GPU-bound device, where the queue is full regardless, so
+// shallower staging may cost little throughput.
+//   ?stages=1  lowest latency, CPU waits on each readback
+//   ?stages=2  compromise
+//   ?stages=3  default, deepest pipeline
+const STAGES_CFG = Math.max(1, Math.min(4, urlParams.has('stages') ? parseInt(urlParams.get('stages')) : 3));
+
 const REFINE_EVERY = urlParams.has('refineEvery') ? parseInt(urlParams.get('refineEvery')) : 16;
-const REFINE_THRESH = urlParams.has('refineThresh') ? parseFloat(urlParams.get('refineThresh')) : -6;
-const COARSEN_THRESH = urlParams.has('coarsenThresh') ? parseFloat(urlParams.get('coarsenThresh')) : -7;
+// Vorticity refinement thresholds, log2|omega| per L0 block (see
+// amr_criterion.wgsl, which reduces max|omega| per block, and
+// amr_manage.wgsl's epsFor which does the comparison).
+//
+// RETUNED from -6/-7, which was leaving most of the shed wake unrefined.
+// Measured on one frozen flow state at res=8 levels=3, blockage=3.3
+// (1024 L0 blocks, domain max |omega| per block = 2.76e-2):
+//
+//   thresh   |omega| >=   blocks selected   % of wake (|omega|>=1e-3) covered
+//     -6       1.56e-2         14                    7%
+//     -7       7.81e-3         59                   29%
+//     -8       3.91e-3         91                   45%
+//     -9       1.95e-3        153                   76%
+//    -10       9.77e-4        202                  100%
+//
+// At -6 the bar sat at 57% of the DOMAIN MAXIMUM: only blocks carrying more
+// than half the peak vorticity anywhere got refined, which in practice meant
+// the body's immediate surroundings and nothing else. 68 of the 77 refined
+// blocks were coming from geometry forcing (isNearBody), not from this
+// criterion at all. A vortex shed from the card stayed refined only while
+// inside the body's geometric halo; once it convected out it dropped to L0
+// and dissipated, so a trail that is evenly spaced on the dense solver came
+// out of the AMR build with vortices MISSING -- the reported symptom.
+//
+// -9 covers 76% of vorticity-bearing blocks. -10 covers 100% but refines
+// ~20% of the whole domain, which starts giving back the point of AMR;
+// available via ?refineThresh=-10&coarsenThresh=-11 if fidelity matters more
+// than cost for a given run.
+//
+// CAVEAT worth knowing before re-tuning: an absolute threshold is
+// structurally fragile here. The domain peak |omega| was measured swinging
+// 2.4x (2.4e-2 .. 5.8e-2) across runs at identical nominal physics, purely
+// from where the card is in its tumble, so no single constant is right at
+// all phases. A criterion relative to the current domain maximum would be
+// scale- and phase-free; that is a design change to the refinement
+// machinery, not a retune, and has not been attempted.
+const REFINE_THRESH = urlParams.has('refineThresh') ? parseFloat(urlParams.get('refineThresh')) : -9;
+const COARSEN_THRESH = urlParams.has('coarsenThresh') ? parseFloat(urlParams.get('coarsenThresh')) : -10;
 
 // Geometry-forced refinement (see amr_manage.wgsl's isNearBody): blocks near
 // the card's SDF -- now or FORCE_REFINE_LOOKAHEAD macro-steps from now, by
@@ -81,11 +163,107 @@ const COARSEN_THRESH = urlParams.has('coarsenThresh') ? parseFloat(urlParams.get
 // coarsened, independent of the vorticity criterion above. Fixes the
 // "blunting" gap where a lagging vorticity signal leaves the card's own
 // sharp geometry on the coarse grid (e.g. the whole startup transient,
-// before any wake vorticity exists). Margin default (8 = one BLOCK) and
-// lookahead default (matches REFINE_EVERY, the re-evaluation cadence it's
-// meant to bridge) are starting points, not measured -- retune alongside
-// REFINE_THRESH/COARSEN_THRESH once exercised against a live run.
-const FORCE_REFINE_MARGIN = urlParams.has('forceRefineMargin') ? parseFloat(urlParams.get('forceRefineMargin')) : 8;
+// before any wake vorticity exists).
+//
+// MARGIN: 16, retuned from the original 8 (which its own comment flagged as
+// "a starting point, not measured"). This is the measured value; two things
+// make 8 too small.
+//
+// 1. isNearBody tests the block's CENTRE, not its nearest point. A BLOCK=8
+//    block's centre is up to 4*sqrt(2) ~ 5.66 cells from its own nearest
+//    corner, so a margin of M only GUARANTEES refinement out to M - 5.66.
+//    At M=8 that is 2.3 cells; measured coverage was indeed 100% only to
+//    phi ~ 2.5, decaying to 52% at phi=8 and 5% by phi=12.
+// 2. The boundary layer is thicker than that. Binning the field by distance
+//    from the surface at page defaults (Re=1067, A=32), the body-relative
+//    speed does not plateau until phi ~ 12-15 L0 cells, and |grad u| is
+//    still ~21% of its peak where coverage has already fallen to half.
+//
+// So the coarse/fine interface sat INSIDE the boundary layer, and blocks
+// flipped refined/coarse as the card translated past them -- the periodic
+// artifacts visible at block boundaries. Measured directly, as the ratio of
+// |d.omega| across level transitions to |d.omega| between same-level
+// neighbours at the same distance from the body:
+//
+//   margin=8   437 seam pairs inside phi<8, ratio 1.39x-1.86x at phi 5-8
+//   margin=16   38 seam pairs inside phi<8, ratio 1.02x  (artifact gone)
+//
+// The vorticity criterion cannot cover this gap on its own: measured BL
+// vorticity is ~2.7e-3 = 2^-8.5, well under REFINE_THRESH=-6 (2^-6), so it
+// never fires there and refinement near the body rests entirely on this
+// margin.
+//
+// Cost is ~nil today: active L1 blocks go 54 -> ~92 (median), still inside
+// the 128-slot default pool (max observed 100), and frame time is unchanged
+// (median 7.2ms -> 6.0-7.0ms across repeats) because every pool pass already
+// dispatches MAX_FINE_BLOCKS slots regardless of how many are active --
+// inactive slots early-out, so the work was already being paid for. Raising
+// MAX_FINE_BLOCKS *would* cost real time; raising this margin does not.
+//
+// Deliberately NOT applied to main-cylinder-amr.js, which has its own copy
+// of this constant, a different geometry/regime, and currently-passing
+// physics validation -- retuning it needs its own measurement. amr_manage.
+// wgsl's isNearBody is shared by both pages, so the centre-vs-corner
+// semantics are left alone rather than changed underneath the harness.
+// Refinement LADDER (shaders/common_refine.wgsl, AGAL Algorithm 3).
+// REFINE_THRESH above is the base rung -- the physical log2|omega| at which a
+// region earns its FIRST level of refinement. Each further level costs
+// N_REFINE_INC more octaves, so
+//     desired >= k   <=>   log2|omega|_physical >= REFINE_THRESH + INC*(k-1)
+// AGAL's own default INC is 1.0 (input/input.txt), i.e. one octave per level.
+// N_REFINE_MAX clamps the criterion from above, as AGAL does.
+const N_REFINE_INC = urlParams.has('refineInc') ? parseFloat(urlParams.get('refineInc')) : 1.0;
+const N_REFINE_MAX = urlParams.has('refineMax') ? parseFloat(urlParams.get('refineMax')) : 1.0;
+
+const FORCE_REFINE_MARGIN = urlParams.has('forceRefineMargin') ? parseFloat(urlParams.get('forceRefineMargin')) : 16;
+// get_phi returns a cheap LOWER BOUND once it exceeds SDF_FAR=64 (see
+// shaders/common_geometry.wgsl). That is exact for every consumer only while
+// all phi thresholds stay below it, and FORCE_REFINE_MARGIN is URL-settable,
+// so check rather than trust.
+// ?sdfFar= overrides get_phi's far-field early-out cutoff (see
+// shaders/common_geometry.wgsl). A very large value disables the early-out
+// entirely, which is the A/B for whether it helps or hurts on a given GPU.
+const SDF_FAR = urlParams.has('sdfFar') ? parseFloat(urlParams.get('sdfFar')) : 64;
+// ?f16=1 / ?f16=2: store `f` as packed half pairs (5 u32 words/cell instead of 9
+// f32s), cutting its traffic 1.80x. plans/perf-characterization.md measures
+// the phone as bandwidth bound with `f` as essentially all the traffic, and
+// settles the accuracy question by experiment -- see shaders/common_fpack.wgsl
+// for the layout and f-pack.mjs for the host side.
+//
+// DEFAULT OFF while it earns its place on real devices. Off is not merely
+// "the old numbers": F16=0 makes the shaders bitcast one f32 per u32, which
+// is byte-for-byte the previous layout, so it is the same computation and not
+// a second code path to keep honest.
+//
+// Buffer ALLOCATION is deliberately unchanged (still 9 words/cell) -- this is
+// a bandwidth change, not yet a footprint one. That keeps every
+// arrayLength(&f)/9u stride derivation in the shaders correct as-is and every
+// page's buffer sizing untouched; shrinking the allocation is a separate step
+// once this is proven.
+const F16 = urlParams.has('f16') ? (parseInt(urlParams.get('f16')) || 0) : 0;
+
+// ── ?ghostcopy=1 -- legacy materialized same-level ghost cells ───────────────
+// Default 0: the fine step resolves a source cell that falls outside its tile
+// against the owning same-level tile directly (blockSlot), so the
+// between-substep fine-fine ghost COPY pass is not encoded at all. Measured
+// worth 9.9% of frame GPU time on the desktop and 13.1% on the phone (the pass
+// itself was 16.7-17.5%; the fine step gives 3.6-7.5% of that back, since half
+// a tile's threads now pull from another slot's memory) -- see
+// plans/perf-characterization.md's "The one lead left" for the full
+// decomposition on both devices.
+//
+// 1 restores the old path exactly (clamp at the slot's own buffer edge, plus
+// the copy pass), so the two can be A/B'd for both speed and physics on one
+// build: `node tools/validate-all.js --extra=ghostcopy=1` runs the whole
+// validation sweep against the legacy path.
+const GHOST_COPY = urlParams.has('ghostcopy') ? (parseInt(urlParams.get('ghostcopy')) || 0) : 0;
+
+if (FORCE_REFINE_MARGIN >= SDF_FAR) {
+  throw new Error(`?forceRefineMargin=${FORCE_REFINE_MARGIN} is at or above get_phi's SDF_FAR cutoff (${SDF_FAR}) -- ` +
+    `beyond that the far-field early-out in shaders/common_geometry.wgsl returns a lower bound and isNearBody ` +
+    `would silently under-refine. Raise SDF_FAR together with it if you really need a margin this large.`);
+}
+
 const FORCE_REFINE_LOOKAHEAD = urlParams.has('forceRefineLookahead') ? parseFloat(urlParams.get('forceRefineLookahead')) : REFINE_EVERY;
 // L0 window-space edge band (coarse cells) excluded from vorticity-driven
 // refinement -- keeps fine blocks out of the ALBC sponge (amr_step.wgsl
@@ -113,6 +291,36 @@ function paramsForChildLevel(childLevel) {
     return { REFINE_THRESH, COARSEN_THRESH, FORCE_REFINE_MARGIN, FORCE_REFINE_LOOKAHEAD };
   }
   const get = (name, base) => urlParams.has(`${name}${childLevel}`) ? parseFloat(urlParams.get(`${name}${childLevel}`)) : base;
+  // LEVEL-CONSISTENT VORTICITY THRESHOLD.
+  //
+  // amr_criterion.wgsl and amr_criterion_pool.wgsl both reduce a raw
+  // lattice-cell velocity DIFFERENCE (`(u[x+1]-u[x-1])*0.5`) with no division
+  // by the cell size. AGAL, which this criterion is derived from, divides by
+  // the level's own dx (solver_lbm_criterion.cu: `.../(2.0*dx_L)`), making
+  // the criterion a physical velocity gradient that means the same thing at
+  // every level.
+  //
+  // Without that division, a level-m cell is 2^-m the size of an L0 cell, so
+  // the same PHYSICAL vorticity produces an omega 2^-m as large -- yet every
+  // level was compared against the same absolute threshold. Deeper levels
+  // were therefore systematically under-refined by 2^m: a level-1 block
+  // needed 2x the physical vorticity of an L0 block to earn level-2
+  // children, a level-2 block 4x. A vortex became LESS likely to keep its
+  // refinement the moment it got refined, which is the compounding form of
+  // the "shed vortices go missing" symptom.
+  //
+  // Correcting the threshold instead of the shader is exact, not an
+  // approximation: the comparison is log2(omega) >= THRESH, and
+  //   log2(omega_physical) = log2(omega_lattice / dx_m) = log2(omega_lattice) + m
+  // so requiring log2(omega_lattice) >= THRESH - m is identical to dividing
+  // by dx_m. m is the level the criterion is EVALUATED on, which for a
+  // decision about creating childLevel tiles is childLevel-1. childLevel===1
+  // is evaluated on L0 (m=0, dx=1) and is returned unchanged above, so the
+  // measured L0 tuning is untouched.
+  // NOTE: the per-level shift that used to live here is gone. The ladder in
+  // common_refine.wgsl now converts the criterion to physical units itself
+  // (amr_manage_pool.wgsl's toPhysical, from PARENT_CELL_SIZE_L0), so
+  // applying a shift here as well would correct it twice.
   return {
     REFINE_THRESH: get('refineThresh', REFINE_THRESH),
     COARSEN_THRESH: get('coarsenThresh', COARSEN_THRESH),
@@ -135,48 +343,43 @@ resSlider.oninput = () => {
 };
 
 // ── Pesavento & Wang (2004) physical parameters ───────────────────────────────
-// These constants define the "regime" of the simulation (Falling Paper).
-//
-// A/B are in COARSE-grid units, and are deliberately HALF of main.js's dense-
-// reference values (64,8) -- this is the AMR resource-savings fix: the card
-// is defined as a fine-level body (64,8-equivalent), and only appears at
-// that size where the refinement halo (see amr_manage.wgsl's isNearBody)
-// actually resolves it at 2x. Everywhere else, the same W x H coarse buffer
-// now spans a domain 2x wider (4x the area) in body-lengths for identical
-// coarse-grid memory, vs. always running the card at dense-equivalent size.
-let A = 32, B = 4;
-let I_STAR = 0.34;
-let TAU = 0.509;
-let U_T = 0.05;
+// Shared verbatim with main.js via card-params.mjs -- see that module's
+// header for why these live in one place rather than two, and for what each
+// quantity means. The property this page depends on specifically: because
+// card size and flow regime are resolution-independent (BLOCKAGE/ASPECT/RE)
+// rather than raw lattice-cell counts, pasting the same
+// ?blockage=&aspect=&re=&ut= onto this page and main.js's reproduces the
+// identical physical system. The AMR resource win is then purely a matter of
+// choosing a LOWER `res` here than on the dense page, with `levels`
+// recovering the missing resolution at the body -- generalizing what used to
+// be a hardcoded A=32,B=4 "half of main.js's dense reference" special case.
+// tools/test-card-params.js asserts that equivalence directly.
+let { BLOCKAGE, ASPECT, I_STAR, RE, U_T } = parseCardParams(urlParams);
 
-let RHO_B, MASS, I_BODY, G_LU, G_EFF;
+// Derived in recalculate() below. TAU here is this page's L0 (coarsest) tau;
+// every finer level's own tau follows from it via tauAtLevel().
+let A, B, TAU, RHO_B, MASS, I_BODY, G_LU, G_EFF;
 
 function recalculate() {
-  RHO_B  = I_STAR * 2 * A**3 / (B * (A**2 + B**2));
-  RHO_B  = Math.max(1.05, RHO_B);
-  MASS   = RHO_B * Math.PI * A * B;
-  I_BODY = RHO_B * Math.PI * A * B * (A**2 + B**2) / 4;
-  G_LU   = U_T**2 / (Math.PI * B * (RHO_B - 1));
-  G_EFF  = G_LU * (1 - 1 / RHO_B);
+  ({ A, B, TAU, RHO_B, MASS, I_BODY, G_LU, G_EFF } =
+    deriveCardParams({ W, BLOCKAGE, ASPECT, I_STAR, RE, U_T }));
 }
 recalculate();
 
-// ── Milestone 6 (plans/AMR-multilevel.md): recursive fine tau. L0's own
-// tau is TAU (the slider value, read live off CardState by the dense
-// shader). Every deeper level's tau is the same Dupuis-Chopard relation
-// amr_interp_dense_parent.wgsl already applies once (tau_fine =
-// 2*tau_coarse - 0.5), just walked m times -- tauAtLevel(0) is L0's own
-// tau, tauAtLevel(1) is L1's (what amr_interp_pool_parent.wgsl needs as
-// `parentTau` when interpolating L1->L2), etc. Plain JS, not a GPU
-// readback -- TAU is already a live JS variable the slider mutates
-// directly, so this needs no round-trip.
+// ── Milestone 6 (plans/AMR-multilevel.md): recursive fine tau. L0's own tau
+// is TAU (read live off CardState by the dense shader); every deeper level
+// applies the Dupuis-Chopard relation amr_interp_dense_parent.wgsl already
+// uses once (tau_fine = 2*tau_coarse - 0.5), walked m times. tauAtLevel(0)
+// is L0's own tau, tauAtLevel(1) is L1's (what amr_interp_pool_parent.wgsl
+// needs as `parentTau` when interpolating L1->L2), etc. Plain JS, not a GPU
+// readback -- TAU is already a live JS variable the slider mutates directly.
+// Thin wrapper over card-params.mjs's pure tauAtLevelOf(tau0, m) so callers
+// here keep the existing one-argument form against the live TAU.
 function tauAtLevel(m) {
-  let t = TAU;
-  for (let i = 0; i < m; i++) t = 2 * t - 0.5;
-  return t;
+  return tauAtLevelOf(TAU, m);
 }
 
-const FSCALE  = 1e4;
+const FSCALE  = 1e7;
 
 const EX = [0, 1, 0,-1, 0, 1,-1,-1, 1];
 const EY = [0, 0, 1, 0,-1, 1, 1,-1,-1];
@@ -302,7 +505,10 @@ function allocLevelPool(device, U, m, NBX_m, NBY_m, maxFineBlocks) {
     fSizePool: fSizePool_m,
     finePoolF_a: device.createBuffer({ size: fSizePool_m, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC }),
     finePoolF_b: device.createBuffer({ size: fSizePool_m, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC }),
-    finePoolVel: device.createBuffer({ size: maxFineBlocks * NCELLS1 * 2 * 4, usage: U.STORAGE | U.COPY_SRC }),
+    // COPY_DST is load-bearing, not boilerplate: debugSnapshotLoad writes
+    // this buffer via queue.writeBuffer, which is a validation error --
+    // silently discarded -- without it. See velBuf's own note below.
+    finePoolVel: device.createBuffer({ size: maxFineBlocks * NCELLS1 * 2 * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC }),
     blockSlotBuf: device.createBuffer({ size: NBLOCKS_m * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC }),
     slotToBlockBuf: device.createBuffer({ size: maxFineBlocks * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC }),
     blockCriterionBuf: device.createBuffer({ size: NBLOCKS_m * 4, usage: U.STORAGE | U.COPY_DST }),
@@ -399,7 +605,18 @@ async function init() {
   // Milestone 6 needs real per-level GPU timing; leave this on for the AMR
   // dev build from the start (main.js keeps it off with `0 &&` -- don't
   // touch that file, this is deliberately different here).
-  const hasTimestamp = 0 && adapter.features.has('timestamp-query');
+  // GPU-side timing. Restored from a `0 &&` hard-disable (commit 30c9e86,
+  // "Nerf timestamp for mobile") which threw away desktop timing to
+  // accommodate mobile -- but the feature test on this same line already
+  // handles that: an adapter without 'timestamp-query' simply reports
+  // wall-clock instead. The reason it had to be disabled rather than merely
+  // feature-detected is that the old code used encoder.writeTimestamp(),
+  // which was REMOVED from WebGPU (it needed the
+  // chromium-experimental-timestamp-query-inside-passes flag); the supported
+  // form is timestampWrites in a pass descriptor, which is what is used
+  // below. Without this, "GPU" and "SYNC" in the overlay were the same
+  // wall-clock number wearing two labels.
+  const hasTimestamp = adapter.features.has('timestamp-query');
 
   // WebGPU devices default to the spec MINIMUM limits (128 MiB storage
   // buffer bindings, 256 MiB total buffer size) regardless of what the
@@ -448,28 +665,66 @@ async function init() {
     requiredLimits,
   });
 
+  // Slots 0/1 are the whole-frame span. 2..QUERY_CAP-1 are for
+  // debugProfileMacroStep's per-pass breakdown (2 per pass), which is what
+  // makes dispatch work attributable rather than guessed at. One macro-step
+  // is ~9 passes at N=2 and ~20 at N=3, rising to ~32 on a refine step, so
+  // 128 slots leaves generous headroom.
+  const QUERY_CAP = 128;
   const querySet = hasTimestamp ? device.createQuerySet({
     type: 'timestamp',
-    count: 2
+    count: QUERY_CAP
   }) : null;
   const queryResolveBuffer = hasTimestamp ? device.createBuffer({
-    size: 16,
+    size: QUERY_CAP * 8,
     usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC
   }) : null;
-  const queryReadBuffer = hasTimestamp ? device.createBuffer({
-    size: 16,
-    usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
-  }) : null;
+
+  // A backgrounded tab on mobile is a common way to lose the GPU device, and
+  // nothing here was watching for it: on loss every subsequent submit is
+  // silently ignored, the frame loop keeps spinning, and the page just stops
+  // advancing with no indication why. Surface it instead. `reason ===
+  // 'destroyed'` is our own teardown and is not an error.
+  device.lost.then((info) => {
+    if (info.reason === 'destroyed') return;
+    deviceLost = true;
+    statusEl.textContent = `error: GPU device lost (${info.reason}) -- ${info.message || 'no message'}. Reload to restart.`;
+    statusEl.style.color = '#f77';
+    console.error('WebGPU device lost:', info);
+  });
 
   device.pushErrorScope('validation');
 
   const ctx = canvas.getContext('webgpu');
   const fmt = navigator.gpu.getPreferredCanvasFormat();
 
+  // Reconfigure ONLY on a real size change. This used to run unconditionally
+  // on every `resize` event, and both halves of it are destructive:
+  // assigning canvas.width/height resets the drawing buffer even when the
+  // value is unchanged, and ctx.configure() replaces the swapchain,
+  // invalidating textures that in-flight command buffers still reference
+  // (this page keeps up to STAGES frames in flight).
+  //
+  // On desktop `resize` fires when you resize the window, so the cost was
+  // invisible. On a PHONE it fires constantly -- the URL bar hides and shows
+  // on any scroll or drag, which includes touching the control sliders --
+  // so the swapchain was being torn down and rebuilt underneath frames that
+  // were already submitted. Reported symptom: the view "twitches back" a few
+  // frames, correlated with moving sliders or switching away and back.
+  //
+  // Also guards the degenerate case: clientWidth/Height read 0 during some
+  // layout transitions (and while hidden), and a 0-sized canvas is not a
+  // valid configuration.
+  let cfgW = 0, cfgH = 0;
   function resize() {
     const dpr = window.devicePixelRatio || 1;
-    canvas.width  = Math.round(canvas.clientWidth * dpr);
-    canvas.height = Math.round(canvas.clientHeight * dpr);
+    const w = Math.round(canvas.clientWidth * dpr);
+    const h = Math.round(canvas.clientHeight * dpr);
+    if (w <= 0 || h <= 0) return;      // mid-layout / hidden: nothing to configure
+    if (w === cfgW && h === cfgH) return; // same size: reconfiguring is pure damage
+    cfgW = w; cfgH = h;
+    canvas.width = w;
+    canvas.height = h;
     ctx.configure({ device, format: fmt, alphaMode: 'opaque' });
   }
   window.addEventListener('resize', resize);
@@ -484,7 +739,14 @@ async function init() {
   // already bit the vpm branch once (commit 83d3c8c).
   const f_a     = device.createBuffer({ size: fSize, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
   const f_b     = device.createBuffer({ size: fSize, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
-  const velBuf  = device.createBuffer({ size: NCELLS * 2 * 4, usage: U.STORAGE | U.COPY_SRC });
+  // COPY_DST: debugSnapshotLoad restores this with queue.writeBuffer.
+  // Without the flag that write is a validation error and is silently
+  // dropped, so a loaded snapshot keeps whatever ux/uy were already there.
+  // The load path's own comment already describes this exact symptom
+  // ("rho round-tripped exactly, but ux/uy didn't -- the asymmetry was the
+  // tell") -- the writeBuffer call was added then, but the usage flag was
+  // not, so the fix never actually took effect.
+  const velBuf  = device.createBuffer({ size: NCELLS * 2 * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
   const forceBuf = device.createBuffer({ size: 16, usage: U.STORAGE | U.COPY_SRC | U.COPY_DST });
   // Milestone 8: harmless placeholder for a "child level's blockSlot"
   // binding when no such level actually exists in this configuration (the
@@ -513,22 +775,43 @@ async function init() {
   // that, per plans/AMR-multilevel-M5.md's explicit non-goal, only ever
   // handles level 1 until Milestone 10.
   const fSizePool = MAX_FINE_BLOCKS * NCELLS1 * 9 * 4;
+
+  // The ONLY two places the GPU's `f` layout and everyone else's meet.
+  // Everything outside the GPU -- the initial equilibrium, the snapshot
+  // format, the diagnostics below, and every tool under tools/ -- speaks f32
+  // plane-major, unconditionally. Under F16 the GPU buffer holds packed half
+  // pairs instead, so it is converted here on the way in and back on the way
+  // out, and nothing downstream has to know. See f-pack.mjs for why that is
+  // the boundary rather than teaching every consumer a second format.
+  //
+  // With F16 off both are the identity plus the copy the old code already
+  // did, so this is not a new cost on the default path.
+  const writeF = (buf, f32, ncells) => {
+    const src = packF(f32, ncells, F16);
+    device.queue.writeBuffer(buf, 0, src.buffer, src.byteOffset, ncells * fWords(F16) * 4);
+  };
+  const readF = (mapped, ncells) =>
+    F16 ? unpackF(new Uint32Array(mapped), ncells, true) : new Float32Array(mapped).slice();
   const pools = [undefined]; // pools[0] unused -- L0 is the dense grid, not a pool level
   {
     let curNBX = NBX, curNBY = NBY; // level 1's logical grid = today's coarse block grid
     for (let m = 1; m < N_LEVELS; m++) {
       const maxFineBlocks = m === 1
         ? MAX_FINE_BLOCKS // unchanged param/default -- level 1 is byte-identical to today
-        : (urlParams.has(`maxFineBlocks${m}`) ? parseInt(urlParams.get(`maxFineBlocks${m}`)) : 128);
+        // 256, not 128: measured L2 demand at the retuned thresholds peaked
+        // at 136 over 84k steps, and at res=8 levels=3 the old 128 default
+        // saturated outright (128/128 active). See MAX_FINE_BLOCKS above for
+        // why exhaustion here shows up as horizontal bands.
+        : (urlParams.has(`maxFineBlocks${m}`) ? parseInt(urlParams.get(`maxFineBlocks${m}`)) : 256);
       const pool = allocLevelPool(device, U, m, curNBX, curNBY, maxFineBlocks);
-      device.queue.writeBuffer(pool.finePoolF_a, 0, initFPool(maxFineBlocks));
+      writeF(pool.finePoolF_a, initFPool(maxFineBlocks), maxFineBlocks * NCELLS1);
       pools.push(pool);
       curNBX *= 2; curNBY *= 2; // next level's logical grid extent (quadtree doubling per axis)
     }
   }
 
   device.queue.writeBuffer(cardStateBuf, 0, initCardState());
-  device.queue.writeBuffer(f_a, 0, initF());
+  writeF(f_a, initF(), NCELLS);
   // pools[1].finePoolF_a's equilibrium pre-fill, and blockSlotBuf/
   // slotToBlockBuf's -1 fill, already happened above in allocLevelPool
   // (uniformly for every level, not just level 1 -- see its own comment).
@@ -577,23 +860,49 @@ async function init() {
     updateLevelParams(); // TAU changed -- every level's recursive tau shifts too
   };
 
-  const sliders = [
-    { id: 'A', setter: v => A = v, dp: 0 },
-    { id: 'B', setter: v => B = v, dp: 0 },
-    { id: 'I_STAR', setter: v => I_STAR = v, dp: 2 },
-    { id: 'TAU', setter: v => TAU = v, dp: 3 },
-    { id: 'U_T', setter: v => U_T = v, dp: 3 },
-  ];
-  sliders.forEach(s => {
-    const el = document.getElementById(`slider-${s.id}`);
-    const valEl = document.getElementById(`val-${s.id}`);
-    el.oninput = () => {
-      s.setter(parseFloat(el.value));
-      valEl.textContent = el.value;
-      recalculate();
-      paramsDirty = true;
-    };
-  });
+  // See main.js's identical block for the full rationale: RE is the
+  // canonical flow-regime state, TAU is the one control that goes the other
+  // way (dragging it back-solves RE first).
+  const blockageEl = document.getElementById('slider-BLOCKAGE');
+  const aspectEl   = document.getElementById('slider-ASPECT');
+  const iStarEl    = document.getElementById('slider-I_STAR');
+  const reEl       = document.getElementById('slider-RE');
+  const tauEl      = document.getElementById('slider-TAU');
+  const utEl       = document.getElementById('slider-U_T');
+
+  // Show the control's OWN value first, then the lattice-unit quantity it
+  // derives -- see main.js's identical block for why the derived-only form
+  // this replaces was actively misleading.
+  const refreshDerivedReadouts = () => {
+    document.getElementById('val-BLOCKAGE').textContent = `${BLOCKAGE.toFixed(1)} (A=${A.toFixed(1)})`;
+    document.getElementById('val-ASPECT').textContent = `${ASPECT.toFixed(3)} (B=${B.toFixed(1)})`;
+    document.getElementById('val-I_STAR').textContent = I_STAR.toFixed(2);
+    document.getElementById('val-RE').textContent = Math.round(RE);
+    document.getElementById('val-TAU').textContent = TAU.toFixed(4);
+    document.getElementById('val-U_T').textContent = U_T.toFixed(3);
+  };
+
+  blockageEl.oninput = () => { BLOCKAGE = parseFloat(blockageEl.value); recalculate(); refreshDerivedReadouts(); paramsDirty = true; };
+  aspectEl.oninput   = () => { ASPECT   = parseFloat(aspectEl.value);   recalculate(); refreshDerivedReadouts(); paramsDirty = true; };
+  iStarEl.oninput    = () => { I_STAR   = parseFloat(iStarEl.value);    recalculate(); refreshDerivedReadouts(); paramsDirty = true; };
+  utEl.oninput       = () => { U_T      = parseFloat(utEl.value);       recalculate(); refreshDerivedReadouts(); paramsDirty = true; };
+  reEl.oninput       = () => { RE       = parseFloat(reEl.value);       recalculate(); refreshDerivedReadouts(); paramsDirty = true; };
+  tauEl.oninput      = () => {
+    const tau = parseFloat(tauEl.value);
+    RE = reynoldsFromTau(tau, A, U_T);
+    reEl.value = RE;
+    recalculate();
+    refreshDerivedReadouts();
+    paramsDirty = true;
+  };
+
+  blockageEl.value = BLOCKAGE;
+  aspectEl.value   = ASPECT;
+  iStarEl.value    = I_STAR;
+  reEl.value       = RE;
+  tauEl.value      = TAU;
+  utEl.value       = U_T;
+  refreshDerivedReadouts();
 
   // Refinement-coverage (green) overlay opacity. Render-only; does not affect
   // the simulation. Writing the uniform takes effect on the next frame.
@@ -620,11 +929,12 @@ async function init() {
     };
   }
 
-  const [stepSM, frcSM, phySM, renSM, interpDenseSM, interpPoolSM, step1SM, step1PoolSM, avgSM, avgPoolSM, criterionSM, manageSM, force1SM, force1PoolSM, criterionPoolSM, managePoolSM] = await Promise.all([
+  const [stepSM, frcSM, phySM, renSM, digestSM, interpDenseSM, interpPoolSM, step1SM, step1PoolSM, avgSM, avgPoolSM, criterionSM, manageSM, force1SM, force1PoolSM, criterionPoolSM, managePoolSM] = await Promise.all([
     loadShader(device, 'shaders/amr_step.wgsl'),
     loadShader(device, 'shaders/amr_force.wgsl'),
     loadShader(device, 'shaders/amr_physics.wgsl'),
     loadShader(device, 'shaders/amr_render.wgsl'),
+    loadShader(device, 'shaders/amr_digest.wgsl'),
     loadShader(device, 'shaders/amr_interp_dense_parent.wgsl'),
     // Milestone 6: sibling shader for every L(m)->L(m+1) hop with m>=1 --
     // see shaders/amr_interp_pool_parent.wgsl's header for the addressing
@@ -772,7 +1082,11 @@ async function init() {
     { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
     { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-    { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }
+    { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    // binding 5: blockSlot -- neighbour-addressed streaming (see the
+    // DIRECT_GHOST override in shaders/amr_step1.wgsl). Present in the layout
+    // even under ?ghostcopy=1, where the shader simply never reads it.
+    { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }
   ]});
   const avgBGL = device.createBindGroupLayout({ label: 'avgBGL', entries: [
     { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
@@ -793,7 +1107,9 @@ async function init() {
     { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } }
+    { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+    // binding 8: blockSlot -- see step1BGL's binding 5.
+    { binding: 8, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }
   ]});
   // Milestone 7: level>=2 average, writing into a parent POOL tile via
   // parentSlot/quadrant instead of cellIndex() -- see
@@ -833,30 +1149,37 @@ async function init() {
     { binding: 8, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }
   ]});
 
-  const constants = { W, H };
-  const fineConstants = { W, H, RB };
+  const constants = { W, H, SDF_FAR };
+  // Same, plus the packed-f layout selector. Separate object because
+  // `constants` is also fed to phy/render, whose modules don't declare F16 --
+  // and WebGPU makes passing an undeclared override a pipeline-creation
+  // error, not a warning. Every pipeline whose shader @includes
+  // common_fpack.wgsl must get F16; no other pipeline may.
+  const fConstants = { ...constants, F16 };
+  const fineConstants = { W, H, RB, F16 };
   // Render fragment needs HAS_LEVEL2 to gate the level-2 override; keep it
   // separate from fineConstants, which is also fed to the avg compute
   // pipeline (whose shader has no HAS_LEVEL2 override).
   const renderConstants = { W, H, RB, HAS_LEVEL2: N_LEVELS > 2 ? 1 : 0 };
   // GHOST_ONLY=1: steady-state ghost-only reinterpolation (every macro-step).
   // GHOST_ONLY=0: full-slot fill, used once on block activation (see debugActivateBlock).
-  const interpConstants = { W, H, RB, GHOST_ONLY: 1 };
-  const interpInitConstants = { W, H, RB, GHOST_ONLY: 0 };
+  const interpConstants = { W, H, RB, GHOST_ONLY: 1, F16 };
+  const interpInitConstants = { W, H, RB, GHOST_ONLY: 0, F16 };
   // Between-substep fine-fine-only ghost re-exchange (see amr_interp_c2f.wgsl's
   // FINE_FINE_ONLY note and the dispatch between f1a/f1b below).
-  const interpFFConstants = { W, H, RB, GHOST_ONLY: 1, FINE_FINE_ONLY: 1 };
-  const step1Constants = { W, H, RB };
+  const interpFFConstants = { W, H, RB, GHOST_ONLY: 1, FINE_FINE_ONLY: 1, F16 };
+  const step1Constants = { W, H, RB, SDF_FAR, F16, DIRECT_GHOST: GHOST_COPY ? 0 : 1 };
   const criterionConstants = { W, H };
-  const manageConstants = { W, H, REFINE_THRESH, COARSEN_THRESH, FORCE_REFINE_MARGIN, FORCE_REFINE_LOOKAHEAD, SPONGE_EXCLUDE_W, HAS_LEVEL2: N_LEVELS > 2 ? 1 : 0 };
+  const manageConstants = { W, H, SDF_FAR, REFINE_THRESH, COARSEN_THRESH, FORCE_REFINE_MARGIN, FORCE_REFINE_LOOKAHEAD, SPONGE_EXCLUDE_W, HAS_LEVEL2: N_LEVELS > 2 ? 1 : 0,
+    N_REFINE_INC, N_REFINE_MAX, MAX_LEVEL: N_LEVELS - 1 };
 
   const stepPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [stepBGL] }),
-    compute: { module: stepSM, entryPoint: 'main', constants }
+    compute: { module: stepSM, entryPoint: 'main', constants: fConstants }
   });
   const frcPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [frcBGL] }),
-    compute: { module: frcSM, entryPoint: 'main', constants }
+    compute: { module: frcSM, entryPoint: 'main', constants: fConstants }
   });
   const phyPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [phyBGL] }),
@@ -892,9 +1215,9 @@ async function init() {
   // runtime uniform (levelParams), not baked into the pipeline, precisely
   // so ONE compiled pipeline object is reusable across every L(m)->L(m+1)
   // pair (see shaders/amr_interp_pool_parent.wgsl's header).
-  const interpPoolConstants = { RB, GHOST_ONLY: 1 };
-  const interpPoolInitConstants = { RB, GHOST_ONLY: 0 };
-  const interpPoolFFConstants = { RB, GHOST_ONLY: 1, FINE_FINE_ONLY: 1 };
+  const interpPoolConstants = { RB, GHOST_ONLY: 1, F16 };
+  const interpPoolInitConstants = { RB, GHOST_ONLY: 0, F16 };
+  const interpPoolFFConstants = { RB, GHOST_ONLY: 1, FINE_FINE_ONLY: 1, F16 };
   const interpPoolParentPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [interpPoolParentBGL] }),
     compute: { module: interpPoolSM, entryPoint: 'main', constants: interpPoolConstants }
@@ -926,22 +1249,61 @@ async function init() {
   });
   const avgPoolPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [avgPoolBGL] }),
-    compute: { module: avgPoolSM, entryPoint: 'main', constants: { RB } }
+    compute: { module: avgPoolSM, entryPoint: 'main', constants: { RB, F16 } }
   });
+  // ── Measurement-instrument pipeline twins (see benchSkip below) ──────────
+  // Built unconditionally but only ever bound when the matching ?benchSkip=
+  // group is set, so the normal dispatch path is untouched. Each is the SAME
+  // shader module as its real counterpart with one override constant flipped,
+  // which is what keeps them honest: a variant compiled from different source
+  // could differ for reasons unrelated to the thing being measured (the trap
+  // ?quantF16 fell into -- see plans/perf-characterization.md).
+  //
+  // *-noop: pass still encoded and dispatched at full width, returns before
+  // touching any buffer. Difference vs. skipping the pass outright is the
+  // fixed per-pass cost; the remainder is the work. See the NOOP override in
+  // shaders/amr_interp_*.wgsl / amr_average_*.wgsl for the measured split.
+  const noopPLs = {
+    interpDense:  device.createComputePipeline({ layout: device.createPipelineLayout({ bindGroupLayouts: [interpBGL] }),           compute: { module: interpDenseSM, entryPoint: 'main', constants: { ...interpConstants,       NOOP: 1 } } }),
+    interpPool:   device.createComputePipeline({ layout: device.createPipelineLayout({ bindGroupLayouts: [interpPoolParentBGL] }), compute: { module: interpPoolSM,  entryPoint: 'main', constants: { ...interpPoolConstants,   NOOP: 1 } } }),
+    avg:          device.createComputePipeline({ layout: device.createPipelineLayout({ bindGroupLayouts: [avgBGL] }),              compute: { module: avgSM,         entryPoint: 'main', constants: { ...fineConstants,        NOOP: 1 } } }),
+    avgPool:      device.createComputePipeline({ layout: device.createPipelineLayout({ bindGroupLayouts: [avgPoolBGL] }),          compute: { module: avgPoolSM,     entryPoint: 'main', constants: { RB, F16,                 NOOP: 1 } } }),
+  };
+  // step1-ring: fine step over the tile INTERIOR only, skipping the ghost
+  // ring -- a proxy for FB 20 -> 16. See the SKIP_GHOST override in
+  // shaders/amr_step1.wgsl for what it measured and what it corrects.
+  const ringPLs = {
+    step1:     device.createComputePipeline({ layout: device.createPipelineLayout({ bindGroupLayouts: [step1BGL] }),     compute: { module: step1SM,     entryPoint: 'main', constants: { ...step1Constants, SKIP_GHOST: 1 } } }),
+    step1Pool: device.createComputePipeline({ layout: device.createPipelineLayout({ bindGroupLayouts: [step1PoolBGL] }), compute: { module: step1PoolSM, entryPoint: 'main', constants: { ...step1Constants, SKIP_GHOST: 1 } } }),
+  };
+  // ghostcopy: the legacy materialized-same-level-ghost path (DIRECT_GHOST=0
+  // plus the fine-fine copy pass re-encoded), as a bench CONFIGURATION rather
+  // than only a page-load flag. That matters on the phone, which gets one
+  // sweep per session and whose medians are worthless across sessions because
+  // it thermally ramps 24-57% -- ?bench=1 interleaves its configurations
+  // within one run, so this is the only way to A/B the change there at all.
+  // Note the sign: this config is SLOWER than the baseline, so its reported
+  // share is negative, and the magnitude is what neighbour-addressed streaming
+  // buys. Same module, one override flipped -- see the noopPLs comment on why
+  // a variant compiled from different source would not be honest.
+  const legacyGhostPLs = {
+    step1:     device.createComputePipeline({ layout: device.createPipelineLayout({ bindGroupLayouts: [step1BGL] }),     compute: { module: step1SM,     entryPoint: 'main', constants: { ...step1Constants, DIRECT_GHOST: 0 } } }),
+    step1Pool: device.createComputePipeline({ layout: device.createPipelineLayout({ bindGroupLayouts: [step1PoolBGL] }), compute: { module: step1PoolSM, entryPoint: 'main', constants: { ...step1Constants, DIRECT_GHOST: 0 } } }),
+  };
   // Milestone 8: level 1's own force pass. HAS_CHILD is baked in at
   // pipeline-creation time -- level 1 has exactly one dedicated pipeline
   // (not shared across levels), so whether level 2 exists is fixed for the
   // whole session (see amr_force1.wgsl's header).
   const force1PL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [force1BGL] }),
-    compute: { module: force1SM, entryPoint: 'main', constants: { W, H, RB, HAS_CHILD: N_LEVELS > 2 ? 1 : 0 } }
+    compute: { module: force1SM, entryPoint: 'main', constants: { W, H, RB, HAS_CHILD: N_LEVELS > 2 ? 1 : 0, F16 } }
   });
   // Milestone 8: level>=2's own force pass, one pipeline reused across
   // every such level (no per-level overrides -- hasChild/dxL are runtime
   // LevelParams reads, see amr_force1_pool.wgsl's header).
   const force1PoolPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [force1PoolBGL] }),
-    compute: { module: force1PoolSM, entryPoint: 'main', constants: { W, H, RB } }
+    compute: { module: force1PoolSM, entryPoint: 'main', constants: { W, H, RB, F16 } }
   });
   const criterionPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [criterionBGL] }),
@@ -983,12 +1345,13 @@ async function init() {
     // are needed here -- just whether that level exists at all.
     const hasGrandchild = (m + 2) < N_LEVELS;
     const poolConstants = {
-      W, H, RB,
+      W, H, RB, SDF_FAR,
       NBX_PARENT: parentPool.NBX, NBY_PARENT: parentPool.NBY,
       PARENT_CELL_SIZE_L0: cellSizeL0AtLevel(m),
       PARENT_HAS_CACHED_ORIGIN: parentIsDense ? 0 : 1,
       SPONGE_EXCLUDE_W,
       ...childParams,
+      N_REFINE_INC, N_REFINE_MAX, MAX_LEVEL: N_LEVELS - 1,
       HAS_GRANDCHILD: hasGrandchild ? 1 : 0,
     };
     criterionPoolPLs[m] = device.createComputePipeline({
@@ -1019,6 +1382,24 @@ async function init() {
   // uniform from overlayOpacityBuf's fill).
   const outlineOpacityBuf = device.createBuffer({ size: 4, usage: U.UNIFORM | U.COPY_DST });
   device.queue.writeBuffer(outlineOpacityBuf, 0, new Float32Array([0.0]));
+  // Field digest (see shaders/amr_digest.wgsl): one dispatch per rendered
+  // frame that fingerprints the L0 velocity field, so the watchdog can tell
+  // whether a frame ever reproduces an EARLIER frame's field -- which
+  // ordinary dynamics never does, but showing a stale buffer would.
+  const digestBuf = device.createBuffer({ size: 16, usage: U.STORAGE | U.COPY_SRC });
+  const digestBGL = device.createBindGroupLayout({ entries: [
+    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+  ]});
+  const digestBG = device.createBindGroup({ layout: digestBGL, entries: [
+    { binding: 0, resource: { buffer: velBuf } },
+    { binding: 1, resource: { buffer: digestBuf } },
+  ]});
+  const digestPL = device.createComputePipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [digestBGL] }),
+    compute: { module: digestSM, entryPoint: 'main', constants: { NCELLS } },
+  });
+
   const renBG = device.createBindGroup({ layout: renBGL, entries: [{ binding: 0, resource: { buffer: velBuf } }, { binding: 1, resource: { buffer: cardStateBuf } }, { binding: 2, resource: { buffer: pools[1].finePoolVel } }, { binding: 3, resource: { buffer: pools[1].blockSlotBuf } }, { binding: 4, resource: { buffer: overlayOpacityBuf } }, { binding: 5, resource: { buffer: N_LEVELS > 2 ? pools[2].finePoolVel : pools[1].finePoolVel } }, { binding: 6, resource: { buffer: N_LEVELS > 2 ? pools[2].blockSlotBuf : dummyBlockSlotBuf } }, { binding: 7, resource: { buffer: outlineOpacityBuf } }]});
 
   // Milestone 4 bind groups (pool-aware, superseding M2's single-region ones).
@@ -1031,8 +1412,8 @@ async function init() {
   // Fine ping-pong within a macro-step is a fixed 2-call sequence (ab then
   // ba), not a persistent toggle like the coarse useB -- always call both,
   // in order, every macro-step.
-  const step1BG_ab = device.createBindGroup({ layout: step1BGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: pools[1].finePoolF_a } }, { binding: 2, resource: { buffer: pools[1].finePoolF_b } }, { binding: 3, resource: { buffer: pools[1].finePoolVel } }, { binding: 4, resource: { buffer: pools[1].slotToBlockBuf } }]});
-  const step1BG_ba = device.createBindGroup({ layout: step1BGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: pools[1].finePoolF_b } }, { binding: 2, resource: { buffer: pools[1].finePoolF_a } }, { binding: 3, resource: { buffer: pools[1].finePoolVel } }, { binding: 4, resource: { buffer: pools[1].slotToBlockBuf } }]});
+  const step1BG_ab = device.createBindGroup({ layout: step1BGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: pools[1].finePoolF_a } }, { binding: 2, resource: { buffer: pools[1].finePoolF_b } }, { binding: 3, resource: { buffer: pools[1].finePoolVel } }, { binding: 4, resource: { buffer: pools[1].slotToBlockBuf } }, { binding: 5, resource: { buffer: pools[1].blockSlotBuf } }]});
+  const step1BG_ba = device.createBindGroup({ layout: step1BGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: pools[1].finePoolF_b } }, { binding: 2, resource: { buffer: pools[1].finePoolF_a } }, { binding: 3, resource: { buffer: pools[1].finePoolVel } }, { binding: 4, resource: { buffer: pools[1].slotToBlockBuf } }, { binding: 5, resource: { buffer: pools[1].blockSlotBuf } }]});
   // Fine-fine-only ghost re-exchange, run BETWEEN f1a and f1b. f1a writes the
   // post-substep-1 pool into pools[1].finePoolF_b (the buffer f1b then reads), so this
   // refreshes each block's fine-fine seam ghosts IN PLACE in pools[1].finePoolF_b from
@@ -1143,6 +1524,7 @@ async function init() {
       { binding: 5, resource: { buffer: childPool.originXBuf } },
       { binding: 6, resource: { buffer: childPool.originYBuf } },
       { binding: 7, resource: { buffer: childPool.levelParamsBuf } },
+      { binding: 8, resource: { buffer: childPool.blockSlotBuf } },
     ]});
     childPool.step1PoolBG_ba = device.createBindGroup({ layout: step1PoolBGL, entries: [
       { binding: 0, resource: { buffer: cardStateBuf } },
@@ -1153,6 +1535,7 @@ async function init() {
       { binding: 5, resource: { buffer: childPool.originXBuf } },
       { binding: 6, resource: { buffer: childPool.originYBuf } },
       { binding: 7, resource: { buffer: childPool.levelParamsBuf } },
+      { binding: 8, resource: { buffer: childPool.blockSlotBuf } },
     ]});
 
     const avgEntries = (parentBuf) => [
@@ -1232,9 +1615,10 @@ async function init() {
   };
 
   // Triple-buffering for readbacks to avoid CPU-GPU stalls
-  const STAGES = 3;
+  const STAGES = STAGES_CFG;
   const stages = Array.from({ length: STAGES }, () => ({
-    card: device.createBuffer({ size: 104, usage: U.MAP_READ | U.COPY_DST }),
+    // 104 bytes of CardState + 16 bytes of field digest, read back together
+    card: device.createBuffer({ size: 120, usage: U.MAP_READ | U.COPY_DST }),
     query: hasTimestamp ? device.createBuffer({ size: 16, usage: U.MAP_READ | U.COPY_DST }) : null,
     inFlight: false,
     step: 0
@@ -1307,10 +1691,10 @@ async function init() {
     for (const st of levelStaging) allBuffers.push(st.f, st.vel, st.blockSlot, st.slotToBlock, st.parentSlot, st.quadrant, st.originX, st.originY);
     await Promise.all(allBuffers.map(b => b.mapAsync(GPUMapMode.READ)));
 
-    const f = new Float32Array(stagingF.getMappedRange()).slice();
+    const f = readF(stagingF.getMappedRange(), NCELLS);
     const vel = new Float32Array(stagingVel.getMappedRange()).slice();
     const card = Array.from(new Float32Array(stagingCard.getMappedRange()).slice());
-    const fPool = new Float32Array(stagingFPool.getMappedRange()).slice();
+    const fPool = readF(stagingFPool.getMappedRange(), MAX_FINE_BLOCKS * NCELLS1);
     const velPool = new Float32Array(stagingVelPool.getMappedRange()).slice();
     const blockSlotArr = Array.from(new Int32Array(stagingBlockSlot.getMappedRange()).slice());
     const slotToBlockArr = Array.from(new Int32Array(stagingSlotToBlock.getMappedRange()).slice());
@@ -1335,7 +1719,7 @@ async function init() {
       const m = i + 2;
       const pool = pools[m];
       const st = levelStaging[i];
-      const fPool_m = new Float32Array(st.f.getMappedRange()).slice();
+      const fPool_m = readF(st.f.getMappedRange(), pool.MAX_FINE_BLOCKS * NCELLS1);
       const velPool_m = new Float32Array(st.vel.getMappedRange()).slice();
       const blockSlotArr_m = Array.from(new Int32Array(st.blockSlot.getMappedRange()).slice());
       const slotToBlockArr_m = Array.from(new Int32Array(st.slotToBlock.getMappedRange()).slice());
@@ -1364,7 +1748,7 @@ async function init() {
       cardState: card,
       fB64: bytesToB64(new Uint8Array(f.buffer, f.byteOffset, f.byteLength)),
       velB64: bytesToB64(new Uint8Array(vel.buffer, vel.byteOffset, vel.byteLength)),
-      params: { A, B, I_STAR, TAU, U_T, resLog2 },
+      params: { A, B, BLOCKAGE, ASPECT, RE, I_STAR, TAU, U_T, resLog2 },
       numLevels: N_LEVELS,
       pools: poolsOut,
     };
@@ -1397,7 +1781,7 @@ async function init() {
     }
     const f = b64ToFloat32(snapshot.fB64, NCELLS * 9);
     const vel = b64ToFloat32(snapshot.velB64, NCELLS * 2);
-    device.queue.writeBuffer(f_a, 0, f.buffer, f.byteOffset, fSize);
+    writeF(f_a, f, NCELLS);
     // velBuf is a separate GPU buffer, not derived from f_a by anything
     // debugSnapshotLoad itself runs -- omitting this write left it holding
     // whatever was there before the load (stale ux/uy from a prior run)
@@ -1416,7 +1800,7 @@ async function init() {
       }
       const fPool_m = b64ToFloat32(snapPool.fB64, pool.MAX_FINE_BLOCKS * NCELLS1 * 9);
       const velPool_m = b64ToFloat32(snapPool.velB64, pool.MAX_FINE_BLOCKS * NCELLS1 * 2);
-      device.queue.writeBuffer(pool.finePoolF_a, 0, fPool_m.buffer, fPool_m.byteOffset, pool.fSizePool);
+      writeF(pool.finePoolF_a, fPool_m, pool.MAX_FINE_BLOCKS * NCELLS1);
       device.queue.writeBuffer(pool.finePoolVel, 0, velPool_m.buffer, velPool_m.byteOffset, pool.MAX_FINE_BLOCKS * NCELLS1 * 2 * 4);
       device.queue.writeBuffer(pool.blockSlotBuf, 0, new Int32Array(snapPool.blockSlot));
       device.queue.writeBuffer(pool.slotToBlockBuf, 0, new Int32Array(snapPool.slotToBlock));
@@ -1496,13 +1880,15 @@ async function init() {
   //   CURRENT state, this level's OWN substep A, then -- if level+1 exists
   //   -- recurse into level+1 ONCE, average level+1 back into THIS level,
   //   and re-interpolate INTO level+1 (using this level's just-averaged-
-  //   into state) so level+1's NEXT cycle sees fresh ghosts. Then this
-  //   level's own same-level fine-fine ghost refresh (a project-specific
-  //   stand-in for AGAL's own neighbor-aware streaming -- see
-  //   amr_interp_dense_parent.wgsl's FINE_FINE_ONLY note; AGAL's mesh
-  //   doesn't need this pass because it addresses neighbor blocks directly
-  //   during streaming instead of materializing ghost cells in a padded
-  //   buffer). Then this level's OWN substep B, and -- again if level+1
+  //   into state) so level+1's NEXT cycle sees fresh ghosts. Then, under
+  //   ?ghostcopy=1 ONLY, this level's own same-level fine-fine ghost
+  //   refresh -- the pass this project used to need in place of AGAL's own
+  //   neighbor-aware streaming. The default build now does what AGAL does
+  //   (addresses neighbor blocks directly during streaming rather than
+  //   materializing same-level ghost cells), so there is no pass here at
+  //   all: see DIRECT_GHOST in shaders/amr_step1.wgsl, and
+  //   plans/perf-characterization.md for what removing it measured.
+  //   Then this level's OWN substep B, and -- again if level+1
   //   exists -- recurse into level+1 a SECOND time and average again.
   //   Every non-root level therefore does exactly 2 of its own substeps
   //   per call, and drives its child through exactly 2 full cycles (one
@@ -1535,47 +1921,52 @@ async function init() {
       const stepBG = useB ? stepBG_ba : stepBG_ab;
       if (hasChild) {
         const readBG = useB ? interpBG_readB : interpBG_readA;
-        const p = enc.beginComputePass(); p.setPipeline(interpPL); p.setBindGroup(0, readBG); p.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); p.end();
+        if (!skipGroup('interp')) { const p = beginPass(enc, 'L0->L1 interp'); p.setPipeline(skipGroup('interp-noop') ? noopPLs.interpDense : interpPL); p.setBindGroup(0, readBG); p.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); p.end(); }
       }
-      const s = enc.beginComputePass(); s.setPipeline(stepPL); s.setBindGroup(0, stepBG); s.dispatchWorkgroups(WGX, WGY); s.end();
+      const s = beginPass(enc, 'L0 step'); s.setPipeline(stepPL); s.setBindGroup(0, stepBG); s.dispatchWorkgroups(WGX, WGY); s.end();
       if (hasChild) {
         S_Advance(1, enc);
         const avgBG = useB ? avgBG_targetA : avgBG_targetB;
-        const a = enc.beginComputePass(); a.setPipeline(avgPL); a.setBindGroup(0, avgBG); a.dispatchWorkgroups(1, 1, MAX_FINE_BLOCKS); a.end();
+        if (!skipGroup('avg')) { const a = beginPass(enc, 'L1->L0 average'); a.setPipeline(skipGroup('avg-noop') ? noopPLs.avg : avgPL); a.setBindGroup(0, avgBG); a.dispatchWorkgroups(1, 1, MAX_FINE_BLOCKS); a.end(); }
       }
       return;
     }
 
     const pool = pools[level];
     const isL1 = level === 1;
+    // Legacy materialized-ghost path: the page-load flag, or the in-session
+    // bench configuration (see legacyGhostPLs).
+    const legacyGhost = GHOST_COPY !== 0 || skipGroup('ghostcopy');
     let cur = 'a'; // THIS level's own current buffer, local to this call (see header)
 
     const interpIntoChild = (readCur) => {
       if (!hasChild) return;
       const childPool = pools[level + 1];
       const bg = readCur === 'a' ? childPool.interpPoolParentBG_readA : childPool.interpPoolParentBG_readB;
-      const p = enc.beginComputePass(); p.setPipeline(interpPoolParentPL); p.setBindGroup(0, bg); p.dispatchWorkgroups(WGX1, WGY1, childPool.MAX_FINE_BLOCKS); p.end();
+      if (skipGroup('interp')) return; const p = beginPass(enc, `L${level}->L${level+1} interp`); p.setPipeline(skipGroup('interp-noop') ? noopPLs.interpPool : interpPoolParentPL); p.setBindGroup(0, bg); p.dispatchWorkgroups(WGX1, WGY1, childPool.MAX_FINE_BLOCKS); p.end();
     };
     const averageFromChild = (writeCur) => {
       if (!hasChild) return;
       const childPool = pools[level + 1];
       const bg = writeCur === 'a' ? childPool.avgPoolBG_targetA : childPool.avgPoolBG_targetB;
-      const p = enc.beginComputePass(); p.setPipeline(avgPoolPL); p.setBindGroup(0, bg); p.dispatchWorkgroups(1, 1, childPool.MAX_FINE_BLOCKS); p.end();
+      if (skipGroup('avg')) return; const p = beginPass(enc, `L${level+1}->L${level} average`); p.setPipeline(skipGroup('avg-noop') ? noopPLs.avgPool : avgPoolPL); p.setBindGroup(0, bg); p.dispatchWorkgroups(1, 1, childPool.MAX_FINE_BLOCKS); p.end();
     };
     const substep = (readCur) => {
       if (isL1) {
         const bg = readCur === 'a' ? step1BG_ab : step1BG_ba;
-        const p = enc.beginComputePass(); p.setPipeline(step1PL); p.setBindGroup(0, bg); p.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); p.end();
+        const pl = skipGroup('step1-ring') ? ringPLs.step1 : (legacyGhost ? legacyGhostPLs.step1 : step1PL);
+        if (skipGroup('step1')) return; const p = beginPass(enc, 'L1 step'); p.setPipeline(pl); p.setBindGroup(0, bg); p.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); p.end();
       } else {
         const bg = readCur === 'a' ? pool.step1PoolBG_ab : pool.step1PoolBG_ba;
-        const p = enc.beginComputePass(); p.setPipeline(step1PoolPL); p.setBindGroup(0, bg); p.dispatchWorkgroups(WGX1, WGY1, pool.MAX_FINE_BLOCKS); p.end();
+        const pl = skipGroup('step1-ring') ? ringPLs.step1Pool : (legacyGhost ? legacyGhostPLs.step1Pool : step1PoolPL);
+        if (skipGroup('step1')) return; const p = beginPass(enc, `L${level} step`); p.setPipeline(pl); p.setBindGroup(0, bg); p.dispatchWorkgroups(WGX1, WGY1, pool.MAX_FINE_BLOCKS); p.end();
       }
     };
     const fineFineRefresh = () => {
       if (isL1) {
-        const p = enc.beginComputePass(); p.setPipeline(interpFFPL); p.setBindGroup(0, interpFFBG_b); p.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); p.end();
+        const p = beginPass(enc, 'L1 fine-fine ghost'); p.setPipeline(interpFFPL); p.setBindGroup(0, interpFFBG_b); p.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); p.end();
       } else {
-        const p = enc.beginComputePass(); p.setPipeline(interpPoolParentFFPL); p.setBindGroup(0, pool.interpPoolParentFFBG_b); p.dispatchWorkgroups(WGX1, WGY1, pool.MAX_FINE_BLOCKS); p.end();
+        const p = beginPass(enc, `L${level} fine-fine ghost`); p.setPipeline(interpPoolParentFFPL); p.setBindGroup(0, pool.interpPoolParentFFBG_b); p.dispatchWorkgroups(WGX1, WGY1, pool.MAX_FINE_BLOCKS); p.end();
       }
     };
 
@@ -1587,15 +1978,105 @@ async function init() {
       averageFromChild(cur);  // level+1's full cycle #1 lands in level's CURRENT ('b')
       interpIntoChild(cur);   // re-interpolate level+1's ghosts from level's just-updated state
     }
-    // Same-level fine-fine refresh, after any sibling's own average might
-    // have just landed (see header) and before substep B reads it.
-    fineFineRefresh();
+    // Legacy same-level fine-fine refresh (?ghostcopy=1 only). The default
+    // path needs no pass here: substep B's own gather reaches into the
+    // neighbour tile directly, so it reads the neighbour's post-`average`
+    // interior rather than a copy taken before that average landed. See the
+    // DIRECT_GHOST override in shaders/amr_step1.wgsl.
+    if (legacyGhost) fineFineRefresh();
     substep(cur);           // reads 'b', writes 'a'
     cur = 'a';
     if (hasChild) {
       S_Advance(level + 1, enc);
       averageFromChild(cur);  // level+1's full cycle #2 lands in level's CURRENT ('a')
     }
+  }
+
+  // ── GPU pass timing ──────────────────────────────────────────────────────
+  // Every compute pass in the macro-step goes through beginPass() so it can
+  // be individually timed on demand. When `profiler` is null (the normal
+  // case) this is exactly enc.beginComputePass() with no overhead; when
+  // debugProfileMacroStep() sets it, each pass gets its own timestamp pair
+  // and a label, which is what turns "AMR is slow" into "this pass is slow".
+  //
+  // Timestamps come from the pass DESCRIPTOR (timestampWrites), not from
+  // encoder.writeTimestamp() -- that entry point was removed from WebGPU and
+  // is why timing was disabled here in the first place.
+  // ── Pass-group skipping, for cost attribution on coarse-timer devices ────
+  // The per-pass timestamp profile is useless on hardware whose timestamp
+  // counter is coarse: the target PowerVR part ticks at 65536 ns, so a
+  // ~1125us macro-step is only ~17 ticks spread across 9-12 passes and every
+  // per-pass reading lands in a 1-8 tick bucket. (Confirmed: every value it
+  // reports is an exact integer multiple of 65536 ns.) Frame time, at ~1100
+  // ticks, is quantised by ~0.1% and is fine.
+  //
+  // So attribute at FRAME scale instead: skip a group of passes, measure the
+  // change in frame GPU time, and the difference is that group's real cost.
+  // ?benchSkip=force,interp etc. This is a MEASUREMENT MODE -- skipping
+  // passes makes the physics wrong by construction. It exists to answer
+  // "what does this group cost", nothing else.
+  // Groups. The first set REMOVE a pass; the rest are instrument variants that
+  // keep the pass but change what it does, so a share can be split further:
+  //
+  //   force, phy, step1, interp, avg   -- pass not encoded at all
+  //   interp-noop, avg-noop            -- pass encoded and dispatched at full
+  //                                       width, returns immediately
+  //   step1-ring                       -- fine step over tile interior only
+  //                                       (proxy for FB 20 -> 16)
+  //   ghostcopy                        -- ADDS the legacy fine-fine ghost copy
+  //                                       pass back and reverts the fine step
+  //                                       to clamped streaming, so its share is
+  //                                       NEGATIVE and its magnitude is what
+  //                                       neighbour-addressed streaming buys
+  //
+  // The `ghost` and `ghost-noop` groups are gone with the pass they named --
+  // measuring "skip the fine-fine copy" is meaningless now that the default
+  // build never encodes it. `ghostcopy` asks the same question from the other
+  // side. An old ?benchSkip=ghost is now REJECTED rather than silently
+  // reporting ~0%, which is the whole point of enumerating these names.
+  //
+  // Why the -noop variants exist: removing a pass removes its fixed per-pass
+  // cost AND its work at the same time, so a plain skip cannot tell you which
+  // one you are looking at. Measured on desktop, removing a coupling pass is
+  // worth 15-19% of frame GPU time while running it as a no-op is worth 2-6%
+  // -- i.e. the AMR coupling cost is work, not pass count, so fusing coupling
+  // passes would not pay. See the NOOP override in shaders/amr_interp_*.wgsl.
+  //
+  // step1-ring exists because the two target devices should disagree about it:
+  // it measured 0.2% on the desktop (correcting a ~10.5% estimate in
+  // plans/perf-characterization.md) but the phone is bandwidth-bound and the
+  // traffic model predicts ~10% there.
+  // Every valid group name. Enumerated rather than free-form because an
+  // unrecognised name is otherwise INVISIBLE: it just never matches a
+  // skipGroup() call, the passes all run, and the configuration reports a ~0%
+  // share that reads as a real measurement. That is unrecoverable on the phone,
+  // which tools/bench-amr.js cannot drive and which gets one sweep per
+  // session (see plans/perf-characterization.md on adb) -- the same class
+  // of silent-failure trap as a sweep interrupted by backgrounding, which this
+  // file already refuses to report quietly.
+  const BENCH_GROUPS = new Set([
+    'force', 'phy', 'step1', 'interp', 'avg',
+    'interp-noop', 'avg-noop', 'step1-ring', 'ghostcopy',
+  ]);
+  function validateSkipGroups(groups, where) {
+    const bad = [...groups].filter(g => !BENCH_GROUPS.has(g));
+    if (bad.length) throw new Error(`${where}: unknown benchSkip group(s) ${bad.join(', ')} -- known: ${[...BENCH_GROUPS].join(', ')}`);
+  }
+  const benchSkip = new Set((urlParams.get('benchSkip') || '').split(',').filter(Boolean));
+  validateSkipGroups(benchSkip, '?benchSkip=');
+  function skipGroup(g) { return benchSkip.has(g); }
+
+  let profiler = null;
+  function beginPass(enc, label) {
+    if (profiler && profiler.next + 2 <= profiler.cap) {
+      const i = profiler.next;
+      profiler.next += 2;
+      profiler.labels.push({ label, i });
+      return enc.beginComputePass({
+        timestampWrites: { querySet, beginningOfPassWriteIndex: i, endOfPassWriteIndex: i + 1 },
+      });
+    }
+    return enc.beginComputePass();
   }
 
   // Factored out of frame()'s loop so debugStepSync can reuse it exactly --
@@ -1625,9 +2106,9 @@ async function init() {
       // Evaluated ONCE, before the fixed-point loop below -- a block's own
       // vorticity doesn't change just because a neighbor gets (de)activated
       // this round, so re-evaluating per iteration would be wasted work.
-      const crit = enc.beginComputePass(); crit.setPipeline(criterionPL); crit.setBindGroup(0, criterionBG); crit.dispatchWorkgroups(WGX, WGY); crit.end();
+      const crit = beginPass(enc, 'criterion L0'); crit.setPipeline(criterionPL); crit.setBindGroup(0, criterionBG); crit.dispatchWorkgroups(WGX, WGY); crit.end();
       for (let m = 1; m < N_LEVELS - 1; m++) {
-        const c = enc.beginComputePass(); c.setPipeline(criterionPoolPLs[m]); c.setBindGroup(0, criterionPoolBGs[m]); c.dispatchWorkgroups(2, 2, pools[m].MAX_FINE_BLOCKS); c.end();
+        const c = beginPass(enc, `criterion L${m}`); c.setPipeline(criterionPoolPLs[m]); c.setBindGroup(0, criterionPoolBGs[m]); c.dispatchWorkgroups(2, 2, pools[m].MAX_FINE_BLOCKS); c.end();
       }
 
       // Milestone 9: 2:1-balance fixed-point loop -- coarsen finest-to-
@@ -1645,20 +2126,20 @@ async function init() {
       for (let iter = 0; iter < FIXED_POINT_ITERS; iter++) {
         for (let m = N_LEVELS - 1; m >= 1; m--) {
           if (m === 1) {
-            const p = enc.beginComputePass(); p.setPipeline(manageCoarsenPL); p.setBindGroup(0, manageBG); p.dispatchWorkgroups(WG_MANAGE); p.end();
+            const p = beginPass(enc, 'manage coarsen L1'); p.setPipeline(manageCoarsenPL); p.setBindGroup(0, manageBG); p.dispatchWorkgroups(WG_MANAGE); p.end();
           } else {
             const parentLevel = m - 1;
             const wg = Math.ceil(pools[m].MAX_FINE_BLOCKS / 64);
-            const p = enc.beginComputePass(); p.setPipeline(managePoolCoarsenPLs[parentLevel]); p.setBindGroup(0, managePoolBGs[parentLevel]); p.dispatchWorkgroups(wg); p.end();
+            const p = beginPass(enc, `manage coarsen L${m}`); p.setPipeline(managePoolCoarsenPLs[parentLevel]); p.setBindGroup(0, managePoolBGs[parentLevel]); p.dispatchWorkgroups(wg); p.end();
           }
         }
         for (let m = 1; m < N_LEVELS; m++) {
           if (m === 1) {
-            const p = enc.beginComputePass(); p.setPipeline(manageRefinePL); p.setBindGroup(0, manageBG); p.dispatchWorkgroups(WG_MANAGE); p.end();
+            const p = beginPass(enc, 'manage refine L1'); p.setPipeline(manageRefinePL); p.setBindGroup(0, manageBG); p.dispatchWorkgroups(WG_MANAGE); p.end();
           } else {
             const parentLevel = m - 1;
             const wg = Math.ceil(pools[parentLevel].MAX_FINE_BLOCKS / 64);
-            const p = enc.beginComputePass(); p.setPipeline(managePoolRefinePLs[parentLevel]); p.setBindGroup(0, managePoolBGs[parentLevel]); p.dispatchWorkgroups(wg); p.end();
+            const p = beginPass(enc, `manage refine L${m}`); p.setPipeline(managePoolRefinePLs[parentLevel]); p.setBindGroup(0, managePoolBGs[parentLevel]); p.dispatchWorkgroups(wg); p.end();
           }
         }
       }
@@ -1668,10 +2149,10 @@ async function init() {
       // level>=2: pool-parent init pipeline, reading readA since a
       // level's own buffer is always "current" at a macro-step boundary --
       // same invariant debugActivateBlock already relies on).
-      const init = enc.beginComputePass(); init.setPipeline(interpInitPL); init.setBindGroup(0, interpInitBG); init.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); init.end();
+      const init = beginPass(enc, 'L1 init fill'); init.setPipeline(interpInitPL); init.setBindGroup(0, interpInitBG); init.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); init.end();
       for (let m = 2; m < N_LEVELS; m++) {
         const pool = pools[m];
-        const p = enc.beginComputePass(); p.setPipeline(interpPoolParentInitPL); p.setBindGroup(0, pool.interpPoolParentBG_readA); p.dispatchWorkgroups(WGX1, WGY1, pool.MAX_FINE_BLOCKS); p.end();
+        const p = beginPass(enc, `L${m} init fill`); p.setPipeline(interpPoolParentInitPL); p.setBindGroup(0, pool.interpPoolParentBG_readA); p.dispatchWorkgroups(WGX1, WGY1, pool.MAX_FINE_BLOCKS); p.end();
       }
     }
     macroStepCounter++;
@@ -1681,19 +2162,19 @@ async function init() {
     // once per macro-step, outside the fluid recursion entirely (same as
     // AGAL's own S_ComputeForces* calls, handled alongside S_Advance, not
     // inside it).
-    const frc = enc.beginComputePass(); frc.setPipeline(frcPL); frc.setBindGroup(0, frcBG); frc.dispatchWorkgroups(WGX, WGY); frc.end();
+    if (!skipGroup('force') && !skipGroup('force0')) { const frc = beginPass(enc, 'force L0'); frc.setPipeline(frcPL); frc.setBindGroup(0, frcBG); frc.dispatchWorkgroups(WGX, WGY); frc.end(); }
     // Milestone 8: every level's own force contribution, all before `phy`
     // drains+resets the shared atomic forces[] buffer. Order among these
     // (and vs. frc above) doesn't matter -- each reads only its own
     // level's "current, pre-macro-step" state and independently atomicAdds
     // into forces[], the same commutativity argument as interp-vs-step at
     // the root of S_Advance.
-    const f1frc = enc.beginComputePass(); f1frc.setPipeline(force1PL); f1frc.setBindGroup(0, force1BG); f1frc.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); f1frc.end();
+    if (!skipGroup('force')) { const f1frc = beginPass(enc, 'force L1'); f1frc.setPipeline(force1PL); f1frc.setBindGroup(0, force1BG); f1frc.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); f1frc.end(); }
     for (let c = 2; c < N_LEVELS; c++) {
       const pool = pools[c];
-      const p = enc.beginComputePass(); p.setPipeline(force1PoolPL); p.setBindGroup(0, pool.force1PoolBG); p.dispatchWorkgroups(WGX1, WGY1, pool.MAX_FINE_BLOCKS); p.end();
+      if (!skipGroup('force')) { const p = beginPass(enc, `force L${c}`); p.setPipeline(force1PoolPL); p.setBindGroup(0, pool.force1PoolBG); p.dispatchWorkgroups(WGX1, WGY1, pool.MAX_FINE_BLOCKS); p.end(); }
     }
-    const phy = enc.beginComputePass(); phy.setPipeline(phyPL); phy.setBindGroup(0, phyBG); phy.dispatchWorkgroups(1); phy.end();
+    if (!skipGroup('phy')) { const phy = beginPass(enc, 'body dynamics'); phy.setPipeline(phyPL); phy.setBindGroup(0, phyBG); phy.dispatchWorkgroups(1); phy.end(); }
 
     S_Advance(0, enc);
 
@@ -1746,8 +2227,8 @@ async function init() {
   }
 
   function resetSim() {
-    device.queue.writeBuffer(f_a, 0, initF());
-    device.queue.writeBuffer(pools[1].finePoolF_a, 0, initFPool());
+    writeF(f_a, initF(), NCELLS);
+    writeF(pools[1].finePoolF_a, initFPool(), MAX_FINE_BLOCKS * NCELLS1);
     device.queue.writeBuffer(cardStateBuf, 0, initCardState());
     device.queue.writeBuffer(forceBuf, 0, new Int32Array([0, 0, 0, 0]));
     blockSlotCPU.fill(-1);
@@ -1761,7 +2242,7 @@ async function init() {
     for (let c = 2; c < N_LEVELS; c++) {
       const pool = pools[c];
       const qc = quadCPU[c];
-      device.queue.writeBuffer(pool.finePoolF_a, 0, initFPool(pool.MAX_FINE_BLOCKS));
+      writeF(pool.finePoolF_a, initFPool(pool.MAX_FINE_BLOCKS), pool.MAX_FINE_BLOCKS * NCELLS1);
       qc.blockSlotCPU.fill(-1);
       qc.slotToBlockCPU.fill(-1);
       device.queue.writeBuffer(pool.blockSlotBuf, 0, qc.blockSlotCPU);
@@ -2045,7 +2526,7 @@ async function init() {
         }
       }
     }
-    device.queue.writeBuffer(pools[1].finePoolF_a, 0, marker);
+    writeF(pools[1].finePoolF_a, marker, NPOOL);
 
     const enc = device.createCommandEncoder();
     const ipl = enc.beginComputePass();
@@ -2060,7 +2541,7 @@ async function init() {
     enc2.copyBufferToBuffer(pools[1].finePoolF_a, 0, stagingFPool, 0, fSizePool);
     device.queue.submit([enc2.finish()]);
     await stagingFPool.mapAsync(GPUMapMode.READ);
-    const result = new Float32Array(stagingFPool.getMappedRange()).slice();
+    const result = readF(stagingFPool.getMappedRange(), NPOOL);
     stagingFPool.unmap();
     return Array.from(result.subarray(0, NPOOL));
   }
@@ -2101,7 +2582,7 @@ async function init() {
     enc.copyBufferToBuffer(pool.finePoolF_a, 0, stage, 0, pool.fSizePool);
     device.queue.submit([enc.finish()]);
     await stage.mapAsync(GPUMapMode.READ);
-    const f = new Float32Array(stage.getMappedRange()).slice();
+    const f = readF(stage.getMappedRange(), pool.MAX_FINE_BLOCKS * NCELLS1);
     stage.unmap();
     stage.destroy();
     return Array.from(f);
@@ -2133,7 +2614,7 @@ async function init() {
         }
       }
     }
-    device.queue.writeBuffer(f_a, 0, f);
+    writeF(f_a, f, NCELLS);
   }
 
   // Always reads GPU state directly (not the CPU mirror, which goes stale
@@ -2248,6 +2729,13 @@ async function init() {
 
   async function debugStepSync(n) {
     liveMode = false;
+    // This path bypasses frame() entirely, so it has to flush pending
+    // parameter changes itself -- otherwise a headless driver that sets a
+    // slider and then steps would silently run the old values.
+    if (paramsDirty) {
+      updateGPUParams();
+      paramsDirty = false;
+    }
     for (let k = 0; k < n; k += STEPS_PER_FRAME) {
       const enc = device.createCommandEncoder();
       for (let s = 0; s < STEPS_PER_FRAME; s++) dispatchMacroStep(enc);
@@ -2286,7 +2774,392 @@ async function init() {
     }));
   }
 
+  // Per-pass GPU timing for ONE macro-step. Runs the identical dispatch
+  // sequence the live loop runs (dispatchMacroStep, not a reimplementation),
+  // with `profiler` set so every beginPass() call gets its own timestamp
+  // pair, then resolves and returns {label, ms} in dispatch order. This is
+  // the measurement that makes dispatch tuning falsifiable: it attributes
+  // frame time to individual passes rather than leaving it as one number.
+  //
+  // `reps` runs the macro-step several times and returns the MEDIAN per
+  // label -- a single macro-step is short enough that one sample is mostly
+  // scheduling noise. Passes that only appear on refine steps (criterion /
+  // manage / init fill, every REFINE_EVERY steps) will be present in some
+  // reps and absent in others; each label reports its own sample count.
+  async function debugProfileMacroStep(reps = 8) {
+    if (!hasTimestamp) {
+      throw new Error('debugProfileMacroStep: adapter lacks the timestamp-query feature -- no GPU timing available on this device');
+    }
+    const readBuf = device.createBuffer({ size: QUERY_CAP * 8, usage: U.MAP_READ | U.COPY_DST });
+    const byLabel = new Map();
+    for (let r = 0; r < reps; r++) {
+      profiler = { cap: QUERY_CAP, next: 2, labels: [] }; // 0/1 reserved for the frame span
+      const enc = device.createCommandEncoder();
+      dispatchMacroStep(enc);
+      const used = profiler.next;
+      enc.resolveQuerySet(querySet, 0, used, queryResolveBuffer, 0);
+      enc.copyBufferToBuffer(queryResolveBuffer, 0, readBuf, 0, used * 8);
+      device.queue.submit([enc.finish()]);
+      await device.queue.onSubmittedWorkDone();
+      await readBuf.mapAsync(GPUMapMode.READ);
+      const ts = new BigUint64Array(readBuf.getMappedRange()).slice();
+      readBuf.unmap();
+      for (const { label, i } of profiler.labels) {
+        const ms = Number(ts[i + 1] - ts[i]) / 1e6;
+        // A disjoint or unresolved query reads back as 0 (or negative). Drop
+        // it rather than recording a pass as free -- a zero here means "not
+        // measured", which is a very different claim from "costs nothing".
+        if (!Number.isFinite(ms) || ms <= 0) continue;
+        if (!byLabel.has(label)) byLabel.set(label, []);
+        byLabel.get(label).push(ms);
+      }
+      profiler = null;
+    }
+    readBuf.destroy();
+    const out = [];
+    let total = 0;
+    for (const [label, xs] of byLabel) {
+      xs.sort((a, b) => a - b);
+      const med = xs[Math.floor(xs.length / 2)];
+      out.push({ label, ms: med, samples: xs.length });
+      total += med;
+    }
+    return { passes: out, totalMs: total, reps };
+  }
+
+  // ── Telemetry back channel (opt-in: ?telemetry=1) ────────────────────────
+  // A device that is not the dev machine -- a phone on the LAN -- has no CDP
+  // endpoint to attach to, so its performance is otherwise unobservable, and
+  // "realtime on desktop AND mobile" is a stated goal of this project. With
+  // ?telemetry=1 the page POSTs a periodic sample to the dev server's
+  // /_telemetry endpoint (see https.py), which appends it to telemetry.log.
+  //
+  // Off unless explicitly requested, same-origin only, and local-only: the
+  // dev server writes a plain file next to the page and forwards nothing.
+  // Failures are swallowed -- a page serving from anywhere without the
+  // endpoint (GitHub Pages, say) must not break because a beacon 404s.
+  const TELEMETRY = urlParams.get('telemetry') === '1';
+  const TELEMETRY_EVERY_MS = 5000;
+  // ?profile=1 additionally attaches a per-pass GPU breakdown, so a device
+  // that cannot be attached to over CDP (a phone) can still report WHERE its
+  // frame time goes, not just how much of it there is. Rate-limited hard --
+  // the profile serializes one macro-step per rep, so it is far more
+  // disruptive than a plain sample.
+  const TELEMETRY_PROFILE = urlParams.get('profile') === '1';
+  const TELEMETRY_PROFILE_EVERY_MS = 20000;
+  let telemetryLast = 0;
+  // -Infinity so the FIRST sample carries a profile; the rate limit applies
+  // only to subsequent ones. Waiting 20s for the first breakdown makes a
+  // short phone session report nothing useful.
+  let telemetryProfileLast = -Infinity;
+  let telemetryInfo = null;
+  async function telemetrySample(gpuMs, syncMs, stepNow) {
+    if (!TELEMETRY) return;
+    const now = performance.now();
+    if (now - telemetryLast < TELEMETRY_EVERY_MS) return;
+    telemetryLast = now;
+    if (!telemetryInfo) {
+      let adapterInfo = {};
+      try {
+        const ai = adapter.info || (adapter.requestAdapterInfo ? await adapter.requestAdapterInfo() : {});
+        adapterInfo = { vendor: ai.vendor, architecture: ai.architecture, device: ai.device, description: ai.description };
+      } catch { /* adapter info is optional and gated on some browsers */ }
+      telemetryInfo = {
+        page: 'index-amr.html',
+        ua: navigator.userAgent,
+        dpr: window.devicePixelRatio,
+        screen: `${window.screen.width}x${window.screen.height}`,
+        adapter: adapterInfo,
+        hasTimestamp,
+        config: {
+          res: resLog2, W, levels: N_LEVELS, blockage: BLOCKAGE, aspect: ASPECT,
+          re: RE, tau: TAU, maxFineBlocks: MAX_FINE_BLOCKS,
+          forceRefineMargin: FORCE_REFINE_MARGIN, refineThresh: REFINE_THRESH,
+          stepsPerFrame: STEPS_PER_FRAME,
+        },
+      };
+    }
+    // Active fine-block counts per level, read from the CPU-visible free
+    // count rather than a GPU readback -- a readback here would stall the
+    // very frame loop being measured.
+    const body = {
+      ...telemetryInfo,
+      t: new Date().toISOString(),
+      step: stepNow,
+      gpuMs: Number.isFinite(gpuMs) ? +gpuMs.toFixed(3) : null,
+      syncMs: Number.isFinite(syncMs) ? +syncMs.toFixed(3) : null,
+      // L0-cell throughput only -- see the mlups comment in the frame loop.
+      l0Mlups: gpuMs > 0 ? +((NCELLS * STEPS_PER_FRAME) / (gpuMs * 1e3)).toFixed(1) : null,
+      watch: {
+        frames: readbackWatch.n,
+        stepBack: readbackWatch.stepBack,
+        worstStepBack: readbackWatch.worstStepBack,
+        posJump: readbackWatch.posJump,
+        fieldRepeat: readbackWatch.fieldRepeat,
+        offReversals: readbackWatch.offReversals,
+        worstOffReversal: readbackWatch.worstOffReversal,
+        offMaxStep: readbackWatch.offMaxStep,
+        offBackFrames: readbackWatch.offBackFrames,
+        offTrace: readbackWatch.offTrace,
+        samples: readbackWatch.samples,
+        diverged: readbackWatch.diverged,
+        divergedAtStep: readbackWatch.divergedAtStep,
+        runUp: readbackWatch.history,
+      },
+    };
+    if (BENCH && !benchDone && !benchRunning && step >= BENCH_WARM) {
+      benchRunning = true;
+      try {
+        const benchStartStep = step;
+        body.bench = await runBenchSweep();
+        body.bench.startedAtStep = benchStartStep;
+        body.bench.endedAtStep = step;
+        benchDone = true;
+        statusEl.textContent = '[AMR-dev] benchmark sweep complete -- results sent';
+      } catch (e) { body.benchError = String(e && e.message || e); benchDone = true; }
+      finally { benchRunning = false; }
+    }
+    if (TELEMETRY_PROFILE && hasTimestamp && now - telemetryProfileLast > TELEMETRY_PROFILE_EVERY_MS) {
+      telemetryProfileLast = now;
+      // Pause stepping across the profile. Timestamps taken while the frame
+      // loop is still submitting come back disjoint (several passes read
+      // exactly 0.0000), because the profiler's own submissions interleave
+      // with the live loop's. Restored in the finally below.
+      const wasLive = liveMode;
+      try {
+        liveMode = false;
+        await device.queue.onSubmittedWorkDone();
+        const p = await debugProfileMacroStep(6);
+        body.profile = { totalMs: +p.totalMs.toFixed(4), reps: p.reps,
+          passes: p.passes.map(x => ({ label: x.label, ms: +x.ms.toFixed(4), n: x.samples })) };
+        body.activeByLevel = {};
+        for (let m = 1; m < N_LEVELS; m++) {
+          try { body.activeByLevel[m] = (await debugListActiveBlocks(m)).length; } catch { /* best-effort */ }
+        }
+      } catch (e) {
+        body.profileError = String(e && e.message || e);
+      } finally {
+        liveMode = wasLive;
+      }
+    }
+    try {
+      await fetch('/_telemetry', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body), keepalive: true,
+      });
+    } catch { /* no endpoint (static hosting) -- telemetry is best-effort */ }
+  }
+
+  // ── On-device benchmark sweep (?bench=1) ─────────────────────────────────
+  // Frame-scale differential attribution, which is the only kind that works
+  // on a coarse-timestamp device (see the benchSkip comment above). Runs a
+  // sequence of pass-skip configurations, measuring median frame GPU time
+  // for each, then POSTs one summary. Difference from the 'none' baseline is
+  // that group's cost.
+  //
+  // Refinement is FROZEN for the duration (setAutoRefine(false)) so every
+  // configuration sees the same block topology -- otherwise skipping the
+  // criterion pass would change the active block count and the comparison
+  // would be measuring two different simulations.
+  //
+  // The physics is deliberately wrong while this runs. It is a stopwatch,
+  // not a simulation.
+  const BENCH = urlParams.get('bench') === '1';
+  // Sweep does not start until the flow and the refinement have developed.
+  // The sweep used to begin on the first telemetry tick, ~5s after load --
+  // about 1350 steps on the phone, where measured L1 demand is still climbing
+  // and does not peak until 6k-12k. That measured an unrepresentative
+  // topology and every published phone attribution inherited it.
+  const BENCH_WARM = urlParams.has('benchWarm') ? parseInt(urlParams.get('benchWarm')) : 12000;
+  const BENCH_ROUNDS = urlParams.has('benchRounds') ? parseInt(urlParams.get('benchRounds')) : 3;
+  // Target wall-clock per timed run. Validated on the desktop at 2500ms, which
+  // reproduced tools/bench-amr.js's headline (interp+avg+ghost 44.7% vs 44.1%)
+  // at 4.5% spread but left the small instrument rows (-noop, step1-ring, all
+  // 1-5% effects) at 13-20% spread and occasionally negative. 4000ms buys that
+  // resolution back and still fits: switching from live-rAF sampling to timed
+  // synchronous runs cut the per-configuration cost from a fixed 5s, so a
+  // 13-config sweep at 3 rounds is ~3.5 min plus warm-up rather than longer.
+  const BENCH_MEASURE_MS = urlParams.has('benchMeasureMs') ? parseInt(urlParams.get('benchMeasureMs')) : 4000;
+  // 13 configurations at BENCH_ROUNDS=3 is (3+1)*13*5s = ~4.3 min of sweep on
+  // top of the warm-up, so budget ~5 min of foregrounded, screen-on device.
+  // The -noop and step1-ring entries are the instrument variants documented
+  // at benchSkip above; they are here rather than desktop-only because the
+  // phone cannot be driven the way tools/bench-amr.js drives the desktop (adb
+  // does expose CDP, but debugStepSync over it killed Chrome -- see
+  // plans/perf-characterization.md), so this sweep is the way to ask that
+  // device the same questions.
+  // ?benchConfigs=none,interp,avg,ghostcopy,interp+avg trims the list. Worth
+  // using on a device you have to hold in your hand: every configuration costs
+  // (BENCH_ROUNDS+1) * BENCH_MEASURE_MS, and a shorter sweep also spends less
+  // of itself inside this device's own thermal ramp. 'none' is always kept --
+  // every share is relative to it.
+  const BENCH_CONFIGS_DEFAULT = ['none', 'force', 'phy', 'force+phy', 'interp', 'avg', 'ghostcopy', 'step1', 'interp+avg',
+                                 'interp-noop', 'avg-noop', 'step1-ring'];
+  const BENCH_CONFIGS = urlParams.has('benchConfigs')
+    // URLSearchParams decodes '+' as a space, and '+' is this list's own
+    // combine operator, so an unencoded ?benchConfigs=interp+avg+ghost arrives
+    // as 'interp avg ghost'. Accept both rather than rejecting a URL that a
+    // reader would swear is correct -- this gets typed by hand on a phone.
+    ? [...new Set(['none', ...urlParams.get('benchConfigs').split(',')
+        .map(c => c.trim().replace(/\s+/g, '+')).filter(Boolean)])]
+    : BENCH_CONFIGS_DEFAULT;
+  async function runBenchSweep() {
+    const wasAuto = autoRefine;
+    await setAutoRefine(false);
+    const activeByLevel = {};
+    for (let m = 1; m < N_LEVELS; m++) {
+      try { activeByLevel[m] = (await debugListActiveBlocks(m)).length; } catch { /* best-effort */ }
+    }
+    // ROUND-ROBIN over several rounds with the order rotated, not each
+    // configuration measured to completion in turn. This device throttles
+    // 24-57% within a session (see plans/perf-characterization.md), so a
+    // sequential sweep measures the first configuration coldest and the last
+    // hottest -- which lands entirely on the 'none' baseline, understating
+    // every share. Interleaving spreads the ramp evenly instead. Same
+    // reasoning, and the same fix, as tools/bench-amr.js --skip.
+    // Backgrounding still invalidates the sweep, even now that timing no longer
+    // depends on requestAnimationFrame: a hidden tab gets its GPU work
+    // deprioritised and its timers throttled, so whichever configurations were
+    // current while it was hidden are timed against a different machine. A
+    // phone run was already lost to this once, silently. Record it and refuse
+    // to report a sweep that was interrupted.
+    let benchHidden = document.visibilityState === 'hidden';
+    const onVis = () => { if (document.visibilityState === 'hidden') benchHidden = true; };
+    document.addEventListener('visibilitychange', onVis);
+
+    // Time a fixed number of macro-steps with the frame loop STOPPED, the same
+    // way tools/bench-amr.js does -- NOT by sampling per-frame GPU timestamps
+    // from the live rAF loop, which is what this used to do.
+    //
+    // The old method could not be trusted, and was measured failing: a desktop
+    // run of it reported spreads of 25-88% and NEGATIVE shares down to -73%
+    // (skipping work cannot make a frame slower), against a ground truth from
+    // tools/bench-amr.js of interp+avg+ghost = 44%. The reason is structural
+    // rather than statistical -- on a device that finishes its frame well
+    // inside the vsync interval the GPU sits idle most of each frame and
+    // clocks down, so per-frame timestamps scatter no matter how many are
+    // averaged. Stopping the frame loop and timing a synchronous run removes
+    // vsync, the compositor and the readback pipeline in one move; the same
+    // instrument measured 2.5-5.6% spread that way.
+    //
+    // liveMode is restored at the end of the sweep (debugStepSync clears it).
+    const measure = async () => {
+      const t0 = performance.now();
+      await debugStepSync(stepsPerMeasure);
+      return performance.now() - t0;
+    };
+    const applySkip = (cfg) => {
+      benchSkip.clear();
+      if (cfg !== 'none') for (const g of cfg.split('+')) benchSkip.add(g);
+    };
+    // Fail before the sweep, not silently during it: a mistyped entry in
+    // BENCH_CONFIGS would otherwise cost a whole ~5 min device session and
+    // report a plausible-looking 0% share for that row.
+    for (const cfg of BENCH_CONFIGS) {
+      if (cfg !== 'none') validateSkipGroups(cfg.split('+'), `BENCH_CONFIGS entry "${cfg}"`);
+    }
+    // Discard a whole settling round -- one discarded run was measurably not
+    // enough on the desktop (44-85% spread on the early rows).
+    const totalSteps = (BENCH_ROUNDS + 1) * BENCH_CONFIGS.length;
+    let doneSteps = 0;
+    const progress = (label) => {
+      const pct = Math.round((doneSteps / totalSteps) * 100);
+      statusEl.textContent = `[AMR-dev] benchmark ${pct}% -- ${label} (do not switch away)`;
+    };
+    // How many macro-steps is ~BENCH_MEASURE_MS on THIS device? The two target
+    // devices differ by ~40x in frame time, so a fixed step count would be
+    // either far too short to time on the desktop or minutes per configuration
+    // on the phone. Calibrated from a short probe instead, and reported in the
+    // payload so a reader knows what the medians are medians OF.
+    const probeSteps = 4 * STEPS_PER_FRAME;
+    const probeT0 = performance.now();
+    await debugStepSync(probeSteps);
+    const msPerStep = (performance.now() - probeT0) / probeSteps;
+    let stepsPerMeasure = Math.round(BENCH_MEASURE_MS / msPerStep / STEPS_PER_FRAME) * STEPS_PER_FRAME;
+    stepsPerMeasure = Math.max(STEPS_PER_FRAME, Math.min(stepsPerMeasure, 200 * STEPS_PER_FRAME));
+
+    progress('settling');
+    for (const cfg of BENCH_CONFIGS) { applySkip(cfg); await measure(); doneSteps++; progress('settling ' + cfg); }
+
+    const samples = new Map(BENCH_CONFIGS.map(c => [c, []]));
+    for (let r = 0; r < BENCH_ROUNDS; r++) {
+      for (let i = 0; i < BENCH_CONFIGS.length; i++) {
+        const cfg = BENCH_CONFIGS[(i + r) % BENCH_CONFIGS.length];
+        applySkip(cfg);
+        const m = await measure();
+        if (m != null) samples.get(cfg).push(m);
+        doneSteps++;
+        progress(`round ${r + 1}/${BENCH_ROUNDS}, ${cfg}`);
+      }
+    }
+    const results = BENCH_CONFIGS.map(cfg => {
+      const xs = samples.get(cfg).slice().sort((a, b) => a - b);
+      return {
+        cfg, n: xs.length,
+        // Wall-clock ms for stepsPerMeasure macro-steps, not per-frame GPU ms.
+        medianMs: xs.length ? +xs[Math.floor(xs.length / 2)].toFixed(1) : null,
+        spreadPct: xs.length > 1 ? +(((xs[xs.length - 1] - xs[0]) / xs[Math.floor(xs.length / 2)]) * 100).toFixed(1) : null,
+      };
+    });
+    benchSkip.clear();
+    document.removeEventListener('visibilitychange', onVis);
+    if (wasAuto) await setAutoRefine(true);
+    liveMode = true; // debugStepSync cleared it; the page must resume after the sweep
+    const base = results.find(r => r.cfg === 'none');
+    for (const r of results) {
+      r.deltaMs = (base && base.medianMs != null && r.medianMs != null)
+        ? +(base.medianMs - r.medianMs).toFixed(1) : null;
+      r.sharePct = (base && base.medianMs) ? +((r.deltaMs / base.medianMs) * 100).toFixed(1) : null;
+    }
+    return {
+      activeByLevel, results,
+      // What the medians are medians of, so a reader can sanity-check them.
+      method: 'debugStepSync', stepsPerMeasure, msPerStepProbe: +msPerStep.toFixed(4),
+      // Reported, not silently dropped: a caller who sees interrupted=true
+      // should discard the numbers rather than wonder why they look odd.
+      interrupted: benchHidden,
+      // VALIDATED 2026-09-07 against tools/bench-amr.js on the same machine and
+      // config, with every competing GPU client stopped. Large groups agree:
+      //
+      //   group             this sweep   bench-amr
+      //   interp            13.8%        15.6-17.3%
+      //   avg               12.2%        12.1-15.9%
+      //   ghost             13.3%        13.7-18.5%
+      //   step1             32.7%        27.5-31.7%
+      //   interp+avg+ghost  40.5%        43.9-49.1%
+      //
+      // (`ghost` and `interp+avg+ghost` no longer exist as configurations --
+      // the pass they skipped is gone; `ghostcopy` measures the same boundary
+      // from the other side. The rows are kept because they are the only
+      // published cross-check of this sweep against bench-amr.js.)
+      //
+      // The small rows do NOT resolve, on any run: interp-noop/avg-noop/
+      // step1-ring are 0.2-5% effects by bench-amr and came back as 7.9%,
+      // -3.6% and -12.2% here. The baseline itself carries ~15% spread because
+      // the card keeps falling through the sweep while refinement is frozen,
+      // so the workload drifts under every row equally. Read anything under
+      // ~10% as "below the floor", not as a measurement -- and, for the
+      // pass-REMOVING groups, a NEGATIVE share means exactly that, since
+      // skipping work cannot make a run slower. `ghostcopy` is the one
+      // configuration whose share is negative BY DESIGN (it adds work back),
+      // so read its magnitude, not its sign, against the same ~10% floor. Use
+      // tools/bench-amr.js for the small effects on any device that has a CDP
+      // endpoint; this sweep exists for the one that does not.
+      noiseFloorPct: 10,
+    };
+  }
+  const readbackWatch = { lastStep: null, lastY: null, n: 0, stepBack: 0, worstStepBack: 0,
+                          posJump: 0, fieldRepeat: 0, digests: [], samples: [],
+                          lastOffX: null, lastOffY: null, offDirX: 0, offDirY: 0,
+                          offReversals: 0, worstOffReversal: 0, offMaxStep: 0, offBackFrames: 0, offTrace: [], ring: [], diverged: false, divergedAtStep: null, history: null };
+
+  let benchRunning = false;
+  let benchDone = false;
+
   window.__AMR = {
+    runBenchSweep,
+    hasTimestamp: () => hasTimestamp,
+    debugProfileMacroStep,
     setLive: (v) => { liveMode = !!v; },
     isLive: () => liveMode,
     reset: resetSim,
@@ -2312,19 +3185,42 @@ async function init() {
       perLevel: Array.from({ length: N_LEVELS - 1 }, (_, i) => ({ childLevel: i + 1, ...paramsForChildLevel(i + 1) })),
     }),
     getNumLevels: () => N_LEVELS,
+    getF16: () => F16,
+    // Set the pass-skip set AFTER warm-up, which is the only way a skip A/B
+    // is valid: passing ?benchSkip= in the URL means the warm-up itself runs
+    // with the modified physics, so the card follows a different trajectory
+    // and refinement settles on a different topology. Measured -- warming up
+    // with force skipped gave 73 active L1 blocks against 123 for the
+    // baseline, so the two runs were not doing comparable work at all. See
+    // tools/bench-amr.js --skip.
+    setBenchSkip: (groups) => {
+      const next = (groups || []).filter(Boolean);
+      validateSkipGroups(next, 'setBenchSkip');
+      benchSkip.clear();
+      for (const g of next) benchSkip.add(g);
+      return [...benchSkip];
+    },
     getLevelPoolSizes,
     tauAtLevel,
   };
 
   async function frame() {
     try {
-      if (!liveMode) {
-        requestAnimationFrame(() => frame().catch(handleErr));
-        return;
-      }
+      if (deviceLost) return; // stop the rAF chain; every submit would be a no-op
+      // Flush pending slider changes BEFORE the liveMode early-return.
+      // With this after it, a parameter changed while the sim was paused was
+      // silently dropped, and debugStepSync (which never goes through this
+      // function) would then advance the sim with the OLD values while the
+      // control panel showed the new ones. Found while testing a mid-run
+      // Blockage drag: A stayed at 38.8 for 16000 steps after the slider and
+      // its readout had both moved to 20.3.
       if (paramsDirty) {
         updateGPUParams();
         paramsDirty = false;
+      }
+      if (!liveMode) {
+        requestAnimationFrame(() => frame().catch(handleErr));
+        return;
       }
 
       const stage = stages[currentStageIdx];
@@ -2337,15 +3233,20 @@ async function init() {
       device.pushErrorScope('validation');
       const enc = device.createCommandEncoder();
 
+      // Whole-frame GPU span. A compute pass may carry timestampWrites
+      // without dispatching anything, so an empty pass at each end brackets
+      // the frame's real work without touching dispatchMacroStep.
       if (hasTimestamp) {
-        // enc.writeTimestamp(querySet, 0);
+        const t0 = enc.beginComputePass({ timestampWrites: { querySet, beginningOfPassWriteIndex: 0 } });
+        t0.end();
       }
 
       for (let s = 0; s < STEPS_PER_FRAME; s++) dispatchMacroStep(enc);
       step += STEPS_PER_FRAME;
 
       if (hasTimestamp) {
-        // enc.writeTimestamp(querySet, 1);
+        const t1 = enc.beginComputePass({ timestampWrites: { querySet, endOfPassWriteIndex: 1 } });
+        t1.end();
         enc.resolveQuerySet(querySet, 0, 2, queryResolveBuffer, 0);
         enc.copyBufferToBuffer(queryResolveBuffer, 0, stage.query, 0, 16);
       }
@@ -2353,7 +3254,16 @@ async function init() {
       const rp = enc.beginRenderPass({ colorAttachments: [{ view: ctx.getCurrentTexture().createView(), clearValue: { r:0.07, g:0.07, b:0.1, a:1 }, loadOp: 'clear', storeOp: 'store' }]});
       rp.setPipeline(renPL); rp.setBindGroup(0, renBG); rp.draw(6); rp.end();
 
+      // Only run when telemetry is on. It exists to answer a diagnostic
+      // question, and a normal run should not pay for an instrument -- least
+      // of all one whose cost cannot be measured on the machine it is
+      // suspected on.
+      if (TELEMETRY && !skipGroup('digest')) {
+        const dg = beginPass(enc, 'field digest');
+        dg.setPipeline(digestPL); dg.setBindGroup(0, digestBG); dg.dispatchWorkgroups(1); dg.end();
+      }
       enc.copyBufferToBuffer(cardStateBuf, 0, stage.card, 0, 104);
+      enc.copyBufferToBuffer(digestBuf, 0, stage.card, 104, 16);
 
       const tSubmit = performance.now();
       device.queue.submit([enc.finish()]);
@@ -2362,6 +3272,19 @@ async function init() {
       stage.inFlight = true;
       stage.step = step;
 
+      // ── Ordering watchdog ────────────────────────────────────────────
+      // Reported symptom: on a slow device the display appears to jump
+      // BACKWARD a few frames now and then. The step counter itself is
+      // monotonic (verified in telemetry), so any regression has to be in
+      // what gets displayed -- which is read back per stage, and three
+      // stages are in flight at once. If two readbacks are ever processed
+      // out of order, the older one overwrites the newer one's status and
+      // trajectory row, and the display goes back in time.
+      //
+      // Desktop cannot reproduce it (monotonic over hundreds of updates even
+      // at sync/gpu = 3.3), so this records the evidence on whatever device
+      // actually shows it, rather than guessing from here. Cheap enough to
+      // leave on: two comparisons per frame.
       const processReadback = async (st) => {
         const pCard = st.card.mapAsync(GPUMapMode.READ);
         const pQuery = hasTimestamp ? st.query.mapAsync(GPUMapMode.READ) : Promise.resolve();
@@ -2378,16 +3301,154 @@ async function init() {
           gpuTime = performance.now() - tSubmit;
         }
 
+        // Out-of-order / regression detection on the ACTUAL readback
+        // sequence, not the 250ms-throttled status line.
+        if (readbackWatch.lastStep !== null) {
+          if (st.step < readbackWatch.lastStep) {
+            readbackWatch.stepBack++;
+            readbackWatch.worstStepBack = Math.max(readbackWatch.worstStepBack, readbackWatch.lastStep - st.step);
+            if (readbackWatch.samples.length < 12) {
+              readbackWatch.samples.push({ kind: 'step', from: readbackWatch.lastStep, to: st.step });
+            }
+          }
+          // y_total/x_total are accumulated displacement: a physical
+          // quantity that cannot jump discontinuously in one frame. A large
+          // jump means we are looking at a stale readback, not new physics.
+          //
+          // The finiteness test is FIRST and separate on purpose. Every
+          // comparison with NaN is false, so `dy > 50` silently passes a
+          // solver that has already diverged -- which is exactly what
+          // happened: a phone run blew up while this watchdog reported
+          // frames=1127, stepBack=0, posJump=0. A NaN check cannot be
+          // expressed as a magnitude threshold.
+          if (!Number.isFinite(d[20]) || !Number.isFinite(d[4]) || !Number.isFinite(d[7])) {
+            if (!readbackWatch.diverged) {
+              readbackWatch.diverged = true;
+              readbackWatch.divergedAtStep = st.step;
+              // The run-up is the diagnostic, not the NaN itself.
+              readbackWatch.history = readbackWatch.ring.slice();
+            }
+          } else {
+            const dy = Math.abs(d[20] - readbackWatch.lastY);
+            if (readbackWatch.lastY !== null && dy > 50) {
+              readbackWatch.posJump++;
+              if (readbackWatch.samples.length < 12) {
+                readbackWatch.samples.push({ kind: 'y', from: +readbackWatch.lastY.toFixed(2), to: +d[20].toFixed(2), atStep: st.step });
+              }
+            }
+          }
+          // MOVING-WINDOW OFFSET TRACKING.
+          // The render translates the ENTIRE field by state.off_x/off_y
+          // (amr_render.wgsl's get_ux/get_uy and its bufX/bufY), while the
+          // card is drawn at cx/cy which absorb the sub-cell remainder. So a
+          // twitching offset moves the whole VIEW back and forth while the
+          // card's orientation and the field's content stay unperturbed --
+          // which is exactly the reported symptom, and is invisible to every
+          // other signal here: y_total/x_total are accumulated displacement
+          // and stay smooth across an offset reversal by construction
+          // (amr_physics.wgsl splits position into floor -> off and
+          // fraction -> cx).
+          //
+          // off wraps modulo W/H, so take the SIGNED SHORTEST delta -- a
+          // 255 -> 0 step is +1, not -255.
+          const wrapDelta = (cur, prev, n) => {
+            let dd = (cur - prev) % n;
+            if (dd > n / 2) dd -= n;
+            if (dd < -n / 2) dd += n;
+            return dd;
+          };
+          if (readbackWatch.lastOffX !== null) {
+            const dxo = wrapDelta(d[22], readbackWatch.lastOffX, W);
+            const dyo = wrapDelta(d[23], readbackWatch.lastOffY, H);
+            // A reversal is a sign flip against the recent trend, not merely
+            // a negative step: the card genuinely flutters, so sustained
+            // motion in either direction is physical and expected.
+            if (dxo !== 0) {
+              if (readbackWatch.offDirX !== 0 && Math.sign(dxo) !== readbackWatch.offDirX) {
+                readbackWatch.offReversals++;
+                readbackWatch.worstOffReversal = Math.max(readbackWatch.worstOffReversal, Math.abs(dxo));
+                if (readbackWatch.samples.length < 12) {
+                  readbackWatch.samples.push({ kind: 'offX', atStep: st.step, delta: dxo, prevDir: readbackWatch.offDirX });
+                }
+              }
+              readbackWatch.offDirX = Math.sign(dxo);
+            }
+            if (dyo !== 0) {
+              if (readbackWatch.offDirY !== 0 && Math.sign(dyo) !== readbackWatch.offDirY) {
+                readbackWatch.offReversals++;
+                readbackWatch.worstOffReversal = Math.max(readbackWatch.worstOffReversal, Math.abs(dyo));
+              }
+              readbackWatch.offDirY = Math.sign(dyo);
+            }
+            readbackWatch.offMaxStep = Math.max(readbackWatch.offMaxStep, Math.abs(dxo), Math.abs(dyo));
+            // Counting REVERSALS alone was the wrong measure: between two
+            // reversals the offset can travel one way for dozens of frames,
+            // and the viewer sees the scene translate backward on EVERY
+            // frame with a negative delta, not just on the frame the
+            // direction flips. Count those directly, and keep a short trace
+            // so an observed twitch can be matched against what the window
+            // actually did around that moment.
+            if (dxo < 0 || dyo < 0) readbackWatch.offBackFrames++;
+            readbackWatch.offTrace.push({ s: st.step, dx: dxo, dy: dyo });
+            if (readbackWatch.offTrace.length > 32) readbackWatch.offTrace.shift();
+          }
+          readbackWatch.lastOffX = d[22];
+          readbackWatch.lastOffY = d[23];
+
+          // Rolling run-up buffer, kept regardless, so a divergence report
+          // carries the frames BEFORE it rather than just the moment of.
+          readbackWatch.ring.push({
+            s: st.step, y: +Number(d[20]).toFixed(2), vy: +Number(d[4]).toFixed(5),
+            om: +Number(d[5]).toFixed(6), fy: +Number(d[7]).toPrecision(4), th: +Number(d[2]).toFixed(3),
+          });
+          if (readbackWatch.ring.length > 24) readbackWatch.ring.shift();
+        }
+        // Field-repeat detection. `dig` fingerprints the whole L0 velocity
+        // field; ordinary dynamics never reproduces an earlier frame's field
+        // exactly, so an exact match against a recent frame means the
+        // display went back in time rather than forward.
+        // `d` already maps the WHOLE staging buffer; a second getMappedRange
+        // for the digest would overlap it and throw. CardState occupies
+        // floats 0..25 (104 bytes), the digest floats 26..29.
+        const key = `${d[26]}|${d[27]}|${d[28]}`;
+        const prevIdx = readbackWatch.digests.indexOf(key);
+        if (prevIdx !== -1) {
+          readbackWatch.fieldRepeat++;
+          if (readbackWatch.samples.length < 12) {
+            readbackWatch.samples.push({
+              kind: 'fieldRepeat', atStep: st.step,
+              framesBack: readbackWatch.digests.length - prevIdx,
+            });
+          }
+        }
+        readbackWatch.digests.push(key);
+        if (readbackWatch.digests.length > 16) readbackWatch.digests.shift();
+
+        readbackWatch.lastStep = st.step;
+        readbackWatch.lastY = d[20];
+        readbackWatch.n++;
+
         if (st.step < 100000) {
           trajectory.push([st.step, d[0], d[20], d[21], d[2], d[3], d[4], d[5], d[6], d[7], d[8]]);
         }
 
         if (performance.now() - lastT > 250) {
+          // L0 cells only -- it deliberately ignores every fine level, so it
+          // is a coarse-grid-throughput figure, NOT total work done, and is
+          // not comparable across level counts. tools/bench-amr.js computes
+          // the honest cell-updates/s using live per-level active counts.
           const mlups = (NCELLS * STEPS_PER_FRAME) / (gpuTime * 1e3);
           mlupsEl.textContent = mlups.toFixed(1);
           gpuMsEl.textContent = gpuTime.toFixed(2);
           syncMsEl.textContent = (performance.now() - tSubmit).toFixed(2);
-          statusEl.textContent = `[AMR-dev] step ${st.step}  y=${d[20].toFixed(1)}  x=${d[21].toFixed(1)}  vy=${d[4].toFixed(4)}  Fy=${d[7].toExponential(2)}  θ=${d[2].toFixed(2)}`;
+          telemetrySample(gpuTime, performance.now() - tSubmit, st.step);
+          // Not while a benchmark sweep owns the status line: this runs on
+          // every readback and silently overwrote the sweep's own progress
+          // messages within a frame, so "benchmark round 2/3" was never
+          // actually visible to anyone asked to watch for it.
+          if (!benchRunning) {
+            statusEl.textContent = `[AMR-dev] step ${st.step}  y=${d[20].toFixed(1)}  x=${d[21].toFixed(1)}  vy=${d[4].toFixed(4)}  Fy=${d[7].toExponential(2)}  θ=${d[2].toFixed(2)}`;
+          }
           lastT = performance.now();
         }
 

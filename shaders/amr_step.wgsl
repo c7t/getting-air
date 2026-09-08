@@ -20,12 +20,17 @@
 
 // @include "common_geometry.wgsl"
 // @include "common_lattice.wgsl"
+// @include "common_fpack.wgsl"
 // @include "common_sponge.wgsl"
 // @include "common_walls.wgsl"
 
+
+
+
+
 @group(0) @binding(0) var<storage, read>       state : CardState;
-@group(0) @binding(1) var<storage, read>       f_in  : array<f32>;
-@group(0) @binding(2) var<storage, read_write> f_out : array<f32>;
+@group(0) @binding(1) var<storage, read>       f_in  : array<u32>;
+@group(0) @binding(2) var<storage, read_write> f_out : array<u32>;
 @group(0) @binding(3) var<storage, read_write> vel   : array<f32>;
 
 override W : u32;
@@ -106,7 +111,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       // Bounce-back -- see lbm_step.wgsl's identical branch for the
       // formula/derivation.
       let corr = 2f * wt[i] * (f32(ex[i]) * usx + f32(ey[i]) * usy) / CS2;
-      f[i] = f_in[opp[i] * (W * H) + cell] + corr;
+      f[i] = fUnpack(f_in[fIdx(opp[i], (W * H), cell)], opp[i]) + corr;
     } else if (WALL_Y != 0u && wallSourceOutside(wy, ey[i])) {
       // Channel wall bounce-back (window-space -- the physical wall is
       // anchored in window coordinates, same as the body SDF and sponge
@@ -114,11 +119,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       // identical branch.
       let wallUx = wallVelocityX(wy, ey[i], WALL_U0, WALL_U1);
       let corr = 2f * wt[i] * f32(ex[i]) * wallUx / CS2;
-      f[i] = f_in[opp[i] * (W * H) + cell] + corr;
+      f[i] = fUnpack(f_in[fIdx(opp[i], (W * H), cell)], opp[i]) + corr;
     } else {
       let bx_src = (cx + W - u32(ex[i])) % W;
       let by_src = (cy + H - u32(ey[i])) % H;
-      f[i] = f_in[i * (W * H) + cellIndex(bx_src, by_src)];
+      f[i] = fUnpack(f_in[fIdx(i, (W * H), cellIndex(bx_src, by_src))], i);
     }
   }
 
@@ -160,6 +165,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let sponge_weight = spongeWeight(dist_x, dist_y, SPONGE_W);
 
   let omg = 1.0f / state.tau;
+  // Gathered, then stored a whole cell at a time: under F16 two planes share
+  // a word, so a per-plane store would be a read-modify-write race. See
+  // common_fpack.wgsl.
+  var fo: array<f32,9>;
   for (var i = 0u; i < 9u; i++) {
     let exf = f32(ex[i]); let eyf = f32(ey[i]);
     let eu  = exf*ux + eyf*uy;
@@ -175,6 +184,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let eu_far = exf*SPONGE_UX + eyf*SPONGE_UY;
     let f_target = wt[i] * (1.0f + 3.0f*eu_far + 4.5f*eu_far*eu_far - 1.5f*(SPONGE_UX*SPONGE_UX + SPONGE_UY*SPONGE_UY)); // rho=1.0, u=(SPONGE_UX,SPONGE_UY) equilibrium
 
-    f_out[i * (W * H) + cell] = mix(f_collide, f_target, sponge_weight);
+    fo[i] = mix(f_collide, f_target, sponge_weight);
+  }
+  let nw = fWords();
+  for (var wi = 0u; wi < nw; wi++) {
+    f_out[wi * (W * H) + cell] = fPack(fo[fLo(wi)], fo[fHi(wi)], wi);
   }
 }

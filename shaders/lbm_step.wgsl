@@ -3,12 +3,13 @@
 
 // @include "common_geometry.wgsl"
 // @include "common_lattice.wgsl"
+// @include "common_fpack.wgsl"
 // @include "common_sponge.wgsl"
 // @include "common_walls.wgsl"
 
 @group(0) @binding(0) var<storage, read>       state : CardState;
-@group(0) @binding(1) var<storage, read>       f_in  : array<f32>;
-@group(0) @binding(2) var<storage, read_write> f_out : array<f32>;
+@group(0) @binding(1) var<storage, read>       f_in  : array<u32>;
+@group(0) @binding(2) var<storage, read_write> f_out : array<u32>;
 @group(0) @binding(3) var<storage, read_write> vel   : array<f32>;
 
 override W : u32;
@@ -57,6 +58,8 @@ override WALL_U1 : f32 = 0.0f;
 // Uniform body-force density (e.g. Poiseuille's driving force), added to
 // every cell's Guo forcing source term unconditionally -- not gated by
 // chi, unlike the near-body penalty force. Default (0,0) is a no-op.
+
+
 override FORCE_X : f32 = 0.0f;
 override FORCE_Y : f32 = 0.0f;
 
@@ -109,19 +112,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       // term specifically) avoids a circular dependency on this cell's own
       // not-yet-gathered rho.
       let corr = 2f * wt[i] * (f32(ex[i]) * usx + f32(ey[i]) * usy) / CS2;
-      f[i] = f_in[opp[i] * (W * H) + cell] + corr;
+      f[i] = fUnpack(f_in[fIdx(opp[i], (W * H), cell)], opp[i]) + corr;
     } else if (WALL_Y != 0u && wallSourceOutside(y, ey[i])) {
       // Channel wall bounce-back (see shaders/common_walls.wgsl) -- same
       // reflect-and-correct idiom as the body case above, just a position
       // test instead of an SDF test. usy is always 0 (horizontal walls).
       let wallUx = wallVelocityX(y, ey[i], WALL_U0, WALL_U1);
       let corr = 2f * wt[i] * f32(ex[i]) * wallUx / CS2;
-      f[i] = f_in[opp[i] * (W * H) + cell] + corr;
+      f[i] = fUnpack(f_in[fIdx(opp[i], (W * H), cell)], opp[i]) + corr;
     } else {
       // Map window source to buffer source
       let bx_src = (wx_src + u32(state.off_x)) % W;
       let by_src = (wy_src + u32(state.off_y)) % H;
-      f[i] = f_in[i * (W * H) + (by_src * W + bx_src)];
+      f[i] = fUnpack(f_in[fIdx(i, (W * H), (by_src * W + bx_src))], i);
     }
   }
 
@@ -162,6 +165,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let sponge_weight = spongeWeight(dist_x, dist_y, SPONGE_W);
 
   let omg = 1.0f / state.tau;
+  // Gathered, then stored a whole cell at a time: under F16 two planes share
+  // a word, so a per-plane store would be a read-modify-write race. See
+  // common_fpack.wgsl.
+  var fo: array<f32,9>;
   for (var i = 0u; i < 9u; i++) {
     let exf = f32(ex[i]); let eyf = f32(ey[i]);
     let eu  = exf*ux + eyf*uy;
@@ -177,6 +184,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let eu_far = exf*SPONGE_UX + eyf*SPONGE_UY;
     let f_target = wt[i] * (1.0f + 3.0f*eu_far + 4.5f*eu_far*eu_far - 1.5f*(SPONGE_UX*SPONGE_UX + SPONGE_UY*SPONGE_UY)); // rho=1.0, u=(SPONGE_UX,SPONGE_UY) equilibrium
 
-    f_out[i * (W * H) + cell] = mix(f_collide, f_target, sponge_weight);
+    fo[i] = mix(f_collide, f_target, sponge_weight);
+  }
+  // Whole-cell store -- see common_fpack.wgsl on why planes cannot be
+  // written individually.
+  let nw = fWords();
+  for (var wi = 0u; wi < nw; wi++) {
+    f_out[wi * (W * H) + cell] = fPack(fo[fLo(wi)], fo[fHi(wi)], wi);
   }
 }

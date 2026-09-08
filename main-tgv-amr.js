@@ -54,11 +54,36 @@
 // {ok:true}, no body to check coverage against -- debugReadCardState).
 
 import { assembleShader } from './shader-loader.mjs';
+import { packF, unpackF, fWords } from './f-pack.mjs';
 
 const canvas   = document.getElementById('c');
 const statusEl = document.getElementById('status');
 
 const urlParams = new URLSearchParams(window.location.search);
+// ?f16=1 / ?f16=2: real packed-half storage for `f` -- see shaders/common_fpack.wgsl
+// and f-pack.mjs. Wired on EVERY page that consumes those shaders, including
+// the ones with no accuracy check of their own: a page that quietly ignored
+// ?f16= would make a green `validate-all --extra=f16=1` sweep look like it
+// covered ground it never touched, which is the kind of false confidence
+// this repo has been bitten by before.
+const F16 = urlParams.has('f16') ? (parseInt(urlParams.get('f16')) || 0) : 0;
+
+// ── ?ghostcopy=1 -- legacy materialized same-level ghost cells ───────────────
+// Default 0: the fine step resolves a source cell that falls outside its tile
+// against the owning same-level tile directly (blockSlot), so the
+// between-substep fine-fine ghost COPY pass is not encoded at all. Measured
+// worth 9.9% of frame GPU time on the desktop and 13.1% on the phone (the pass
+// itself was 16.7-17.5%; the fine step gives 3.6-7.5% of that back, since half
+// a tile's threads now pull from another slot's memory) -- see
+// plans/perf-characterization.md's "The one lead left" for the full
+// decomposition on both devices.
+//
+// 1 restores the old path exactly (clamp at the slot's own buffer edge, plus
+// the copy pass), so the two can be A/B'd for both speed and physics on one
+// build: `node tools/validate-all.js --extra=ghostcopy=1` runs the whole
+// validation sweep against the legacy path.
+const GHOST_COPY = urlParams.has('ghostcopy') ? (parseInt(urlParams.get('ghostcopy')) || 0) : 0;
+
 let resLog2 = parseInt(urlParams.get('res')) || 6;
 // Floor of 5 (N=32, NBX=4) -- same structural minimum as main-channel-
 // amr.js (more than one coarse block per axis), not the cylinder
@@ -249,7 +274,10 @@ function allocLevelPool(device, U, m, NBX_m, NBY_m, maxFineBlocks) {
     fSizePool: fSizePool_m,
     finePoolF_a: device.createBuffer({ size: fSizePool_m, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC }),
     finePoolF_b: device.createBuffer({ size: fSizePool_m, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC }),
-    finePoolVel: device.createBuffer({ size: maxFineBlocks * NCELLS1 * 2 * 4, usage: U.STORAGE | U.COPY_SRC }),
+    // COPY_DST is load-bearing, not boilerplate: debugSnapshotLoad writes
+    // this buffer via queue.writeBuffer, which is a validation error --
+    // silently discarded -- without it. See velBuf's own note below.
+    finePoolVel: device.createBuffer({ size: maxFineBlocks * NCELLS1 * 2 * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC }),
     blockSlotBuf: device.createBuffer({ size: NBLOCKS_m * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC }),
     slotToBlockBuf: device.createBuffer({ size: maxFineBlocks * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC }),
     blockCriterionBuf: device.createBuffer({ size: NBLOCKS_m * 4, usage: U.STORAGE | U.COPY_DST }),
@@ -322,10 +350,33 @@ async function init() {
   const ctx = canvas.getContext('webgpu');
   const fmt = navigator.gpu.getPreferredCanvasFormat();
 
+  // Reconfigure ONLY on a real size change. This used to run unconditionally
+  // on every `resize` event, and both halves of it are destructive:
+  // assigning canvas.width/height resets the drawing buffer even when the
+  // value is unchanged, and ctx.configure() replaces the swapchain,
+  // invalidating textures that in-flight command buffers still reference
+  // (this page keeps up to STAGES frames in flight).
+  //
+  // On desktop `resize` fires when you resize the window, so the cost was
+  // invisible. On a PHONE it fires constantly -- the URL bar hides and shows
+  // on any scroll or drag, which includes touching the control sliders --
+  // so the swapchain was being torn down and rebuilt underneath frames that
+  // were already submitted. Reported symptom: the view "twitches back" a few
+  // frames, correlated with moving sliders or switching away and back.
+  //
+  // Also guards the degenerate case: clientWidth/Height read 0 during some
+  // layout transitions (and while hidden), and a 0-sized canvas is not a
+  // valid configuration.
+  let cfgW = 0, cfgH = 0;
   function resize() {
     const dpr = window.devicePixelRatio || 1;
-    canvas.width  = Math.round(canvas.clientWidth * dpr);
-    canvas.height = Math.round(canvas.clientHeight * dpr);
+    const w = Math.round(canvas.clientWidth * dpr);
+    const h = Math.round(canvas.clientHeight * dpr);
+    if (w <= 0 || h <= 0) return;      // mid-layout / hidden: nothing to configure
+    if (w === cfgW && h === cfgH) return; // same size: reconfiguring is pure damage
+    cfgW = w; cfgH = h;
+    canvas.width = w;
+    canvas.height = h;
     ctx.configure({ device, format: fmt, alphaMode: 'opaque' });
   }
   window.addEventListener('resize', resize);
@@ -335,11 +386,28 @@ async function init() {
   const fSize   = NCELLS * 9 * 4;
   const f_a     = device.createBuffer({ size: fSize, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
   const f_b     = device.createBuffer({ size: fSize, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
-  const velBuf  = device.createBuffer({ size: NCELLS * 2 * 4, usage: U.STORAGE | U.COPY_SRC });
+  // COPY_DST: debugSnapshotLoad restores this with queue.writeBuffer.
+  // Without the flag that write is a validation error and is silently
+  // dropped, so a loaded snapshot keeps whatever ux/uy were already there.
+  // The load path's own comment already describes this exact symptom
+  // ("rho round-tripped exactly, but ux/uy didn't -- the asymmetry was the
+  // tell") -- the writeBuffer call was added then, but the usage flag was
+  // not, so the fix never actually took effect.
+  const velBuf  = device.createBuffer({ size: NCELLS * 2 * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
   const dummyBlockSlotBuf = device.createBuffer({ size: 4, usage: U.STORAGE | U.COPY_DST });
   device.queue.writeBuffer(dummyBlockSlotBuf, 0, new Int32Array([-1]));
   const dummyCriterionBuf = device.createBuffer({ size: 4, usage: U.STORAGE | U.COPY_DST });
   device.queue.writeBuffer(dummyCriterionBuf, 0, new Float32Array([0]));
+
+  // See main-amr.js's copy for the rationale: the GPU buffer holds packed
+  // half pairs under F16, everything else speaks f32 plane-major, and these
+  // two are the only places the two meet.
+  const writeF = (buf, f32, ncells) => {
+    const src = packF(f32, ncells, F16);
+    device.queue.writeBuffer(buf, 0, src.buffer, src.byteOffset, ncells * fWords(F16) * 4);
+  };
+  const readF = (mapped, ncells) =>
+    F16 ? unpackF(new Uint32Array(mapped), ncells, true) : new Float32Array(mapped).slice();
 
   const cardStateBuf = device.createBuffer({ size: 104, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
 
@@ -351,14 +419,14 @@ async function init() {
         ? MAX_FINE_BLOCKS
         : (urlParams.has(`maxFineBlocks${m}`) ? parseInt(urlParams.get(`maxFineBlocks${m}`)) : 128);
       const pool = allocLevelPool(device, U, m, curNBX, curNBY, maxFineBlocks);
-      device.queue.writeBuffer(pool.finePoolF_a, 0, initFPool(maxFineBlocks));
+      writeF(pool.finePoolF_a, initFPool(maxFineBlocks), maxFineBlocks * NCELLS1);
       pools.push(pool);
       curNBX *= 2; curNBY *= 2;
     }
   }
 
   device.queue.writeBuffer(cardStateBuf, 0, initCardState());
-  device.queue.writeBuffer(f_a, 0, initF());
+  writeF(f_a, initF(), NCELLS);
   device.queue.writeBuffer(pools[1].freeListBuf, 0, new Int32Array(MAX_FINE_BLOCKS).map((_, i) => i));
   device.queue.writeBuffer(pools[1].freeCountBuf, 0, new Int32Array([MAX_FINE_BLOCKS]));
 
@@ -475,7 +543,11 @@ async function init() {
     { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
     { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-    { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }
+    { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    // binding 5: blockSlot -- neighbour-addressed streaming (see the
+    // DIRECT_GHOST override in shaders/amr_step1.wgsl). Present in the layout
+    // even under ?ghostcopy=1, where the shader simply never reads it.
+    { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }
   ]});
   const avgBGL = device.createBindGroupLayout({ label: 'avgBGL', entries: [
     { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
@@ -491,7 +563,9 @@ async function init() {
     { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } }
+    { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+    // binding 8: blockSlot -- see step1BGL's binding 5.
+    { binding: 8, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }
   ]});
   const avgPoolBGL = device.createBindGroupLayout({ label: 'avgPoolBGL', entries: [
     { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
@@ -505,13 +579,16 @@ async function init() {
   const constants = { W, H };
 
   // Fully periodic, no body, no walls, no force -- see this file's header.
-  const stepConstants = { W, H, HAS_BODY: 0, SPONGE_W: 0 };
+  const stepConstants = { W, H, HAS_BODY: 0, SPONGE_W: 0, F16 };
   const fineConstants = { W, H, RB };
+  // Split from fineConstants, which also drives the render fragment --
+  // render.wgsl has no F16 override and WebGPU rejects an undeclared one.
+  const avgConstants = { W, H, RB, F16 };
 
-  const interpConstants = { W, H, RB, GHOST_ONLY: 1 };
-  const interpInitConstants = { W, H, RB, GHOST_ONLY: 0 };
-  const interpFFConstants = { W, H, RB, GHOST_ONLY: 1, FINE_FINE_ONLY: 1 };
-  const step1Constants = { ...stepConstants, RB };
+  const interpConstants = { W, H, RB, GHOST_ONLY: 1, F16 };
+  const interpInitConstants = { W, H, RB, GHOST_ONLY: 0, F16 };
+  const interpFFConstants = { W, H, RB, GHOST_ONLY: 1, FINE_FINE_ONLY: 1, F16 };
+  const step1Constants = { ...stepConstants, RB, DIRECT_GHOST: GHOST_COPY ? 0 : 1 };
   const criterionConstants = { W, H };
   const manageConstants = { W, H, REFINE_THRESH, COARSEN_THRESH, FORCE_REFINE_MARGIN, FORCE_REFINE_LOOKAHEAD, HAS_LEVEL2: N_LEVELS > 2 ? 1 : 0, HAS_BODY: 0 };
 
@@ -525,7 +602,7 @@ async function init() {
   });
   const step1PoolPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [step1PoolBGL] }),
-    compute: { module: step1PoolSM, entryPoint: 'main', constants: { ...step1Constants, K_EPS: 1.5 } }
+    compute: { module: step1PoolSM, entryPoint: 'main', constants: { ...step1Constants, K_EPS: 1.5, F16 } }
   });
 
   const renPL = device.createRenderPipeline({
@@ -546,9 +623,9 @@ async function init() {
     layout: device.createPipelineLayout({ bindGroupLayouts: [interpBGL] }),
     compute: { module: interpDenseSM, entryPoint: 'main', constants: interpFFConstants }
   });
-  const interpPoolConstants = { RB, GHOST_ONLY: 1 };
-  const interpPoolInitConstants = { RB, GHOST_ONLY: 0 };
-  const interpPoolFFConstants = { RB, GHOST_ONLY: 1, FINE_FINE_ONLY: 1 };
+  const interpPoolConstants = { RB, GHOST_ONLY: 1, F16 };
+  const interpPoolInitConstants = { RB, GHOST_ONLY: 0, F16 };
+  const interpPoolFFConstants = { RB, GHOST_ONLY: 1, FINE_FINE_ONLY: 1, F16 };
   const interpPoolParentPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [interpPoolParentBGL] }),
     compute: { module: interpPoolSM, entryPoint: 'main', constants: interpPoolConstants }
@@ -563,11 +640,11 @@ async function init() {
   });
   const avgPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [avgBGL] }),
-    compute: { module: avgSM, entryPoint: 'main', constants: fineConstants }
+    compute: { module: avgSM, entryPoint: 'main', constants: avgConstants }
   });
   const avgPoolPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [avgPoolBGL] }),
-    compute: { module: avgPoolSM, entryPoint: 'main', constants: { RB } }
+    compute: { module: avgPoolSM, entryPoint: 'main', constants: { RB, F16 } }
   });
   const criterionPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [criterionBGL] }),
@@ -615,8 +692,8 @@ async function init() {
 
   const stepBG_ab = device.createBindGroup({ layout: stepBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_a } }, { binding: 2, resource: { buffer: f_b } }, { binding: 3, resource: { buffer: velBuf } }]});
   const stepBG_ba = device.createBindGroup({ layout: stepBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_b } }, { binding: 2, resource: { buffer: f_a } }, { binding: 3, resource: { buffer: velBuf } }]});
-  const step1BG_ab = device.createBindGroup({ layout: step1BGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: pools[1].finePoolF_a } }, { binding: 2, resource: { buffer: pools[1].finePoolF_b } }, { binding: 3, resource: { buffer: pools[1].finePoolVel } }, { binding: 4, resource: { buffer: pools[1].slotToBlockBuf } }]});
-  const step1BG_ba = device.createBindGroup({ layout: step1BGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: pools[1].finePoolF_b } }, { binding: 2, resource: { buffer: pools[1].finePoolF_a } }, { binding: 3, resource: { buffer: pools[1].finePoolVel } }, { binding: 4, resource: { buffer: pools[1].slotToBlockBuf } }]});
+  const step1BG_ab = device.createBindGroup({ layout: step1BGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: pools[1].finePoolF_a } }, { binding: 2, resource: { buffer: pools[1].finePoolF_b } }, { binding: 3, resource: { buffer: pools[1].finePoolVel } }, { binding: 4, resource: { buffer: pools[1].slotToBlockBuf } }, { binding: 5, resource: { buffer: pools[1].blockSlotBuf } }]});
+  const step1BG_ba = device.createBindGroup({ layout: step1BGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: pools[1].finePoolF_b } }, { binding: 2, resource: { buffer: pools[1].finePoolF_a } }, { binding: 3, resource: { buffer: pools[1].finePoolVel } }, { binding: 4, resource: { buffer: pools[1].slotToBlockBuf } }, { binding: 5, resource: { buffer: pools[1].blockSlotBuf } }]});
 
   const overlayOpacityBuf = device.createBuffer({ size: 4, usage: U.UNIFORM | U.COPY_DST });
   device.queue.writeBuffer(overlayOpacityBuf, 0, new Float32Array([1.0]));
@@ -706,6 +783,7 @@ async function init() {
       { binding: 5, resource: { buffer: childPool.originXBuf } },
       { binding: 6, resource: { buffer: childPool.originYBuf } },
       { binding: 7, resource: { buffer: childPool.levelParamsBuf } },
+      { binding: 8, resource: { buffer: childPool.blockSlotBuf } },
     ]});
     childPool.step1PoolBG_ba = device.createBindGroup({ layout: step1PoolBGL, entries: [
       { binding: 0, resource: { buffer: cardStateBuf } },
@@ -716,6 +794,7 @@ async function init() {
       { binding: 5, resource: { buffer: childPool.originXBuf } },
       { binding: 6, resource: { buffer: childPool.originYBuf } },
       { binding: 7, resource: { buffer: childPool.levelParamsBuf } },
+      { binding: 8, resource: { buffer: childPool.blockSlotBuf } },
     ]});
 
     const avgEntries = (parentBuf) => [
@@ -810,7 +889,12 @@ async function init() {
       averageFromChild(cur);
       interpIntoChild(cur);
     }
-    fineFineRefresh();
+    // Legacy same-level fine-fine refresh (?ghostcopy=1 only). The default
+    // path needs no pass here: substep B's own gather reaches into the
+    // neighbour tile directly, so it reads the neighbour's post-`average`
+    // interior rather than a copy taken before that average landed. See the
+    // DIRECT_GHOST override in shaders/amr_step1.wgsl.
+    if (GHOST_COPY) fineFineRefresh();
     substep(cur);
     cur = 'a';
     if (hasChild) {
@@ -868,8 +952,8 @@ async function init() {
   }
 
   function resetSim() {
-    device.queue.writeBuffer(f_a, 0, initF());
-    device.queue.writeBuffer(pools[1].finePoolF_a, 0, initFPool());
+    writeF(f_a, initF(), NCELLS);
+    writeF(pools[1].finePoolF_a, initFPool(), MAX_FINE_BLOCKS * NCELLS1);
     device.queue.writeBuffer(cardStateBuf, 0, initCardState());
     device.queue.writeBuffer(pools[1].blockSlotBuf, 0, new Int32Array(NBLOCKS).fill(-1));
     device.queue.writeBuffer(pools[1].slotToBlockBuf, 0, new Int32Array(MAX_FINE_BLOCKS).fill(-1));
@@ -877,7 +961,7 @@ async function init() {
     device.queue.writeBuffer(pools[1].freeCountBuf, 0, new Int32Array([MAX_FINE_BLOCKS]));
     for (let c = 2; c < N_LEVELS; c++) {
       const pool = pools[c];
-      device.queue.writeBuffer(pool.finePoolF_a, 0, initFPool(pool.MAX_FINE_BLOCKS));
+      writeF(pool.finePoolF_a, initFPool(pool.MAX_FINE_BLOCKS), pool.MAX_FINE_BLOCKS * NCELLS1);
       device.queue.writeBuffer(pool.blockSlotBuf, 0, new Int32Array(pool.NBLOCKS).fill(-1));
       device.queue.writeBuffer(pool.slotToBlockBuf, 0, new Int32Array(pool.MAX_FINE_BLOCKS).fill(-1));
       const freeQuads = Array.from({ length: pool.MAX_FINE_BLOCKS / 4 }, (_, i) => i);

@@ -25,11 +25,20 @@
 // tools/lib/field-reconstruct.js's loadDenseFields already decodes).
 
 import { assembleShader } from './shader-loader.mjs';
+import { packF, unpackF, fWords } from './f-pack.mjs';
 
 const canvas   = document.getElementById('c');
 const statusEl = document.getElementById('status');
 
 const urlParams = new URLSearchParams(window.location.search);
+// ?f16=1 / ?f16=2: real packed-half storage for `f` -- see shaders/common_fpack.wgsl
+// and f-pack.mjs. Wired on EVERY page that consumes those shaders, including
+// the ones with no accuracy check of their own: a page that quietly ignored
+// ?f16= would make a green `validate-all --extra=f16=1` sweep look like it
+// covered ground it never touched, which is the kind of false confidence
+// this repo has been bitten by before.
+const F16 = urlParams.has('f16') ? (parseInt(urlParams.get('f16')) || 0) : 0;
+
 let resLog2 = parseInt(urlParams.get('res')) || 8;
 if (resLog2 < 6) resLog2 = 6;
 if (resLog2 > 11) resLog2 = 11;
@@ -127,10 +136,33 @@ async function init() {
   const ctx = canvas.getContext('webgpu');
   const fmt = navigator.gpu.getPreferredCanvasFormat();
 
+  // Reconfigure ONLY on a real size change. This used to run unconditionally
+  // on every `resize` event, and both halves of it are destructive:
+  // assigning canvas.width/height resets the drawing buffer even when the
+  // value is unchanged, and ctx.configure() replaces the swapchain,
+  // invalidating textures that in-flight command buffers still reference
+  // (this page keeps up to STAGES frames in flight).
+  //
+  // On desktop `resize` fires when you resize the window, so the cost was
+  // invisible. On a PHONE it fires constantly -- the URL bar hides and shows
+  // on any scroll or drag, which includes touching the control sliders --
+  // so the swapchain was being torn down and rebuilt underneath frames that
+  // were already submitted. Reported symptom: the view "twitches back" a few
+  // frames, correlated with moving sliders or switching away and back.
+  //
+  // Also guards the degenerate case: clientWidth/Height read 0 during some
+  // layout transitions (and while hidden), and a 0-sized canvas is not a
+  // valid configuration.
+  let cfgW = 0, cfgH = 0;
   function resize() {
     const dpr = window.devicePixelRatio || 1;
-    canvas.width  = Math.round(canvas.clientWidth * dpr);
-    canvas.height = Math.round(canvas.clientHeight * dpr);
+    const w = Math.round(canvas.clientWidth * dpr);
+    const h = Math.round(canvas.clientHeight * dpr);
+    if (w <= 0 || h <= 0) return;      // mid-layout / hidden: nothing to configure
+    if (w === cfgW && h === cfgH) return; // same size: reconfiguring is pure damage
+    cfgW = w; cfgH = h;
+    canvas.width = w;
+    canvas.height = h;
     ctx.configure({ device, format: fmt, alphaMode: 'opaque' });
   }
   window.addEventListener('resize', resize);
@@ -172,9 +204,19 @@ async function init() {
     ]);
   }
 
+  // See main-amr.js's copy for the rationale: the GPU buffer holds packed
+  // half pairs under F16, everything else speaks f32 plane-major, and these
+  // two are the only places the two meet.
+  const writeF = (buf, f32, ncells) => {
+    const src = packF(f32, ncells, F16);
+    device.queue.writeBuffer(buf, 0, src.buffer, src.byteOffset, ncells * fWords(F16) * 4);
+  };
+  const readF = (mapped, ncells) =>
+    F16 ? unpackF(new Uint32Array(mapped), ncells, true) : new Float32Array(mapped).slice();
+
   const cardStateBuf = device.createBuffer({ size: 104, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
   device.queue.writeBuffer(cardStateBuf, 0, cardInit());
-  device.queue.writeBuffer(f_a, 0, initF());
+  writeF(f_a, initF(), NCELLS);
   device.queue.writeBuffer(forceBuf, 0, new Int32Array([0, 0, 0, 0]));
 
   // TAU is live-adjustable post-init, same "write immediately, not through a
@@ -227,14 +269,16 @@ async function init() {
   // main.js's own falling-card convention: quiescent far field, diffuse
   // (Brinkman/Guo) body coupling. See this file's own header.
   const constants = { W, H };
+  // See main.js: only the f-touching pipelines may be given F16.
+  const fConstants = { W, H, F16 };
 
   const stepPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [stepBGL] }),
-    compute: { module: stepSM, entryPoint: 'main', constants }
+    compute: { module: stepSM, entryPoint: 'main', constants: fConstants }
   });
   const frcPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [frcBGL] }),
-    compute: { module: frcSM, entryPoint: 'main', constants }
+    compute: { module: frcSM, entryPoint: 'main', constants: fConstants }
   });
   // KINEMATIC=1 -- see shaders/physics.wgsl's own comment and
   // main-reentry-amr.js's identical phyPL construction.
@@ -286,7 +330,7 @@ async function init() {
 
   function resetSim() {
     device.queue.writeBuffer(cardStateBuf, 0, cardInit());
-    device.queue.writeBuffer(f_a, 0, initF());
+    writeF(f_a, initF(), NCELLS);
     device.queue.writeBuffer(forceBuf, 0, new Int32Array([0, 0, 0, 0]));
     step = 0;
     useB = false;
@@ -383,7 +427,7 @@ async function init() {
     device.queue.submit([enc.finish()]);
 
     await Promise.all([stagingF, stagingVel, stagingCard].map(b => b.mapAsync(GPUMapMode.READ)));
-    const f = new Float32Array(stagingF.getMappedRange()).slice();
+    const f = readF(stagingF.getMappedRange(), NCELLS);
     const vel = new Float32Array(stagingVel.getMappedRange()).slice();
     const card = Array.from(new Float32Array(stagingCard.getMappedRange()).slice());
     stagingF.unmap();

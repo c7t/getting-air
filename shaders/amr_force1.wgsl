@@ -18,20 +18,32 @@
 //    force there would double-count against whichever cell actually OWNS
 //    that physical point. Only isInterior cells contribute.
 //
-// 2. Area weighting. Fx/Fy here are a per-CELL momentum exchange, not
-//    normalized by cell size -- summing raw per-cell values unweighted
-//    across levels would make a refined region report ~4x the coarse
-//    level's total force per doubling of resolution (a 2x2 patch of fine
-//    cells replacing 1 coarse cell, each of comparable magnitude, summed
-//    without correction). To integrate to the SAME total regardless of
-//    which level currently owns a region (the exact invariance this
-//    milestone's own validation checks), each level's contribution must be
-//    weighted by its own dx_L^2 relative to L0's dx_L0=1. L1's dx is a
-//    fixed 0.5 (footprint-preserving with L0, same reasoning as
-//    amr_step1.wgsl's literal epsilon), so AREA_WEIGHT=0.25 is a literal
-//    here, not a runtime lookup (contrast amr_force1_pool.wgsl, whose
-//    shared pipeline serves multiple levels and needs it from
-//    levelParams.dxL instead).
+// 2. Cross-level weighting. Fx/Fy here are a per-CELL momentum exchange,
+//    not normalized by cell size or by this level's own timestep, so a
+//    raw unweighted sum would not integrate to the same total regardless
+//    of which level owns a region (the exact invariance Milestone 8's own
+//    validation checks). The weight is dx_L^1, and BOTH factors matter:
+//
+//      cell mass  ~ rho * dx_L^2   (2D volume measure)
+//      timestep     dt_L = dx_L    (acoustic scaling: dx and dt halve together)
+//      force = mass * du / dt   ->  dx_L^2 / dx_L  =  dx_L
+//
+//    An earlier version used dx_L^2, applying only the volume measure and
+//    silently dropping the 1/dt_L factor -- level L runs 2^L substeps per
+//    L0 macro-step, but this pass runs ONCE per macro-step and reads one
+//    substep's momentum exchange, so the missing factor is exactly 2^L =
+//    1/dx_L. Measured on the cylinder harness at Re=100: that bug cost 2x
+//    at L1 and 4x at L2 (Cd 0.943 -> 1.430 at N=2, and the N=3 case went
+//    from unusable to inside the literature band). This is the same dx^1
+//    the bounce-back branch below already used -- for the same reason, not
+//    (as its old comment claimed) because one is a perimeter integral and
+//    the other a volume integral: the mass and timestep factors combine to
+//    dx^1 either way.
+//
+//    L1's dx is a fixed 0.5 (footprint-preserving with L0, same reasoning
+//    as amr_step1.wgsl's literal epsilon), so this is a literal here, not
+//    a runtime lookup (contrast amr_force1_pool.wgsl, whose shared
+//    pipeline serves multiple levels and needs it from levelParams.dxL).
 //
 // Finest-wins masking (see amr_force.wgsl's header for the general
 // rationale): whether THIS tile is superseded by an active level-2 child
@@ -44,9 +56,11 @@
 
 // @include "common_geometry.wgsl"
 // @include "common_lattice.wgsl"
+// @include "common_fpack.wgsl"
+// @include "common_reduce.wgsl"
 
 @group(0) @binding(0) var<storage, read>       state          : CardState;
-@group(0) @binding(1) var<storage, read>       f_in           : array<f32>;
+@group(0) @binding(1) var<storage, read>       f_in           : array<u32>;
 @group(0) @binding(2) var<storage, read_write> forces         : array<atomic<i32>, 4>;
 @group(0) @binding(3) var<storage, read>       slotToBlock    : array<i32>;
 @group(0) @binding(4) var<storage, read>       childBlockSlot : array<i32>; // level 2's blockSlot, or a harmless dummy if HAS_CHILD=0 -- see header
@@ -60,15 +74,17 @@ override HAS_CHILD : u32 = 0u;
 override USE_BOUNCEBACK : u32 = 0u;
 const GHOST = 2u;
 const BLOCK = 8u;
-const FSCALE = 10000f;
+// FSCALE: see shaders/amr_force1_pool.wgsl's FSCALE comment for why this
+// is 1e7 and not 1e4 (per-workgroup truncation in the atomic reduction).
+const FSCALE = 10000000f;
 const K_EPS = 1.5f;
-const AREA_WEIGHT = 0.25f; // dx_L1^2 = 0.5^2 -- see header
+const AREA_WEIGHT = 0.5f; // dx_L1^1 -- see header point 2
 // Bounce-back's MEM sum is a PERIMETER (line) integral over boundary
 // links, not the diffuse method's VOLUME integral over penalized cells --
 // a finer grid has MORE boundary links along the SAME physical perimeter
 // (density ~ 1/dx), but each link's own population-based contribution
 // doesn't shrink with dx the way a volume-density penalty force does, so
-// the cross-level correction is dx^1 here, not AREA_WEIGHT's dx^2.
+// dx^1, the same weight AREA_WEIGHT now carries -- see header point 2.
 // Live-verified: dx^2 gave Cd=0.631 (target 1.35) on the N=2 (L1-only)
 // cylinder case; dx^1 gives Cd=1.262, matching within tolerance.
 const LINE_WEIGHT = 0.5f; // dx_L1 -- see above
@@ -164,7 +180,7 @@ fn main(
               let srcWx = wrapf(srcBufX - state.off_x, f32(W));
               let srcWy = wrapf(srcBufY - state.off_y, f32(H));
               if (get_phi(vec2<f32>(srcWx, srcWy), state) < 0f) {
-                let f_opp = f_in[opp[i] * poolPlaneStride + cell];
+                let f_opp = fUnpack(f_in[fIdx(opp[i], poolPlaneStride, cell)], opp[i]);
                 let corr = 2f * wt[i] * (f32(ex[i]) * usx + f32(ey[i]) * usy) / CS2;
                 fx_body += -f32(ex[i]) * (2f * f_opp + corr) * LINE_WEIGHT;
                 fy_body += -f32(ey[i]) * (2f * f_opp + corr) * LINE_WEIGHT;
@@ -183,7 +199,7 @@ fn main(
               let srcX = clamp(i32(fx) - ex[i], 0, i32(FB) - 1);
               let srcY = clamp(i32(fy) - ey[i], 0, i32(FB) - 1);
               let srcCell = slot * (FB * FB) + u32(srcY) * FB + u32(srcX);
-              let fi = f_in[i * poolPlaneStride + srcCell];
+              let fi = fUnpack(f_in[fIdx(i, poolPlaneStride, srcCell)], i);
               rho     += fi;
               ux_star += fi * f32(ex[i]);
               uy_star += fi * f32(ey[i]);
@@ -214,15 +230,14 @@ fn main(
   wg_tz[lid] = tz_body;
   workgroupBarrier();
 
+  // Parallel tree reduction (common_reduce.wgsl) -- replaces a 64-step
+  // serial sum that lane 0 used to run alone. See that file for the
+  // on-device measurement that motivated it.
+  wgReduceSum3(lid);
   if (lid == 0u) {
-    var sum_fx = 0.0f;
-    var sum_fy = 0.0f;
-    var sum_tz = 0.0f;
-    for (var i = 0u; i < 64u; i++) {
-      sum_fx += wg_fx[i];
-      sum_fy += wg_fy[i];
-      sum_tz += wg_tz[i];
-    }
+    let sum_fx = wg_fx[0];
+    let sum_fy = wg_fy[0];
+    let sum_tz = wg_tz[0];
     atomicAdd(&forces[0], safeFixed(sum_fx * FSCALE));
     atomicAdd(&forces[1], safeFixed(sum_fy * FSCALE));
     atomicAdd(&forces[2], safeFixed(sum_tz * FSCALE));
