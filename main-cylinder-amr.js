@@ -2642,7 +2642,44 @@ async function init() {
         }
       }
     }
-    return { ok: violations.length === 0, violations, counts };
+
+    // ── Corner balance, reported SEPARATELY ──────────────────────────────
+    // The check above is edge-only ([N,S,E,W]) and always was, so nothing has
+    // ever asserted that a tile's DIAGONAL neighbour sits within one level.
+    // Fine for the ring path (interp fills a corner ghost from the parent when
+    // the corner tile is absent); NOT fine for ?ghostfree=1, whose bilinear
+    // parent stencil reads the parent's corner cell directly. Measured: before
+    // CORNER_BALANCE, 100% of ghost-free clamp fallbacks were diagonal.
+    //
+    // `ok` is deliberately NOT gated on it -- corner balance is a requirement
+    // of the ghost-free path, not the default one. Callers assert it via
+    // amr-invariants.js's requireCornerBalance.
+    const cornerViolations = [];
+    const CORNER_OFFSETS = [['NW', -1, -1], ['NE', 1, -1], ['SW', -1, 1], ['SE', 1, 1]];
+    for (let m = 1; m < N_LEVELS; m++) {
+      for (const key of activeSets[m]) {
+        const [bx, by] = key.split(',').map(Number);
+        if (hasChild(m, bx, by)) continue;
+        for (const [corner, dx, dy] of CORNER_OFFSETS) {
+          const nbx = (bx + dx + NBX_[m]) % NBX_[m];
+          const nby = (by + dy + NBY_[m]) % NBY_[m];
+          // No borderMaxDepth analogue: a diagonal neighbour touches at a
+          // single point, so "deepest tile along a shared edge" is the wrong
+          // quantity. Ancestor depth is what the ghost-free stencil cares
+          // about -- does a tile exist at my level there.
+          const nDepth = activeSets[m].has(`${nbx},${nby}`) ? m : ancestorDepth(m, nbx, nby);
+          if (Math.abs(m - nDepth) > 1) cornerViolations.push({ level: m, bx, by, neighbor: [nbx, nby], nDepth, corner });
+        }
+      }
+    }
+
+    return {
+      ok: violations.length === 0,
+      violations,
+      counts,
+      cornerOk: cornerViolations.length === 0,
+      cornerViolations,
+    };
   }
 
   // Persisted form of the "coverage_check.js-style scan" described (but

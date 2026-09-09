@@ -389,6 +389,11 @@ async function runTgvPhysics(Page, Runtime, opts, config) {
 
 async function runInvariants(Runtime, opts, global) {
   return runInvariantSweep(Runtime, {
+      // Corner (diagonal) 2:1 balance is a hard requirement of ?ghostfree=1 --
+      // its bilinear parent stencil reads the parent's corner cell directly --
+      // and is NOT required by the default ring path. Asserted exactly when
+      // the run is a ghost-free one. See plans/ghost-free.md.
+      requireCornerBalance: /(^|&)ghostfree=1(&|$)/.test(opts.extra || ''),
     steps: opts.invariantSteps,
     checkEvery: opts.invariantCheckEvery,
     timeout: opts.physicsTimeout,
@@ -396,7 +401,9 @@ async function runInvariants(Runtime, opts, global) {
     // cov/bad come back null (not empty) on a page that exposes no
     // geometry-coverage scan or card-state readback -- print n/a, never OK.
     onCheckpoint: (stepsDone, { bal, cov, bad }) => {
-      console.log(`    step ${stepsDone}: 2:1-balance ${bal.ok ? 'OK' : `FAIL (${bal.violations.length})`}, ` +
+      const corner = bal.cornerOk === undefined ? ''
+        : `, corner ${bal.cornerOk ? 'OK' : `${bal.cornerViolations.length}`}`;
+      console.log(`    step ${stepsDone}: 2:1-balance ${bal.ok ? 'OK' : `FAIL (${bal.violations.length})`}${corner}, ` +
         `coverage ${cov === null ? 'n/a' : cov.ok ? 'OK' : `FAIL (${cov.violations.length})`}, ` +
         `field ${bad === null ? 'n/a' : bad.length ? `FAIL (${bad.join(',')})` : 'OK'}`);
     },

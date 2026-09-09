@@ -3035,7 +3035,48 @@ async function init() {
         }
       }
     }
-    return { ok: violations.length === 0, violations, counts };
+
+    // ── Corner balance, reported SEPARATELY ──────────────────────────────
+    // The check above is edge-only ([N,S,E,W]) and always was, so nothing has
+    // ever asserted that a tile's DIAGONAL neighbour sits within one level.
+    // That is fine for the ring path -- interp fills a corner ghost from the
+    // parent when the corner tile is absent -- and NOT fine for ?ghostfree=1,
+    // whose bilinear parent stencil reads the parent's corner cell directly.
+    // Measured: before CORNER_BALANCE, 100% of the ghost-free clamp fallbacks
+    // were diagonal (?diag=1).
+    //
+    // Kept as its own list rather than folded into `violations`, and `ok` is
+    // deliberately NOT gated on it: corner balance is a REQUIREMENT of the
+    // ghost-free path, not of the default one, so failing every default run on
+    // it would be wrong. Callers that need it assert cornerOk themselves --
+    // see tools/lib/amr-invariants.js's requireCornerBalance.
+    const cornerViolations = [];
+    const CORNER_OFFSETS = [['NW', -1, -1], ['NE', 1, -1], ['SW', -1, 1], ['SE', 1, 1]];
+    for (let m = 1; m < N_LEVELS; m++) {
+      for (const key of activeSets[m]) {
+        const [bx, by] = key.split(',').map(Number);
+        if (hasChild(m, bx, by)) continue;
+        for (const [corner, dx, dy] of CORNER_OFFSETS) {
+          const nbx = (bx + dx + NBX_[m]) % NBX_[m];
+          const nby = (by + dy + NBY_[m]) % NBY_[m];
+          // No borderMaxDepth analogue for a corner: a diagonal neighbour
+          // touches at a single point, so the deepest tile along a shared EDGE
+          // is not the right quantity. Ancestor depth is, and it is what the
+          // ghost-free stencil actually cares about (does a tile exist at my
+          // level there).
+          const nDepth = activeSets[m].has(`${nbx},${nby}`) ? m : ancestorDepth(m, nbx, nby);
+          if (Math.abs(m - nDepth) > 1) cornerViolations.push({ level: m, bx, by, neighbor: [nbx, nby], nDepth, corner });
+        }
+      }
+    }
+
+    return {
+      ok: violations.length === 0,
+      violations,
+      counts,
+      cornerOk: cornerViolations.length === 0,
+      cornerViolations,
+    };
   }
 
   // Deterministic synchronous stepping, bypassing rAF entirely -- lets two

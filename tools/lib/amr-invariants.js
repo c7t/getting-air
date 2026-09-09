@@ -36,7 +36,8 @@ function checkFinite(state) {
 // than throwing -- a missing optional check is reported as skipped, never as
 // a pass, so this can't quietly look greener than it is.
 async function runInvariantSweep(Runtime, opts) {
-  const { steps, checkEvery, timeout = 300, onCheckpoint, global: G = 'window.__CYL' } = opts;
+  const { steps, checkEvery, timeout = 300, onCheckpoint, global: G = 'window.__CYL',
+          requireCornerBalance = false } = opts;
 
   const has = async (fn) => {
     const r = await evalExpr(Runtime, `typeof ${G}.${fn} === 'function'`);
@@ -56,6 +57,14 @@ async function runInvariantSweep(Runtime, opts) {
   await evalExpr(Runtime, `${G}.reset()`);
 
   const balanceViolations = [];
+  // Corner (diagonal) 2:1 balance, asserted only when the caller says the run
+  // requires it. It is a REQUIREMENT OF ?ghostfree=1, whose bilinear parent
+  // stencil reads the parent's corner cell directly, and NOT of the default
+  // ring path, where interp fills a corner ghost from the parent when the
+  // corner tile is absent. Always COLLECTED, so a default run still reports
+  // how much corner imbalance it is carrying -- which is the number that says
+  // what corner balance would cost if it were ever made unconditional.
+  const cornerViolations = [];
   const coverageViolations = [];
   const fieldViolations = [];
   let stepsDone = 0;
@@ -69,6 +78,9 @@ async function runInvariantSweep(Runtime, opts) {
     const bal = await evalExpr(Runtime, `${G}.debugCheck21Balance()`, 30000);
     if (bal.exceptionDetails) throw new Error(`debugCheck21Balance failed at step ${stepsDone}: ${bal.exceptionDetails.text}`);
     if (!bal.result.value.ok) balanceViolations.push({ step: stepsDone, violations: bal.result.value.violations });
+    if (bal.result.value.cornerOk === false) {
+      cornerViolations.push({ step: stepsDone, count: bal.result.value.cornerViolations.length, violations: bal.result.value.cornerViolations.slice(0, 8) });
+    }
 
     let cov = null;
     if (hasCoverage) {
@@ -94,8 +106,11 @@ async function runInvariantSweep(Runtime, opts) {
     if (bad.length) break;
   }
 
-  const ok = balanceViolations.length === 0 && coverageViolations.length === 0 && fieldViolations.length === 0;
-  return { ok, stepsDone, balanceViolations, coverageViolations, fieldViolations, hasCoverage, hasCardState };
+  const cornerFails = requireCornerBalance ? cornerViolations.length > 0 : false;
+  const ok = balanceViolations.length === 0 && coverageViolations.length === 0
+    && fieldViolations.length === 0 && !cornerFails;
+  return { ok, stepsDone, balanceViolations, cornerViolations, requireCornerBalance,
+    coverageViolations, fieldViolations, hasCoverage, hasCardState };
 }
 
 module.exports = { evalExpr, checkFinite, runInvariantSweep };
