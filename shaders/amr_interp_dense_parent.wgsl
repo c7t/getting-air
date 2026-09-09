@@ -44,6 +44,7 @@
 
 // @include "common_geometry.wgsl"
 // @include "common_lattice.wgsl"
+// @include "common_interp.wgsl"
 // @include "common_fpack.wgsl"
 
 @group(0) @binding(0) var<storage, read>       state       : CardState;
@@ -143,12 +144,8 @@ fn wrapCoord(v: i32, n: u32) -> u32 {
   return u32(((v % m) + m) % m);
 }
 
-struct CoarseSample {
-  rho: f32,
-  ux: f32,
-  uy: f32,
-  fneq: array<f32, 9>,
-}
+// CoarseSample lives in common_interp.wgsl, alongside the blend that consumes
+// it -- this file supplies only the FETCH.
 // wx, wy here are BUFFER-space integer coordinates (periodic, no off_x
 // mapping needed -- see file header).
 fn sampleCoarse(bx_in: i32, by_in: i32) -> CoarseSample {
@@ -294,37 +291,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let s01 = sampleCoarse(x0, y1);
   let s11 = sampleCoarse(x1, y1);
 
-  let w00 = (1f - tx) * (1f - ty);
-  let w10 = tx * (1f - ty);
-  let w01 = (1f - tx) * ty;
-  let w11 = tx * ty;
-
-  let rho = w00*s00.rho + w10*s10.rho + w01*s01.rho + w11*s11.rho;
-  let ux  = w00*s00.ux  + w10*s10.ux  + w01*s01.ux  + w11*s11.ux;
-  let uy  = w00*s00.uy  + w10*s10.uy  + w01*s01.uy  + w11*s11.uy;
-
-  let tau_coarse = state.tau;
-  let tau_fine = 2.0f * tau_coarse - 0.5f;
-  // Dupuis-Chopard non-equilibrium rescale, coarse->fine. The factor is
-  // (tau_fine/tau_coarse) * (dx_fine/dx_coarse) = (tau_fine/tau_coarse) * (1/n),
-  // with refinement ratio n=2. fneq scales as tau * (velocity gradient per
-  // lattice cell); the same physical shear spans 2x as many fine cells, so the
-  // per-cell gradient (and hence fneq) is halved on the fine grid. Omitting the
-  // 1/n factor leaves an O(1) (2x) non-equilibrium stress discontinuity at every
-  // fine<->coarse interface, injecting spurious vorticity there.
-  let rescale = 0.5f * tau_fine / tau_coarse;
-
+  // Bilinear blend + Dupuis-Chopard rescale: shared with
+  // amr_interp_pool_parent.wgsl, see common_interp.wgsl. L0's own tau is the
+  // parent tau here, since this shader's parent is always the dense grid.
   // f_pool is direction-major across the WHOLE pool (matching the coarse
   // f_coarse convention): plane stride = MAX_FINE_BLOCKS*FB*FB, derived via
   // arrayLength instead of a separate override (the buffer's actual size
   // already encodes it).
   let poolPlaneStride = arrayLength(&f_pool) / 9u;
   let poolCellBase = slot * (FB * FB) + fy * FB + fx;
-  var fo: array<f32,9>;
-  for (var i = 0u; i < 9u; i++) {
-    let fneq = w00*s00.fneq[i] + w10*s10.fneq[i] + w01*s01.fneq[i] + w11*s11.fneq[i];
-    fo[i] = feqD2Q9(rho, ux, uy, i) + rescale * fneq;
-  }
+  var fo: array<f32,9> = interpCoarseToFine(s00, s10, s01, s11, tx, ty, state.tau);
   let nw = fWords();
   for (var wi = 0u; wi < nw; wi++) {
     f_pool[wi * poolPlaneStride + poolCellBase] = fPack(fo[fLo(wi)], fo[fHi(wi)], wi);

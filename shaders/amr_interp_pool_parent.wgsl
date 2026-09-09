@@ -46,6 +46,7 @@
 // this one compiled pipeline is reused across all of them (decision 2).
 
 // @include "common_lattice.wgsl"
+// @include "common_interp.wgsl"
 // @include "common_fpack.wgsl"
 
 struct LevelParams {
@@ -133,12 +134,8 @@ fn parentCellIndex(pSlot: u32, ix: i32, iy: i32) -> u32 {
   return pSlot * (FB * FB) + fyp * FB + fxp;
 }
 
-struct CoarseSample {
-  rho: f32,
-  ux: f32,
-  uy: f32,
-  fneq: array<f32, 9>,
-}
+// CoarseSample lives in common_interp.wgsl, alongside the blend that consumes
+// it -- this file supplies only the FETCH.
 fn sampleParentPool(pSlot: u32, ix: i32, iy: i32) -> CoarseSample {
   let cell = parentCellIndex(pSlot, ix, iy);
   let parentPlaneStride = arrayLength(&f_parent_pool) / 9u;
@@ -258,28 +255,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let s01 = sampleParentPool(pSlot, x0, y1);
   let s11 = sampleParentPool(pSlot, x1, y1);
 
-  let w00 = (1f - tx) * (1f - ty);
-  let w10 = tx * (1f - ty);
-  let w01 = (1f - tx) * ty;
-  let w11 = tx * ty;
-
-  let rho = w00*s00.rho + w10*s10.rho + w01*s01.rho + w11*s11.rho;
-  let ux  = w00*s00.ux  + w10*s10.ux  + w01*s01.ux  + w11*s11.ux;
-  let uy  = w00*s00.uy  + w10*s10.uy  + w01*s01.uy  + w11*s11.uy;
-
-  let tau_coarse = levelParams.parentTau;
-  let tau_fine = 2.0f * tau_coarse - 0.5f;
-  // Dupuis-Chopard non-equilibrium rescale, same factor/reasoning as
-  // amr_interp_dense_parent.wgsl -- see that file for the derivation.
-  let rescale = 0.5f * tau_fine / tau_coarse;
-
+  // Bilinear blend + Dupuis-Chopard rescale: shared with
+  // amr_interp_dense_parent.wgsl, see common_interp.wgsl. levelParams.parentTau
+  // (not state.tau) because a mid-chain parent has its own tau -- see this
+  // file's header and main-amr.js's tauAtLevel().
   let poolPlaneStride = arrayLength(&f_pool) / 9u;
   let poolCellBase = slot * (FB * FB) + fy * FB + fx;
-  var fo: array<f32,9>;
-  for (var i = 0u; i < 9u; i++) {
-    let fneq = w00*s00.fneq[i] + w10*s10.fneq[i] + w01*s01.fneq[i] + w11*s11.fneq[i];
-    fo[i] = feqD2Q9(rho, ux, uy, i) + rescale * fneq;
-  }
+  var fo: array<f32,9> = interpCoarseToFine(s00, s10, s01, s11, tx, ty, levelParams.parentTau);
   let nw = fWords();
   for (var wi = 0u; wi < nw; wi++) {
     f_pool[wi * poolPlaneStride + poolCellBase] = fPack(fo[fLo(wi)], fo[fHi(wi)], wi);
