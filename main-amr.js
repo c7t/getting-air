@@ -186,6 +186,55 @@ const REFINE_EVERY = urlParams.has('refineEvery') ? parseInt(urlParams.get('refi
 // all phases. A criterion relative to the current domain maximum would be
 // scale- and phase-free; that is a design change to the refinement
 // machinery, not a retune, and has not been attempted.
+//
+// ── Block artifacts in the wake: what was measured, 2026-09-08 ────────────
+// Reported symptom: block-shaped artifacts in the wake, clearest at low
+// vortGamma, plus lumpiness induced on the shed vortices. Measured with
+// tools/measure-refinement.js (which persists these scans -- run it before
+// touching any number here). Findings, in the order they change what you
+// would do:
+//
+// 1. The artifacts sit on COARSE/FINE INTERFACES. Confirmed by capturing one
+//    frozen state twice, with and without the quadtree outline overlay: the
+//    visible square edges land on tile boundaries.
+//
+// 2. The interfaces cut THROUGH vortices. At the shipped -9, 77-79 of the
+//    ~100 vorticity-bearing blocks (|omega| >= 1e-3) are selected -- so ~25%
+//    of the wake sits on L0, and the level boundary runs across the outer
+//    envelope of each shed vortex rather than around it. -10 reaches 100% of
+//    the wake for 10.1% of the domain, notably cheaper than the ~20% this
+//    comment's own table estimated (that table was measured at blockage=3.3;
+//    the shipped card is now blockage=8, i.e. smaller).
+//
+// 3. It is NOT hysteresis thrashing, so do not narrow the band looking for
+//    it. Churn is high -- level 2 turns over ~23-31% of its tiles per
+//    refinement round -- but FLAPPING (a block re-created within a few rounds
+//    of being released) is 0-3% of births. The churn is the refined region
+//    following a convecting wake, which is what it is supposed to do.
+//
+// 4. THE THRESHOLD IS NOT WHAT BINDS at the shipped defaults -- this is the
+//    finding that matters, and it is why lowering REFINE_THRESH alone reads
+//    as nearly inert. SPONGE_EXCLUDE_W (8, below) suppresses vorticity-driven
+//    refinement in a band around the WINDOW edge, and the falling card's wake
+//    trails straight through that band, so a standing, window-fixed, block-
+//    aligned L1->L0 boundary sits across the wake and every shed vortex
+//    convects through it. Measured at 26k steps, L1 active tiles:
+//        default (-9, band on)        86-88
+//        -11 inc2, band still on      94     <- threshold looks inert
+//        -9, band off                102
+//        -11 inc2, band off          191     <- threshold binds hard now
+//    Retuning REFINE_THRESH without touching the band mostly does nothing.
+//
+// NOT CHANGED HERE, deliberately. Any of these is a physics change to the
+// page that Pages serves, and this page cannot validate one: see
+// tools/measure-refinement.js's own warning -- changing refinement changes
+// the trajectory, and the falling card is chaotic, so two runs are at
+// different points in the tumble within a few thousand steps and their wakes
+// are not comparable by eye or by any field norm. That is
+// plans/AMR-vs-dense-validation.md's Finding #3 again. Validate a retune on
+// the cylinder harness (statistically steady, literature Cd/St) or with
+// tools/validate-divergence.js (both legs seeded from one state), then bring
+// it back here.
 // Vorticity color tone curve (shaders/common_vortcolor.wgsl). Overridable
 // per-run so the look can be dialed against a live sim rather than guessed
 // at: ?vortScale= moves the curve's knee, ?vortGamma= shapes the low end.
