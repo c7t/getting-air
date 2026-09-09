@@ -1,6 +1,7 @@
 import { reportFatal, reportNoWebGPU, reportNoAdapter } from './error-overlay.mjs';
 import { installVortControls } from './vort-controls.mjs';
 import { createTrail } from './trajectory-trail.mjs';
+import { createSimPacer, parseSimRate, DEFAULT_TU_PER_SEC } from './sim-rate.mjs';
 import { assembleShader } from './shader-loader.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
 import {
@@ -29,6 +30,14 @@ const VORT_SCALE = parseFloat(urlParams.get('vortScale')) || 40.0;
 const VORT_GAMMA = parseFloat(urlParams.get('vortGamma')) || 1.2;
 
 let resLog2 = parseResLog2(urlParams, DENSE_DEFAULT_RES_LOG2);
+
+// Fixed simulation RATE (sim-rate.mjs). STEPS_PER_FRAME below is now a
+// CEILING, not a target: the pacer asks for however many steps a wall-clock
+// interval is worth, so the physics runs at the same speed on every device
+// that can keep up, and slower devices are clamped to exactly their old
+// behaviour. ?simRate= is in a/u_t per wall-second, the paper's own time unit.
+const SIM_RATE = parseSimRate(urlParams);
+
 
 let W = 1 << resLog2;
 let H = W;
@@ -346,6 +355,23 @@ async function init() {
 
   const WGX = Math.ceil(W / 8), WGY = Math.ceil(H / 8);
   const STEPS_PER_FRAME = 64;
+
+  // The pacer replaces the fixed 64-steps-per-frame loop. STEPS_PER_FRAME is
+  // passed as the ceiling; see sim-rate.mjs for why that is what keeps the
+  // phone at full speed while halving the desktop.
+  const pacer = createSimPacer({ maxStepsPerFrame: STEPS_PER_FRAME, tuPerSec: SIM_RATE });
+  const rateSlider = document.getElementById('slider-SIM_RATE');
+  const rateValEl = document.getElementById('val-SIM_RATE');
+  if (rateSlider) {
+    rateSlider.value = SIM_RATE;   // ?simRate= wins over the markup
+    if (rateValEl) rateValEl.textContent = SIM_RATE.toFixed(2);
+    rateSlider.oninput = () => {
+      const v = parseFloat(rateSlider.value);
+      if (rateValEl) rateValEl.textContent = v.toFixed(2);
+      pacer.setRate(v);
+    };
+  }
+
   let step = 0, lastT = performance.now();
   let useB = false;
 
@@ -415,7 +441,11 @@ async function init() {
         enc.writeTimestamp(querySet, 0);
       }
 
-      for (let s = 0; s < STEPS_PER_FRAME; s++) {
+      // Paced, not fixed: however many steps this frame's wall-clock interval
+      // is worth, capped at STEPS_PER_FRAME. Always even (sim-rate.mjs), so
+      // useB returns to its initial value at every frame boundary.
+      const nSteps = pacer.stepsForFrame(performance.now(), A / U_T);
+      for (let s = 0; s < nSteps; s++) {
         const stepBG = useB ? stepBG_ba : stepBG_ab;
         const frcBG  = useB ? frcBG_b  : frcBG_a;
         
@@ -425,7 +455,7 @@ async function init() {
         
         useB = !useB;
       }
-      step += STEPS_PER_FRAME;
+      step += nSteps;
 
       if (hasTimestamp) {
         enc.writeTimestamp(querySet, 1);
@@ -445,6 +475,9 @@ async function init() {
       // Start asynchronous readback
       stage.inFlight = true;
       stage.step = step;
+      // Steps THIS frame actually dispatched -- the MLUPS readout divides
+      // the GPU span by it, and it is no longer a constant.
+      stage.steps = nSteps;
       
       const processReadback = async (st) => {
         const pCard = st.card.mapAsync(GPUMapMode.READ);
@@ -473,7 +506,7 @@ async function init() {
         trail.push(d[21], d[20], 2 * A);
         
         if (performance.now() - lastT > 250) {
-          const mlups = (NCELLS * STEPS_PER_FRAME) / (gpuTime * 1e3);
+          const mlups = (NCELLS * (st.steps || 0)) / (gpuTime * 1e3);
           mlupsEl.textContent = mlups.toFixed(1);
           gpuMsEl.textContent = gpuTime.toFixed(2);
           syncMsEl.textContent = (performance.now() - tSubmit).toFixed(2);
