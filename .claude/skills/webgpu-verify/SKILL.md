@@ -128,14 +128,46 @@ canvas is a failure to render, not success.
   (e.g. an analytic-vs-measured match) suddenly show a large, unexplained
   error — looks exactly like a code regression but is really just GPU
   contention slowing/jittering the simulation. Before trusting a surprising
-  result, check `ps aux | grep "[c]hrome.*vpm-chrome-profile"` (or whatever
-  profile-dir prefix you're using) and `pkill -f` any stragglers, then rerun
-  on a clean GPU before concluding there's a real bug.
+  result, run `make chrome-clean DRY_RUN=1` to see what is still alive, then
+  `make chrome-clean` and rerun on a clean GPU before concluding there's a
+  real bug. (Match on the profile dir, never on the process name -- `pkill -f
+  chrome` would take the user's own browser with it.)
 
 ## Cleanup
 
+If you launched Chrome by hand (section 2), the simplest cleanup is:
+
+```bash
+make chrome-clean          # add DRY_RUN=1 to see what it would do first
+kill $(cat /tmp/vpm-https.pid) 2>/dev/null
+```
+
+`make chrome-clean` kills every debug Chrome whose `--user-data-dir` lives under
+`/tmp/vpm-chrome-profile` and removes the dirs. It identifies them from `/proc`
+by profile dir, never by process name, so the user's own browser can never be
+matched -- unlike a bare `pkill -f chrome`, which can and must not be used here.
+
+The equivalent by hand, if you prefer:
+
 ```bash
 kill $(cat /tmp/vpm-chrome.pid) $(cat /tmp/vpm-https.pid) 2>/dev/null
-pkill -f "vpm-chrome-profile" 2>/dev/null   # catches any orphaned instances too
-rm -rf /tmp/vpm-chrome-profile*
+pkill -f -- "--user-data-dir=/tmp/vpm-chrome-profile" 2>/dev/null   # orphans too
+rm -rf /tmp/vpm-chrome-profile
 ```
+
+### What the Node tools do about this, and what they deliberately don't
+
+`tools/lib/browser-lifecycle.js` (used by validate-all.js and friends) REUSES a
+Chrome that is already listening on the debug port -- that is what keeps exactly
+one WebGPU context alive across a whole run instead of one per config. The
+consequence is that a run which ADOPTS a Chrome does not own it and will not
+kill it on teardown: another run may be adopting the same one, and this skill
+deliberately leaves one open for manual driving.
+
+So a run killed part-way (timeout, Ctrl-C, crash before teardown) orphans its
+Chrome, and every later run then adopts it without owning it. Its stale PROFILE
+DIR is swept automatically by the next launch, so disk no longer grows
+unbounded -- one session left 712 MB behind before that existed -- but the
+PROCESS is only reclaimed by `make chrome-clean`. Run it when you are done, and
+before trusting a surprising performance or accuracy number (see the orphan
+warning above).
