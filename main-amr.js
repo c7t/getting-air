@@ -10,6 +10,9 @@
 // discovering that kind of bug from wrong-looking output.
 
 import { reportFatal, reportNoWebGPU, reportNoAdapter } from './error-overlay.mjs';
+import { installVortControls } from './vort-controls.mjs';
+import { createTrail } from './trajectory-trail.mjs';
+import { installChromeToggle } from './ui-chrome.mjs';
 import { assembleShader } from './shader-loader.mjs';
 import {
   deriveCardParams, parseCardParams, parseResLog2, reynoldsFromTau,
@@ -22,13 +25,31 @@ const canvas   = document.getElementById('c');
 let deviceLost = false;
 const statusEl = document.getElementById('status');
 
+// The page ships with its chrome collapsed (index-amr.html's `class="ui-hidden"`);
+// this is the single button that brings it back. Wired HERE, at module top
+// level, rather than inside init() alongside the other controls: if WebGPU
+// setup throws, init()'s remaining statements never run, and a toggle wired
+// there would strand the page with no way to expand the UI. It needs nothing
+// from the GPU. (error-overlay.mjs also force-reveals on any fatal, so the
+// two paths are independent -- neither relies on the other having run.)
+installChromeToggle(document.getElementById('ui-toggle'));
+
 const urlParams = new URLSearchParams(window.location.search);
-// Default is one step below main.js's own default (resLog2=8, W=256) --
-// with the default levels=2, this reproduces the "lower far-field
-// resolution, the fine level recovers the body's resolution" AMR win via
-// the general BLOCKAGE/ASPECT/RE mechanism below (see the comment above
-// `let BLOCKAGE`), generalizing what used to be a hardcoded A=32,B=4 "half
-// of main.js's dense reference" special case.
+// Default resLog2=8 (W=256) with levels=3: two octaves of refinement give
+// the "lower far-field resolution, the fine levels recover the body's
+// resolution" AMR win via the general BLOCKAGE/ASPECT/RE mechanism below
+// (see the comment above `let BLOCKAGE`), generalizing what used to be a
+// hardcoded A=32,B=4 "half of main.js's dense reference" special case. At
+// the shipped BLOCKAGE=8 the card is A=16,B=2 here, A=32,B=4 at L1 --
+// Pesavento & Wang's Fig. 2 ellipse in lattice units -- and A=64,B=8 at L2.
+// Two octaves rather than one because B=2 at L0 leaves the card's thin
+// dimension badly under-resolved.
+//
+// NOTE main.js now defaults to this SAME resLog2=8, not to the res 10 this
+// page's L2 is equivalent to -- that grid does not fit on the mobile target.
+// So a bare index.html is this page's L0, not its matched dense comparison;
+// that run is `index.html?res=10` (card-params.mjs's
+// AMR_EQUIVALENT_DENSE_RES_LOG2, and see DENSE_DEFAULT_RES_LOG2's comment).
 let resLog2 = parseResLog2(urlParams, AMR_DEFAULT_RES_LOG2);
 
 let W = 1 << resLog2;
@@ -155,6 +176,14 @@ const REFINE_EVERY = urlParams.has('refineEvery') ? parseInt(urlParams.get('refi
 // all phases. A criterion relative to the current domain maximum would be
 // scale- and phase-free; that is a design change to the refinement
 // machinery, not a retune, and has not been attempted.
+// Vorticity color tone curve (shaders/common_vortcolor.wgsl). Overridable
+// per-run so the look can be dialed against a live sim rather than guessed
+// at: ?vortScale= moves the curve's knee, ?vortGamma= shapes the low end.
+// Parsed identically on both pages -- the two views are meant to be compared
+// by eye, so a knob that existed on only one of them would defeat that.
+const VORT_SCALE = parseFloat(urlParams.get('vortScale')) || 40.0;
+const VORT_GAMMA = parseFloat(urlParams.get('vortGamma')) || 1.2;
+
 const REFINE_THRESH = urlParams.has('refineThresh') ? parseFloat(urlParams.get('refineThresh')) : -9;
 const COARSEN_THRESH = urlParams.has('coarsenThresh') ? parseFloat(urlParams.get('coarsenThresh')) : -10;
 
@@ -907,9 +936,16 @@ async function init() {
 
   // Refinement-coverage (green) overlay opacity. Render-only; does not affect
   // the simulation. Writing the uniform takes effect on the next frame.
+  //
+  // The shipped default is the slider's own `value` in index-amr.html (0, i.e.
+  // off) -- read back out by opacityFromSlider() where the uniform is created,
+  // so the number lives in exactly one place. It used to be written here as a
+  // literal 1.0 AND as a separate literal in the markup, which is two things
+  // to keep in step for no reason.
   const overlaySlider = document.getElementById('slider-overlay');
   const overlayValEl = document.getElementById('val-overlay');
   if (overlaySlider) {
+    if (overlayValEl) overlayValEl.textContent = parseFloat(overlaySlider.value).toFixed(2);
     overlaySlider.oninput = () => {
       const v = parseFloat(overlaySlider.value);
       overlayValEl.textContent = v.toFixed(2);
@@ -923,6 +959,7 @@ async function init() {
   const outlineSlider = document.getElementById('slider-outline');
   const outlineValEl = document.getElementById('val-outline');
   if (outlineSlider) {
+    if (outlineValEl) outlineValEl.textContent = parseFloat(outlineSlider.value).toFixed(2);
     outlineSlider.oninput = () => {
       const v = parseFloat(outlineSlider.value);
       outlineValEl.textContent = v.toFixed(2);
@@ -1161,6 +1198,8 @@ async function init() {
   // Render fragment needs HAS_LEVEL2 to gate the level-2 override; keep it
   // separate from fineConstants, which is also fed to the avg compute
   // pipeline (whose shader has no HAS_LEVEL2 override).
+  // VORT_SCALE/VORT_GAMMA are supplied by makeRenderPipeline below, which is
+  // the only thing that ever varies them.
   const renderConstants = { W, H, RB, HAS_LEVEL2: N_LEVELS > 2 ? 1 : 0 };
   // GHOST_ONLY=1: steady-state ghost-only reinterpolation (every macro-step).
   // GHOST_ONLY=0: full-slot fill, used once on block activation (see debugActivateBlock).
@@ -1186,11 +1225,24 @@ async function init() {
     layout: device.createPipelineLayout({ bindGroupLayouts: [phyBGL] }),
     compute: { module: phySM, entryPoint: 'main', constants }
   });
-  const renPL = device.createRenderPipeline({
+  // VORT_SCALE/VORT_GAMMA are pipeline-overridable constants specialized into
+  // the fragment shader here, so changing them live means rebuilding this one
+  // pipeline. vort-controls.mjs owns the sliders and the per-frame coalescing
+  // (and documents why these are not uniforms); this side owns only the
+  // pipeline itself.
+  const makeRenderPipeline = (scale, gamma) => device.createRenderPipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [renBGL] }),
     vertex: { module: renSM, entryPoint: 'vs_main', constants },
-    fragment: { module: renSM, entryPoint: 'fs_main', targets: [{ format: fmt }], constants: renderConstants },
+    fragment: {
+      module: renSM, entryPoint: 'fs_main', targets: [{ format: fmt }],
+      constants: { ...renderConstants, VORT_SCALE: scale, VORT_GAMMA: gamma },
+    },
     primitive: { topology: 'triangle-list' },
+  });
+  let renPL = makeRenderPipeline(VORT_SCALE, VORT_GAMMA);
+  installVortControls({
+    scale: VORT_SCALE, gamma: VORT_GAMMA,
+    rebuild: (scale, gamma) => { renPL = makeRenderPipeline(scale, gamma); },
   });
   const interpPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [interpBGL] }),
@@ -1376,13 +1428,23 @@ async function init() {
   const frcBG_b = device.createBindGroup({ layout: frcBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_b } }, { binding: 2, resource: { buffer: forceBuf } }, { binding: 3, resource: { buffer: pools[1].blockSlotBuf } }]});
 
   const phyBG = device.createBindGroup({ layout: phyBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: forceBuf } }]});
+  // Both opacity uniforms are seeded from their slider's shipped `value`, so
+  // the default lives only in index-amr.html and the uniform cannot start out
+  // disagreeing with the control that owns it. `fallback` covers a page that
+  // has no such slider at all (the harness pages reuse parts of this file).
+  const opacityFromSlider = (el, fallback) => {
+    const v = el ? parseFloat(el.value) : NaN;
+    return Number.isFinite(v) ? v : fallback;
+  };
   const overlayOpacityBuf = device.createBuffer({ size: 4, usage: U.UNIFORM | U.COPY_DST });
-  device.queue.writeBuffer(overlayOpacityBuf, 0, new Float32Array([1.0])); // overlay fully on by default
+  device.queue.writeBuffer(overlayOpacityBuf, 0,
+    new Float32Array([opacityFromSlider(overlaySlider, 0.0)]));
   // Quadtree outline opacity -- optional, off by default (see
   // shaders/amr_render.wgsl's own comment on why this is a separate
   // uniform from overlayOpacityBuf's fill).
   const outlineOpacityBuf = device.createBuffer({ size: 4, usage: U.UNIFORM | U.COPY_DST });
-  device.queue.writeBuffer(outlineOpacityBuf, 0, new Float32Array([0.0]));
+  device.queue.writeBuffer(outlineOpacityBuf, 0,
+    new Float32Array([opacityFromSlider(outlineSlider, 0.0)]));
   // Field digest (see shaders/amr_digest.wgsl): one dispatch per rendered
   // frame that fingerprints the L0 velocity field, so the watchdog can tell
   // whether a frame ever reproduces an EARLIER frame's field -- which
@@ -1603,6 +1665,24 @@ async function init() {
   let macroStepCounter = 0;
 
   const trajectory = [];
+
+  // Rolling trajectory trail (trajectory-trail.mjs). Fed from the SAME
+  // CardState readback that fills trajectory[] for the CSV export -- the
+  // debug log and the on-screen line are one source of truth. The CSV keeps
+  // the full run; only the trail's own buffer rolls, since it needs just
+  // enough history to draw one window of descent.
+  const trail = createTrail(document.getElementById('trail'));
+  let trailOpacity = 1.0;
+  const trailSlider = document.getElementById('slider-TRAIL');
+  const trailValEl = document.getElementById('val-TRAIL');
+  if (trailSlider) {
+    trailOpacity = parseFloat(trailSlider.value);
+    if (trailValEl) trailValEl.textContent = trailOpacity.toFixed(2);
+    trailSlider.oninput = () => {
+      trailOpacity = parseFloat(trailSlider.value);
+      if (trailValEl) trailValEl.textContent = trailOpacity.toFixed(2);
+    };
+  }
 
   document.getElementById('download').onclick = () => {
     const header = "step,cx,cy_total,cx_total,theta,vx,vy,omega,fx,fy,tz\n";
@@ -2257,6 +2337,7 @@ async function init() {
     useB = false;
     step = 0;
     trajectory.length = 0;
+    trail.clear();
   }
 
   // Activates coarse block (bx,by) [0<=bx<NBX, 0<=by<NBY, buffer-space --
@@ -3254,6 +3335,7 @@ async function init() {
 
       const rp = enc.beginRenderPass({ colorAttachments: [{ view: ctx.getCurrentTexture().createView(), clearValue: { r:0.07, g:0.07, b:0.1, a:1 }, loadOp: 'clear', storeOp: 'store' }]});
       rp.setPipeline(renPL); rp.setBindGroup(0, renBG); rp.draw(6); rp.end();
+      trail.draw(2 * A, trailOpacity);
 
       // Only run when telemetry is on. It exists to answer a diagnostic
       // question, and a normal run should not pay for an instrument -- least
@@ -3432,6 +3514,9 @@ async function init() {
         if (st.step < 100000) {
           trajectory.push([st.step, d[0], d[20], d[21], d[2], d[3], d[4], d[5], d[6], d[7], d[8]]);
         }
+        // d[21] = x_total, d[20] = y_total -- the card's UNWRAPPED path. The
+        // wrapped cx/cy cannot be used: they never leave the buffer centre.
+        trail.push(d[21], d[20], 2 * A);
 
         if (performance.now() - lastT > 250) {
           // L0 cells only -- it deliberately ignores every fine level, so it

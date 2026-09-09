@@ -1,6 +1,7 @@
 // Visualization shader with smooth analytical mask and vorticity calculation.
 
 // @include "common_geometry.wgsl"
+// @include "common_vortcolor.wgsl"
 
 @group(0) @binding(0) var<storage, read> vel         : array<f32>;
 @group(0) @binding(1) var<storage, read> state       : CardState;
@@ -258,14 +259,11 @@ fn fs_main(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> {
     }
   }
 
-  // Blue for clockwise (negative), red for counter-clockwise (positive)
-  let val = clamp(omega * 80.0f, -1.0f, 1.0f);
-  var c: vec3<f32>;
-  if (val > 0.0) {
-    c = mix(vec3(0.05, 0.05, 0.1), vec3(1.0, 0.3, 0.2), val);
-  } else {
-    c = mix(vec3(0.05, 0.05, 0.1), vec3(0.2, 0.5, 1.0), -val);
-  }
+  // Blue for clockwise (negative), red for counter-clockwise (positive).
+  // Shared verbatim with the dense view so the two are comparable by eye --
+  // see shaders/common_vortcolor.wgsl, including why this mapping is level-
+  // INdependent even though refined regions legitimately show sharper cores.
+  var c = vorticityColor(omega);
 
   // Refined-block coverage overlay: additive green (not a mix toward gray --
   // a mix is barely visible against the near-black low-vorticity

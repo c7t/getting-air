@@ -39,8 +39,11 @@ export const CARD_PARAM_DEFAULTS = {
   // as a lattice-unit slider) means the card's size relative to the domain
   // no longer silently changes when the Resolution slider does -- and it is
   // what makes the same card expressible at any grid resolution.
-  // 2.0 => A = W/4, i.e. the historical A=64 at the dense page's W=256.
-  BLOCKAGE: 2.0,
+  // 8.0 => A = W/16, i.e. A=16 at both pages' shipped W=256 and A=64 at the
+  // AMR-equivalent dense run's W=1024 (see the pairing note below).
+  // Pesavento & Wang's reference card a=32, b=4 [lu] is the rung between
+  // them -- the AMR page's L1.
+  BLOCKAGE: 8.0,
 
   // ASPECT: e = B/A, Pesavento & Wang's aspect ratio. Their reference card
   // is a=32, b=4 [lu], e=0.125.
@@ -49,16 +52,29 @@ export const CARD_PARAM_DEFAULTS = {
   // I_STAR: dimensionless moment of inertia,
   //   I* = b(a^2+b^2)rho_b / (2 a^3 rho_f)
   // characterizing the rotation dynamics -- see deriveCardParams' RHO_B.
-  I_STAR: 0.34,
+  // 0.17 is the paper's Fig. 2 tumbling case (Re=1100, I*=0.17, e=0.125),
+  // verified against 2004_PRL_Pesavento_Wang.pdf p.2, which states this same
+  // closed form for I*.
+  I_STAR: 0.17,
 
   // RE: Reynolds number, the canonical stored flow-regime quantity. TAU is
   // always DERIVED from it (see deriveCardParams) so that changing card size
   // (BLOCKAGE/ASPECT) or U_T holds Re fixed instead of silently drifting it
   // -- the whole point of exposing Re at all.
-  //   nu = (TAU-0.5)/3;  Re := U_T*A/nu
-  // 1066.667 reproduces main.js's old hand-computed comment exactly:
-  // A=64, U_T=0.05, TAU=0.509 -> Re ~= 1066.7 ("Re ~ 1100").
-  RE: 1066.667,
+  //
+  // CONVENTION: Pesavento & Wang's, keyed to the CHORD 2a, not the semi-major
+  // axis (2004_PRL_Pesavento_Wang.pdf p.2: "Re = 2*u_t*a/nu, using the
+  // terminal velocity estimated by balancing gravity against the fluid force
+  // on a plate of size 2a and drag coefficient 1").
+  //   nu = (TAU-0.5)/3;  Re := 2*U_T*A/nu
+  // This module used to define Re as U_T*A/nu, i.e. exactly HALF the paper's
+  // number, while its comment claimed the stored 1066.667 was the paper's
+  // "Re ~ 1100" -- so the shipped card was really running at Re=2133 in the
+  // published units. Both directions of the tau<->Re pair carry the factor of
+  // 2 now, so this value can be read straight off the paper.
+  //
+  // 1100 is the paper's Fig. 2 tumbling case (Re=1100, I*=0.17, e=0.125).
+  RE: 1100,
 
   // U_T: target terminal velocity [lattice units/step]. Small enough to keep
   // Ma < 0.1 during the free-fall transient, so even fast tumbles stay well
@@ -67,21 +83,44 @@ export const CARD_PARAM_DEFAULTS = {
 };
 
 // ── The dense/AMR default pairing ────────────────────────────────────────────
-// These two defaults are not independent: the AMR page is meant to run its L0
-// grid AMR_DEFAULT_LEVELS-1 octaves COARSER than the dense reference, and to
-// recover the body's resolution with that many refinement levels. Out of the
-// box the two pages should therefore describe the same physical system at the
-// same effective resolution at the body, differing only in how much of the
-// far field is resolved -- which is the entire AMR claim.
+// The AMR page runs its L0 grid AMR_DEFAULT_LEVELS-1 octaves COARSER than the
+// dense run it is meant to reproduce, recovering the body's resolution with
+// that many refinement levels. The two then describe the same physical system
+// at the same effective resolution at the body, differing only in how much of
+// the far field is resolved -- which is the entire AMR claim. The dense run
+// that claim is against is therefore always
 //
-//   AMR_DEFAULT_RES_LOG2 === DENSE_DEFAULT_RES_LOG2 - (AMR_DEFAULT_LEVELS - 1)
+//   AMR_EQUIVALENT_DENSE_RES_LOG2 = AMR_DEFAULT_RES_LOG2 + (AMR_DEFAULT_LEVELS - 1)
 //
-// tools/test-card-params.js asserts exactly that, so changing one of these
-// without the other fails a test instead of silently making the pages'
-// default runs incomparable.
+// The AMR page defaults to W=256 (res 8) with 3 levels -- two octaves of
+// refinement, which is what actually subdivides the near-body/card region
+// finely enough for this card (at BLOCKAGE=8 its L0 semi-minor axis is only
+// B=2 cells, so one octave leaves the thin dimension badly under-resolved).
+// Down the hierarchy the card is A=16,B=2 at L0, A=32,B=4 at L1 -- exactly
+// Pesavento & Wang's a=32, b=4 in lattice units -- and A=64,B=8 at L2.
+export const AMR_DEFAULT_RES_LOG2 = 8;
+export const AMR_DEFAULT_LEVELS = 3;
+export const AMR_EQUIVALENT_DENSE_RES_LOG2 =
+  AMR_DEFAULT_RES_LOG2 + (AMR_DEFAULT_LEVELS - 1);
+
+// DENSE_DEFAULT_RES_LOG2 is deliberately NOT that number. res 10 (W=1024) is
+// 16x res 8's cells, and the dense page allocates its whole grid up front:
+// that much is unallocatable on the mobile target (see
+// plans/perf-characterization.md for the device the mobile numbers come
+// from), so a bare index.html at the matched resolution would simply fail to
+// start there rather than being merely slow. The dense page therefore stays
+// at W=256, showing the same physical card (BLOCKAGE/ASPECT/I_STAR/RE are
+// shared) at the AMR page's L0 resolution -- a coarse view of the same
+// system, NOT the matched comparison run.
+//
+// So: a bare index.html and a bare index-amr.html are no longer a
+// like-for-like pair, and a cost or field comparison between the two must
+// pass ?res=10 to index.html (i.e. AMR_EQUIVALENT_DENSE_RES_LOG2) rather
+// than trusting the defaults. tools/test-card-params.js pins both halves of
+// this -- that res 10 really is the equivalent run, and that the shipped
+// dense default really is lower on purpose -- so neither half can drift
+// silently back into a wrong comparison.
 export const DENSE_DEFAULT_RES_LOG2 = 8;
-export const AMR_DEFAULT_RES_LOG2 = 7;
-export const AMR_DEFAULT_LEVELS = 2;
 
 // Resolution clamp both pages enforce. Kept here so the AMR-vs-dense
 // resolution ladder (tools/lib/amr-resolution-mapping.js) and the pages
@@ -90,17 +129,23 @@ export const RES_LOG2_MIN = 6;
 export const RES_LOG2_MAX = 11;
 
 // ── Reynolds <-> tau ─────────────────────────────────────────────────────────
-// nu = (tau - 0.5)/3 and Re = u*a/nu, solved each way. `a` is the semi-major
-// axis in the LATTICE UNITS OF THE LEVEL WHOSE TAU THIS IS -- for the AMR
-// page that means L0's own A with L0's own tau (finer levels then follow
-// from tauAtLevel, which preserves Re by construction; see its comment).
+// nu = (tau - 0.5)/3 and Re = 2*u*a/nu, solved each way. The factor of 2 is
+// Pesavento & Wang's chord-based length scale (2a, the full major axis) --
+// see CARD_PARAM_DEFAULTS.RE for the quote and for the half-Re bug this
+// convention replaced. Both functions carry it, so they stay a true inverse
+// pair and every Re in this module is directly comparable to the paper's.
+//
+// `a` is the semi-major axis in the LATTICE UNITS OF THE LEVEL WHOSE TAU
+// THIS IS -- for the AMR page that means L0's own A with L0's own tau (finer
+// levels then follow from tauAtLevel, which preserves Re by construction;
+// see its comment).
 
 export function tauFromReynolds(re, a, u_t) {
-  return 0.5 + 3 * u_t * a / re;
+  return 0.5 + 6 * u_t * a / re;
 }
 
 export function reynoldsFromTau(tau, a, u_t) {
-  return 3 * u_t * a / (tau - 0.5);
+  return 6 * u_t * a / (tau - 0.5);
 }
 
 // ── Per-level tau (AMR) ──────────────────────────────────────────────────────

@@ -19,6 +19,8 @@
 // polls exactly that (it fails on /^error:/i and on the text never advancing),
 // and it cannot see the DOM overlay.
 
+import { revealChrome } from './ui-chrome.mjs';
+
 // Prominent, readable fatal-error box. Idempotent -- repeated calls reuse and
 // overwrite the one element rather than stacking boxes for a failure that
 // cascades into several handlers.
@@ -37,6 +39,13 @@ export function showFatal(msg) {
   }
   el.textContent = msg;
   el.style.display = 'block';
+  // A page whose chrome is collapsed (ui-chrome.mjs) would otherwise report
+  // the failure into a hidden #status line. The box above is already visible
+  // -- it is appended to #canvas-container, which is never part of the
+  // chrome -- so this is about the rest of the diagnosis: the status line,
+  // the perf readouts, and the controls that let the user try something else.
+  // No-op on a page that never collapses its chrome.
+  revealChrome();
 }
 
 // The body of every page's handleErr(). `String(e)` rather than `e.message`

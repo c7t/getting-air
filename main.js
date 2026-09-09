@@ -1,4 +1,6 @@
 import { reportFatal, reportNoWebGPU, reportNoAdapter } from './error-overlay.mjs';
+import { installVortControls } from './vort-controls.mjs';
+import { createTrail } from './trajectory-trail.mjs';
 import { assembleShader } from './shader-loader.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
 import {
@@ -17,6 +19,14 @@ const urlParams = new URLSearchParams(window.location.search);
 // covered ground it never touched, which is the kind of false confidence
 // this repo has been bitten by before.
 const F16 = urlParams.has('f16') ? (parseInt(urlParams.get('f16')) || 0) : 0;
+
+// Vorticity color tone curve (shaders/common_vortcolor.wgsl). Overridable
+// per-run so the look can be dialed against a live sim rather than guessed
+// at: ?vortScale= moves the curve's knee, ?vortGamma= shapes the low end.
+// Parsed identically on both pages -- the two views are meant to be compared
+// by eye, so a knob that existed on only one of them would defeat that.
+const VORT_SCALE = parseFloat(urlParams.get('vortScale')) || 40.0;
+const VORT_GAMMA = parseFloat(urlParams.get('vortGamma')) || 1.2;
 
 let resLog2 = parseResLog2(urlParams, DENSE_DEFAULT_RES_LOG2);
 
@@ -283,6 +293,12 @@ async function init() {
   // Separate dict for the pipelines whose shaders @include common_fpack.wgsl;
   // phy/render don't declare F16 and WebGPU makes that a hard error.
   const fConstants = { W, H, F16 };
+  // Likewise the render fragment needs its own dict: only render.wgsl declares
+  // VORT_SCALE/VORT_GAMMA (via common_vortcolor.wgsl), and supplying an
+  // override a pipeline's shader does not declare is the same hard error.
+  // The two VORT_* values are supplied by makeRenderPipeline below, which is
+  // the only thing that ever varies them.
+  const renderConstants = { W, H };
 
   const stepPL = device.createComputePipeline({ 
     layout: device.createPipelineLayout({ bindGroupLayouts: [stepBGL] }), 
@@ -296,11 +312,24 @@ async function init() {
     layout: device.createPipelineLayout({ bindGroupLayouts: [phyBGL] }), 
     compute: { module: phySM, entryPoint: 'main', constants } 
   });
-  const renPL = device.createRenderPipeline({
+  // VORT_SCALE/VORT_GAMMA are pipeline-overridable constants specialized into
+  // the fragment shader here, so changing them live means rebuilding this one
+  // pipeline. vort-controls.mjs owns the sliders and the per-frame coalescing
+  // (and documents why these are not uniforms); this side owns only the
+  // pipeline itself.
+  const makeRenderPipeline = (scale, gamma) => device.createRenderPipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [renBGL] }),
     vertex: { module: renSM, entryPoint: 'vs_main', constants },
-    fragment: { module: renSM, entryPoint: 'fs_main', targets: [{ format: fmt }], constants },
+    fragment: {
+      module: renSM, entryPoint: 'fs_main', targets: [{ format: fmt }],
+      constants: { ...renderConstants, VORT_SCALE: scale, VORT_GAMMA: gamma },
+    },
     primitive: { topology: 'triangle-list' },
+  });
+  let renPL = makeRenderPipeline(VORT_SCALE, VORT_GAMMA);
+  installVortControls({
+    scale: VORT_SCALE, gamma: VORT_GAMMA,
+    rebuild: (scale, gamma) => { renPL = makeRenderPipeline(scale, gamma); },
   });
 
   const stepBG_ab = device.createBindGroup({ layout: stepBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_a } }, { binding: 2, resource: { buffer: f_b } }, { binding: 3, resource: { buffer: velBuf } }]});
@@ -321,6 +350,24 @@ async function init() {
   let useB = false;
 
   const trajectory = [];
+
+  // Rolling trajectory trail (trajectory-trail.mjs). Fed from the SAME
+  // CardState readback that fills trajectory[] for the CSV export -- the
+  // debug log and the on-screen line are one source of truth. The CSV keeps
+  // the full run; only the trail's own buffer rolls, since it needs just
+  // enough history to draw one window of descent.
+  const trail = createTrail(document.getElementById('trail'));
+  let trailOpacity = 1.0;
+  const trailSlider = document.getElementById('slider-TRAIL');
+  const trailValEl = document.getElementById('val-TRAIL');
+  if (trailSlider) {
+    trailOpacity = parseFloat(trailSlider.value);
+    if (trailValEl) trailValEl.textContent = trailOpacity.toFixed(2);
+    trailSlider.oninput = () => {
+      trailOpacity = parseFloat(trailSlider.value);
+      if (trailValEl) trailValEl.textContent = trailOpacity.toFixed(2);
+    };
+  }
 
   document.getElementById('download').onclick = () => {
     const header = "step,cx,cy_total,cx_total,theta,vx,vy,omega,fx,fy,tz\n";
@@ -388,6 +435,7 @@ async function init() {
 
       const rp = enc.beginRenderPass({ colorAttachments: [{ view: ctx.getCurrentTexture().createView(), clearValue: { r:0.07, g:0.07, b:0.1, a:1 }, loadOp: 'clear', storeOp: 'store' }]});
       rp.setPipeline(renPL); rp.setBindGroup(0, renBG); rp.draw(6); rp.end();
+      trail.draw(2 * A, trailOpacity);
       
       enc.copyBufferToBuffer(cardStateBuf, 0, stage.card, 0, 104);
       
@@ -420,6 +468,9 @@ async function init() {
           // Record: step, cx, cy_total, cx_total, theta, vx, vy, omega, fx, fy, tz
           trajectory.push([st.step, d[0], d[20], d[21], d[2], d[3], d[4], d[5], d[6], d[7], d[8]]);
         }
+        // d[21] = x_total, d[20] = y_total -- the card's UNWRAPPED path. The
+        // wrapped cx/cy cannot be used: they never leave the buffer centre.
+        trail.push(d[21], d[20], 2 * A);
         
         if (performance.now() - lastT > 250) {
           const mlups = (NCELLS * STEPS_PER_FRAME) / (gpuTime * 1e3);
