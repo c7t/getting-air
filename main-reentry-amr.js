@@ -35,6 +35,7 @@
 // validation error scope.
 
 import { reportFatal, reportNoWebGPU, reportNoAdapter } from './error-overlay.mjs';
+import { createTotalUnwrapper } from './card-total.mjs';
 import { assembleShader } from './shader-loader.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
 
@@ -1366,6 +1367,9 @@ async function init() {
   let macroStepCounter = 0;
 
   const trajectory = [];
+  // Restores true totals from the shaders' wrapped x_total/y_total --
+  // see card-total.mjs.
+  const totals = createTotalUnwrapper(W, H);
 
   document.getElementById('download').onclick = () => {
     const header = "step,cx,cy_total,cx_total,theta,vx,vy,omega,fx,fy,tz\n";
@@ -1898,6 +1902,7 @@ async function init() {
   }
 
   function resetSim() {
+    totals.reset();
     writeF(f_a, initF(), NCELLS);
     writeF(pools[1].finePoolF_a, initFPool(), MAX_FINE_BLOCKS * NCELLS1);
     device.queue.writeBuffer(cardStateBuf, 0, initCardState());
@@ -2584,8 +2589,10 @@ async function init() {
           gpuTime = performance.now() - tSubmit;
         }
 
+        // x_total/y_total come back WRAPPED -- see card-total.mjs.
+        const { x: xTotal, y: yTotal } = totals.unwrap(d[21], d[20]);
         if (st.step < 100000) {
-          trajectory.push([st.step, d[0], d[20], d[21], d[2], d[3], d[4], d[5], d[6], d[7], d[8]]);
+          trajectory.push([st.step, d[0], yTotal, xTotal, d[2], d[3], d[4], d[5], d[6], d[7], d[8]]);
         }
 
         if (performance.now() - lastT > 250) {
@@ -2593,7 +2600,7 @@ async function init() {
           mlupsEl.textContent = mlups.toFixed(1);
           gpuMsEl.textContent = gpuTime.toFixed(2);
           syncMsEl.textContent = (performance.now() - tSubmit).toFixed(2);
-          statusEl.textContent = `[Reentry] step ${st.step}  y=${d[20].toFixed(1)}  x=${d[21].toFixed(1)}  vy=${d[4].toFixed(4)}  Fy=${d[7].toExponential(2)}  θ=${d[2].toFixed(2)}`;
+          statusEl.textContent = `[Reentry] step ${st.step}  y=${yTotal.toFixed(1)}  x=${xTotal.toFixed(1)}  vy=${d[4].toFixed(4)}  Fy=${d[7].toExponential(2)}  θ=${d[2].toFixed(2)}`;
           lastT = performance.now();
         }
 

@@ -12,6 +12,7 @@
 import { reportFatal, reportNoWebGPU, reportNoAdapter } from './error-overlay.mjs';
 import { installVortControls } from './vort-controls.mjs';
 import { createTrail } from './trajectory-trail.mjs';
+import { createTotalUnwrapper } from './card-total.mjs';
 import { createSimPacer, parseSimRate, DEFAULT_TU_PER_SEC } from './sim-rate.mjs';
 import { installChromeToggle } from './ui-chrome.mjs';
 import { assembleShader } from './shader-loader.mjs';
@@ -1698,6 +1699,11 @@ async function init() {
   // the full run; only the trail's own buffer rolls, since it needs just
   // enough history to draw one window of descent.
   const trail = createTrail(document.getElementById('trail'));
+  // See main.js's identical note and card-total.mjs: the shaders keep
+  // x_total/y_total wrapped, this restores the true float64 totals. The
+  // backward-jump watchdog below reads the unwrapped value too -- fed the raw
+  // one it would count every wrap as a stale readback.
+  const totals = createTotalUnwrapper(W, H);
   let trailOpacity = 1.0;
   const trailSlider = document.getElementById('slider-TRAIL');
   const trailValEl = document.getElementById('val-TRAIL');
@@ -2364,6 +2370,7 @@ async function init() {
     step = 0;
     trajectory.length = 0;
     trail.clear();
+    totals.reset();
     pacer.reset();
   }
 
@@ -3462,6 +3469,10 @@ async function init() {
         await Promise.all([pCard, pQuery]);
 
         const d = new Float32Array(st.card.getMappedRange());
+        // d[21]/d[20] are the WRAPPED accumulators (see card-total.mjs).
+        // Unwrap FIRST -- before the backward-jump watchdog below, which
+        // would otherwise read each wrap as a stale readback.
+        const { x: xTotal, y: yTotal } = totals.unwrap(d[21], d[20]);
         let gpuTime = 0;
         if (hasTimestamp) {
           const timestamps = new BigUint64Array(st.query.getMappedRange());
@@ -3491,7 +3502,7 @@ async function init() {
           // happened: a phone run blew up while this watchdog reported
           // frames=1127, stepBack=0, posJump=0. A NaN check cannot be
           // expressed as a magnitude threshold.
-          if (!Number.isFinite(d[20]) || !Number.isFinite(d[4]) || !Number.isFinite(d[7])) {
+          if (!Number.isFinite(yTotal) || !Number.isFinite(d[4]) || !Number.isFinite(d[7])) {
             if (!readbackWatch.diverged) {
               readbackWatch.diverged = true;
               readbackWatch.divergedAtStep = st.step;
@@ -3499,11 +3510,11 @@ async function init() {
               readbackWatch.history = readbackWatch.ring.slice();
             }
           } else {
-            const dy = Math.abs(d[20] - readbackWatch.lastY);
+            const dy = Math.abs(yTotal - readbackWatch.lastY);
             if (readbackWatch.lastY !== null && dy > 50) {
               readbackWatch.posJump++;
               if (readbackWatch.samples.length < 12) {
-                readbackWatch.samples.push({ kind: 'y', from: +readbackWatch.lastY.toFixed(2), to: +d[20].toFixed(2), atStep: st.step });
+                readbackWatch.samples.push({ kind: 'y', from: +readbackWatch.lastY.toFixed(2), to: +yTotal.toFixed(2), atStep: st.step });
               }
             }
           }
@@ -3568,7 +3579,7 @@ async function init() {
           // Rolling run-up buffer, kept regardless, so a divergence report
           // carries the frames BEFORE it rather than just the moment of.
           readbackWatch.ring.push({
-            s: st.step, y: +Number(d[20]).toFixed(2), vy: +Number(d[4]).toFixed(5),
+            s: st.step, y: +Number(yTotal).toFixed(2), vy: +Number(d[4]).toFixed(5),
             om: +Number(d[5]).toFixed(6), fy: +Number(d[7]).toPrecision(4), th: +Number(d[2]).toFixed(3),
           });
           if (readbackWatch.ring.length > 24) readbackWatch.ring.shift();
@@ -3595,15 +3606,15 @@ async function init() {
         if (readbackWatch.digests.length > 16) readbackWatch.digests.shift();
 
         readbackWatch.lastStep = st.step;
-        readbackWatch.lastY = d[20];
+        readbackWatch.lastY = yTotal;
         readbackWatch.n++;
 
         if (st.step < 100000) {
-          trajectory.push([st.step, d[0], d[20], d[21], d[2], d[3], d[4], d[5], d[6], d[7], d[8]]);
+          trajectory.push([st.step, d[0], yTotal, xTotal, d[2], d[3], d[4], d[5], d[6], d[7], d[8]]);
         }
-        // d[21] = x_total, d[20] = y_total -- the card's UNWRAPPED path. The
-        // wrapped cx/cy cannot be used: they never leave the buffer centre.
-        trail.push(d[21], d[20], 2 * A);
+        // The card's UNWRAPPED path. The wrapped cx/cy cannot be used: they
+        // never leave the buffer centre.
+        trail.push(xTotal, yTotal, 2 * A);
 
         if (performance.now() - lastT > 250) {
           // L0 cells only -- it deliberately ignores every fine level, so it
@@ -3620,7 +3631,7 @@ async function init() {
           // messages within a frame, so "benchmark round 2/3" was never
           // actually visible to anyone asked to watch for it.
           if (!benchRunning) {
-            statusEl.textContent = `[AMR-dev] step ${st.step}  y=${d[20].toFixed(1)}  x=${d[21].toFixed(1)}  vy=${d[4].toFixed(4)}  Fy=${d[7].toExponential(2)}  θ=${d[2].toFixed(2)}`;
+            statusEl.textContent = `[AMR-dev] step ${st.step}  y=${yTotal.toFixed(1)}  x=${xTotal.toFixed(1)}  vy=${d[4].toFixed(4)}  Fy=${d[7].toExponential(2)}  θ=${d[2].toFixed(2)}`;
           }
           lastT = performance.now();
         }

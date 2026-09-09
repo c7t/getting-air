@@ -25,6 +25,7 @@
 // tools/lib/field-reconstruct.js's loadDenseFields already decodes).
 
 import { reportFatal, reportNoWebGPU, reportNoAdapter } from './error-overlay.mjs';
+import { createTotalUnwrapper } from './card-total.mjs';
 import { assembleShader } from './shader-loader.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
 
@@ -319,6 +320,9 @@ async function init() {
   // D/U0 to normalize by, matching main-amr.js/main-reentry-amr.js's own
   // raw-force CSV convention.
   const trajectory = [];
+  // Restores true totals from the shaders' wrapped x_total/y_total --
+  // see card-total.mjs.
+  const totals = createTotalUnwrapper(W, H);
 
   function dispatchMacroStep(enc) {
     const stepBG = useB ? stepBG_ba : stepBG_ab;
@@ -330,6 +334,7 @@ async function init() {
   }
 
   function resetSim() {
+    totals.reset();
     device.queue.writeBuffer(cardStateBuf, 0, cardInit());
     writeF(f_a, initF(), NCELLS);
     device.queue.writeBuffer(forceBuf, 0, new Int32Array([0, 0, 0, 0]));
@@ -492,11 +497,15 @@ async function init() {
       const processReadback = async (st) => {
         await st.card.mapAsync(GPUMapMode.READ);
         const d = new Float32Array(st.card.getMappedRange());
+        // x_total/y_total come back WRAPPED -- see card-total.mjs. Prescribed
+        // kinematics still accumulate, so this page's own readouts decay the
+        // same way without unwrapping.
+        const { x: xTotal, y: yTotal } = totals.unwrap(d[21], d[20]);
         const fx = d[6], fy = d[7], tz = d[8];
         if (st.step < 500000) trajectory.push([st.step, fx, fy, tz]);
 
         if (performance.now() - lastT > 250) {
-          statusEl.textContent = `[Reentry-dense] step ${st.step}  y=${d[20].toFixed(1)}  x=${d[21].toFixed(1)}  vy=${d[4].toFixed(4)}  Fy=${fy.toExponential(2)}  θ=${d[2].toFixed(2)}`;
+          statusEl.textContent = `[Reentry-dense] step ${st.step}  y=${yTotal.toFixed(1)}  x=${xTotal.toFixed(1)}  vy=${d[4].toFixed(4)}  Fy=${fy.toExponential(2)}  θ=${d[2].toFixed(2)}`;
           lastT = performance.now();
         }
 

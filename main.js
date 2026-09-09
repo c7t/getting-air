@@ -1,6 +1,7 @@
 import { reportFatal, reportNoWebGPU, reportNoAdapter } from './error-overlay.mjs';
 import { installVortControls } from './vort-controls.mjs';
 import { createTrail } from './trajectory-trail.mjs';
+import { createTotalUnwrapper } from './card-total.mjs';
 import { createSimPacer, parseSimRate, DEFAULT_TU_PER_SEC } from './sim-rate.mjs';
 import { assembleShader } from './shader-loader.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
@@ -383,6 +384,11 @@ async function init() {
   // the full run; only the trail's own buffer rolls, since it needs just
   // enough history to draw one window of descent.
   const trail = createTrail(document.getElementById('trail'));
+  // The shaders keep x_total/y_total wrapped so their f32 precision stops
+  // decaying with run length; this turns them back into true float64 totals.
+  // Everything below reads xTotal/yTotal, never d[21]/d[20] -- see
+  // card-total.mjs.
+  const totals = createTotalUnwrapper(W, H);
   let trailOpacity = 1.0;
   const trailSlider = document.getElementById('slider-TRAIL');
   const trailValEl = document.getElementById('val-TRAIL');
@@ -496,21 +502,25 @@ async function init() {
           gpuTime = performance.now() - tSubmit;
         }
 
+        // d[21]/d[20] are the WRAPPED accumulators; unwrap once here so
+        // every consumer below sees one true, monotonic total.
+        const { x: xTotal, y: yTotal } = totals.unwrap(d[21], d[20]);
+
         // Update trajectory from this specific completed step
         if (st.step < 100000) {
           // Record: step, cx, cy_total, cx_total, theta, vx, vy, omega, fx, fy, tz
-          trajectory.push([st.step, d[0], d[20], d[21], d[2], d[3], d[4], d[5], d[6], d[7], d[8]]);
+          trajectory.push([st.step, d[0], yTotal, xTotal, d[2], d[3], d[4], d[5], d[6], d[7], d[8]]);
         }
-        // d[21] = x_total, d[20] = y_total -- the card's UNWRAPPED path. The
-        // wrapped cx/cy cannot be used: they never leave the buffer centre.
-        trail.push(d[21], d[20], 2 * A);
+        // The card's UNWRAPPED path. The wrapped cx/cy cannot be used: they
+        // never leave the buffer centre.
+        trail.push(xTotal, yTotal, 2 * A);
         
         if (performance.now() - lastT > 250) {
           const mlups = (NCELLS * (st.steps || 0)) / (gpuTime * 1e3);
           mlupsEl.textContent = mlups.toFixed(1);
           gpuMsEl.textContent = gpuTime.toFixed(2);
           syncMsEl.textContent = (performance.now() - tSubmit).toFixed(2);
-          statusEl.textContent = `step ${st.step}  y=${d[20].toFixed(1)}  x=${d[21].toFixed(1)}  vy=${d[4].toFixed(4)}  Fy=${d[7].toExponential(2)}  θ=${d[2].toFixed(2)}`;
+          statusEl.textContent = `step ${st.step}  y=${yTotal.toFixed(1)}  x=${xTotal.toFixed(1)}  vy=${d[4].toFixed(4)}  Fy=${d[7].toExponential(2)}  θ=${d[2].toFixed(2)}`;
           lastT = performance.now();
         }
         
