@@ -12,6 +12,7 @@
 import { reportFatal, reportNoWebGPU, reportNoAdapter } from './error-overlay.mjs';
 import { installVortControls } from './vort-controls.mjs';
 import { createTrail } from './trajectory-trail.mjs';
+import { createSimPacer, parseSimRate, DEFAULT_TU_PER_SEC } from './sim-rate.mjs';
 import { installChromeToggle } from './ui-chrome.mjs';
 import { assembleShader } from './shader-loader.mjs';
 import {
@@ -51,6 +52,14 @@ const urlParams = new URLSearchParams(window.location.search);
 // that run is `index.html?res=10` (card-params.mjs's
 // AMR_EQUIVALENT_DENSE_RES_LOG2, and see DENSE_DEFAULT_RES_LOG2's comment).
 let resLog2 = parseResLog2(urlParams, AMR_DEFAULT_RES_LOG2);
+
+// Fixed simulation RATE (sim-rate.mjs). STEPS_PER_FRAME below is now a
+// CEILING, not a target: the pacer asks for however many steps a wall-clock
+// interval is worth, so the physics runs at the same speed on every device
+// that can keep up, and slower devices are clamped to exactly their old
+// behaviour. ?simRate= is in a/u_t per wall-second, the paper's own time unit.
+const SIM_RATE = parseSimRate(urlParams);
+
 
 let W = 1 << resLog2;
 let H = W;
@@ -1658,6 +1667,23 @@ async function init() {
   // Milestone 4b: manage dispatches one thread per coarse block.
   const WG_MANAGE = Math.ceil(NBLOCKS / 64);
   const STEPS_PER_FRAME = 64;
+
+  // The pacer replaces the fixed 64-steps-per-frame loop. STEPS_PER_FRAME is
+  // passed as the ceiling; see sim-rate.mjs for why that is what keeps the
+  // phone at full speed while halving the desktop.
+  const pacer = createSimPacer({ maxStepsPerFrame: STEPS_PER_FRAME, tuPerSec: SIM_RATE });
+  const rateSlider = document.getElementById('slider-SIM_RATE');
+  const rateValEl = document.getElementById('val-SIM_RATE');
+  if (rateSlider) {
+    rateSlider.value = SIM_RATE;   // ?simRate= wins over the markup
+    if (rateValEl) rateValEl.textContent = SIM_RATE.toFixed(2);
+    rateSlider.oninput = () => {
+      const v = parseFloat(rateSlider.value);
+      if (rateValEl) rateValEl.textContent = v.toFixed(2);
+      pacer.setRate(v);
+    };
+  }
+
   let step = 0, lastT = performance.now();
   let useB = false;
   let liveMode = true;
@@ -2338,6 +2364,7 @@ async function init() {
     step = 0;
     trajectory.length = 0;
     trail.clear();
+    pacer.reset();
   }
 
   // Activates coarse block (bx,by) [0<=bx<NBX, 0<=by<NBY, buffer-space --
@@ -3242,7 +3269,11 @@ async function init() {
     runBenchSweep,
     hasTimestamp: () => hasTimestamp,
     debugProfileMacroStep,
-    setLive: (v) => { liveMode = !!v; },
+    // reset() on resume: frame() returns early while paused without ever
+    // reaching the pacer, so its last-timestamp would otherwise be stale by
+    // the whole pause. (MAX_FRAME_DT_MS and the accumulator cap already
+    // bound the damage to one frame; this makes it exactly zero.)
+    setLive: (v) => { liveMode = !!v; if (liveMode) pacer.reset(); },
     isLive: () => liveMode,
     reset: resetSim,
     getStep: () => step,
@@ -3323,8 +3354,12 @@ async function init() {
         t0.end();
       }
 
-      for (let s = 0; s < STEPS_PER_FRAME; s++) dispatchMacroStep(enc);
-      step += STEPS_PER_FRAME;
+      // Paced, not fixed: however many steps this frame's wall-clock interval
+      // is worth, capped at STEPS_PER_FRAME. Always even (sim-rate.mjs), which
+      // the useB ping-pong invariant above depends on.
+      const nSteps = pacer.stepsForFrame(performance.now(), A / U_T);
+      for (let s = 0; s < nSteps; s++) dispatchMacroStep(enc);
+      step += nSteps;
 
       if (hasTimestamp) {
         const t1 = enc.beginComputePass({ timestampWrites: { querySet, endOfPassWriteIndex: 1 } });
@@ -3354,6 +3389,9 @@ async function init() {
 
       stage.inFlight = true;
       stage.step = step;
+      // Steps THIS frame actually dispatched -- the MLUPS readout divides
+      // the GPU span by it, and it is no longer a constant.
+      stage.steps = nSteps;
 
       // ── Ordering watchdog ────────────────────────────────────────────
       // Reported symptom: on a slow device the display appears to jump
@@ -3523,7 +3561,7 @@ async function init() {
           // is a coarse-grid-throughput figure, NOT total work done, and is
           // not comparable across level counts. tools/bench-amr.js computes
           // the honest cell-updates/s using live per-level active counts.
-          const mlups = (NCELLS * STEPS_PER_FRAME) / (gpuTime * 1e3);
+          const mlups = (NCELLS * (st.steps || 0)) / (gpuTime * 1e3);
           mlupsEl.textContent = mlups.toFixed(1);
           gpuMsEl.textContent = gpuTime.toFixed(2);
           syncMsEl.textContent = (performance.now() - tSubmit).toFixed(2);
