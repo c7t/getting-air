@@ -121,11 +121,6 @@ fn fineToCoarseUnit(fCoord: u32, origin: u32) -> f32 {
   return f32(origin) - 0.25 + 0.5 * j;
 }
 
-fn wrapCoord(v: i32, n: u32) -> u32 {
-  let m = i32(n);
-  return u32(((v % m) + m) % m);
-}
-
 // Parent-local-interior-unit coordinates (ix,iy) -> flat index into the
 // parent's own FB*FB tile at `pSlot`. No wrap, no neighbor-slot lookup --
 // see the file header for why the +GHOST offset alone always lands in the
