@@ -39,8 +39,9 @@
 //
 // Reinhard (a/(1+a)) is used instead: monotonic, asymptotic to 1 but never
 // reaching it, so there is always some gradient left at the top end no matter
-// how strong the core. VORT_GAMMA then shapes the low end back up, since pure
-// Reinhard alone darkens the mid-tones relative to the old linear ramp.
+// how strong the core. VORT_GAMMA then shapes the low end, either lifting it
+// back toward the old linear ramp's brightness (below 1) or deepening the
+// background so the structure stands out against it (above 1).
 //
 // Both knobs are pipeline-overridable and driven from `?vortScale=` /
 // `?vortGamma=` on either page (main.js and main-amr.js parse them
@@ -48,13 +49,15 @@
 // guessed at and recompiled. Note the OLD look is not exactly reproducible by
 // any setting here -- the hard clip is the thing being removed.
 
-// Reference scale: |omega| * VORT_SCALE == 1 is the curve's knee (the old
-// mapping's saturation point). Larger = more of the field pushed bright.
-override VORT_SCALE : f32 = 80.0;
+// Reference scale: |omega| * VORT_SCALE == 1 is the curve's knee. 80 was the
+// old mapping's saturation point, so 40 puts the knee at twice the vorticity
+// -- less of the field pushed bright. Larger = brighter overall.
+override VORT_SCALE : f32 = 40.0;
 // Shapes the compressed magnitude. 1.0 = pure Reinhard. Below 1 lifts weak
-// vorticity back toward its old brightness while leaving the top end
-// compressed; above 1 darkens the field generally.
-override VORT_GAMMA : f32 = 0.75;
+// vorticity toward its old brightness while leaving the top end compressed;
+// above 1 darkens the field generally. 1.2 deepens the near-black background
+// so the wake reads against it instead of sitting in a haze.
+override VORT_GAMMA : f32 = 1.2;
 
 // Near-black background, warm red for counter-clockwise (positive), cool blue
 // for clockwise (negative). Unchanged from the mapping this replaced.

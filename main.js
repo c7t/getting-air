@@ -24,8 +24,8 @@ const F16 = urlParams.has('f16') ? (parseInt(urlParams.get('f16')) || 0) : 0;
 // at: ?vortScale= moves the curve's knee, ?vortGamma= shapes the low end.
 // Parsed identically on both pages -- the two views are meant to be compared
 // by eye, so a knob that existed on only one of them would defeat that.
-const VORT_SCALE = parseFloat(urlParams.get('vortScale')) || 80.0;
-const VORT_GAMMA = parseFloat(urlParams.get('vortGamma')) || 0.75;
+const VORT_SCALE = parseFloat(urlParams.get('vortScale')) || 40.0;
+const VORT_GAMMA = parseFloat(urlParams.get('vortGamma')) || 1.2;
 
 let resLog2 = parseResLog2(urlParams, DENSE_DEFAULT_RES_LOG2);
 

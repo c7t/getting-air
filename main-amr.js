@@ -180,8 +180,8 @@ const REFINE_EVERY = urlParams.has('refineEvery') ? parseInt(urlParams.get('refi
 // at: ?vortScale= moves the curve's knee, ?vortGamma= shapes the low end.
 // Parsed identically on both pages -- the two views are meant to be compared
 // by eye, so a knob that existed on only one of them would defeat that.
-const VORT_SCALE = parseFloat(urlParams.get('vortScale')) || 80.0;
-const VORT_GAMMA = parseFloat(urlParams.get('vortGamma')) || 0.75;
+const VORT_SCALE = parseFloat(urlParams.get('vortScale')) || 40.0;
+const VORT_GAMMA = parseFloat(urlParams.get('vortGamma')) || 1.2;
 
 const REFINE_THRESH = urlParams.has('refineThresh') ? parseFloat(urlParams.get('refineThresh')) : -9;
 const COARSEN_THRESH = urlParams.has('coarsenThresh') ? parseFloat(urlParams.get('coarsenThresh')) : -10;
