@@ -243,43 +243,38 @@ const REFINE_EVERY = urlParams.has('refineEvery') ? parseInt(urlParams.get('refi
 //    band (an earlier pass here blamed that; the band is one block wide at
 //    the WINDOW edge and cannot explain a near-wake artifact).
 //
-//    Two blockers, and only the first is now fixed.
+//    ROOT CAUSE, FOUND AND FIXED: the level-2 blockCriterion was identically
+//    ZERO, always. criterionPoolBGs bound `m === 1 ? velBuf : ...` as
+//    amr_criterion_pool.wgsl's parent velocity, handing a dense,
+//    cellIndex-addressed L0 buffer to a shader that addresses BY POOL SLOT --
+//    the dense-parent pattern the neighbouring interp/step bind groups
+//    legitimately use, copied to the one shader that has no dense-parent
+//    variant. So amr_manage_pool.wgsl's refine() saw maxCrit ~= 0 for every
+//    parent and the vorticity criterion could NEVER promote a tile to level 2.
+//    Level 2 was 100% geometry-forced, which is exactly what the phi scan
+//    showed before the cause was known. See the parentVel BUGFIX in the
+//    criterion/manage bind-group loop below.
 //
-//    (a) THE MISSING HALF OF THE REFINE CASCADE -- fixed, ?demandCascade=1.
-//    amr_manage_pool.wgsl refine()'s 2:1 gate vetoes a criterion-only refine
-//    unless all 4 same-level neighbours of the parent are active, and nothing
-//    ever forced those neighbours, so the veto deadlocked: L1 tile A asks for
-//    L2 children, A's neighbour B does not exist, so A is vetoed -- and B is
-//    created only by its own criterion, by geometry, or by amr_manage.wgsl's
-//    cascade, which fires on a neighbour that ALREADY HAS an L2 child. A has
-//    none, because it was just vetoed. 19 of the affected tiles were in this
-//    state. See amr_manage.wgsl's level2Wanted.
+//    Measured, same build, A/B on that one line (40k steps):
+//      level-2 criterion non-zero entries   0 / 4096  ->  1132 / 4096
+//      level-2 criterion max                0         ->  0.0308
+//      active level-2 tiles                 64        ->  244
+//      block-centre phi covered by L2   -0.5 .. 7.9   ->  -0.3 .. 57.7
+//    The last line is the artifact: level 2 used to stop at the forced halo
+//    (margin 8), so the L1/L2 boundary sat a few cells off the body and every
+//    shed vortex crossed it right at the trailing edge. It now follows the
+//    wake out to ~7x that distance.
 //
-//    (b) SOMETHING ELSE, still open, and it is the bigger share. Measured
-//    with ?demandCascade=1 ON, against the criterion the shader really uses
-//    (amr_criterion_pool.wgsl replicated exactly from the snapshot's level-1
-//    velocity field, not estimated from L0): of 70 active L1 tiles with no L2
-//    child, 40 have a level-1-measured criterion that asks for level 2 --
-//    some at physical log2|omega| = -5.6, five octaves above the -8 rung.
-//    Ruled out for these: the neighbour gate (satisfied), pool exhaustion
-//    (48 of 256 level-2 tiles active, 52 of 64 quads free), the sponge band
-//    (the card sits at the window centre), and the coarsen side (their
-//    desiredLevelCoarsen is 2, so the release test is false). The near-card
-//    level map is bit-for-bit unchanged with the cascade on, and L2 still
-//    covers exactly phi -0.5 .. 7.9. Whatever this is, it lives in
-//    amr_manage_pool.wgsl's refine() path, not in the tuning constants --
-//    that is where to look next, and dumping childCriterion straight off the
-//    GPU (rather than reconstructing it) is the measurement to do first.
+//    A SEPARATE, SMALLER blocker was also real and is fixed independently:
+//    the refine cascade's missing growth half (?demandCascade). 19 tiles were
+//    in that state. See amr_manage.wgsl's level2Wanted.
 //
-//    This is a gap opened by an earlier, correct fix. The cascade used to be
-//    criterion-based ("does my neighbour WANT a level-2 child") and was
-//    switched to existence-based because a flickering desire signal broke 2:1
-//    balance -- see amr_manage.wgsl's header. Existence is right for HOLDING
-//    balance around an already-deep region; nothing replaced the growth
-//    direction. Fixing it means re-introducing a demand signal that can only
-//    ever CREATE (never justify keeping) a tile, which is exactly the shape
-//    that broke balance before -- so it needs the 2:1 invariant sweep on this
-//    page, which now exists as validate-all.js's amr-dev-invariants config.
+//    A caution for whoever measures here next: blockCriterionBuf had no
+//    COPY_SRC, so debugReadBlockCriterion's copy was a validation error, the
+//    command buffer was dropped, and EVERY level read back as all zeros --
+//    which looks exactly like "the criterion pass never ran" and did produce
+//    one wrong reading before a level-1 control (known-good, since L1
+//    refinement demonstrably works) exposed it. COPY_SRC is now set.
 //
 // NOT CHANGED HERE, deliberately. Any of these is a physics change to the
 // page that Pages serves, and this page cannot validate one: see
@@ -656,7 +651,10 @@ function allocLevelPool(device, U, m, NBX_m, NBY_m, maxFineBlocks) {
     finePoolVel: device.createBuffer({ size: maxFineBlocks * NCELLS1 * 2 * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC }),
     blockSlotBuf: device.createBuffer({ size: NBLOCKS_m * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC }),
     slotToBlockBuf: device.createBuffer({ size: maxFineBlocks * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC }),
-    blockCriterionBuf: device.createBuffer({ size: NBLOCKS_m * 4, usage: U.STORAGE | U.COPY_DST }),
+    blockCriterionBuf: device.createBuffer({ size: NBLOCKS_m * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC }),  // COPY_SRC so debugReadBlockCriterion can read it back; without it the
+    // copy is a validation error, the whole command buffer is dropped, and
+    // the staging buffer reads back as all zeros -- which looks exactly like
+    // "the criterion pass never ran" and cost a wrong diagnosis once.
     freeCountBuf: device.createBuffer({ size: 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC }),
     newlyActivatedBuf: device.createBuffer({ size: maxFineBlocks * 4, usage: U.STORAGE | U.COPY_DST }),
   };
@@ -943,11 +941,22 @@ async function init() {
     for (let m = 1; m < N_LEVELS; m++) {
       const maxFineBlocks = m === 1
         ? MAX_FINE_BLOCKS // unchanged param/default -- level 1 is byte-identical to today
-        // 256, not 128: measured L2 demand at the retuned thresholds peaked
-        // at 136 over 84k steps, and at res=8 levels=3 the old 128 default
-        // saturated outright (128/128 active). See MAX_FINE_BLOCKS above for
-        // why exhaustion here shows up as horizontal bands.
-        : (urlParams.has(`maxFineBlocks${m}`) ? parseInt(urlParams.get(`maxFineBlocks${m}`)) : 256);
+        // 512, not 256. The old 256 was sized when the level-2 vorticity
+        // criterion was silently dead (blockCriterionBuf all zeros -- see the
+        // parentVel BUGFIX below), so level 2 was purely the geometry halo and
+        // its demand was correspondingly small. With the criterion actually
+        // driving it, measured demand over 40k steps with the caps lifted is
+        // min 100 / median 176 / MAX 304, so 256 would sit below the peak --
+        // and exhaustion is not graceful: slots are granted in blockID order,
+        // so the free list dries up part-way through a row and the denied
+        // blocks form horizontal BANDS across the refined region. 512 is ~1.7x
+        // the measured peak, matching the headroom MAX_FINE_BLOCKS above uses,
+        // and costs ~16.4 MiB of level-2 pool buffers against ~8.2 MiB before.
+        // Level 1 needs no change: its demand over the same run is min 50 /
+        // median 114 / max 172 against a 384 cap. The cylinder harness needs
+        // none either -- its own L2 sits flat at 68 against a 128 cap, since a
+        // pinned body at Re=100 has a far smaller wake than a tumbling card.
+        : (urlParams.has(`maxFineBlocks${m}`) ? parseInt(urlParams.get(`maxFineBlocks${m}`)) : 512);
       const pool = allocLevelPool(device, U, m, curNBX, curNBY, maxFineBlocks);
       writeF(pool.finePoolF_a, initFPool(maxFineBlocks), maxFineBlocks * NCELLS1);
       pools.push(pool);
@@ -1626,7 +1635,33 @@ async function init() {
   for (let m = 1; m < N_LEVELS - 1; m++) {
     const parentPool = pools[m];
     const childPool = pools[m + 1];
-    const parentVel = m === 1 ? velBuf : parentPool.finePoolVel;
+    // BUGFIX: ALWAYS the parent pool's own finePoolVel, never velBuf.
+    // amr_criterion_pool.wgsl's binding 0 is the PARENT LEVEL's fine pool
+    // velocity and it addresses that buffer BY POOL SLOT
+    // (slot*(FB*FB) + fy*FB + fx). This shader only ever runs with a pool
+    // level as its parent -- m >= 1 -- so there is no dense case to special-
+    // case here; the `m === 1 ? velBuf : ...` this replaces was the
+    // dense-parent pattern the neighbouring interp/step bind groups legitimately
+    // use, copied to a shader that has no dense-parent variant.
+    //
+    // Handing it velBuf fed a dense, cellIndex-addressed L0 buffer to
+    // slot-addressed reads: wrong layout for every slot, and past roughly the
+    // first third of the slots the reads run off the end of a buffer less than
+    // half the size the pool layout expects. The result was a level-2
+    // blockCriterion of essentially ZERO everywhere -- measured 2^-39.86 for
+    // all 85 active L1 parents, against a host reconstruction from level 1's
+    // own field showing up to 2^-5.6.
+    //
+    // So amr_manage_pool.wgsl's refine() saw maxCrit ~= 0 for every parent,
+    // desiredLevel(toPhysical(eps)) was 0, and the vorticity criterion could
+    // NEVER promote a tile to level 2. Level 2 was 100% geometry-forced --
+    // which is exactly what a phi scan showed independently before the cause
+    // was known: L2 covered block centres at phi -0.5 .. 7.9, the
+    // childLevel-2 forced halo (margin 8) and nothing beyond it. That pins
+    // the L1/L2 boundary a few cells off the body, so every shed vortex
+    // crosses it right at the trailing edge -- the reported block artifacts
+    // and the lumpiness induced on the shed vortices.
+    const parentVel = parentPool.finePoolVel;
     const parentSlotToBlockBuf = m === 1 ? pools[1].slotToBlockBuf : parentPool.slotToBlockBuf;
     const parentBlockSlotBuf = m === 1 ? pools[1].blockSlotBuf : parentPool.blockSlotBuf;
     const parentOriginXBuf = m === 1 ? dummyBlockSlotBuf : parentPool.originXBuf; // dummy: level-1 parent has no cached origin (PARENT_HAS_CACHED_ORIGIN=0 gates it out)
@@ -2796,6 +2831,31 @@ async function init() {
   // needing a full debugSnapshotSave (which, per
   // plans/AMR-multilevel-M5.md's explicit non-goal, only ever handles
   // level 1 until Milestone 10).
+  // Raw per-block criterion for a level, straight off the GPU. Added while
+  // chasing the near-wake artifact: the refine decision for level m+1 reads
+  // pools[m+1].blockCriterionBuf, and reconstructing that value on the host
+  // from a snapshot's velocity field only tells you what it SHOULD be. When
+  // the two disagree, the criterion pass is at fault; when they agree, the
+  // refine path is. Reading it is the only way to tell them apart.
+  //
+  // Indexed by that level's own block grid (pools[level].NBLOCKS), which is
+  // the same indexing amr_manage_pool.wgsl's refine() uses for childCriterion
+  // and amr_criterion_pool.wgsl uses when writing it.
+  async function debugReadBlockCriterion(level = 2) {
+    const pool = pools[level];
+    if (!pool) throw new Error(`level ${level} has no pool (N_LEVELS=${N_LEVELS})`);
+    const bytes = pool.NBLOCKS * 4;
+    const stage = device.createBuffer({ size: bytes, usage: U.MAP_READ | U.COPY_DST });
+    const enc = device.createCommandEncoder();
+    enc.copyBufferToBuffer(pool.blockCriterionBuf, 0, stage, 0, bytes);
+    device.queue.submit([enc.finish()]);
+    await stage.mapAsync(GPUMapMode.READ);
+    const c = Array.from(new Float32Array(stage.getMappedRange()));
+    stage.unmap();
+    stage.destroy();
+    return { level, NBX: pool.NBX, NBY: pool.NBY, criterion: c };
+  }
+
   async function debugReadPool(level = 1) {
     const pool = pools[level];
     const stage = device.createBuffer({ size: pool.fSizePool, usage: U.MAP_READ | U.COPY_DST });
@@ -3450,6 +3510,7 @@ async function init() {
     debugProbeGhostFill,
     debugRunSteadyGhostFill,
     debugReadPool,
+    debugReadBlockCriterion,
     debugInjectSyntheticField,
     setAutoRefine,
     isAutoRefine: () => autoRefine,

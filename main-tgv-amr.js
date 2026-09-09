@@ -302,7 +302,10 @@ function allocLevelPool(device, U, m, NBX_m, NBY_m, maxFineBlocks) {
     finePoolVel: device.createBuffer({ size: maxFineBlocks * NCELLS1 * 2 * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC }),
     blockSlotBuf: device.createBuffer({ size: NBLOCKS_m * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC }),
     slotToBlockBuf: device.createBuffer({ size: maxFineBlocks * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC }),
-    blockCriterionBuf: device.createBuffer({ size: NBLOCKS_m * 4, usage: U.STORAGE | U.COPY_DST }),
+    blockCriterionBuf: device.createBuffer({ size: NBLOCKS_m * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC }),  // COPY_SRC so debugReadBlockCriterion can read it back; without it the
+    // copy is a validation error, the whole command buffer is dropped, and
+    // the staging buffer reads back as all zeros -- which looks exactly like
+    // "the criterion pass never ran" and cost a wrong diagnosis once.
     freeCountBuf: device.createBuffer({ size: 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC }),
     newlyActivatedBuf: device.createBuffer({ size: maxFineBlocks * 4, usage: U.STORAGE | U.COPY_DST }),
   };
@@ -746,7 +749,33 @@ async function init() {
   for (let m = 1; m < N_LEVELS - 1; m++) {
     const parentPool = pools[m];
     const childPool = pools[m + 1];
-    const parentVel = m === 1 ? velBuf : parentPool.finePoolVel;
+    // BUGFIX: ALWAYS the parent pool's own finePoolVel, never velBuf.
+    // amr_criterion_pool.wgsl's binding 0 is the PARENT LEVEL's fine pool
+    // velocity and it addresses that buffer BY POOL SLOT
+    // (slot*(FB*FB) + fy*FB + fx). This shader only ever runs with a pool
+    // level as its parent -- m >= 1 -- so there is no dense case to special-
+    // case here; the `m === 1 ? velBuf : ...` this replaces was the
+    // dense-parent pattern the neighbouring interp/step bind groups legitimately
+    // use, copied to a shader that has no dense-parent variant.
+    //
+    // Handing it velBuf fed a dense, cellIndex-addressed L0 buffer to
+    // slot-addressed reads: wrong layout for every slot, and past roughly the
+    // first third of the slots the reads run off the end of a buffer less than
+    // half the size the pool layout expects. The result was a level-2
+    // blockCriterion of essentially ZERO everywhere -- measured 2^-39.86 for
+    // all 85 active L1 parents, against a host reconstruction from level 1's
+    // own field showing up to 2^-5.6.
+    //
+    // So amr_manage_pool.wgsl's refine() saw maxCrit ~= 0 for every parent,
+    // desiredLevel(toPhysical(eps)) was 0, and the vorticity criterion could
+    // NEVER promote a tile to level 2. Level 2 was 100% geometry-forced --
+    // which is exactly what a phi scan showed independently before the cause
+    // was known: L2 covered block centres at phi -0.5 .. 7.9, the
+    // childLevel-2 forced halo (margin 8) and nothing beyond it. That pins
+    // the L1/L2 boundary a few cells off the body, so every shed vortex
+    // crosses it right at the trailing edge -- the reported block artifacts
+    // and the lumpiness induced on the shed vortices.
+    const parentVel = parentPool.finePoolVel;
     const parentSlotToBlockBuf = m === 1 ? pools[1].slotToBlockBuf : parentPool.slotToBlockBuf;
     const parentBlockSlotBuf = m === 1 ? pools[1].blockSlotBuf : parentPool.blockSlotBuf;
     const parentOriginXBuf = m === 1 ? dummyBlockSlotBuf : parentPool.originXBuf;
