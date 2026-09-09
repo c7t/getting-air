@@ -11,6 +11,7 @@
 
 import { reportFatal, reportNoWebGPU, reportNoAdapter } from './error-overlay.mjs';
 import { installVortControls } from './vort-controls.mjs';
+import { createTrail } from './trajectory-trail.mjs';
 import { installChromeToggle } from './ui-chrome.mjs';
 import { assembleShader } from './shader-loader.mjs';
 import {
@@ -1665,6 +1666,24 @@ async function init() {
 
   const trajectory = [];
 
+  // Rolling trajectory trail (trajectory-trail.mjs). Fed from the SAME
+  // CardState readback that fills trajectory[] for the CSV export -- the
+  // debug log and the on-screen line are one source of truth. The CSV keeps
+  // the full run; only the trail's own buffer rolls, since it needs just
+  // enough history to draw one window of descent.
+  const trail = createTrail(document.getElementById('trail'));
+  let trailOpacity = 1.0;
+  const trailSlider = document.getElementById('slider-TRAIL');
+  const trailValEl = document.getElementById('val-TRAIL');
+  if (trailSlider) {
+    trailOpacity = parseFloat(trailSlider.value);
+    if (trailValEl) trailValEl.textContent = trailOpacity.toFixed(2);
+    trailSlider.oninput = () => {
+      trailOpacity = parseFloat(trailSlider.value);
+      if (trailValEl) trailValEl.textContent = trailOpacity.toFixed(2);
+    };
+  }
+
   document.getElementById('download').onclick = () => {
     const header = "step,cx,cy_total,cx_total,theta,vx,vy,omega,fx,fy,tz\n";
     const rows = trajectory.map(r => r.map(v => v.toFixed(6)).join(",")).join("\n");
@@ -2318,6 +2337,7 @@ async function init() {
     useB = false;
     step = 0;
     trajectory.length = 0;
+    trail.clear();
   }
 
   // Activates coarse block (bx,by) [0<=bx<NBX, 0<=by<NBY, buffer-space --
@@ -3315,6 +3335,7 @@ async function init() {
 
       const rp = enc.beginRenderPass({ colorAttachments: [{ view: ctx.getCurrentTexture().createView(), clearValue: { r:0.07, g:0.07, b:0.1, a:1 }, loadOp: 'clear', storeOp: 'store' }]});
       rp.setPipeline(renPL); rp.setBindGroup(0, renBG); rp.draw(6); rp.end();
+      trail.draw(2 * A, trailOpacity);
 
       // Only run when telemetry is on. It exists to answer a diagnostic
       // question, and a normal run should not pay for an instrument -- least
@@ -3493,6 +3514,9 @@ async function init() {
         if (st.step < 100000) {
           trajectory.push([st.step, d[0], d[20], d[21], d[2], d[3], d[4], d[5], d[6], d[7], d[8]]);
         }
+        // d[21] = x_total, d[20] = y_total -- the card's UNWRAPPED path. The
+        // wrapped cx/cy cannot be used: they never leave the buffer centre.
+        trail.push(d[21], d[20], 2 * A);
 
         if (performance.now() - lastT > 250) {
           // L0 cells only -- it deliberately ignores every fine level, so it

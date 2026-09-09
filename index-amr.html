@@ -30,6 +30,15 @@
       width:  min(100cqw, 100cqh);
       height: min(100cqw, 100cqh);
     }
+    /* Trajectory trail overlay -- a 2D canvas sharing the WebGPU canvas's
+       box. The `canvas` rule above sizes both identically; this one lifts it
+       out of flow and centres it on top. pointer-events:none so it never
+       intercepts a click meant for the page. */
+    #trail {
+      position: absolute; left: 50%; top: 50%;
+      transform: translate(-50%, -50%);
+      pointer-events: none;
+    }
     #status {
       position: absolute; top: 8px; left: 8px;
       font-size: 12px; color: #7f7; background: rgba(0,0,0,0.6);
@@ -86,6 +95,7 @@
 <body class="ui-hidden">
   <div id="canvas-container">
     <canvas id="c"></canvas>
+    <canvas id="trail"></canvas>
     <div id="status">initializing...</div>
     <div id="perf">
       <div><span class="perf-label">MLUPS:</span> <span id="val-mlups">0.0</span></div>
@@ -131,6 +141,11 @@
       <label>Ut (gravity)</label>
       <input type="range" id="slider-U_T" min="0.01" max="0.15" step="0.005" value="0.05">
       <span id="val-U_T">0.05</span>
+    </div>
+    <div class="control-row">
+      <label>Trajectory trail</label>
+      <input type="range" id="slider-TRAIL" min="0" max="1" step="0.05" value="1">
+      <span id="val-TRAIL">1.00</span>
     </div>
     <div class="control-row">
       <label>Vorticity scale</label>
