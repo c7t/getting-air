@@ -77,6 +77,16 @@ const F16 = urlParams.has('f16') ? (parseInt(urlParams.get('f16')) || 0) : 0;
 // validation sweep against the legacy path.
 const GHOST_COPY = urlParams.has('ghostcopy') ? (parseInt(urlParams.get('ghostcopy')) || 0) : 0;
 
+// ── ?diag=1 -- refinement convergence counters ──────────────────────────────
+// Makes the refine round's fixed-point loop report whether it actually
+// SETTLED, instead of just running out of iterations. Off by default and
+// zero-cost when off: the DIAG override gates every atomic.
+const DIAG = urlParams.has('diag') ? (parseInt(urlParams.get('diag')) || 0) : 0;
+// ?refineIters= overrides the fixed-point iteration count. Kept because it is
+// what distinguishes an oscillation (more rounds do not help) from slow
+// propagation (they do) when `converged` reads false.
+const REFINE_ITERS_OVERRIDE = urlParams.has('refineIters') ? (parseInt(urlParams.get('refineIters')) || 0) : 0;
+
 let resLog2 = parseInt(urlParams.get('res')) || 8;
 // Floor of 5 (W=32, NBX=4), not the cylinder harness's 7 -- that floor came
 // from a sensible-blockage-domain convention that doesn't apply here (no
@@ -392,6 +402,9 @@ async function init() {
   // Harmless placeholders for "child level's blockSlot/blockCriterion"
   // bindings when no such level exists in this configuration -- see
   // main-amr.js's identical dummy buffers.
+  // ?diag=1 counters -- 8 u32 slots, read+zeroed via debugReadDiag().
+  const diagBuf = device.createBuffer({ size: 8 * 4, usage: U.STORAGE | U.COPY_SRC | U.COPY_DST });
+  const diagReadBuf = device.createBuffer({ size: 8 * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
   const dummyBlockSlotBuf = device.createBuffer({ size: 4, usage: U.STORAGE | U.COPY_DST });
   device.queue.writeBuffer(dummyBlockSlotBuf, 0, new Int32Array([-1]));
   const dummyCriterionBuf = device.createBuffer({ size: 4, usage: U.STORAGE | U.COPY_DST });
@@ -511,7 +524,9 @@ async function init() {
     { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
     { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    { binding: 8, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }
+    { binding: 8, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    // binding 9: ?diag=1 convergence counters. Always bound; never touched at DIAG=0.
+    { binding: 9, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }
   ]});
   const criterionPoolBGL = device.createBindGroupLayout({ label: 'criterionPoolBGL', entries: [
     { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
@@ -597,7 +612,7 @@ async function init() {
   let step1Constants = { ...stepConstants, RB, DIRECT_GHOST: GHOST_COPY ? 0 : 1 };
   const criterionConstants = { W, H };
   // HAS_BODY=0: isNearBody is unconditionally false (shaders/amr_manage.wgsl).
-  const manageConstants = { W, H, REFINE_THRESH, COARSEN_THRESH, FORCE_REFINE_MARGIN, FORCE_REFINE_LOOKAHEAD, DEMAND_CASCADE, HAS_LEVEL2: N_LEVELS > 2 ? 1 : 0, HAS_BODY: 0 };
+  const manageConstants = { DIAG, W, H, REFINE_THRESH, COARSEN_THRESH, FORCE_REFINE_MARGIN, FORCE_REFINE_LOOKAHEAD, DEMAND_CASCADE, HAS_LEVEL2: N_LEVELS > 2 ? 1 : 0, HAS_BODY: 0 };
 
   // Re (via FORCE_X/WALL_U1) is baked into the L0/L1(+pool) step pipelines
   // as an override -- changing it means recreating those pipelines (cheap:
@@ -738,7 +753,7 @@ async function init() {
   const interpInitBG_readB = device.createBindGroup({ layout: interpBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_b } }, { binding: 2, resource: { buffer: pools[1].finePoolF_a } }, { binding: 3, resource: { buffer: pools[1].slotToBlockBuf } }, { binding: 4, resource: { buffer: pools[1].newlyActivatedBuf } }, { binding: 5, resource: { buffer: pools[1].blockSlotBuf } }]});
 
   const criterionBG = device.createBindGroup({ layout: criterionBGL, entries: [{ binding: 0, resource: { buffer: velBuf } }, { binding: 1, resource: { buffer: pools[1].blockCriterionBuf } }]});
-  const manageBG = device.createBindGroup({ layout: manageBGL, entries: [{ binding: 0, resource: { buffer: pools[1].blockCriterionBuf } }, { binding: 1, resource: { buffer: pools[1].blockSlotBuf } }, { binding: 2, resource: { buffer: pools[1].slotToBlockBuf } }, { binding: 3, resource: { buffer: pools[1].freeListBuf } }, { binding: 4, resource: { buffer: pools[1].freeCountBuf } }, { binding: 5, resource: { buffer: pools[1].newlyActivatedBuf } }, { binding: 6, resource: { buffer: cardStateBuf } }, { binding: 7, resource: { buffer: N_LEVELS > 2 ? pools[2].blockCriterionBuf : dummyCriterionBuf } }, { binding: 8, resource: { buffer: N_LEVELS > 2 ? pools[2].blockSlotBuf : dummyBlockSlotBuf } }]});
+  const manageBG = device.createBindGroup({ layout: manageBGL, entries: [{ binding: 0, resource: { buffer: pools[1].blockCriterionBuf } }, { binding: 1, resource: { buffer: pools[1].blockSlotBuf } }, { binding: 2, resource: { buffer: pools[1].slotToBlockBuf } }, { binding: 3, resource: { buffer: pools[1].freeListBuf } }, { binding: 4, resource: { buffer: pools[1].freeCountBuf } }, { binding: 5, resource: { buffer: pools[1].newlyActivatedBuf } }, { binding: 6, resource: { buffer: cardStateBuf } }, { binding: 7, resource: { buffer: N_LEVELS > 2 ? pools[2].blockCriterionBuf : dummyCriterionBuf } }, { binding: 8, resource: { buffer: N_LEVELS > 2 ? pools[2].blockSlotBuf : dummyBlockSlotBuf } }, { binding: 9, resource: { buffer: diagBuf } }]});
 
   const criterionPoolBGs = {};
   const managePoolBGs = {};
@@ -977,8 +992,15 @@ async function init() {
         const c = enc.beginComputePass(); c.setPipeline(criterionPoolPLs[m]); c.setBindGroup(0, criterionPoolBGs[m]); c.dispatchWorkgroups(2, 2, pools[m].MAX_FINE_BLOCKS); c.end();
       }
 
-      const FIXED_POINT_ITERS = Math.max(1, N_LEVELS - 1);
+      const FIXED_POINT_ITERS = REFINE_ITERS_OVERRIDE > 0 ? REFINE_ITERS_OVERRIDE
+        : Math.max(1, N_LEVELS - 1);
       for (let iter = 0; iter < FIXED_POINT_ITERS; iter++) {
+        // Zero the convergence counters before the LAST iteration only, so what
+        // they hold afterwards describes exactly that iteration. A nonzero
+        // `granted` then means the loop was still creating tiles when its fixed
+        // iteration count ran out -- the topology handed to the solver has
+        // outstanding refinement. See debugReadDiag().
+        if (DIAG && iter === FIXED_POINT_ITERS - 1) enc.clearBuffer(diagBuf, 12, 20);
         for (let m = N_LEVELS - 1; m >= 1; m--) {
           if (m === 1) {
             const p = enc.beginComputePass(); p.setPipeline(manageCoarsenPL); p.setBindGroup(0, manageBG); p.dispatchWorkgroups(WG_MANAGE); p.end();

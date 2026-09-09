@@ -398,6 +398,16 @@ const F16 = urlParams.has('f16') ? (parseInt(urlParams.get('f16')) || 0) : 0;
 // validation sweep against the legacy path.
 const GHOST_COPY = urlParams.has('ghostcopy') ? (parseInt(urlParams.get('ghostcopy')) || 0) : 0;
 
+// ── ?diag=1 -- refinement convergence counters ──────────────────────────────
+// Makes the refine round's fixed-point loop report whether it actually
+// SETTLED, instead of just running out of iterations. Off by default and
+// zero-cost when off: the DIAG override gates every atomic.
+const DIAG = urlParams.has('diag') ? (parseInt(urlParams.get('diag')) || 0) : 0;
+// ?refineIters= overrides the fixed-point iteration count. Kept because it is
+// what distinguishes an oscillation (more rounds do not help) from slow
+// propagation (they do) when `converged` reads false.
+const REFINE_ITERS_OVERRIDE = urlParams.has('refineIters') ? (parseInt(urlParams.get('refineIters')) || 0) : 0;
+
 if (FORCE_REFINE_MARGIN >= SDF_FAR) {
   throw new Error(`?forceRefineMargin=${FORCE_REFINE_MARGIN} is at or above get_phi's SDF_FAR cutoff (${SDF_FAR}) -- ` +
     `beyond that the far-field early-out in shaders/common_geometry.wgsl returns a lower bound and isNearBody ` +
@@ -897,6 +907,9 @@ async function init() {
   // there, even though its hasChild/HAS_CHILD gate means it's never read).
   // A single -1 entry is enough -- masking logic only ever indexes it when
   // hasChild is true, which is never the case for whoever binds this.
+  // ?diag=1 counters -- 8 u32 slots, read+zeroed via debugReadDiag().
+  const diagBuf = device.createBuffer({ size: 8 * 4, usage: U.STORAGE | U.COPY_SRC | U.COPY_DST });
+  const diagReadBuf = device.createBuffer({ size: 8 * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
   const dummyBlockSlotBuf = device.createBuffer({ size: 4, usage: U.STORAGE | U.COPY_DST });
   device.queue.writeBuffer(dummyBlockSlotBuf, 0, new Int32Array([-1]));
   // Milestone 9: same idea, for a "child level's blockCriterion" binding
@@ -1204,7 +1217,9 @@ async function init() {
     // Milestone 9: level 2's own blockCriterion/blockSlot, for the cascade/
     // coarsen-block checks (harmless dummies when HAS_LEVEL2=0).
     { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    { binding: 8, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }
+    { binding: 8, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    // binding 9: ?diag=1 convergence counters. Always bound; never touched at DIAG=0.
+    { binding: 9, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }
   ]});
   // Milestone 9: per-quadrant criterion for any level-(m+1) decision,
   // parent=level m -- see amr_criterion_pool.wgsl's header (one pipeline
@@ -1334,7 +1349,7 @@ async function init() {
   const interpFFConstants = { W, H, RB, GHOST_ONLY: 1, FINE_FINE_ONLY: 1, F16 };
   const step1Constants = { W, H, RB, SDF_FAR, F16, DIRECT_GHOST: GHOST_COPY ? 0 : 1 };
   const criterionConstants = { W, H };
-  const manageConstants = { W, H, SDF_FAR, REFINE_THRESH, COARSEN_THRESH, FORCE_REFINE_MARGIN, FORCE_REFINE_LOOKAHEAD, SPONGE_EXCLUDE_W, DEMAND_CASCADE, HAS_LEVEL2: N_LEVELS > 2 ? 1 : 0,
+  const manageConstants = { DIAG, W, H, SDF_FAR, REFINE_THRESH, COARSEN_THRESH, FORCE_REFINE_MARGIN, FORCE_REFINE_LOOKAHEAD, SPONGE_EXCLUDE_W, DEMAND_CASCADE, HAS_LEVEL2: N_LEVELS > 2 ? 1 : 0,
     N_REFINE_INC, N_REFINE_MAX, MAX_LEVEL: N_LEVELS - 1 };
 
   const stepPL = device.createComputePipeline({
@@ -1622,7 +1637,7 @@ async function init() {
 
   // Milestone 4b bind groups.
   const criterionBG = device.createBindGroup({ layout: criterionBGL, entries: [{ binding: 0, resource: { buffer: velBuf } }, { binding: 1, resource: { buffer: pools[1].blockCriterionBuf } }]});
-  const manageBG = device.createBindGroup({ layout: manageBGL, entries: [{ binding: 0, resource: { buffer: pools[1].blockCriterionBuf } }, { binding: 1, resource: { buffer: pools[1].blockSlotBuf } }, { binding: 2, resource: { buffer: pools[1].slotToBlockBuf } }, { binding: 3, resource: { buffer: pools[1].freeListBuf } }, { binding: 4, resource: { buffer: pools[1].freeCountBuf } }, { binding: 5, resource: { buffer: pools[1].newlyActivatedBuf } }, { binding: 6, resource: { buffer: cardStateBuf } }, { binding: 7, resource: { buffer: N_LEVELS > 2 ? pools[2].blockCriterionBuf : dummyCriterionBuf } }, { binding: 8, resource: { buffer: N_LEVELS > 2 ? pools[2].blockSlotBuf : dummyBlockSlotBuf } }]});
+  const manageBG = device.createBindGroup({ layout: manageBGL, entries: [{ binding: 0, resource: { buffer: pools[1].blockCriterionBuf } }, { binding: 1, resource: { buffer: pools[1].blockSlotBuf } }, { binding: 2, resource: { buffer: pools[1].slotToBlockBuf } }, { binding: 3, resource: { buffer: pools[1].freeListBuf } }, { binding: 4, resource: { buffer: pools[1].freeCountBuf } }, { binding: 5, resource: { buffer: pools[1].newlyActivatedBuf } }, { binding: 6, resource: { buffer: cardStateBuf } }, { binding: 7, resource: { buffer: N_LEVELS > 2 ? pools[2].blockCriterionBuf : dummyCriterionBuf } }, { binding: 8, resource: { buffer: N_LEVELS > 2 ? pools[2].blockSlotBuf : dummyBlockSlotBuf } }, { binding: 9, resource: { buffer: diagBuf } }]});
 
   // Milestone 9: one criterion/manage bind group per PARENT level
   // (1..N_LEVELS-2), deciding child level m+1. Parent=level 1 sources from
@@ -2375,8 +2390,15 @@ async function init() {
       // (N<=3, plans/AMR-multilevel.md's Milestone 9 text) -- see
       // amr_manage_pool.wgsl's header for why cascades don't chain deeper
       // than one hop there.
-      const FIXED_POINT_ITERS = Math.max(1, N_LEVELS - 1);
+      const FIXED_POINT_ITERS = REFINE_ITERS_OVERRIDE > 0 ? REFINE_ITERS_OVERRIDE
+        : Math.max(1, N_LEVELS - 1);
       for (let iter = 0; iter < FIXED_POINT_ITERS; iter++) {
+        // Zero the convergence counters before the LAST iteration only, so what
+        // they hold afterwards describes exactly that iteration. A nonzero
+        // `granted` then means the loop was still creating tiles when its fixed
+        // iteration count ran out -- the topology handed to the solver has
+        // outstanding refinement. See debugReadDiag().
+        if (DIAG && iter === FIXED_POINT_ITERS - 1) enc.clearBuffer(diagBuf, 12, 20);
         for (let m = N_LEVELS - 1; m >= 1; m--) {
           if (m === 1) {
             const p = beginPass(enc, 'manage coarsen L1'); p.setPipeline(manageCoarsenPL); p.setBindGroup(0, manageBG); p.dispatchWorkgroups(WG_MANAGE); p.end();
@@ -3527,7 +3549,40 @@ async function init() {
   let benchRunning = false;
   let benchDone = false;
 
+  // ── ?diag=1 refinement convergence ───────────────────────────────────────
+  // Reads AND ZEROES, so successive calls give per-interval counts rather than
+  // a running total -- which is what makes "transient while refinement catches
+  // up" vs "steady state" answerable.
+  //
+  // The refine counters describe the FINAL fixed-point iteration only (they are
+  // cleared just before it, see dispatchMacroStep). converged=false means the
+  // loop was still creating tiles when its fixed iteration count ran out, so
+  // the topology the solver then runs on has outstanding refinement.
+  // byCascade isolates 2:1 balance still propagating outward.
+  //
+  // If converged reads false, check whether MORE iterations help (?refineIters=)
+  // before assuming slow propagation: if they do not, it is an oscillation --
+  // refine granting tiles that coarsen then releases -- which is a different
+  // bug with a different fix.
+  async function debugReadDiag() {
+    const enc = device.createCommandEncoder();
+    enc.copyBufferToBuffer(diagBuf, 0, diagReadBuf, 0, 32);
+    device.queue.submit([enc.finish()]);
+    await diagReadBuf.mapAsync(GPUMapMode.READ);
+    const v = Array.from(new Uint32Array(diagReadBuf.getMappedRange().slice(0)));
+    diagReadBuf.unmap();
+    device.queue.writeBuffer(diagBuf, 0, new Uint32Array(8));
+    return {
+      diagEnabled: DIAG !== 0,
+      refineGrantedLastIter: v[3],
+      refineByCascadeLastIter: v[4],
+      refinePoolExhausted: v[5],
+      converged: v[3] === 0 && v[5] === 0,
+    };
+  }
+
   window.__AMR = {
+    debugReadDiag,
     runBenchSweep,
     hasTimestamp: () => hasTimestamp,
     debugProfileMacroStep,
