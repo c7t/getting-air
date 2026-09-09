@@ -212,18 +212,47 @@ const REFINE_EVERY = urlParams.has('refineEvery') ? parseInt(urlParams.get('refi
 //    of being released) is 0-3% of births. The churn is the refined region
 //    following a convecting wake, which is what it is supposed to do.
 //
-// 4. THE THRESHOLD IS NOT WHAT BINDS at the shipped defaults -- this is the
-//    finding that matters, and it is why lowering REFINE_THRESH alone reads
-//    as nearly inert. SPONGE_EXCLUDE_W (8, below) suppresses vorticity-driven
-//    refinement in a band around the WINDOW edge, and the falling card's wake
-//    trails straight through that band, so a standing, window-fixed, block-
-//    aligned L1->L0 boundary sits across the wake and every shed vortex
-//    convects through it. Measured at 26k steps, L1 active tiles:
-//        default (-9, band on)        86-88
-//        -11 inc2, band still on      94     <- threshold looks inert
-//        -9, band off                102
-//        -11 inc2, band off          191     <- threshold binds hard now
-//    Retuning REFINE_THRESH without touching the band mostly does nothing.
+// 4. LEVEL 2 IS GEOMETRY-ONLY, and that is the near-wake artifact. Measured
+//    at 26k steps: the block centres covered by L2 span phi -0.5 .. 7.9,
+//    i.e. EXACTLY the forced halo (childLevel-2 margin 8) and nothing beyond
+//    it. The vorticity criterion never extends level 2 into the wake at all,
+//    so the L1/L2 boundary is pinned a few cells off the card's surface and
+//    every shed vortex crosses it right at the trailing edge -- which is
+//    where the artifact is reported, and it is NOT the domain-edge sponge
+//    band (an earlier pass here blamed that; the band is one block wide at
+//    the WINDOW edge and cannot explain a near-wake artifact).
+//
+//    35 L1 tiles carry vorticity at or above the level-2 rung yet have no L2
+//    child; 19 of those are vetoed by amr_manage_pool.wgsl refine()'s
+//    2:1-balance neighbour gate, which requires all 4 same-level neighbours
+//    of the parent to be active for a CRITERION-only refine. (The remaining
+//    16 are not yet accounted for -- candidates are inSpongeBandAt, which
+//    gates the pool criterion too, and the fact that the real L1->L2 decision
+//    reads level 1's own field where this scan estimates from L0.)
+//
+//    That veto DEADLOCKS, and the deadlock is the root cause:
+//      - L1 tile A's criterion asks for L2 children, but A's L1 edge-neighbour
+//        B does not exist, so the gate vetoes A.
+//      - B is only created if B's own criterion or isNearBody asks, or by
+//        amr_manage.wgsl's cascade -- and that cascade fires on
+//        hasLevel2Child(neighbour), i.e. a neighbour that ALREADY HAS an L2
+//        child. A has none, precisely because it was just vetoed.
+//      - So B is never created, and A can never refine. The refined region
+//        cannot GROW outward from a criterion demand; it can only be held
+//        together around a region that geometry already forced.
+//    It is self-reinforcing: the L1 region stays thin and ragged in the near
+//    wake, which keeps vetoing the L2 refines that would resolve the shear
+//    layer, which keeps it ragged.
+//
+//    This is a gap opened by an earlier, correct fix. The cascade used to be
+//    criterion-based ("does my neighbour WANT a level-2 child") and was
+//    switched to existence-based because a flickering desire signal broke 2:1
+//    balance -- see amr_manage.wgsl's header. Existence is right for HOLDING
+//    balance around an already-deep region; nothing replaced the growth
+//    direction. Fixing it means re-introducing a demand signal that can only
+//    ever CREATE (never justify keeping) a tile, which is exactly the shape
+//    that broke balance before -- so it needs the 2:1 invariant sweep on this
+//    page, which now exists as validate-all.js's amr-dev-invariants config.
 //
 // NOT CHANGED HERE, deliberately. Any of these is a physics change to the
 // page that Pages serves, and this page cannot validate one: see
