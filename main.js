@@ -308,12 +308,57 @@ async function init() {
     layout: device.createPipelineLayout({ bindGroupLayouts: [phyBGL] }), 
     compute: { module: phySM, entryPoint: 'main', constants } 
   });
-  const renPL = device.createRenderPipeline({
+  // The vorticity tone curve's gamma is a pipeline-OVERRIDABLE CONSTANT, not
+  // a uniform: it is specialized into the fragment shader at pipeline
+  // creation. Changing it live therefore means rebuilding this one pipeline,
+  // which is what makeRenderPipeline() below exists for.
+  //
+  // WHY NOT A UNIFORM, which would be the obvious way to make it live: ten
+  // pages (main.js, main-amr.js and the eight scenario harnesses) each own a
+  // private copy of renBGL/renBG for these two shared render shaders. Adding
+  // a binding means editing all ten in lockstep, and getting that wrong in
+  // exactly one of them is 238e48c -- the bug CLAUDE.md's boot-smoke note
+  // exists because of. Respecializing a single small fragment pipeline on a
+  // UI action costs a fraction of a frame and touches no binding at all.
+  const makeRenderPipeline = (gamma) => device.createRenderPipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [renBGL] }),
     vertex: { module: renSM, entryPoint: 'vs_main', constants },
-    fragment: { module: renSM, entryPoint: 'fs_main', targets: [{ format: fmt }], constants: renderConstants },
+    fragment: {
+      module: renSM, entryPoint: 'fs_main', targets: [{ format: fmt }],
+      constants: { ...renderConstants, VORT_GAMMA: gamma },
+    },
     primitive: { topology: 'triangle-list' },
   });
+  let renPL = makeRenderPipeline(VORT_GAMMA);
+
+  // Slider -> pipeline. Rebuilds are coalesced to at most one per animation
+  // frame: oninput fires far faster than frames during a drag, and each
+  // rebuild is real work. The readout updates immediately regardless, so the
+  // control still feels direct.
+  const gammaSlider = document.getElementById('slider-VORT_GAMMA');
+  const gammaValEl = document.getElementById('val-VORT_GAMMA');
+  if (gammaSlider) {
+    gammaSlider.value = VORT_GAMMA;   // ?vortGamma= wins over the markup
+    if (gammaValEl) gammaValEl.textContent = VORT_GAMMA.toFixed(2);
+    let pendingGamma = null;
+    gammaSlider.oninput = () => {
+      const g = parseFloat(gammaSlider.value);
+      if (gammaValEl) gammaValEl.textContent = g.toFixed(2);
+      const alreadyQueued = pendingGamma !== null;
+      pendingGamma = g;
+      if (alreadyQueued) return;
+      requestAnimationFrame(() => {
+        const target = pendingGamma;
+        pendingGamma = null;
+        try {
+          renPL = makeRenderPipeline(target);
+        } catch (e) {
+          // Never let a visualization knob take down the sim.
+          console.error('[getting-air] render pipeline rebuild failed:', e);
+        }
+      });
+    };
+  }
 
   const stepBG_ab = device.createBindGroup({ layout: stepBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_a } }, { binding: 2, resource: { buffer: f_b } }, { binding: 3, resource: { buffer: velBuf } }]});
   const stepBG_ba = device.createBindGroup({ layout: stepBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_b } }, { binding: 2, resource: { buffer: f_a } }, { binding: 3, resource: { buffer: velBuf } }]});
