@@ -111,6 +111,27 @@ const BLOCK = 8;
 const RB = BLOCK;
 const FB = RB * 2 + 2 * GHOST;
 const NCELLS1 = FB * FB;
+// ── ?demandCascade=1 -- the growth half of Milestone 9's refine cascade ────
+// plans/AMR-multilevel.md specifies: "a quad may only refine to level m+1 if
+// its same-level neighbors are already present; if a neighbor is more than one
+// level coarser, force THAT neighbor to refine first (recursively, if the gap
+// is >1)". Only the veto half was ever implemented, so a criterion-driven
+// refine can be vetoed forever by a neighbour that would only ever have been
+// created BY that refine. Measured live on index-amr.html: level 2 never
+// extends past the geometry halo into the wake, which pins the L1/L2 boundary
+// a few cells off the body so every shed vortex crosses it right there.
+//
+// The recursion the plan asks for is a poor GPU fit, but the depth is known up
+// front and the fixed-point loop below is the bounded equivalent: growth
+// advances one level per iteration and the loop already runs N_LEVELS-1 times,
+// which is the exact bound. See shaders/amr_manage.wgsl's level2Wanted for the
+// mechanism, why it is a union with (not a replacement for) the existence-based
+// cascade that superseded it, and why it stops at the L0->L1 hop.
+//
+// Default 0 -- provably byte-identical to the previous behaviour (level2Wanted
+// is never called) until the physics is validated on the cylinder harness.
+const DEMAND_CASCADE = urlParams.has('demandCascade') ? (parseInt(urlParams.get('demandCascade')) || 0) : 0;
+
 const MAX_FINE_BLOCKS = urlParams.has('maxFineBlocks') ? parseInt(urlParams.get('maxFineBlocks')) : 128;
 const NBX = W / BLOCK, NBY = H / BLOCK, NBLOCKS = NBX * NBY;
 
@@ -591,7 +612,7 @@ async function init() {
   const interpFFConstants = { W, H, RB, GHOST_ONLY: 1, FINE_FINE_ONLY: 1, F16 };
   const step1Constants = { ...stepConstants, RB, DIRECT_GHOST: GHOST_COPY ? 0 : 1 };
   const criterionConstants = { W, H };
-  const manageConstants = { W, H, REFINE_THRESH, COARSEN_THRESH, FORCE_REFINE_MARGIN, FORCE_REFINE_LOOKAHEAD, HAS_LEVEL2: N_LEVELS > 2 ? 1 : 0, HAS_BODY: 0 };
+  const manageConstants = { W, H, REFINE_THRESH, COARSEN_THRESH, FORCE_REFINE_MARGIN, FORCE_REFINE_LOOKAHEAD, DEMAND_CASCADE, HAS_LEVEL2: N_LEVELS > 2 ? 1 : 0, HAS_BODY: 0 };
 
   const stepPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [stepBGL] }),

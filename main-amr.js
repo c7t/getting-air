@@ -109,6 +109,27 @@ const NCELLS1 = FB * FB; // cells per pool slot
 // horizontal BANDS across the refined region, which is the artifact this
 // whole thread started from. Level 2's demand is stable at 132-140 (verified
 // by varying its cap independently), so 256 there is ~1.8x and stays.
+// ── ?demandCascade=1 -- the growth half of Milestone 9's refine cascade ────
+// plans/AMR-multilevel.md specifies: "a quad may only refine to level m+1 if
+// its same-level neighbors are already present; if a neighbor is more than one
+// level coarser, force THAT neighbor to refine first (recursively, if the gap
+// is >1)". Only the veto half was ever implemented, so a criterion-driven
+// refine can be vetoed forever by a neighbour that would only ever have been
+// created BY that refine. Measured live on index-amr.html: level 2 never
+// extends past the geometry halo into the wake, which pins the L1/L2 boundary
+// a few cells off the body so every shed vortex crosses it right there.
+//
+// The recursion the plan asks for is a poor GPU fit, but the depth is known up
+// front and the fixed-point loop below is the bounded equivalent: growth
+// advances one level per iteration and the loop already runs N_LEVELS-1 times,
+// which is the exact bound. See shaders/amr_manage.wgsl's level2Wanted for the
+// mechanism, why it is a union with (not a replacement for) the existence-based
+// cascade that superseded it, and why it stops at the L0->L1 hop.
+//
+// Default 0 -- provably byte-identical to the previous behaviour (level2Wanted
+// is never called) until the physics is validated on the cylinder harness.
+const DEMAND_CASCADE = urlParams.has('demandCascade') ? (parseInt(urlParams.get('demandCascade')) || 0) : 0;
+
 const MAX_FINE_BLOCKS = urlParams.has('maxFineBlocks') ? parseInt(urlParams.get('maxFineBlocks')) : 384;
 const NBX = W / BLOCK, NBY = H / BLOCK, NBLOCKS = NBX * NBY; // coarse block grid
 
@@ -222,27 +243,33 @@ const REFINE_EVERY = urlParams.has('refineEvery') ? parseInt(urlParams.get('refi
 //    band (an earlier pass here blamed that; the band is one block wide at
 //    the WINDOW edge and cannot explain a near-wake artifact).
 //
-//    35 L1 tiles carry vorticity at or above the level-2 rung yet have no L2
-//    child; 19 of those are vetoed by amr_manage_pool.wgsl refine()'s
-//    2:1-balance neighbour gate, which requires all 4 same-level neighbours
-//    of the parent to be active for a CRITERION-only refine. (The remaining
-//    16 are not yet accounted for -- candidates are inSpongeBandAt, which
-//    gates the pool criterion too, and the fact that the real L1->L2 decision
-//    reads level 1's own field where this scan estimates from L0.)
+//    Two blockers, and only the first is now fixed.
 //
-//    That veto DEADLOCKS, and the deadlock is the root cause:
-//      - L1 tile A's criterion asks for L2 children, but A's L1 edge-neighbour
-//        B does not exist, so the gate vetoes A.
-//      - B is only created if B's own criterion or isNearBody asks, or by
-//        amr_manage.wgsl's cascade -- and that cascade fires on
-//        hasLevel2Child(neighbour), i.e. a neighbour that ALREADY HAS an L2
-//        child. A has none, precisely because it was just vetoed.
-//      - So B is never created, and A can never refine. The refined region
-//        cannot GROW outward from a criterion demand; it can only be held
-//        together around a region that geometry already forced.
-//    It is self-reinforcing: the L1 region stays thin and ragged in the near
-//    wake, which keeps vetoing the L2 refines that would resolve the shear
-//    layer, which keeps it ragged.
+//    (a) THE MISSING HALF OF THE REFINE CASCADE -- fixed, ?demandCascade=1.
+//    amr_manage_pool.wgsl refine()'s 2:1 gate vetoes a criterion-only refine
+//    unless all 4 same-level neighbours of the parent are active, and nothing
+//    ever forced those neighbours, so the veto deadlocked: L1 tile A asks for
+//    L2 children, A's neighbour B does not exist, so A is vetoed -- and B is
+//    created only by its own criterion, by geometry, or by amr_manage.wgsl's
+//    cascade, which fires on a neighbour that ALREADY HAS an L2 child. A has
+//    none, because it was just vetoed. 19 of the affected tiles were in this
+//    state. See amr_manage.wgsl's level2Wanted.
+//
+//    (b) SOMETHING ELSE, still open, and it is the bigger share. Measured
+//    with ?demandCascade=1 ON, against the criterion the shader really uses
+//    (amr_criterion_pool.wgsl replicated exactly from the snapshot's level-1
+//    velocity field, not estimated from L0): of 70 active L1 tiles with no L2
+//    child, 40 have a level-1-measured criterion that asks for level 2 --
+//    some at physical log2|omega| = -5.6, five octaves above the -8 rung.
+//    Ruled out for these: the neighbour gate (satisfied), pool exhaustion
+//    (48 of 256 level-2 tiles active, 52 of 64 quads free), the sponge band
+//    (the card sits at the window centre), and the coarsen side (their
+//    desiredLevelCoarsen is 2, so the release test is false). The near-card
+//    level map is bit-for-bit unchanged with the cascade on, and L2 still
+//    covers exactly phi -0.5 .. 7.9. Whatever this is, it lives in
+//    amr_manage_pool.wgsl's refine() path, not in the tuning constants --
+//    that is where to look next, and dumping childCriterion straight off the
+//    GPU (rather than reconstructing it) is the measurement to do first.
 //
 //    This is a gap opened by an earlier, correct fix. The cascade used to be
 //    criterion-based ("does my neighbour WANT a level-2 child") and was
@@ -1298,7 +1325,7 @@ async function init() {
   const interpFFConstants = { W, H, RB, GHOST_ONLY: 1, FINE_FINE_ONLY: 1, F16 };
   const step1Constants = { W, H, RB, SDF_FAR, F16, DIRECT_GHOST: GHOST_COPY ? 0 : 1 };
   const criterionConstants = { W, H };
-  const manageConstants = { W, H, SDF_FAR, REFINE_THRESH, COARSEN_THRESH, FORCE_REFINE_MARGIN, FORCE_REFINE_LOOKAHEAD, SPONGE_EXCLUDE_W, HAS_LEVEL2: N_LEVELS > 2 ? 1 : 0,
+  const manageConstants = { W, H, SDF_FAR, REFINE_THRESH, COARSEN_THRESH, FORCE_REFINE_MARGIN, FORCE_REFINE_LOOKAHEAD, SPONGE_EXCLUDE_W, DEMAND_CASCADE, HAS_LEVEL2: N_LEVELS > 2 ? 1 : 0,
     N_REFINE_INC, N_REFINE_MAX, MAX_LEVEL: N_LEVELS - 1 };
 
   const stepPL = device.createComputePipeline({
