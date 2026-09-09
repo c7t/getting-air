@@ -174,6 +174,14 @@ const REFINE_EVERY = urlParams.has('refineEvery') ? parseInt(urlParams.get('refi
 // all phases. A criterion relative to the current domain maximum would be
 // scale- and phase-free; that is a design change to the refinement
 // machinery, not a retune, and has not been attempted.
+// Vorticity color tone curve (shaders/common_vortcolor.wgsl). Overridable
+// per-run so the look can be dialed against a live sim rather than guessed
+// at: ?vortScale= moves the curve's knee, ?vortGamma= shapes the low end.
+// Parsed identically on both pages -- the two views are meant to be compared
+// by eye, so a knob that existed on only one of them would defeat that.
+const VORT_SCALE = parseFloat(urlParams.get('vortScale')) || 80.0;
+const VORT_GAMMA = parseFloat(urlParams.get('vortGamma')) || 0.75;
+
 const REFINE_THRESH = urlParams.has('refineThresh') ? parseFloat(urlParams.get('refineThresh')) : -9;
 const COARSEN_THRESH = urlParams.has('coarsenThresh') ? parseFloat(urlParams.get('coarsenThresh')) : -10;
 
@@ -1188,7 +1196,7 @@ async function init() {
   // Render fragment needs HAS_LEVEL2 to gate the level-2 override; keep it
   // separate from fineConstants, which is also fed to the avg compute
   // pipeline (whose shader has no HAS_LEVEL2 override).
-  const renderConstants = { W, H, RB, HAS_LEVEL2: N_LEVELS > 2 ? 1 : 0 };
+  const renderConstants = { W, H, RB, HAS_LEVEL2: N_LEVELS > 2 ? 1 : 0, VORT_SCALE, VORT_GAMMA };
   // GHOST_ONLY=1: steady-state ghost-only reinterpolation (every macro-step).
   // GHOST_ONLY=0: full-slot fill, used once on block activation (see debugActivateBlock).
   const interpConstants = { W, H, RB, GHOST_ONLY: 1, F16 };

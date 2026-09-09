@@ -18,6 +18,14 @@ const urlParams = new URLSearchParams(window.location.search);
 // this repo has been bitten by before.
 const F16 = urlParams.has('f16') ? (parseInt(urlParams.get('f16')) || 0) : 0;
 
+// Vorticity color tone curve (shaders/common_vortcolor.wgsl). Overridable
+// per-run so the look can be dialed against a live sim rather than guessed
+// at: ?vortScale= moves the curve's knee, ?vortGamma= shapes the low end.
+// Parsed identically on both pages -- the two views are meant to be compared
+// by eye, so a knob that existed on only one of them would defeat that.
+const VORT_SCALE = parseFloat(urlParams.get('vortScale')) || 80.0;
+const VORT_GAMMA = parseFloat(urlParams.get('vortGamma')) || 0.75;
+
 let resLog2 = parseResLog2(urlParams, DENSE_DEFAULT_RES_LOG2);
 
 let W = 1 << resLog2;
@@ -283,6 +291,10 @@ async function init() {
   // Separate dict for the pipelines whose shaders @include common_fpack.wgsl;
   // phy/render don't declare F16 and WebGPU makes that a hard error.
   const fConstants = { W, H, F16 };
+  // Likewise the render fragment's own overrides: only render.wgsl declares
+  // VORT_SCALE/VORT_GAMMA (via common_vortcolor.wgsl), and supplying an
+  // override a pipeline's shader does not declare is the same hard error.
+  const renderConstants = { W, H, VORT_SCALE, VORT_GAMMA };
 
   const stepPL = device.createComputePipeline({ 
     layout: device.createPipelineLayout({ bindGroupLayouts: [stepBGL] }), 
@@ -299,7 +311,7 @@ async function init() {
   const renPL = device.createRenderPipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [renBGL] }),
     vertex: { module: renSM, entryPoint: 'vs_main', constants },
-    fragment: { module: renSM, entryPoint: 'fs_main', targets: [{ format: fmt }], constants },
+    fragment: { module: renSM, entryPoint: 'fs_main', targets: [{ format: fmt }], constants: renderConstants },
     primitive: { topology: 'triangle-list' },
   });
 
