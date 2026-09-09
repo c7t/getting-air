@@ -9,7 +9,16 @@
 #   make wgsl     validate every WGSL shader with naga (needs Rust-built naga)
 #   make js       syntax-check every JS module with `node --check`
 #   make tools    install the validation tools (naga-cli via cargo; needs Rust)
+#   make chrome-clean  reclaim debug Chromes left by the GPU tools (see below)
 #   make help     list targets
+#
+# The GPU suites under tools/ reuse a debug Chrome that is already listening on
+# the debug port, so exactly one WebGPU context is alive across a run. A run
+# that ADOPTS one does not own it and will not kill it -- so a run killed
+# part-way leaves a Chrome holding a GPU context, which silently slows and
+# jitters every later measurement. `make chrome-clean` is the explicit reclaim
+# (`make chrome-clean DRY_RUN=1` to look first). Stale PROFILE DIRS are swept
+# automatically on each launch, so only the processes need this.
 #
 # JS validation and the unit tests only need Node; WGSL validation needs `naga`
 # (a Rust tool). `make check` runs JS and the unit tests unconditionally and
@@ -51,7 +60,7 @@ TESTS   := $(sort $(wildcard tools/test-*.js))
 .PHONY: help
 help: ## list targets
 	@grep -hE '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) \
-	  | awk 'BEGIN{FS=":.*## "}{printf "  make %-10s %s\n", $$1, $$2}'
+	  | awk 'BEGIN{FS=":.*## "}{printf "  make %-14s %s\n", $$1, $$2}'
 
 .PHONY: check
 check: js test ## run all static checks (JS + unit tests always; WGSL if naga is available)
@@ -109,6 +118,11 @@ js: ## syntax-check every JS/MJS module with `node --check`
 	done; \
 	if [ $$rc -eq 0 ]; then echo "js: $(words $(JS)) module(s) parse"; else echo "js: FAILED"; fi; \
 	exit $$rc
+
+.PHONY: chrome-clean
+chrome-clean: ## kill leftover debug Chromes from the GPU tools and clear their profile dirs
+	@command -v node >/dev/null 2>&1 || { echo "node not found -- install Node.js"; exit 1; }
+	@node tools/chrome-clean.js $(if $(DRY_RUN),--dry-run,)
 
 .PHONY: tools
 tools: ## install validation tools (naga-cli via cargo; needs Rust)

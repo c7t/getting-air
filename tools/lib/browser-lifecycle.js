@@ -56,14 +56,80 @@ async function chromeDebugOk(port) {
   } catch { return false; }
 }
 
+// Every debug Chrome this file launches gets a fresh mkdtemp profile under
+// this one root, which is also what makes ours identifiable: a Chrome whose
+// --user-data-dir lives here is ours, and any other Chrome (the user's own
+// browsing session, say) is not and must never be touched.
+const PROFILE_ROOT = '/tmp/vpm-chrome-profile';
+
+// Profile dirs of Chromes that are still running. Reading /proc is Linux-
+// specific, which this file already is (it hardcodes /opt/google/chrome).
+function liveProfileDirs() {
+  const live = new Set();
+  let pids = [];
+  try { pids = fs.readdirSync('/proc').filter(d => /^\d+$/.test(d)); } catch { return live; }
+  for (const pid of pids) {
+    let cmd = '';
+    try { cmd = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8'); } catch { continue; }
+    const m = cmd.split('\0').find(a => a.startsWith(`--user-data-dir=${PROFILE_ROOT}/`));
+    if (m) live.add(m.slice('--user-data-dir='.length));
+  }
+  return live;
+}
+
+// Deletes profile dirs no live Chrome is using. Called on every launch, which
+// is what stops them accumulating.
+//
+// WHY THIS IS NEEDED AT ALL. teardown() only cleans up a Chrome THIS process
+// started, and ensureChrome deliberately REUSES one that is already listening
+// (that is what keeps a single WebGPU context alive across a run). So the
+// first run to be killed part-way -- a timeout, a Ctrl-C, a crash before
+// teardown -- orphans both its Chrome and its profile dir, and every later run
+// then adopts that Chrome without owning it and never cleans up either. The
+// dirs are ~150MB each; a session that killed a few runs left 712MB behind
+// before this existed. Sweeping at launch is safe precisely because a dir with
+// no live owner cannot be in use.
+function sweepStaleProfiles() {
+  let entries = [];
+  try { entries = fs.readdirSync(PROFILE_ROOT); } catch { return 0; }
+  const live = liveProfileDirs();
+  let removed = 0;
+  for (const e of entries) {
+    const dir = path.join(PROFILE_ROOT, e);
+    if (live.has(dir)) continue;
+    try { fs.rmSync(dir, { recursive: true, force: true }); removed++; } catch { /* best-effort */ }
+  }
+  return removed;
+}
+
+// Kills every debug Chrome this file is responsible for (identified by its
+// profile dir, never by name) and clears the root. Exposed for `make
+// chrome-clean` -- the explicit "I am done, reclaim the GPU" button, since no
+// single run can safely decide to kill a Chrome another run may be adopting.
+function reapAllChromes() {
+  const live = liveProfileDirs();
+  let killed = 0;
+  let pids = [];
+  try { pids = fs.readdirSync('/proc').filter(d => /^\d+$/.test(d)); } catch { /* nothing to do */ }
+  for (const pid of pids) {
+    let cmd = '';
+    try { cmd = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8'); } catch { continue; }
+    if (!cmd.split('\0').some(a => a.startsWith(`--user-data-dir=${PROFILE_ROOT}/`))) continue;
+    try { process.kill(Number(pid), 'SIGTERM'); killed++; } catch { /* already gone */ }
+  }
+  return { killed, profiles: live.size };
+}
+
 async function ensureChrome(port) {
   if (await chromeDebugOk(port)) {
     console.log(`[setup] Chrome already listening on debug port ${port}`);
     return { started: false, profileDir: null, pid: null };
   }
   console.log('[setup] launching dedicated WebGPU-capable Chrome');
-  const profileRoot = '/tmp/vpm-chrome-profile';
+  const profileRoot = PROFILE_ROOT;
   fs.mkdirSync(profileRoot, { recursive: true });
+  const swept = sweepStaleProfiles();
+  if (swept) console.log(`[setup] removed ${swept} stale Chrome profile dir(s) with no live owner`);
   const profileDir = fs.mkdtempSync(path.join(profileRoot, 'validate-all-'));
   // about:blank, not a config's own URL -- callers drive ONE tab for the
   // whole run (Page.navigate between configs, see navigateTo), never more
@@ -130,13 +196,25 @@ async function waitForGlobal(Runtime, globalExpr, timeoutMs) {
   if (!ok) throw new Error(`${globalExpr} never became available (page failed to load or WebGPU init failed)`);
 }
 
-// Cleans up whatever ensureServer/ensureChrome started (leaves alone
-// anything that was already running before this process touched it).
+// Cleans up whatever ensureServer/ensureChrome started (leaves alone anything
+// that was already running before this process touched it -- a run that
+// ADOPTED a Chrome must not kill it, since another run may be adopting the
+// same one, and the webgpu-verify skill deliberately leaves one open for
+// manual driving. `make chrome-clean` is the explicit way to reclaim those).
+//
+// The stale dirs an adopted-then-orphaned Chrome leaves behind are swept by
+// the next ensureChrome; see sweepStaleProfiles.
 async function teardown({ port, tabId, chrome, server, keepOpen }) {
   if (keepOpen) return;
   await closeTab(port, tabId);
   if (chrome.started) {
-    if (chrome.pid) { try { process.kill(chrome.pid); } catch { /* already gone */ } }
+    // Group kill: Chrome is spawned detached, so it leads its own process
+    // group and its renderer/GPU children belong to it. Signalling just the
+    // parent pid left those children alive holding a GPU context.
+    if (chrome.pid) {
+      try { process.kill(-chrome.pid, 'SIGTERM'); }
+      catch { try { process.kill(chrome.pid, 'SIGTERM'); } catch { /* already gone */ } }
+    }
     await new Promise(r => setTimeout(r, 1000));
     // --user-data-dir profiles are never reused across runs (a fresh
     // mkdtemp every launch), so leaving them behind is pure accumulation --
@@ -149,4 +227,5 @@ async function teardown({ port, tabId, chrome, server, keepOpen }) {
 module.exports = {
   httpsGetOk, waitFor, ensureServer, chromeDebugOk, ensureChrome,
   openTab, firstTab, closeTab, navigateTo, evalExpr, waitForGlobal, teardown,
+  PROFILE_ROOT, liveProfileDirs, sweepStaleProfiles, reapAllChromes,
 };
