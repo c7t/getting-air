@@ -62,12 +62,20 @@ const BASE_URL = 'https://localhost:4444';
 const PORT = 9333;
 
 function parseArgs(argv) {
-  const o = { warm: 20000, steps: 20000, reps: 5, page: 'index-amr.html', configs: [], keepOpen: false, skip: null };
+  const o = { warm: 20000, steps: 20000, reps: 5, page: 'index-amr.html', global: 'window.__AMR', configs: [], keepOpen: false, skip: null };
   for (const a of argv) {
     if (a.startsWith('--warm=')) o.warm = Number(a.slice(7));
     else if (a.startsWith('--steps=')) o.steps = Number(a.slice(8));
     else if (a.startsWith('--reps=')) o.reps = Number(a.slice(7));
     else if (a.startsWith('--page=')) o.page = a.slice(7);
+    // --global= names the page's own debug surface, mirroring
+    // tools/lib/amr-invariants.js's `global` option. index-amr.html exposes
+    // window.__AMR; the cylinder/channel/tgv harnesses expose window.__CYL.
+    // This is what makes a PINNED-BODY benchmark possible: index-amr.html is
+    // the falling card, so any change that perturbs the flow moves the body
+    // and with it the geometry-forced refinement, and the two arms stop
+    // measuring the same topology. index-cylinder-amr.html holds still.
+    else if (a.startsWith('--global=')) o.global = a.slice(9);
     else if (a.startsWith('--skip=')) o.skip = a.slice(7).split(',').filter(Boolean);
     else if (a === '--keepOpen') o.keepOpen = true;
     else if (a === '--help' || a === '-h') { printHelp(); process.exit(0); }
@@ -104,25 +112,34 @@ async function main() {
     return r.result.value;
   };
 
+  const G = opts.global;
+  // --skip drives the in-page pass-group switch, which only index-amr.html
+  // implements. Fail loudly rather than throw a bare "not a function" from
+  // inside a timed run.
+  if (opts.skip && G !== 'window.__AMR') {
+    console.error(`--skip needs setBenchSkip, which only window.__AMR provides (got --global=${G})`);
+    process.exit(2);
+  }
+
   const rows = [];
   try {
     for (const cfg of opts.configs) {
       await BL.navigateTo(Page, `${BASE_URL}/${opts.page}?${cfg}`);
-      await BL.waitForGlobal(Runtime, 'window.__AMR', 180000);
-      await ev('window.__AMR.setLive(false)');
-      await ev(`(async()=>{ await window.__AMR.debugStepSync(${opts.warm}); })()`);
-      await ev('(async()=>{ await window.__AMR.setAutoRefine(false); })()');
+      await BL.waitForGlobal(Runtime, G, 180000);
+      await ev(`${G}.setLive(false)`);
+      await ev(`(async()=>{ await ${G}.debugStepSync(${opts.warm}); })()`);
+      await ev(`(async()=>{ await ${G}.setAutoRefine(false); })()`);
 
-      const nLevels = await ev('window.__AMR.getNumLevels()');
-      const dims = await ev('window.__AMR.getBlockGridDims()');
-      const W = (await ev('window.__AMR.getDims()')).W;
+      const nLevels = await ev(`${G}.getNumLevels()`);
+      const dims = await ev(`${G}.getBlockGridDims()`);
+      const W = (await ev(`${G}.getDims()`)).W;
       const active = {};
       for (let m = 1; m < nLevels; m++) {
-        active[m] = await ev(`(async()=>{ return (await window.__AMR.debugListActiveBlocks(${m})).length; })()`);
+        active[m] = await ev(`(async()=>{ return (await ${G}.debugListActiveBlocks(${m})).length; })()`);
       }
 
       const timeOnce = async () => ev(`(async()=>{ const t0 = performance.now();
-          await window.__AMR.debugStepSync(${opts.steps});
+          await ${G}.debugStepSync(${opts.steps});
           return performance.now() - t0; })()`);
 
       // --skip: vary ONLY the dispatch list, inside this one frozen topology.
@@ -138,7 +155,7 @@ async function main() {
         // configuration instead of loading it onto whichever ran first.
         const apply = async (cfg) => {
           const groups = cfg === 'none' ? [] : cfg.split('+');
-          await ev(`JSON.stringify(window.__AMR.setBenchSkip(${JSON.stringify(groups)}))`);
+          await ev(`JSON.stringify(${G}.setBenchSkip(${JSON.stringify(groups)}))`);
         };
         // Discard a whole settling ROUND, not one run. One was not enough: a
         // sweep whose later rows were clean at 5-11% spread still produced
@@ -163,7 +180,7 @@ async function main() {
           const med = xs[Math.floor(xs.length / 2)];
           return { cfg, med, spread: (xs[xs.length - 1] - xs[0]) / med };
         });
-        await ev(`JSON.stringify(window.__AMR.setBenchSkip([]))`);
+        await ev(`JSON.stringify(${G}.setBenchSkip([]))`);
         const b0 = base.find(r => r.cfg === 'none') || base[0];
         console.log(`?${cfg}`);
         console.log(`   activeByLevel=${JSON.stringify(active)}  (frozen; identical for every row below)`);
