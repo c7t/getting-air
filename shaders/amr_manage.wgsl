@@ -47,6 +47,11 @@
 //   exactly the right reusable test here). Without this, a level-2 region
 //   could end up directly adjacent to a level-0-only region -- a 2-level
 //   gap.
+//   That cascade is EXISTENCE-based, and it has to be: see this file's own
+//   note on binding 7. But existence alone only HOLDS balance around a deep
+//   region that already exists -- it cannot GROW one, which left the other
+//   half of plans/AMR-multilevel.md's Milestone 9 spec unimplemented and
+//   deadlocked. ?demandCascade restores the growth half; see level2Wanted.
 // - coarsen(): blocked if this block itself has an active level-2 child
 //   (can't release a tile still needed as a parent), or if a same-level
 //   (L1) EDGE-NEIGHBOR has one (releasing would leave that neighbor's
@@ -87,10 +92,13 @@
 @group(0) @binding(6) var<storage, read>       state           : CardState;
 // Milestone 9: level 2's own blockCriterion/blockSlot, for the cascade/
 // coarsen-block checks -- harmless dummies when HAS_LEVEL2=0 (N_LEVELS==2).
-// blockCriterionL2 itself is unread since the cascade below switched to
-// hasLevel2Child (existence, not criterion-based "wants") -- left bound
-// rather than removed, to avoid a bind-group-shape change across every
-// JS call site for a pure dead-binding cleanup.
+// blockCriterionL2 was unread for a while, after the cascade below switched
+// to hasLevel2Child (existence, not criterion-based "wants") -- left bound
+// rather than removed, to avoid a bind-group-shape change across every JS
+// call site. ?demandCascade reads it again, for GROWTH only (level2Wanted),
+// which is the use the existence switch never covered. Keeping the binding
+// is what makes that fix free: managePoolBGL is already at the 16-storage-
+// buffer per-stage limit, so a new buffer for this would not have fit.
 @group(0) @binding(7) var<storage, read>       blockCriterionL2 : array<f32>;
 @group(0) @binding(8) var<storage, read>       blockSlotL2      : array<i32>;
 
@@ -108,6 +116,8 @@ override MAX_LEVEL : i32 = 1;
 override FORCE_REFINE_MARGIN : f32;
 override FORCE_REFINE_LOOKAHEAD : f32;
 override HAS_LEVEL2 : u32 = 0u;
+// 0 leaves level2Wanted uncalled, so behaviour is exactly as before.
+override DEMAND_CASCADE : u32 = 0u;
 // When 0, isNearBody is unconditionally false -- no interior geometry to
 // force-refine toward (channel-flow/TGV scenarios), so refinement is
 // purely vorticity-driven. See shaders/lbm_step.wgsl's identical override.
@@ -188,6 +198,66 @@ fn hasLevel2Child(blockID1: u32) -> bool {
   return blockSlotL2[childBlockID0] >= 0;
 }
 
+// True if the L1 tile at `blockID1` -- which must already be active -- has a
+// vorticity criterion that ASKS for a level-2 child, whether or not it has
+// one yet. The growth half of Milestone 9's refine cascade: "if a neighbor is
+// more than one level coarser, force THAT neighbor to refine first".
+//
+// WHY THIS IS NEEDED, AND WHY IT IS NOT THE TEST THAT WAS REMOVED.
+// amr_manage_pool.wgsl's refine() vetoes a criterion-driven L1->L2 refine
+// unless all 4 of the parent's same-level neighbours are already active. The
+// veto shipped; the forcing never did. So: L1 tile A's criterion asks for L2
+// children, but A's neighbour B has no L1 tile, so A is vetoed -- and B is
+// created only by its own criterion, by geometry, or by the cascade above,
+// which fires on a neighbour that ALREADY HAS an L2 child. A has none,
+// because it was just vetoed. B is never created, A never refines. Measured
+// live: level 2 never extends past the geometry halo into the wake at all, so
+// the L1/L2 boundary is pinned a few cells off the body and every shed vortex
+// crosses it there. Self-reinforcing, too -- the thin ragged L1 region is
+// what keeps producing the vetoes.
+//
+// The earlier criterion-based cascade was removed because a "wants" signal is
+// re-evaluated fresh every round and can read false for a child that is still
+// genuinely active, which let a real imbalance go uncascaded. That argument is
+// about HOLDING balance around an existing deep region, and it stands -- which
+// is why this is a UNION with the existence test, never a replacement. Used
+// only to CREATE, a flickering signal is harmless: a round where it reads
+// false simply does not grow the region, and nothing is released on its
+// account (coarsen does not consult it). Raising a block from level 0 to 1
+// also cannot break 2:1 balance by itself; it can only close a gap.
+//
+// BOUNDED, not recursive. The plan says "recursively, if the gap is >1", which
+// is a poor GPU fit -- but the depth is known up front, so the fixed-point
+// loop in the JS dispatch is the bounded equivalent: this grows the region by
+// one level per iteration, and it already runs N_LEVELS-1 times, which is the
+// exact bound because the refine passes run coarsest-to-finest within an
+// iteration. AGAL does the same thing rather than recursing (mesh_amr.cu
+// drives a cblock_ID_ref mark field through staged kernels).
+//
+// SCOPE: this is the L0->L1 hop only. The same deadlock exists one level down
+// at N_LEVELS>=4 (an L2 tile wanting L3 children, vetoed for want of an L2
+// neighbour), and it cannot be fixed the same way -- amr_manage_pool.wgsl
+// would need the level-(m+2) criterion, and it has no binding left. N>=4 is
+// unvalidated anyway; fixing it needs a binding freed first.
+fn level2Wanted(blockID1: u32) -> bool {
+  let nbx = W / BLOCK;
+  let bx = blockID1 % nbx; let by = blockID1 / nbx;
+  let nbxL2 = nbx * 2u;
+  var m = 0f;
+  for (var qy = 0u; qy < 2u; qy++) {
+    for (var qx = 0u; qx < 2u; qx++) {
+      m = max(m, blockCriterionL2[(by * 2u + qy) * nbxL2 + (bx * 2u + qx)]);
+    }
+  }
+  // blockCriterionL2 is reduced from LEVEL 1's own field, so it is in level-1
+  // lattice units; the ladder wants physical. A level-1 cell is half an L0
+  // cell, so physical log2|omega| = lattice + 1 -- the same +m shift
+  // amr_manage_pool.wgsl's toPhysical() applies, and common_refine.wgsl's
+  // "PHYSICAL UNITS" note explains why omitting it under-refines by 2^m.
+  let eps = min(1.0f, log2(max(m, EPS_FLOOR)));
+  return desiredLevel(eps + 1.0f) >= 2;
+}
+
 // Same 4 edge-neighbor blockIDs every fine-fine/manage neighbor lookup in
 // this codebase uses, factored out since both the cascade and coarsen-
 // block checks below need them.
@@ -250,6 +320,10 @@ fn refine(@builtin(global_invocation_id) gid: vec3<u32>) {
     let neighbors = edgeNeighbors(blockID);
     for (var i = 0u; i < 4u; i++) {
       if (blockSlot[neighbors[i]] >= 0 && hasLevel2Child(neighbors[i])) { cascadeWanted = true; }
+      // GROWTH: the neighbour has no L2 child yet but its criterion asks for
+      // one, and it cannot get one until this block exists. Union with the
+      // existence test above, never a replacement -- see level2Wanted.
+      if (DEMAND_CASCADE != 0u && blockSlot[neighbors[i]] >= 0 && level2Wanted(neighbors[i])) { cascadeWanted = true; }
     }
   }
   if (((desiredLevel(epsFor(blockID)) >= 1 && !inSpongeBand(blockID)) || isNearBody(blockID) || cascadeWanted) && currentSlot < 0) {

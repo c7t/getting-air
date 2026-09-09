@@ -120,6 +120,18 @@ function defaultConfigs(baseUrl) {
       url: `${baseUrl}/index-reentry-amr.html`,
       checkBoots: true,
     },
+    // index-amr.html under the structural-invariant sweep. This is the page
+    // the project SHIPS, it defaults to levels=3, and until now the sweep
+    // only ever drove window.__CYL -- so the falling-card page's own 2:1
+    // balance was never under test on any config, only boot-smoked above.
+    // It exposes no body-geometry coverage scan and no card-state readback,
+    // so those two report n/a rather than OK (see tools/lib/amr-invariants.js).
+    {
+      name: 'amr-dev-invariants',
+      url: `${baseUrl}/index-amr.html`,
+      global: 'window.__AMR',
+      checkInvariants: true,
+    },
     {
       name: 'dense-reference',
       url: `${baseUrl}/index-cylinder.html`,
@@ -234,8 +246,11 @@ function defaultConfigs(baseUrl) {
 // tools/validate-amr-vs-dense.js -- see that file's own header for the "one
 // tab reused across the whole run" invariant this relies on.)
 
-async function waitForCYL(Runtime, timeoutMs) {
-  return waitForGlobal(Runtime, 'window.__CYL', timeoutMs);
+// Every scenario harness exposes window.__CYL; index-amr.html (the falling-
+// card page this project ships) exposes window.__AMR instead, so a config
+// names its own surface via `global`.
+async function waitForCYL(Runtime, timeoutMs, global = 'window.__CYL') {
+  return waitForGlobal(Runtime, global, timeoutMs);
 }
 
 // --- per-config runners -----------------------------------------------
@@ -372,15 +387,18 @@ async function runTgvPhysics(Page, Runtime, opts, config) {
   return { ok, results };
 }
 
-async function runInvariants(Runtime, opts) {
+async function runInvariants(Runtime, opts, global) {
   return runInvariantSweep(Runtime, {
     steps: opts.invariantSteps,
     checkEvery: opts.invariantCheckEvery,
     timeout: opts.physicsTimeout,
+    global,
+    // cov/bad come back null (not empty) on a page that exposes no
+    // geometry-coverage scan or card-state readback -- print n/a, never OK.
     onCheckpoint: (stepsDone, { bal, cov, bad }) => {
       console.log(`    step ${stepsDone}: 2:1-balance ${bal.ok ? 'OK' : `FAIL (${bal.violations.length})`}, ` +
-        `coverage ${cov.ok ? 'OK' : `FAIL (${cov.violations.length})`}, ` +
-        `field ${bad.length ? `FAIL (${bad.join(',')})` : 'OK'}`);
+        `coverage ${cov === null ? 'n/a' : cov.ok ? 'OK' : `FAIL (${cov.violations.length})`}, ` +
+        `field ${bad === null ? 'n/a' : bad.length ? `FAIL (${bad.join(',')})` : 'OK'}`);
     },
   });
 }
@@ -447,14 +465,14 @@ async function main() {
           boot = await runBootSmoke(Runtime);
           console.log(`    ${boot.ok ? 'OK' : 'FAIL: ' + boot.reason}`);
         } else {
-          await waitForCYL(Runtime, 15000);
+          await waitForCYL(Runtime, 15000, config.global);
           if (config.checkPhysics) {
             console.log('  -- physics (Cd/St) --');
             physics = await runPhysics(Runtime, opts);
           }
           if (config.checkInvariants) {
             console.log('  -- structural invariants --');
-            invariants = await runInvariants(Runtime, opts);
+            invariants = await runInvariants(Runtime, opts, config.global);
           }
         }
       }

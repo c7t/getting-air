@@ -62,9 +62,12 @@
 //   own deepest-configured case is provably unchanged -- grandchildBlockSlot
 //   is a harmless dummy buffer in that case, never read):
 //   - refine(): cascade -- force this parent to spawn its level-(m+1) quad
-//     even if its own criterion doesn't call for it, if a same-level-m
-//     EDGE-NEIGHBOR already has an ACTIVE level-(m+1) child that itself
-//     already HAS an active level-(m+2) grandchild. EXISTENCE
+//     even if its own criterion doesn't call for it, if a level-(m+1) tile
+//     SHARING A FACE with this parent's own 2x2 child footprint already HAS
+//     an active level-(m+2) grandchild. (That "sharing a face" is load-
+//     bearing and was got wrong once -- see refine()'s own BUGFIX comment on
+//     why testing the neighbor PARENT's quadrant-0 child instead produced
+//     both missed cascades AND a refine/coarsen oscillation.) EXISTENCE
 //     (hasGrandchild), not desire -- an earlier version of this fix used a
 //     criterion-based "does the neighbor's child WANT a grandchild" test
 //     (mirroring amr_manage.wgsl's own level2WantsRefine one level down)
@@ -268,14 +271,59 @@ fn refine(@builtin(global_invocation_id) gid: vec3<u32>) {
   // its own criterion stayed fresh-per-round negative, a live-verified bug
   // in an earlier version of this fix (debugCheck21Balance caught real
   // depth-1-vs-depth-3 violations with the "wants" version).
+  //
+  // BUGFIX: this used to walk the 4 same-level-m EDGE-NEIGHBOR PARENTS and
+  // test hasGrandchild on each one's QUADRANT-0 child -- the (-x,-y) corner
+  // child, whichever side that neighbor was on. A parent has 4 children,
+  // each with its OWN independent grandchild quad, so quadrant 0 is simply
+  // the wrong child on every side but one: for the W neighbor (and the N
+  // one) it is the child FURTHEST from this parent, and for the E/S
+  // neighbors it is only one of the TWO children that actually share the
+  // face. (Quadrant 0 IS the right stand-in for "does this quad exist at
+  // all" -- decision 3's all-or-nothing invariant -- which is what made the
+  // wrong index look right; grandchild EXISTENCE is per-child and carries no
+  // such invariant.) Both error directions were live-verified at N=4 on
+  // index-cylinder-amr.html, and they produce the two violation classes
+  // tools/validate-amr-invariants.js reports there:
+  //   - FALSE NEGATIVE (a bordering child skipped): a genuine level-(m+2)
+  //     region sits edge-adjacent to an un-cascaded level-m leaf --
+  //     debugCheck21Balance's depth-1-next-to-depth-3 pairs.
+  //   - FALSE POSITIVE (a far-side child counted): refine() recreates a quad
+  //     for a grandchild that is NOT adjacent to it, while coarsen()'s own
+  //     guard below -- which walks each child's TRUE same-level-(m+1) edge
+  //     neighbors (childEdgeNeighbors) and so does not see that grandchild
+  //     -- releases it again on the very next fixed-point iteration. That
+  //     create/destroy oscillation is the same mechanism the coarsen()
+  //     BUGFIX below documents one level up: amr_manage.wgsl's own L0->L1
+  //     cascade runs immediately AFTER coarsen() and before refine() in
+  //     dispatch order, so it only ever observed the quad in its destroyed
+  //     state and never granted the L1 tile 2:1 balance needed, leaving a
+  //     depth-2-next-to-depth-0 pair frozen in place for thousands of steps
+  //     (live-verified: identical violating tile coordinates at every
+  //     checkpoint, and unchanged by raising every pool cap 4-8x, which
+  //     rules out pool exhaustion).
+  //
+  // So test the children that actually SHARE A FACE with this parent: the 8
+  // level-(m+1) cells ringing this parent's own 2x2 child footprint, 2 per
+  // side. That set is exactly coarsen()'s own guard set minus this parent's
+  // own 4 children (which cannot exist here -- the quadrant-0 early-out
+  // above already returned if they did), so refine() and coarsen() now agree
+  // about which grandchildren matter, which is what closes the oscillation.
   var cascadeWanted = false;
   if (HAS_GRANDCHILD != 0u) {
-    let nbrBX = array<u32, 4>(bxP, bxP, (bxP + 1u) % NBX_PARENT, (bxP + NBX_PARENT - 1u) % NBX_PARENT);
-    let nbrBY = array<u32, 4>((byP + NBY_PARENT - 1u) % NBY_PARENT, (byP + 1u) % NBY_PARENT, byP, byP);
-    for (var i = 0u; i < 4u; i++) {
-      let nbxN = nbrBX[i]; let nbyN = nbrBY[i];
-      let childBlockIDN = (nbyN * 2u) * nbxChild + (nbxN * 2u);
-      if (childBlockSlot[childBlockIDN] >= 0 && hasGrandchild(childBlockIDN)) {
+    let nbyChild = NBY_PARENT * 2u;
+    let cx0 = bxP * 2u;              let cy0 = byP * 2u;
+    let cx1 = (cx0 + 1u) % nbxChild; let cy1 = (cy0 + 1u) % nbyChild;
+    let xW = (cx0 + nbxChild - 1u) % nbxChild; let xE = (cx0 + 2u) % nbxChild;
+    let yN = (cy0 + nbyChild - 1u) % nbyChild; let yS = (cy0 + 2u) % nbyChild;
+    let ring = array<u32, 8>(
+      yN * nbxChild + cx0, yN * nbxChild + cx1,   // N face
+      yS * nbxChild + cx0, yS * nbxChild + cx1,   // S face
+      cy0 * nbxChild + xE, cy1 * nbxChild + xE,   // E face
+      cy0 * nbxChild + xW, cy1 * nbxChild + xW,   // W face
+    );
+    for (var i = 0u; i < 8u; i++) {
+      if (childBlockSlot[ring[i]] >= 0 && hasGrandchild(ring[i])) {
         cascadeWanted = true;
       }
     }

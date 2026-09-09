@@ -35,6 +35,7 @@
 // validation error scope.
 
 import { reportFatal, reportNoWebGPU, reportNoAdapter } from './error-overlay.mjs';
+import { createTotalUnwrapper } from './card-total.mjs';
 import { assembleShader } from './shader-loader.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
 
@@ -100,6 +101,27 @@ const NCELLS1 = FB * FB; // cells per pool slot
 // means sharper vorticity gradients per unit length, so wake demand should
 // go up, not down) -- while still costing less fine-pool memory (~4.0 MiB)
 // than the coarse grid's own buffers (~5.24 MiB at the default W=256).
+// ── ?demandCascade=1 -- the growth half of Milestone 9's refine cascade ────
+// plans/AMR-multilevel.md specifies: "a quad may only refine to level m+1 if
+// its same-level neighbors are already present; if a neighbor is more than one
+// level coarser, force THAT neighbor to refine first (recursively, if the gap
+// is >1)". Only the veto half was ever implemented, so a criterion-driven
+// refine can be vetoed forever by a neighbour that would only ever have been
+// created BY that refine. Measured live on index-amr.html: level 2 never
+// extends past the geometry halo into the wake, which pins the L1/L2 boundary
+// a few cells off the body so every shed vortex crosses it right there.
+//
+// The recursion the plan asks for is a poor GPU fit, but the depth is known up
+// front and the fixed-point loop below is the bounded equivalent: growth
+// advances one level per iteration and the loop already runs N_LEVELS-1 times,
+// which is the exact bound. See shaders/amr_manage.wgsl's level2Wanted for the
+// mechanism, why it is a union with (not a replacement for) the existence-based
+// cascade that superseded it, and why it stops at the L0->L1 hop.
+//
+// Default 0 -- provably byte-identical to the previous behaviour (level2Wanted
+// is never called) until the physics is validated on the cylinder harness.
+const DEMAND_CASCADE = urlParams.has('demandCascade') ? (parseInt(urlParams.get('demandCascade')) || 0) : 0;
+
 const MAX_FINE_BLOCKS = urlParams.has('maxFineBlocks') ? parseInt(urlParams.get('maxFineBlocks')) : 128;
 const NBX = W / BLOCK, NBY = H / BLOCK, NBLOCKS = NBX * NBY; // coarse block grid
 
@@ -365,7 +387,10 @@ function allocLevelPool(device, U, m, NBX_m, NBY_m, maxFineBlocks) {
     finePoolVel: device.createBuffer({ size: maxFineBlocks * NCELLS1 * 2 * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC }),
     blockSlotBuf: device.createBuffer({ size: NBLOCKS_m * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC }),
     slotToBlockBuf: device.createBuffer({ size: maxFineBlocks * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC }),
-    blockCriterionBuf: device.createBuffer({ size: NBLOCKS_m * 4, usage: U.STORAGE | U.COPY_DST }),
+    blockCriterionBuf: device.createBuffer({ size: NBLOCKS_m * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC }),  // COPY_SRC so debugReadBlockCriterion can read it back; without it the
+    // copy is a validation error, the whole command buffer is dropped, and
+    // the staging buffer reads back as all zeros -- which looks exactly like
+    // "the criterion pass never ran" and cost a wrong diagnosis once.
     freeCountBuf: device.createBuffer({ size: 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC }),
     newlyActivatedBuf: device.createBuffer({ size: maxFineBlocks * 4, usage: U.STORAGE | U.COPY_DST }),
   };
@@ -982,7 +1007,7 @@ async function init() {
   const interpFFConstants = { W, H, RB, GHOST_ONLY: 1, FINE_FINE_ONLY: 1, F16 };
   const step1Constants = { W, H, RB, F16, DIRECT_GHOST: GHOST_COPY ? 0 : 1 };
   const criterionConstants = { W, H };
-  const manageConstants = { W, H, REFINE_THRESH, COARSEN_THRESH, FORCE_REFINE_MARGIN, FORCE_REFINE_LOOKAHEAD, SPONGE_EXCLUDE_W, HAS_LEVEL2: N_LEVELS > 2 ? 1 : 0 };
+  const manageConstants = { W, H, REFINE_THRESH, COARSEN_THRESH, FORCE_REFINE_MARGIN, FORCE_REFINE_LOOKAHEAD, SPONGE_EXCLUDE_W, DEMAND_CASCADE, HAS_LEVEL2: N_LEVELS > 2 ? 1 : 0 };
 
   const stepPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [stepBGL] }),
@@ -1212,7 +1237,33 @@ async function init() {
   for (let m = 1; m < N_LEVELS - 1; m++) {
     const parentPool = pools[m];
     const childPool = pools[m + 1];
-    const parentVel = m === 1 ? velBuf : parentPool.finePoolVel;
+    // BUGFIX: ALWAYS the parent pool's own finePoolVel, never velBuf.
+    // amr_criterion_pool.wgsl's binding 0 is the PARENT LEVEL's fine pool
+    // velocity and it addresses that buffer BY POOL SLOT
+    // (slot*(FB*FB) + fy*FB + fx). This shader only ever runs with a pool
+    // level as its parent -- m >= 1 -- so there is no dense case to special-
+    // case here; the `m === 1 ? velBuf : ...` this replaces was the
+    // dense-parent pattern the neighbouring interp/step bind groups legitimately
+    // use, copied to a shader that has no dense-parent variant.
+    //
+    // Handing it velBuf fed a dense, cellIndex-addressed L0 buffer to
+    // slot-addressed reads: wrong layout for every slot, and past roughly the
+    // first third of the slots the reads run off the end of a buffer less than
+    // half the size the pool layout expects. The result was a level-2
+    // blockCriterion of essentially ZERO everywhere -- measured 2^-39.86 for
+    // all 85 active L1 parents, against a host reconstruction from level 1's
+    // own field showing up to 2^-5.6.
+    //
+    // So amr_manage_pool.wgsl's refine() saw maxCrit ~= 0 for every parent,
+    // desiredLevel(toPhysical(eps)) was 0, and the vorticity criterion could
+    // NEVER promote a tile to level 2. Level 2 was 100% geometry-forced --
+    // which is exactly what a phi scan showed independently before the cause
+    // was known: L2 covered block centres at phi -0.5 .. 7.9, the
+    // childLevel-2 forced halo (margin 8) and nothing beyond it. That pins
+    // the L1/L2 boundary a few cells off the body, so every shed vortex
+    // crosses it right at the trailing edge -- the reported block artifacts
+    // and the lumpiness induced on the shed vortices.
+    const parentVel = parentPool.finePoolVel;
     const parentSlotToBlockBuf = m === 1 ? pools[1].slotToBlockBuf : parentPool.slotToBlockBuf;
     const parentBlockSlotBuf = m === 1 ? pools[1].blockSlotBuf : parentPool.blockSlotBuf;
     const parentOriginXBuf = m === 1 ? dummyBlockSlotBuf : parentPool.originXBuf; // dummy: level-1 parent has no cached origin (PARENT_HAS_CACHED_ORIGIN=0 gates it out)
@@ -1366,6 +1417,9 @@ async function init() {
   let macroStepCounter = 0;
 
   const trajectory = [];
+  // Restores true totals from the shaders' wrapped x_total/y_total --
+  // see card-total.mjs.
+  const totals = createTotalUnwrapper(W, H);
 
   document.getElementById('download').onclick = () => {
     const header = "step,cx,cy_total,cx_total,theta,vx,vy,omega,fx,fy,tz\n";
@@ -1898,6 +1952,7 @@ async function init() {
   }
 
   function resetSim() {
+    totals.reset();
     writeF(f_a, initF(), NCELLS);
     writeF(pools[1].finePoolF_a, initFPool(), MAX_FINE_BLOCKS * NCELLS1);
     device.queue.writeBuffer(cardStateBuf, 0, initCardState());
@@ -2326,13 +2381,62 @@ async function init() {
   // checking it again here would be redundant AND use the wrong
   // granularity), and for each neighbor, walk toward the SHARED edge
   // specifically (borderMaxDepth), not the neighbor's tile as a whole.
-  async function debugCheck21Balance() {
-    const activeSets = {}, NBX_ = {}, NBY_ = {}, counts = {};
+  // Every level's blockSlot copied in ONE command encoder and ONE submit, so
+  // all levels come from the SAME GPU state.
+  //
+  // BUGFIX: debugCheck21Balance used to call debugListActiveBlocks(m) in a
+  // loop, and each of those does its own submit + mapAsync round trip. While
+  // the sim is RUNNING (liveMode, i.e. any ordinary browser session) the
+  // render loop keeps submitting macro-steps between those round trips, so
+  // level 1 was read at one instant and level 2 at a later one -- across, in
+  // general, one or more REFINE_EVERY refinement rounds. A tile coarsened out
+  // of level 1 after the level-1 read, or refined into level 2 before the
+  // level-2 read, then reads back as a depth-2-next-to-depth-0 pair that
+  // never existed at any single instant: a torn snapshot reported as a 2:1
+  // violation.
+  //
+  // This is why the artifact only ever showed up at levels>=3: at levels=2
+  // the loop runs exactly once, so there is only one readback and nothing to
+  // tear against. That made it look like "the second refinement octave breaks
+  // 2:1 balance" when what actually changed was the number of readbacks.
+  // Live-verified on index-amr.html?levels=3 by alternating protocols on one
+  // page: sampling while live reported violations in 2 of 8 samples, while
+  // the paused read taken immediately after each of those was clean every
+  // time (0 of 8). Reading every level in one submit makes the check sound in
+  // both modes; tools/lib/amr-invariants.js pauses first and so was never
+  // affected either way.
+  async function readAllBlockSlots() {
+    const stages = [];
+    const enc = device.createCommandEncoder();
     for (let m = 1; m < N_LEVELS; m++) {
-      const active = await debugListActiveBlocks(m);
-      activeSets[m] = new Set(active.map(b => `${b.bx},${b.by}`));
+      const pool = pools[m];
+      const stage = device.createBuffer({ size: pool.NBLOCKS * 4, usage: U.MAP_READ | U.COPY_DST });
+      enc.copyBufferToBuffer(pool.blockSlotBuf, 0, stage, 0, pool.NBLOCKS * 4);
+      stages.push({ m, stage, pool });
+    }
+    device.queue.submit([enc.finish()]);
+    await Promise.all(stages.map(s => s.stage.mapAsync(GPUMapMode.READ)));
+    const sets = {};
+    for (const { m, stage, pool } of stages) {
+      const blockSlot = new Int32Array(stage.getMappedRange()).slice();
+      stage.unmap();
+      stage.destroy();
+      const active = new Set();
+      for (let blockID = 0; blockID < pool.NBLOCKS; blockID++) {
+        if (blockSlot[blockID] !== -1) active.add(`${blockID % pool.NBX},${Math.floor(blockID / pool.NBX)}`);
+      }
+      sets[m] = active;
+    }
+    return sets;
+  }
+
+  async function debugCheck21Balance() {
+    const NBX_ = {}, NBY_ = {}, counts = {};
+    // One coherent multi-level snapshot -- see readAllBlockSlots.
+    const activeSets = await readAllBlockSlots();
+    for (let m = 1; m < N_LEVELS; m++) {
       NBX_[m] = pools[m].NBX; NBY_[m] = pools[m].NBY;
-      counts[m] = active.length;
+      counts[m] = activeSets[m].size;
     }
     function hasChild(m, bx, by) {
       return m + 1 < N_LEVELS && activeSets[m + 1].has(`${bx * 2},${by * 2}`);
@@ -2535,8 +2639,10 @@ async function init() {
           gpuTime = performance.now() - tSubmit;
         }
 
+        // x_total/y_total come back WRAPPED -- see card-total.mjs.
+        const { x: xTotal, y: yTotal } = totals.unwrap(d[21], d[20]);
         if (st.step < 100000) {
-          trajectory.push([st.step, d[0], d[20], d[21], d[2], d[3], d[4], d[5], d[6], d[7], d[8]]);
+          trajectory.push([st.step, d[0], yTotal, xTotal, d[2], d[3], d[4], d[5], d[6], d[7], d[8]]);
         }
 
         if (performance.now() - lastT > 250) {
@@ -2544,7 +2650,7 @@ async function init() {
           mlupsEl.textContent = mlups.toFixed(1);
           gpuMsEl.textContent = gpuTime.toFixed(2);
           syncMsEl.textContent = (performance.now() - tSubmit).toFixed(2);
-          statusEl.textContent = `[Reentry] step ${st.step}  y=${d[20].toFixed(1)}  x=${d[21].toFixed(1)}  vy=${d[4].toFixed(4)}  Fy=${d[7].toExponential(2)}  θ=${d[2].toFixed(2)}`;
+          statusEl.textContent = `[Reentry] step ${st.step}  y=${yTotal.toFixed(1)}  x=${xTotal.toFixed(1)}  vy=${d[4].toFixed(4)}  Fy=${d[7].toExponential(2)}  θ=${d[2].toFixed(2)}`;
           lastT = performance.now();
         }
 
