@@ -1,4 +1,5 @@
 import { reportFatal, reportNoWebGPU, reportNoAdapter } from './error-overlay.mjs';
+import { installVortControls } from './vort-controls.mjs';
 import { assembleShader } from './shader-loader.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
 import {
@@ -291,10 +292,12 @@ async function init() {
   // Separate dict for the pipelines whose shaders @include common_fpack.wgsl;
   // phy/render don't declare F16 and WebGPU makes that a hard error.
   const fConstants = { W, H, F16 };
-  // Likewise the render fragment's own overrides: only render.wgsl declares
+  // Likewise the render fragment needs its own dict: only render.wgsl declares
   // VORT_SCALE/VORT_GAMMA (via common_vortcolor.wgsl), and supplying an
   // override a pipeline's shader does not declare is the same hard error.
-  const renderConstants = { W, H, VORT_SCALE, VORT_GAMMA };
+  // The two VORT_* values are supplied by makeRenderPipeline below, which is
+  // the only thing that ever varies them.
+  const renderConstants = { W, H };
 
   const stepPL = device.createComputePipeline({ 
     layout: device.createPipelineLayout({ bindGroupLayouts: [stepBGL] }), 
@@ -308,57 +311,25 @@ async function init() {
     layout: device.createPipelineLayout({ bindGroupLayouts: [phyBGL] }), 
     compute: { module: phySM, entryPoint: 'main', constants } 
   });
-  // The vorticity tone curve's gamma is a pipeline-OVERRIDABLE CONSTANT, not
-  // a uniform: it is specialized into the fragment shader at pipeline
-  // creation. Changing it live therefore means rebuilding this one pipeline,
-  // which is what makeRenderPipeline() below exists for.
-  //
-  // WHY NOT A UNIFORM, which would be the obvious way to make it live: ten
-  // pages (main.js, main-amr.js and the eight scenario harnesses) each own a
-  // private copy of renBGL/renBG for these two shared render shaders. Adding
-  // a binding means editing all ten in lockstep, and getting that wrong in
-  // exactly one of them is 238e48c -- the bug CLAUDE.md's boot-smoke note
-  // exists because of. Respecializing a single small fragment pipeline on a
-  // UI action costs a fraction of a frame and touches no binding at all.
-  const makeRenderPipeline = (gamma) => device.createRenderPipeline({
+  // VORT_SCALE/VORT_GAMMA are pipeline-overridable constants specialized into
+  // the fragment shader here, so changing them live means rebuilding this one
+  // pipeline. vort-controls.mjs owns the sliders and the per-frame coalescing
+  // (and documents why these are not uniforms); this side owns only the
+  // pipeline itself.
+  const makeRenderPipeline = (scale, gamma) => device.createRenderPipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [renBGL] }),
     vertex: { module: renSM, entryPoint: 'vs_main', constants },
     fragment: {
       module: renSM, entryPoint: 'fs_main', targets: [{ format: fmt }],
-      constants: { ...renderConstants, VORT_GAMMA: gamma },
+      constants: { ...renderConstants, VORT_SCALE: scale, VORT_GAMMA: gamma },
     },
     primitive: { topology: 'triangle-list' },
   });
-  let renPL = makeRenderPipeline(VORT_GAMMA);
-
-  // Slider -> pipeline. Rebuilds are coalesced to at most one per animation
-  // frame: oninput fires far faster than frames during a drag, and each
-  // rebuild is real work. The readout updates immediately regardless, so the
-  // control still feels direct.
-  const gammaSlider = document.getElementById('slider-VORT_GAMMA');
-  const gammaValEl = document.getElementById('val-VORT_GAMMA');
-  if (gammaSlider) {
-    gammaSlider.value = VORT_GAMMA;   // ?vortGamma= wins over the markup
-    if (gammaValEl) gammaValEl.textContent = VORT_GAMMA.toFixed(2);
-    let pendingGamma = null;
-    gammaSlider.oninput = () => {
-      const g = parseFloat(gammaSlider.value);
-      if (gammaValEl) gammaValEl.textContent = g.toFixed(2);
-      const alreadyQueued = pendingGamma !== null;
-      pendingGamma = g;
-      if (alreadyQueued) return;
-      requestAnimationFrame(() => {
-        const target = pendingGamma;
-        pendingGamma = null;
-        try {
-          renPL = makeRenderPipeline(target);
-        } catch (e) {
-          // Never let a visualization knob take down the sim.
-          console.error('[getting-air] render pipeline rebuild failed:', e);
-        }
-      });
-    };
-  }
+  let renPL = makeRenderPipeline(VORT_SCALE, VORT_GAMMA);
+  installVortControls({
+    scale: VORT_SCALE, gamma: VORT_GAMMA,
+    rebuild: (scale, gamma) => { renPL = makeRenderPipeline(scale, gamma); },
+  });
 
   const stepBG_ab = device.createBindGroup({ layout: stepBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_a } }, { binding: 2, resource: { buffer: f_b } }, { binding: 3, resource: { buffer: velBuf } }]});
   const stepBG_ba = device.createBindGroup({ layout: stepBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_b } }, { binding: 2, resource: { buffer: f_a } }, { binding: 3, resource: { buffer: velBuf } }]});
