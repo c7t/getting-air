@@ -169,7 +169,27 @@ export function createTrail(canvas, opts = {}) {
 
     // Drawn oldest-to-newest in segments with rising alpha, so the tail fades
     // out rather than ending in a hard cut where the buffer happens to stop.
-    ctx.lineCap = 'round';
+    //
+    // BUTT caps, not round. Consecutive segments SHARE their boundary vertex
+    // (segment s ends at i1 and segment s+1 starts at the same i1), and a
+    // round cap paints a half-disc of radius lineWidth/2 CENTRED on the
+    // endpoint. With two separately-stroked sub-paths that means the joint is
+    // painted twice and alpha-composited: at alpha a the joint comes out at
+    // 1-(1-a)^2 instead of a. Measured directly in a canvas, alpha 0.5,
+    // lineWidth 4: mid-of-segment 127, shared vertex 191. Every one of the 23
+    // interior joints was therefore a bright dot -- a visible chain of beads
+    // along the path, reported from a phone. The beads sit (n-1)/24 samples
+    // apart, far longer than the sample interval, which is why the path curves
+    // smoothly BETWEEN them rather than kinking at them.
+    //
+    // A butt cap ends flat exactly at the endpoint, so consecutive segments
+    // abut instead of overlapping: same measurement gives 128/128. lineJoin
+    // stays round and still does the work at every interior vertex, where a
+    // single stroke fills the join once; only the sub-path boundaries were
+    // ever double-painted. The trail's two true ends lose their rounding,
+    // which is invisible: the head carries its own filled marker below, and
+    // the tail ends at 12% alpha.
+    ctx.lineCap = 'butt';
     ctx.lineJoin = 'round';
     ctx.lineWidth = Math.max(1, 1.6 * dpr);
     ctx.strokeStyle = '#fff';
