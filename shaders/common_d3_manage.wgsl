@@ -56,6 +56,10 @@
 @group(0) @binding(6) var<storage, read_write> slotNew     : array<u32>;
 
 override MARGIN : f32 = 2.0f;
+// How many macro-steps pass before the criterion is re-evaluated. The
+// manager refines AHEAD by however far the body can travel in that time --
+// see blockWanted. 1 makes the lead term vanish.
+override MANAGE_EVERY : f32 = 1.0f;
 // The body's own radius is baked into get_phi3, so the criterion needs
 // nothing else about the shape.
 override HAS_BODY : u32 = 0u;
@@ -68,6 +72,24 @@ override HAS_BODY : u32 = 0u;
 // that catches that, and tools/validate-d3-invariants.js is what runs it.
 fn blockWanted(b: vec3<u32>) -> bool {
   if (HAS_BODY == 0u) { return false; }
+  // REFINE AHEAD BY WHERE THE BODY WILL BE, not only where it is. This
+  // criterion is re-evaluated every MANAGE_EVERY steps, so a shell that
+  // only just covers the body at decision time is already stale on the very
+  // next step -- and the geometry-forced constraint is supposed to hold at
+  // EVERY step, not at the ones the manager happens to run on.
+  //
+  // Found by measurement, not foresight: M4.2b-iii's `drift` gate reported
+  // coverage violations at exactly the cells sitting on the margin
+  // boundary, and the body had moved MANAGE_EVERY * |v| = 0.08 cells since
+  // the decision. Tiny, and enough, because a boundary is a boundary.
+  //
+  // Rotation is deliberately not in this term. It matters for a long body
+  // spun about a short axis, and every body that currently uses
+  // ?refine=body is a sphere, for which it is exactly zero. Adding it
+  // speculatively would be an untested term in a criterion whose whole job
+  // is to be checkable.
+  let lead = MANAGE_EVERY * length(vec3<f32>(body.vx, body.vy, body.vz));
+  let reach = MARGIN + lead;
   let lo = vec3<f32>(b * RB);
   let hi = lo + f32(RB);
   var best = 1e30f;
@@ -79,7 +101,7 @@ fn blockWanted(b: vec3<u32>) -> bool {
     best = min(best, get_phi3(p, body));
   }
   best = min(best, get_phi3((lo + hi) * 0.5f, body));
-  return best <= MARGIN;
+  return best <= reach;
 }
 
 fn blockOfId(id: u32) -> vec3<u32> {

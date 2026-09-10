@@ -239,11 +239,21 @@ number at once.
   tools, rescale included. An earlier note in plans/3D.md said the opposite
   and was wrong.
 
+- **The geometry criterion REFINES AHEAD: `MARGIN + manageEvery * |v|`.** A
+  shell that only just covers the body at decision time is stale on the next
+  step, and the constraint has to hold at every step, not the ones the
+  manager runs on. Zero for a pinned body, so it does not disturb the static
+  cases. Do not delete it as an unexplained fudge -- `?refine=body` on the
+  `drift` scenario fails without it.
+
 - Two lessons worth carrying from that work: a "nothing changed" gate cannot
   tell a no-op manager from one that never ran (use `?manageMargin=` to force
   it to act, `?manageStart=` to place the event after the flow develops, and
   watch `debugPoolState()`), and `step` only advances after a whole
-  `debugStepSync` batch, so any per-step interval must use `step + s`.
+  `debugStepSync` batch, so any per-step interval must use `step + s`. A
+  third: a count is not a set -- a translating body holds `inUse` constant
+  while every tile changes hands, which is why `debugPoolState` reports the
+  refined set's bounding box.
 
 - **The AMR invariant checker exists and is GREEN, but its 2:1 half is
   VACUOUS until refinement is multi-level** (`tools/validate-d3-invariants.js`,

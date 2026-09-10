@@ -94,6 +94,23 @@ const CONFIGS = [
   // the coarse field, so allocating 80 of them must no longer destroy the
   // run. Before it landed this config blew up and was flagged as expected;
   // the flag coming off is the gate.
+  // M4.2b-iii: the shell has to FOLLOW a body that moves. The `drift`
+  // scenario gives a free sphere a constant velocity with the fluid force
+  // off, so its trajectory is exactly x0 + v t and any coverage failure is
+  // the manager rather than the flow. This is the one config whose coverage
+  // check is a real gate on dynamic refinement: the initial shell is built
+  // around x0, and by the end the body is many blocks away, so coverage can
+  // only still hold if the set actually moved.
+  //
+  // expectBboxMove: inUse alone proves nothing here -- a translating sphere
+  // refines as many blocks ahead as it coarsens behind, so the COUNT is
+  // constant while every tile changes hands. The refined set's bounding box
+  // is what moves.
+  // The body travels u0 * steps = 0.02 * 1200 = 24 coarse cells = 6 blocks
+  // at RB=4, so the shell's leading edge must move about that far. 4 is a
+  // floor with margin, not a prediction: the point is that it moved at all.
+  { name: 'drift', expectBboxMove: 4, steps: 1200,
+    url: 'scenario=drift&n=24&live=0&levels=2&rb=4&refine=body&margin=2&interface=explode&dynamic=1&manageEvery=4' },
   { name: 'body-refine', expectInUse: 'increase', steps: 8,
     url: 'scenario=sphere&n=16&re=20&u0=0.05&q=19&bounceback=1&live=0&levels=2&rb=4&refine=body&interface=explode&dynamic=1&manageEvery=1&manageMargin=6' },
 ];
@@ -133,14 +150,17 @@ async function runConfig(Runtime, o, c, log) {
   // steps to change hands, and running them long is spending minutes on a
   // field that is deliberately wrong.
   const steps = Math.min(o.steps, c.steps || o.steps);
-  let done = 0, firstInUse = null;
+  let done = 0, firstInUse = null, firstBbox = null;
   while (done <= steps) {
     const bal = await evalOrThrow(Runtime, `${G}.debugCheck21Balance()`, 120000, 'debugCheck21Balance');
     const cov = await evalOrThrow(Runtime, `${G}.debugCheckGeometryCoverage()`, 300000, 'debugCheckGeometryCoverage');
     const ps = await evalOrThrow(Runtime, `${G}.debugPoolState()`, 300000, 'debugPoolState');
     const st = await evalOrThrow(Runtime, `${G}.readStats()`, 300000, 'readStats');
     if (ps.ok === false) res.pool.push({ at: done, n: ps.problems.length, first: ps.problems[0] });
-    if (ps.inUse != null) { res.poolState = ps; if (firstInUse === null) firstInUse = ps.inUse; }
+    if (ps.inUse != null) {
+      res.poolState = ps;
+      if (firstInUse === null) { firstInUse = ps.inUse; firstBbox = ps.bbox; }
+    }
     if (bal.skipped) throw new Error(`2:1 balance unavailable: ${bal.skipped}`);
     res.vacuous = bal.vacuous;
     if (cov.skipped) res.covSkipped = cov.skipped;
@@ -163,6 +183,17 @@ async function runConfig(Runtime, o, c, log) {
     const k = Math.min(o.checkEvery, steps - done);
     await evalOrThrow(Runtime, `${G}.debugStepSync(${k})`, (o.timeout + 30) * 1000, 'debugStepSync');
     done += k;
+  }
+  if (c.expectBboxMove && res.poolState && res.poolState.bbox && firstBbox) {
+    const moved = Math.abs(res.poolState.bbox.lo[0] - firstBbox.lo[0]);
+    const ok = moved >= c.expectBboxMove;
+    res.expectation = { want: `bbox moves >= ${c.expectBboxMove} blocks`, moved, ok };
+    if (!ok) {
+      res.pool.push({ at: 'end', n: 1,
+        first: { kind: 'shellDidNotFollow', movedBlocks: moved, required: c.expectBboxMove,
+                 from: firstBbox.lo, to: res.poolState.bbox.lo } });
+    }
+    log(`refined shell: lo.x ${firstBbox.lo[0]} -> ${res.poolState.bbox.lo[0]} (${moved} blocks) ${ok ? 'ok' : 'DID NOT FOLLOW'}`);
   }
   // Did the manager actually do the thing the config exists to observe?
   if (c.expectInUse && res.poolState) {

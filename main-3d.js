@@ -276,8 +276,13 @@ async function init() {
       // CELL granularity against the same SDF -- an independent route from
       // refineNearBody's block-corner sampling, which is the thing under
       // test rather than the reference.
-      geomForced = { sdf: (q) => Math.hypot(q[0] - bx[0], q[1] - bx[1], q[2] - bx[2]) - sh.a, margin };
-      poolAlloc = refineNearBody(pool, geomForced.sdf, margin);
+      //
+      // sdfAt takes the CENTRE, because the body MOVES (M4.2b-iii) and the
+      // requirement moves with it. Checking against the initial position
+      // would pass a manager that refined a shell and then left it behind,
+      // which is precisely the failure this is meant to catch.
+      geomForced = { radius: sh.a, margin, sdfAt: (c) => (q) => Math.hypot(q[0] - c[0], q[1] - c[1], q[2] - c[2]) - sh.a };
+      poolAlloc = refineNearBody(pool, geomForced.sdfAt(bx), margin);
     } else {
       throw new Error(`?refine=${mode}: expected all, box, bar, slab or body`);
     }
@@ -761,7 +766,11 @@ async function init() {
       // gate needs the two criteria to agree exactly, and two independent
       // parses of one parameter is how they would silently stop agreeing.
       const manageConst = { ...poolConst, HAS_BODY,
-        MARGIN: Number.isFinite(MANAGE_MARGIN) ? MANAGE_MARGIN : geomForced.margin };
+        MARGIN: Number.isFinite(MANAGE_MARGIN) ? MANAGE_MARGIN : geomForced.margin,
+        // The lead term is zero for a pinned body, so the criterion still
+        // reproduces the host's initial set exactly and M4.2b-i's
+        // bit-identical gate is untouched.
+        MANAGE_EVERY };
       const mkManage = (entry) => device.createComputePipelineAsync({
         layout: device.createPipelineLayout({ bindGroupLayouts: [manageBGL] }),
         compute: { module: manageModule, entryPoint: entry, constants: manageConst },
@@ -1391,10 +1400,22 @@ async function init() {
       if (id < 0) continue;
       if (bs[id] !== slot && problems.length < 16) problems.push({ kind: 'orphanSlot', slot, block: id, blockSlot: bs[id] });
     }
+    // The bounding box of the refined set, in block coordinates. inUse alone
+    // cannot show that a shell FOLLOWED a body: a sphere translating refines
+    // as many blocks ahead as it coarsens behind, so the count is constant
+    // while every tile changes hands. The box moves, and that is what
+    // M4.2b-iii is actually claiming.
+    let lo = [1e9, 1e9, 1e9], hi = [-1, -1, -1];
+    for (let id = 0; id < pool.nBlocks; id++) {
+      if (bs[id] < 0) continue;
+      const b = pool.blockOf(id);
+      for (let a = 0; a < 3; a++) { lo[a] = Math.min(lo[a], b[a]); hi[a] = Math.max(hi[a], b[a]); }
+    }
+    const bbox = inUse ? { lo, hi } : null;
     const budgetOk = inUse + free === MAX_SLOTS;
     if (!budgetOk && problems.length < 16) problems.push({ kind: 'budget', inUse, free, maxSlots: MAX_SLOTS });
     return { ok: problems.length === 0, problems, inUse, free, maxSlots: MAX_SLOTS,
-             initialActive: poolAlloc.activeSlots, dynamic: !!DYNAMIC };
+             bbox, initialActive: poolAlloc.activeSlots, dynamic: !!DYNAMIC };
   }
 
   async function debugCheck21Balance() {
@@ -1427,9 +1448,15 @@ async function init() {
     // requirement to check -- reported as SKIPPED, never as a pass.
     if (!geomForced) return { skipped: `?refine=${refineMode} is not geometry-forced` };
     const bs = await readBlockSlot();
-    const r = checkGeometryCoverage(pool, bs, geomForced.sdf, geomForced.margin);
+    // The LIVE body position, read back from the GPU: the host does not step
+    // the body, the physics kernel does, so this is the only place the truth
+    // lives. Against the initial position instead, a manager that refined a
+    // shell once and never moved it would pass.
+    const b = await readBody();
+    const r = checkGeometryCoverage(pool, bs, geomForced.sdfAt([b.cx, b.cy, b.cz]), geomForced.margin);
     return { ok: r.violations.length === 0, violations: r.violations.slice(0, 16),
-             nViolations: r.violations.length, required: r.required };
+             nViolations: r.violations.length, required: r.required,
+             bodyAt: [b.cx, b.cy, b.cz] };
   }
 
   // --- coarse/fine interface diagnostic ------------------------------------

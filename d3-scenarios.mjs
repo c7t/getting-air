@@ -344,6 +344,46 @@ SCENARIOS.sphere = {
   macro: (dims, p) => seedMacro3(dims, () => [p.u0, 0, 0]),
 };
 
+// --- drift: a body that TRANSLATES, for the dynamic-refinement gate --------
+//
+// plans/3D.md M4.2b-iii. A free sphere given an initial linear velocity with
+// the fluid force switched off (NO_FLUID_FORCE), so it crosses the domain in
+// a straight line at a known constant speed.
+//
+// WHY A SCENARIO AND NOT A TWEAK TO `sphere`. Geometry-forced refinement has
+// to follow a body that MOVES, and every other scenario's body is pinned or
+// only rotates -- `spin` turns in place, which never moves the refined shell
+// across a block boundary. Refining ahead of a body and coarsening behind it
+// is the thing under test, and nothing in the suite could exercise it.
+//
+// WHY THE FLUID FORCE IS OFF, which makes this not a fluid case: the body's
+// trajectory is then EXACTLY known -- x(t) = x0 + v t -- so the set of blocks
+// the criterion must refine is known too, and any coverage failure is the
+// manager and not the flow. With the force on, a coverage miss and a body
+// that simply went somewhere else look identical.
+//
+// The fluid is still solved around it, so the refined tiles carry a real
+// solution and a newly-refined tile that was filled wrongly still shows up
+// as a blowup.
+SCENARIOS.drift = {
+  name: 'drift',
+  defaults: { n: 24, tau: 0.8, u0: 0.02 },
+  walls: [],
+  dims: ({ n }) => [4 * n, 2 * n, 2 * n],
+  derive: (p) => {
+    const d = [4 * p.n, 2 * p.n, 2 * p.n];
+    const shape = { kind: SHAPE.SPHERE, a: p.n / 3, b: p.n / 3, c: p.n / 3, r: 0 };
+    // Starts a quarter of the way along x and drifts +x, so it has room to
+    // cross many block boundaries before reaching the far side.
+    const body = makeBodyState({
+      shape, x: [d[0] / 4, d[1] / 2, d[2] / 2], v: [p.u0, 0, 0],
+    });
+    return { nu: nuFromTau(p.tau), body, pinned: false, noFluidForce: true,
+             force: [0, 0, 0], dims: d };
+  },
+  macro: (dims) => seedMacro3(dims, () => [0, 0, 0]),
+};
+
 // --- spin: the 6-DOF integrator, with no fluid in the way ------------------
 //
 // A free body given an initial spin, with the fluid force switched off
