@@ -403,3 +403,49 @@ export function cascade21(wantSets, nbAt, { levels }) {
   }
   return { sets, forced, counts: sets.map((s, m) => (m === 0 ? null : s.size)) };
 }
+
+// --- the pool-parent path (plans/3D.md M5.1a) -------------------------------
+//
+// THE UNIFORM TILE SHAPE, MADE CONCRETE. A tile's interior is 2*RB cells at
+// its OWN level, so it spans RB * 2^(1-m) L0 units: a level-m tile is one
+// OCTANT of a level-(m-1) tile's footprint at doubled density. Every level
+// therefore has the same FB, the same ring, and the same kernels -- the
+// level-2 tile is the level-1 tile moved down a rung.
+//
+// That is what makes this function a one-liner instead of a second
+// addressing scheme: LEVEL m'S TILING IS LEVEL 1'S TILING OF A DOMAIN
+// 2^(m-1) TIMES LARGER. So `resolveSource`, `toGlobalFine`, `fromGlobalFine`
+// and `cellIndex` work at any depth with no change at all, which is exactly
+// the claim tools/test-d3-amr.js re-runs at levels 2 and 3 against the
+// independent global-coordinate route.
+//
+// 2D had to CHANGE TOPOLOGY here (plans/AMR-multilevel.md M5, decision 2):
+// its L1 was footprint-preserving, so a level-3 tile would have needed 4x
+// the linear size of a level-1 tile. 3D never had that problem. Do not port
+// the fix for it.
+export function poolAtLevel(pool, m, { maxSlots } = {}) {
+  if (m < 1) throw new Error(`level ${m} has no pool (level 0 is the dense grid)`);
+  const s = 2 ** (m - 1);
+  return makePool({ dims: pool.dims.map(d => d * s), rb: pool.rb, maxSlots });
+}
+
+// A level-m block's parent at level m-1, and which of the parent's eight
+// octants it is. Valid for m >= 2 only: a level-1 block's parent is the
+// dense L0 grid, which is not a tile and is addressed spatially instead --
+// the two schemes coexist and are not unified, inherited straight from the
+// 2D arc.
+export function parentOfBlock(b) { return [b[0] >> 1, b[1] >> 1, b[2] >> 1]; }
+export function octantOfBlock(b) { return [b[0] & 1, b[1] & 1, b[2] & 1]; }
+
+// WHERE A CHILD SITS INSIDE ITS PARENT'S INTERIOR, from the octant bits
+// alone -- no spatial lookup, no parent-chain walk. The parent's interior is
+// 2*RB cells on each axis and the octant halves it, so the child covers
+// parent-local indices [GHOST + q*RB, GHOST + q*RB + RB) on that axis.
+//
+// The return value is exactly the `origin` argument fineToCoarseUnit already
+// takes, so a child-local index maps into PARENT-LOCAL continuous
+// coordinates through the same stencil function the dense-parent path uses.
+// One function, two callers. A second copy of that arithmetic specialized to
+// pool parents is how the two would drift, and the drift would look like a
+// seam rather than like a bug.
+export function octantOrigin(rb, q) { return GHOST + q * rb; }

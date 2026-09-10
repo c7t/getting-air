@@ -196,6 +196,23 @@ async function init() {
   // as the pool addressing underneath it.
   const LEVELS = Math.max(1, Math.round(numParam('levels', 1)));
   const RB = Math.max(2, Math.round(numParam('rb', 4)));
+  // M5.0. ?levels=3 WAS accepted and silently ran two levels: exactly one
+  // pool is allocated, `AMR` is a boolean, and every dispatch below is the
+  // hand-flattened depth-2 sequence. That on its own is a missing feature;
+  // what makes it a trap is debugCheck21Balance, which reports
+  // `vacuous: LEVELS < 3` -- so at ?levels=3 the ONE tool that would notice
+  // announced it was checking a hierarchy that did not exist, and every M5
+  // stage could have looked green while running nothing.
+  //
+  // Refused rather than clamped, because clamping to 2 is the same silence
+  // with a different spelling: a validation config written as ?levels=3
+  // would pass and mean nothing. M5.3 lifts this, when the recursive
+  // schedule has something to run.
+  if (LEVELS > 2) {
+    statusEl.textContent = `error: ?levels=${LEVELS} is not implemented yet`
+      + ' (the pool-parent path is plans/3D.md M5); ?levels=1 or 2';
+    return;
+  }
   const AMR = LEVELS >= 2;
   let pool = null, poolAlloc = null;
   // The refinement mode, and -- when it is geometry-forced -- the SDF and

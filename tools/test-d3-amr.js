@@ -36,6 +36,7 @@ const close = (a, b, tol, what) =>
     GHOST, fineToCoarseUnit, coarseUnitToFine, makePool, refineWhere,
     refineNearBody, resolveSource, toGlobalFine, fromGlobalFine, storageRatio,
     check21Balance, checkGeometryCoverage, cascade21,
+    poolAtLevel, parentOfBlock, octantOfBlock, octantOrigin,
   } = A;
 
   ok('pool geometry follows FB = 2*RB + 2*GHOST and rejects a non-dividing RB', () => {
@@ -232,6 +233,131 @@ const close = (a, b, tol, what) =>
     }
   });
 
+
+
+  // --- the pool-parent path (plans/3D.md M5.1a) ----------------------------
+  //
+  // The claim these check is that there is NO second addressing scheme at
+  // depth: level m's tiling is level 1's tiling of a 2^(m-1)-times larger
+  // domain, so every function above works unchanged. A claim like that is
+  // exactly the kind that is true when written and quietly false two
+  // milestones later, so it is re-run at depth rather than argued.
+
+  ok('poolAtLevel(m=1) IS the pool, and deeper levels double the block grid', () => {
+    const p = makePool({ dims: [16, 16, 16], rb: 4 });
+    const l1 = poolAtLevel(p, 1);
+    assert.deepStrictEqual(l1.nb, p.nb);
+    assert.strictEqual(l1.FB, p.FB);
+    assert.strictEqual(l1.tileCells, p.tileCells);
+    for (let m = 2; m <= 4; m++) {
+      const lm = poolAtLevel(p, m);
+      // Same tile, more of them -- the uniform-tile-shape claim in one line.
+      assert.strictEqual(lm.FB, p.FB, `FB changed at level ${m}`);
+      assert.strictEqual(lm.rb, p.rb, `RB changed at level ${m}`);
+      assert.deepStrictEqual(lm.nb, p.nb.map(n => n * 2 ** (m - 1)), `nb at level ${m}`);
+      // ...and it agrees with the block grid check21Balance/cascade21 were
+      // written against in M4.2a and M4.2b-iv, which is the whole reason
+      // those two need no change at depth.
+      assert.deepStrictEqual(lm.nb, p.nb.map(n => n * 2 ** (m - 1)));
+    }
+    assert.throws(() => poolAtLevel(p, 0), /no pool/);
+  });
+
+  ok('resolveSource agrees with the global route at level 2 AND level 3', () => {
+    // The same check as "THE ONE" above, at depth. If level m needed its own
+    // addressing this is where it would show, because the global route is
+    // recomputed from that level's own dims and shares no arithmetic with
+    // resolveSource.
+    const base = makePool({ dims: [8, 8, 8], rb: 2 });
+    for (const m of [2, 3]) {
+      const p = poolAtLevel(base, m);
+      const { blockSlot } = refineWhere(p, ({ bx, by, bz }) => (bx + by + bz) % 3 !== 2);
+      const RB2 = 2 * p.rb;
+      let checked = 0, viaNeighbour = 0, viaNull = 0;
+      for (let id = 0; id < p.nBlocks; id++) {
+        if (blockSlot[id] < 0) continue;
+        const b = p.blockOf(id);
+        for (let fz = GHOST; fz < GHOST + RB2; fz++) {
+          for (let fy = GHOST; fy < GHOST + RB2; fy++) {
+            for (const d of [[1, 0, 0], [-1, 1, 0], [0, -1, 1], [1, 1, 1], [-1, -1, -1]]) {
+              const src = [GHOST - d[0], fy - d[1], fz - d[2]];
+              const got = resolveSource(p, blockSlot, b, src);
+              const want = fromGlobalFine(p, toGlobalFine(p, b, src));
+              const wantSlot = blockSlot[p.blockId(...want.block)];
+              checked++;
+              if (want.block.every((c, i) => c === b[i])) {
+                assert.ok(got && got.own, `L${m}: expected own-tile for ${src} in ${b}`);
+                assert.deepStrictEqual([got.fx, got.fy, got.fz], want.local, `L${m}: own local for ${src}`);
+              } else if (wantSlot < 0) {
+                assert.strictEqual(got, null, `L${m}: expected null for ${src} in ${b}`);
+                viaNull++;
+              } else {
+                assert.ok(got && !got.own, `L${m}: expected neighbour for ${src} in ${b}`);
+                assert.strictEqual(got.slot, wantSlot, `L${m}: neighbour slot for ${src} in ${b}`);
+                assert.deepStrictEqual([got.fx, got.fy, got.fz], want.local, `L${m}: neighbour local for ${src}`);
+                viaNeighbour++;
+              }
+            }
+          }
+        }
+      }
+      assert.ok(checked > 500, `L${m}: only ${checked} combinations checked`);
+      assert.ok(viaNeighbour > 20, `L${m}: neighbour path exercised only ${viaNeighbour} times`);
+      assert.ok(viaNull > 20, `L${m}: missing-neighbour path exercised only ${viaNull} times`);
+    }
+  });
+
+  ok('the octant bits alone place a child inside its parent tile', () => {
+    // The pool-parent path's one genuinely new piece: no spatial lookup and
+    // no parent-chain walk, just q. Checked against the GLOBAL route at both
+    // levels -- child global cell -> parent global cell by one halving ->
+    // parent block by one division -> parent-local index. That route shares
+    // nothing with octantOrigin's closed form.
+    const base = makePool({ dims: [8, 8, 8], rb: 2 });
+    for (const m of [2, 3]) {
+      const child = poolAtLevel(base, m);
+      const par = poolAtLevel(base, m - 1);
+      const RB2 = 2 * child.rb;
+      let checked = 0;
+      for (let id = 0; id < child.nBlocks; id += 5) {
+        const b = child.blockOf(id);
+        const pb = parentOfBlock(b), q = octantOfBlock(b);
+        // The parent block is the one that geometrically contains the child.
+        assert.deepStrictEqual(pb, b.map(x => Math.floor(x / 2)), `L${m}: parent of ${b}`);
+        assert.ok(pb.every((c, i) => c < par.nb[i]), `L${m}: parent ${pb} outside the level-${m - 1} grid`);
+        for (const j of [0, 1, GHOST, GHOST + 1, GHOST + RB2 - 1, GHOST + RB2, child.FB - 1]) {
+          for (let a = 0; a < 3; a++) {
+            // Independent route, in global coordinates at each level.
+            const gChild = b[a] * RB2 + (j - GHOST);
+            const nParent = par.dims[a] * 2;                  // parent cells per axis, globally
+            const gParent = Math.floor(gChild / 2);
+            const wrapped = ((gParent % nParent) + nParent) % nParent;
+            const pBlock = Math.floor(wrapped / (2 * par.rb));
+            const pLocal = wrapped - pBlock * 2 * par.rb + GHOST;
+            // Interior cells must land in the parent block the octant names;
+            // ring cells may leave it, which is the ring's whole job.
+            if (j >= GHOST && j < GHOST + RB2) {
+              assert.strictEqual(pBlock, pb[a], `L${m}: axis ${a}, child ${b} local ${j} -> parent block`);
+              assert.strictEqual(pLocal, octantOrigin(child.rb, q[a]) + ((j - GHOST) >> 1),
+                `L${m}: axis ${a}, child ${b} octant ${q[a]} local ${j} -> parent local`);
+            }
+            // The CONTINUOUS mapping, which is what the interpolation
+            // stencil actually consumes: the same fineToCoarseUnit the
+            // dense-parent path uses, with the octant offset as its origin.
+            // Independent route: match physical positions -- a child cell
+            // centre is at (g + 0.5) * dx_child, a parent-local coordinate u
+            // is at (pBlock*2RB + u - GHOST + 0.5) * dx_parent, and
+            // dx_child = dx_parent / 2.
+            const u = fineToCoarseUnit(j, octantOrigin(child.rb, q[a]));
+            const uWant = GHOST - 0.5 + (gChild + 0.5) / 2 - pb[a] * 2 * par.rb;
+            close(u, uWant, 1e-12, `L${m}: axis ${a}, child ${b} local ${j} continuous parent coord`);
+            checked++;
+          }
+        }
+      }
+      assert.ok(checked > 100, `L${m}: only ${checked} placements checked`);
+    }
+  });
 
   // --- structural invariants (plans/3D.md M4.2, risk #2) -------------------
   //
