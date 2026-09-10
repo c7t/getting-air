@@ -449,3 +449,66 @@ export function octantOfBlock(b) { return [b[0] & 1, b[1] & 1, b[2] & 1]; }
 // pool parents is how the two would drift, and the drift would look like a
 // seam rather than like a bug.
 export function octantOrigin(rb, q) { return GHOST + q * rb; }
+
+// THE REFINEMENT HIERARCHY (plans/3D.md M5.1b). Per-level blockSlot maps for
+// a hierarchy `levels` deep, from ONE criterion.
+//
+// THE CRITERION IS EVALUATED AT THE FINEST LEVEL ONLY, and every coarser
+// level's set is whatever `cascade21` requires around it. That is not a
+// simplification, it is the correct statement of what geometry-forced
+// refinement asks for: "push the body's surface and its immediate
+// surroundings onto the FINEST configured level" (sec 1.3). The intermediate
+// shells exist solely as the buffer 2:1 balance demands, so deriving them
+// from the closure gives exactly that and nothing more -- and cascade21's
+// minimality test is the proof there is no halo of unnecessary tiles.
+//
+// It also disposes of a worry the 2D arc carried into its M10: "retune
+// REFINE_THRESH per level, a level-2 region at the surface with level-1 as
+// the buffer shell". For a geometry-forced criterion there is nothing per
+// level to tune -- there is one margin, at the finest level, and the shells
+// follow. A vorticity-driven criterion will need per-level thresholds; this
+// one does not, and that should not be discovered again later.
+//
+// BIT-IDENTICAL AT levels=2 BY CONSTRUCTION, which is M5.1b's gate: the
+// finest level IS level 1, the L0-unit rescale is a no-op, cascade21 is the
+// identity (M4.2b-iv), and slots are handed out in ascending block-id order
+// exactly as refineWhere does. tools/test-d3-amr.js asserts the equality
+// against refineWhere/refineNearBody rather than trusting that reading.
+//
+// `want` is called with the SAME shape refineWhere's predicate takes and in
+// L0 CELL UNITS at every level, so one predicate serves all depths. A
+// level-m view's own cells are 2^(m-1) times smaller than an L0 cell (see
+// poolAtLevel), and getting that rescale wrong would refine a shell of the
+// wrong physical size -- which is why the test drives it at depth 3 and 4,
+// where the factor is not 1.
+export function refineHierarchy(pool, { levels, want, maxSlots }) {
+  if (levels < 2) return { levels: 0, byLevel: [null], sets: [null] };
+  const deepest = levels - 1;
+  const view = poolAtLevel(pool, deepest);
+  const scale = 2 ** (deepest - 1);
+  const finest = new Set();
+  for (let id = 0; id < view.nBlocks; id++) {
+    const [bx, by, bz] = view.blockOf(id);
+    const lo = [bx * view.rb, by * view.rb, bz * view.rb];
+    const hi = lo.map(c => c + view.rb);
+    const mid = lo.map(c => c + view.rb / 2);
+    const l0 = (v) => v.map(c => c / scale);
+    if (want({ level: deepest, bx, by, bz, id, lo: l0(lo), hi: l0(hi), mid: l0(mid) })) {
+      finest.add(`${bx},${by},${bz}`);
+    }
+  }
+  const wants = [null];
+  for (let m = 1; m < levels; m++) wants[m] = (m === deepest ? finest : new Set());
+  const closed = cascade21(wants, (m) => poolAtLevel(pool, m).nb, { levels });
+
+  const byLevel = [null];
+  for (let m = 1; m < levels; m++) {
+    const lv = poolAtLevel(pool, m, { maxSlots: maxSlots && maxSlots[m] });
+    // Ascending block id, the same deterministic order refineWhere uses --
+    // a run has to be reproducible, and the 2D pool's atomicSub free list is
+    // exactly why CLAUDE.md records its Cd as reproducible only to ~1e-3.
+    const alloc = refineWhere(lv, ({ bx, by, bz }) => closed.sets[m].has(`${bx},${by},${bz}`));
+    byLevel[m] = { level: m, pool: lv, ...alloc };
+  }
+  return { levels, byLevel, sets: closed.sets, forced: closed.forced };
+}

@@ -36,7 +36,7 @@ const close = (a, b, tol, what) =>
     GHOST, fineToCoarseUnit, coarseUnitToFine, makePool, refineWhere,
     refineNearBody, resolveSource, toGlobalFine, fromGlobalFine, storageRatio,
     check21Balance, checkGeometryCoverage, cascade21,
-    poolAtLevel, parentOfBlock, octantOfBlock, octantOrigin,
+    poolAtLevel, parentOfBlock, octantOfBlock, octantOrigin, refineHierarchy,
   } = A;
 
   ok('pool geometry follows FB = 2*RB + 2*GHOST and rejects a non-dividing RB', () => {
@@ -695,6 +695,111 @@ const close = (a, b, tol, what) =>
       const orp = orphans(cut, 4).length;
       assert.ok(bal > 0 || orp > 0, `removing forced octet ${g} left a legal tree: it was not necessary`);
     }
+  });
+
+  // --- the refinement hierarchy (plans/3D.md M5.1b) -------------------------
+
+  ok('refineHierarchy at levels=2 is BIT-IDENTICAL to refineWhere/refineNearBody', () => {
+    // M5.1b's gate, and the reason the whole hierarchy can be introduced
+    // against an unchanged answer: at levels=2 the finest level IS level 1,
+    // the L0 rescale is a no-op, and cascade21 is the identity. If this ever
+    // stops holding, the GPU side's own bit-identical gate is measuring
+    // something that already moved.
+    const p = makePool({ dims: [32, 32, 32], rb: 4 });
+    const cases = [
+      ['box', ({ mid }) => mid.every(c => c >= 8 && c < 24)],
+      ['all', () => true],
+      ['ragged', ({ bx, by, bz }) => (bx + by + bz) % 3 !== 2],
+    ];
+    for (const [name, pred] of cases) {
+      const flat = refineWhere(p, pred);
+      const h = refineHierarchy(p, { levels: 2, want: pred });
+      assert.deepStrictEqual(Array.from(h.byLevel[1].blockSlot), Array.from(flat.blockSlot), `${name}: blockSlot`);
+      assert.deepStrictEqual(Array.from(h.byLevel[1].slotToBlock), Array.from(flat.slotToBlock), `${name}: slotToBlock`);
+      assert.strictEqual(h.byLevel[1].activeSlots, flat.activeSlots, `${name}: activeSlots`);
+    }
+    // ...including the real geometry-forced path, predicate and all.
+    const c = [16, 16, 16], R = 5, margin = 2;
+    const sdf = (q) => Math.hypot(q[0] - c[0], q[1] - c[1], q[2] - c[2]) - R;
+    const body = ({ lo, hi }) => {
+      let best = Infinity;
+      for (let i = 0; i < 8; i++) best = Math.min(best, sdf([i & 1 ? hi[0] : lo[0], i & 2 ? hi[1] : lo[1], i & 4 ? hi[2] : lo[2]]));
+      return Math.min(best, sdf([(lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, (lo[2] + hi[2]) / 2])) <= margin;
+    };
+    const flat = refineNearBody(p, sdf, margin);
+    const h = refineHierarchy(p, { levels: 2, want: body });
+    assert.deepStrictEqual(Array.from(h.byLevel[1].blockSlot), Array.from(flat.blockSlot), 'body: blockSlot');
+    assert.ok(flat.activeSlots > 0, 'the body must actually refine something');
+  });
+
+  ok('refineHierarchy builds a 2:1-balanced, properly parented tree at depth', () => {
+    const p = makePool({ dims: [32, 32, 32], rb: 4 });
+    const c = [16, 16, 16], R = 5, margin = 2;
+    const sdf = (q) => Math.hypot(q[0] - c[0], q[1] - c[1], q[2] - c[2]) - R;
+    const body = ({ lo, hi }) => {
+      let best = Infinity;
+      for (let i = 0; i < 8; i++) best = Math.min(best, sdf([i & 1 ? hi[0] : lo[0], i & 2 ? hi[1] : lo[1], i & 4 ? hi[2] : lo[2]]));
+      return Math.min(best, sdf([(lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, (lo[2] + hi[2]) / 2])) <= margin;
+    };
+    for (const levels of [3, 4]) {
+      const h = refineHierarchy(p, { levels, want: body });
+      const nbAt = (m) => poolAtLevel(p, m).nb;
+      // The invariant, by the checker written in M4.2a -- not by re-running
+      // the closure that produced the set.
+      const bal = check21Balance(h.sets, nbAt, { levels });
+      assert.strictEqual(bal.violations.length, 0,
+        `levels=${levels}: ${bal.violations.length} violations, e.g. ${JSON.stringify(bal.violations[0])}`);
+      // Every level is populated and properly parented: a hierarchy that
+      // refined only the finest level would pass 2:1 above only if the
+      // closure were broken, so this is the cross-check on that.
+      for (let m = 1; m < levels; m++) {
+        assert.ok(h.byLevel[m].activeSlots > 0, `levels=${levels}: level ${m} is empty`);
+        for (const k of h.sets[m]) {
+          if (m < 2) continue;
+          const b = k.split(',').map(Number);
+          assert.ok(h.sets[m - 1].has(parentOfBlock(b).join(',')),
+            `levels=${levels}: level-${m} block ${k} has no parent`);
+        }
+      }
+      // Coarser levels must ENCLOSE finer ones, which is what a shell IS.
+      // Checked in physical L0 units so it is a statement about geometry
+      // rather than about indices.
+      for (let m = 2; m < levels; m++) {
+        const wFine = poolAtLevel(p, m).rb / 2 ** (m - 1);
+        const wCoarse = poolAtLevel(p, m - 1).rb / 2 ** (m - 2);
+        let maxFine = -Infinity, maxCoarse = -Infinity;
+        for (const k of h.sets[m]) maxFine = Math.max(maxFine, (Number(k.split(',')[0]) + 1) * wFine);
+        for (const k of h.sets[m - 1]) maxCoarse = Math.max(maxCoarse, (Number(k.split(',')[0]) + 1) * wCoarse);
+        assert.ok(maxCoarse >= maxFine,
+          `levels=${levels}: level ${m - 1} (x<=${maxCoarse}) does not enclose level ${m} (x<=${maxFine})`);
+      }
+    }
+  });
+
+  ok('refineHierarchy covers the body at the FINEST level, at cell granularity', () => {
+    // The requirement geometry-forced refinement actually makes, checked the
+    // independent way checkGeometryCoverage already checks it at level 1:
+    // scan cells against the SDF rather than re-running the block predicate.
+    // Driven at depth 3, where the finest view's cells are 4x smaller than
+    // an L0 cell -- if refineHierarchy's L0 rescale were wrong, the shell
+    // would be the wrong physical size and this is what would say so.
+    const p = makePool({ dims: [16, 16, 16], rb: 4 });
+    const c = [8, 8, 8], R = 3, margin = 1.5;
+    const sdf = (q) => Math.hypot(q[0] - c[0], q[1] - c[1], q[2] - c[2]) - R;
+    const body = ({ lo, hi }) => {
+      let best = Infinity;
+      for (let i = 0; i < 8; i++) best = Math.min(best, sdf([i & 1 ? hi[0] : lo[0], i & 2 ? hi[1] : lo[1], i & 4 ? hi[2] : lo[2]]));
+      return Math.min(best, sdf([(lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, (lo[2] + hi[2]) / 2])) <= margin;
+    };
+    const levels = 3, h = refineHierarchy(p, { levels, want: body });
+    const fine = h.byLevel[levels - 1];
+    // The finest view's cells are 2^(m-1) per L0 cell, so the SDF is
+    // evaluated on the rescaled grid.
+    const s = 2 ** (levels - 2);
+    const r = checkGeometryCoverage(fine.pool, fine.blockSlot, (q) => sdf(q.map(v => v / s)) * s, margin * s);
+    assert.ok(r.required > 0, 'the body must require cells at the finest level');
+    assert.strictEqual(r.violations.length, 0,
+      `${r.violations.length} cells within the margin sit outside the finest level, e.g. ${JSON.stringify(r.violations[0])}`);
   });
 
   if (!process.exitCode) console.log(`\n${pass} check(s) passed`);
