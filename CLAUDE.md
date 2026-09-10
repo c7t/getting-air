@@ -208,9 +208,13 @@ comment above `N_LEVELS`, not this file, for what's current.
 
 ## The 3D fork (`plans/3D.md`)
 
-**M0-M3 are done, and M4 is in progress**: M4.1a and M4.1b have landed, so
-the coarse/fine interface on the `?interface=explode` path is now exactly
-conservative in mass AND momentum. M4.1c (the linear explosion) is next.
+**M0-M3 are done, and M4 is in progress**: M4.1a, M4.1b and M4.1c have
+landed. The coarse/fine interface on the `?interface=explode` path is now
+exactly conservative in mass AND momentum, and its field error has fallen
+to the no-interface control's level -- a refined box tracks `refine=all` to
+within 8-10% at N = 32/48/64, against the default `interp` path's 3.6x.
+M4.1d is next: body coupling on the explode path, then making it the
+default.
 Read `plans/3D.md` before touching any of this — in particular its decision
 table at the top, which records what is settled so it does not get
 re-argued. Two things are settled and load-bearing:
@@ -282,7 +286,21 @@ Also settled, and worth knowing before adding a page:
   place by construction, so the convex corner that defeated refluxing never
   arises. No Dupuis-Chopard rescale anywhere on this path.
 
-  **The one trap, and it cost a full debugging cycle: a ring cell's content
+  **CONSERVATION AND CONSISTENCY ARE SEPARATE REQUIREMENTS HERE, and the
+  geometry ladder cannot tell them apart.** M4.1b ended exactly
+  conservative and did NOT preserve a uniform flow, and the conservation
+  gate went green over a defect worth 8x the field error. At a convex edge
+  a coarse cell's CHILD can cross the seam in one fine step while the
+  coarse cell itself does not, and it cuts both ways: a half-step EXIT no
+  coarse bucket can absorb (drop it and mass leaks; add it and the
+  receiving cell gets more than a uniform state holds), and a half-step
+  ENTRY no coarse cell explodes (leave it and the fine region gathers zero
+  where it should gather the parent's population). They are one defect seen
+  from both sides, they land on the SAME (cell, direction) slot, and in a
+  uniform flow their counts are equal so the net write is zero. **Never add
+  one without the other.**
+
+  **The trap that cost a full debugging cycle: a ring cell's content
   is claimed by `coarse(p) - e_i`, and that cell is not always covered.**
   The `t + dt/2` outflux has moved one FINE cell, so on a diagonal
   direction `coarse(p)` advances on only some of `e_i`'s axes and
@@ -298,6 +316,15 @@ Also settled, and worth knowing before adding a page:
   was measured 4.6x worse in the field, because at a convex corner it hands
   a coarse cell mass that physically sits in a different neighbour.
   Conservation is necessary and not sufficient.
+
+- **A stage that measures as a no-op may be downstream of something
+  bigger.** M4.1c's linear explosion, measured against M4.1b's interface,
+  moved the box case from 2.23e-2 to 2.19e-2 -- inside run-to-run noise,
+  and a reasonable read would have been "the explosion is not where the
+  error is". It was masked: the edge inconsistency above is O(1) and
+  swamped a second-order term. With that fixed, the SAME change is worth a
+  factor of two on every geometry. Before concluding a change does
+  nothing, check whether a larger defect is saturating the measurement.
 
 - **Refluxing (`?reflux=1`) is SUPERSEDED. Do not extend it.** It is what
   measured the corner and is why explode/coalesce was found: it makes the

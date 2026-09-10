@@ -33,18 +33,24 @@
 //   ?margin=2  ?boxfrac=0.5
 //   ?interface=  `interp` (default) is the M3 trilinear-plus-Dupuis-Chopard
 //                coupling: not conservative, but correct everywhere.
-//                `explode` is the M4.1b Chen et al. 2006 explode/coalesce.
-//                EXACTLY conservative in mass AND momentum on every rung of
-//                the geometry ladder (all/slab/bar/box) as of the orphan
-//                pass in common_d3_amr_coalesce.wgsl. Still not the default:
-//                it has no body coupling yet and its remaining seam error
-//                wants the linear explosion. plans/3D.md M4.1b, M4.1c-d.
+//                `explode` is the Chen et al. 2006 explode/coalesce. Exactly
+//                conservative in mass AND momentum on every rung of the
+//                geometry ladder (all/slab/bar/box), and as of M4.1c its
+//                field error tracks the no-interface control to within
+//                8-10% -- there is no seam signature left to find. Still not
+//                the default only because it has no body coupling yet.
+//                plans/3D.md M4.1b-c; M4.1d is the switch-over.
 //   ?reflux=1    OPT-IN coarse/fine interface flux correction (M4). Makes
 //                the interface exactly conservative in mass and momentum,
 //                and on a seam with no convex corner (?refine=slab) halves
 //                the field error. On one WITH a corner (?refine=box, and
 //                any body-fitted shell) it is much WORSE than leaving it
 //                off. Not the default for that reason -- plans/3D.md M4.
+//   ?explin=0    M4.1c: restore M4.1b's UNIFORM explosion. Default 1 is the
+//                linear one -- Ndot_i^f = Ndot_i^c + (r_f - r_c).F_i, with
+//                F_i a central difference taken only on axes with two real
+//                coarse neighbours and projected orthogonal to c_i. Only
+//                meaningful with ?interface=explode.
 //   ?dcpre=1     restore the PRE-collision Dupuis-Chopard fneq factor at the
 //                coarse/fine transfers. That is wrong for this solver's
 //                post-collision buffers and was the M3 interface bug; the
@@ -147,7 +153,8 @@ async function init() {
   // silently ignoring it is the failure above wearing a different hat.
   const PAGE_PARAMS = new Set(['scenario', 'q', 'axis', 'slice', 'mode', 'spf', 'live',
     'uscale', 'vscale', 'vortGamma', 'bounceback', 'chiEps', 'vmax', 'omax',
-    'levels', 'rb', 'refine', 'margin', 'boxfrac', 'dcpre', 'reflux', 'interface']);
+    'levels', 'rb', 'refine', 'margin', 'boxfrac', 'dcpre', 'reflux', 'interface',
+    'explin']);
   for (const k of urlParams.keys()) {
     if (PAGE_PARAMS.has(k) || k in SCENARIOS[scenarioName].defaults) continue;
     throw new Error(`?${k}=: not a parameter of scenario "${scenarioName}" `
@@ -474,6 +481,10 @@ async function init() {
   // in the shipped build (shaders/common_d3_pool.wgsl derives both, and
   // tools/analyze-d3-interface.js is what drives the comparison).
   const DC_PRE = urlParams.get('dcpre') === '1' ? 1 : 0;
+  // M4.1c. The explosion is LINEAR by default; ?explin=0 restores M4.1b's
+  // uniform one so the two can be A/B'd on the same GPU in the same session.
+  // Only meaningful with ?interface=explode.
+  const EXPLODE_LINEAR = urlParams.get('explin') === '0' ? 0 : 1;
   let interpGhostPipe = null, interpFullPipe = null, step1Pipe = null, avgPipe = null;
   let interpBG = null, step1BG_AB = null, step1BG_BA = null, avgBGA = null, avgBGB = null;
   let fluxPipeSet = null, fluxPipeAdd = null, refluxPipe = null;
@@ -622,7 +633,7 @@ async function init() {
         { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
         { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
       ]});
-      explodePipe = await mk(explodeBGL, explodeModule, poolConst);
+      explodePipe = await mk(explodeBGL, explodeModule, { ...poolConst, EXPLODE_LINEAR });
       coalescePipe = await mk(coalesceBGL, coalesceModule, poolConst);
       // Explode reads the coarse field at t and writes the ring of whichever
       // pool buffer substep A will read; coalesce writes back into that SAME

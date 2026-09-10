@@ -145,6 +145,7 @@ fn coalesceOrphans(c: vec3<u32>) {
     if (coveredCoarse3(t)) { continue; }
 
     var s = 0f;
+    var nIn = 0f;
     for (var k = 0u; k < 8u; k++) {
       let off = vec3<i32>(i32(k & 1u), i32((k >> 1u) & 1u), i32((k >> 2u) & 1u));
       let p = wrapFine3(vec3<i32>(t) * 2 + off);
@@ -154,10 +155,24 @@ fn coalesceOrphans(c: vec3<u32>) {
       let q = wrapFine3(p - ei);
       let qb = blockOfFine(q);
       let qs = blockSlot[blockIdOf(qb)];
-      if (qs < 0) { continue; }
-      s += f_pool[i * poolPlane + poolCell(u32(qs), localInTile3(p, qb))];
+      if (qs >= 0) {
+        s += f_pool[i * poolPlane + poolCell(u32(qs), localInTile3(p, qb))];
+      }
+      // IN-ORPHAN, the mirror of the above and the other half of M4.1c's
+      // edge fix. common_d3_amr_explode.wgsl injects c's population into
+      // any of c's OWN children whose one-fine-step destination is inside
+      // the refined region, even though c + e_i is unrefined. That mass has
+      // left the coarse grid, so it has to be taken OFF this slot -- exactly
+      // the amount injected, one eighth of f_i(c) per child, uniform.
+      let ch = wrapFine3(vec3<i32>(c) * 2 + off + ei);
+      if (blockSlot[blockIdOf(blockOfCoarse(coarseOfFine(ch)))] >= 0) { nIn += 1f; }
     }
-    if (s != 0f) { f_coarse[i * ncells + cell] += s * 0.125f; }
+    // One write. In a uniform flow the two orphan counts are equal and this
+    // is exactly zero, which is the CONSISTENCY the OUT-orphan alone broke:
+    // adding half-step exits without removing half-step entries handed the
+    // receiving coarse cell more than a uniform state can hold.
+    let net = s - nIn * f_coarse[i * ncells + cell];
+    if (net != 0f) { f_coarse[i * ncells + cell] += net * 0.125f; }
   }
 }
 
