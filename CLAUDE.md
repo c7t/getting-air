@@ -285,9 +285,18 @@ Also settled, and worth knowing before adding a page:
   change the formulation (volumetric: advection is a rigid-body translation
   of a cell and mass moves by VOLUME OVERLAP, which tiles at corners
   because overlaps partition space) rather than to patch the balance --
-  plans/3D.md M4 has both primary sources read and, importantly, the reason
-  Rohde 2006 alone is not enough: it is MASS conservative and our leak is
-  in MOMENTUM.
+  plans/3D.md M4 has all three primary sources read. **The scheme to build
+  is Chen et al. 2006's EXPLODE/COALESCE** (the PowerFLOW algorithm): the
+  interface coarse layer is subdivided so coarse and fine voxels overlap
+  the same volume, a state whose coarse neighbour does not exist is
+  exploded into the fine voxels and REMOVED from coarse dynamics, and the
+  matching fine states are coalesced back and removed from fine dynamics.
+  Mass goes exactly one place by construction, so the corner never arises.
+  Exact in mass, momentum and energy; second order with a LINEAR explosion,
+  which is conservation-free because our children are already symmetric
+  about the coarse centre. It removes the Dupuis-Chopard rescale entirely.
+  Rohde 2006 is the same family but MASS-only, and our leak is in
+  MOMENTUM.
 
 - **`?refine=all` cannot see an interface bug**, so never treat it as
   coverage for one. With every block refined, the restriction's rescaled
