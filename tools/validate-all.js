@@ -143,6 +143,14 @@ function defaultConfigs(baseUrl) {
       url: `${baseUrl}/index-3d.html?n=24`,
       checkBoots: true,
     },
+    // The AMR page under a boot smoke as well as the physics gate: the gate
+    // drives it paused via debugStepSync, so nothing else here would notice
+    // if the live render loop broke with a pool bound.
+    {
+      name: 'd3-amr-boot',
+      url: `${baseUrl}/index-3d.html?n=24&levels=2&refine=all`,
+      checkBoots: true,
+    },
     {
       name: 'd3-spike-boot',
       url: `${baseUrl}/index-3d-spike.html?n=32&steps=2&reps=1`,
@@ -294,6 +302,15 @@ function defaultConfigs(baseUrl) {
     // value per second in this whole file, since that is the hardest new
     // code and its errors are the least visible (a wrong gyroscopic
     // coupling conserves |L| perfectly and simply tumbles wrongly).
+    // M3: the octree pool at N=2, scored on the analytic Beltrami flow with
+    // every block refined (no coarse/fine interface). See
+    // benchmarks/d3.json's amr_interface_note for what is NOT gated.
+    {
+      name: 'd3-amr',
+      url: `${baseUrl}/index-3d.html?scenario=beltrami&levels=2`,
+      checkD3Physics: 'amr',
+      d3Filter: c => c.name === 'amr-all-RB4',
+    },
     {
       name: 'd3-spin',
       url: `${baseUrl}/index-3d.html?scenario=spin`,
@@ -462,14 +479,21 @@ async function runTgvPhysics(Page, Runtime, opts, config) {
 async function runD3Physics(Page, Runtime, opts, config, watch) {
   const bench = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, 'benchmarks', 'd3.json'), 'utf8'));
   const kind = config.checkD3Physics;
-  const key = { duct: 'duct_cases', beltrami: 'beltrami_cases', tgv: 'tgv_cases', sphere: 'sphere_cases', spin: 'spin_cases' }[kind];
-  const run = { duct: runDuctCase, beltrami: runBeltramiCase, tgv: runTgvReport, sphere: runSphereCase, spin: runSpinCase }[kind];
+  const key = { duct: 'duct_cases', beltrami: 'beltrami_cases', tgv: 'tgv_cases',
+                sphere: 'sphere_cases', spin: 'spin_cases', amr: 'amr_cases' }[kind];
+  const run = { duct: runDuctCase, beltrami: runBeltramiCase, tgv: runTgvReport,
+                sphere: runSphereCase, spin: runSpinCase, amr: runBeltramiCase }[kind];
   // The M2 body cases build their URLs from a different set of knobs (Re,
   // bounceback) than the M1 fluid ones, so the URL builder follows the case
   // kind rather than being one function that knows about everything.
+  // The case KIND is not always the scenario name: the M3 `amr` cases are
+  // beltrami runs with pool parameters, so the scenario they drive is
+  // beltrami. Keeping the two separate is what lets a scenario be scored by
+  // more than one kind of check.
+  const scenarioOf = { amr: 'beltrami' };
   const urlFor = (c) => (kind === 'sphere' || kind === 'spin')
     ? d3BodyCaseUrl(opts.baseUrl, kind, c, opts.extra)
-    : d3CaseUrl(opts.baseUrl, kind, c, opts.extra);
+    : d3CaseUrl(opts.baseUrl, scenarioOf[kind] || kind, c, opts.extra);
   const cases = bench[key].filter(config.d3Filter || (() => true));
 
   const results = [];
@@ -482,7 +506,7 @@ async function runD3Physics(Page, Runtime, opts, config, watch) {
     results.push({ name: c.name, ...res });
   }
   const checksOf = (r) => (kind === 'duct' ? [r.fieldCheck, r.peakCheck, r.xCheck]
-    : kind === 'beltrami' ? [r.fieldCheck, r.rateCheck]
+    : (kind === 'beltrami' || kind === 'amr') ? [r.fieldCheck, r.rateCheck]
     : kind === 'sphere' ? [r.cdCheck, r.settledCheck, r.lateralCheck]
     : kind === 'spin' ? [r.angCheck, r.lCheck, r.qCheck, r.movedCheck]
     : [r.finiteCheck]);

@@ -5,14 +5,16 @@
     "beltrami": "Decaying ABC (Beltrami) flow, triply periodic. curl(u) = k*u, so the nonlinear term is a pure gradient and u(t) = u0 * exp(-nu k^2 t) EXACTLY, with the spatial shape preserved. Genuinely three-dimensional and time-dependent -- an asymmetry between the axes (a transposed index, a dropped uz term in feq, a wrong ez entry) breaks shape preservation, which is what field_l2_tol measures, while decay_rate_tol measures the viscosity the solver actually realizes.",
     "tgv": "3D Taylor-Green vortex. NOT a gate: the nonlinear term does not vanish, so there is no closed form, and the standard Re=1600 comparison is against digitized DNS dissipation curves at 256^3-512^3 that this project does not have. Present as the initial condition that comparison will need, and reported (kinetic energy, enstrophy, dissipation rate) so a regression in it is at least VISIBLE. Reported cases have no tolerances and never fail the suite.",
     "sphere": "Flow past a PINNED sphere in uniform crossflow, ALBC sponge on every face, Cd = Fx / (1/2 rho U^2 pi R^2) against the Schiller-Naumann correlation Cd = 24/Re (1 + 0.15 Re^0.687). Below Re ~ 210 the wake is steady and axisymmetric, so unlike the 2D cylinder there is nothing to time-average -- Cd simply settles, which `settle_tol` verifies rather than assumes (two samples, 70% and 100% of the run). `lateral_tol` bounds the cross-flow force |(Cl, Cs)| / Cd: it must vanish by symmetry, and it is an INDEPENDENT check -- a transposed axis or a wrong torque in the six-scalar force reduction shows up there and not in Cd at all. Cases come in resolution pairs at the same Re so the suite can assert that refining moves Cd TOWARD the reference; a single tolerance can be met by a body of the wrong size with a compensating error, a convergence trend cannot.",
-    "spin": "The 6-DOF integrator with the fluid force switched off (NO_FLUID_FORCE), compared step for step against d3-body.mjs's stepFreeBody(). Not a fluid case: shaders/d3_physics.wgsl is the hardest new code in M2 and its errors are the least visible -- a wrong gyroscopic coupling still conserves |L| exactly and simply tumbles wrongly -- so it is checked against the host reference on real GPU code. The spin starts near the INTERMEDIATE principal axis so the compared trajectory is the tumbling one; `movedCheck` asserts the body actually turned, since agreement on a body that barely moved would prove nothing."
+    "spin": "The 6-DOF integrator with the fluid force switched off (NO_FLUID_FORCE), compared step for step against d3-body.mjs's stepFreeBody(). Not a fluid case: shaders/d3_physics.wgsl is the hardest new code in M2 and its errors are the least visible -- a wrong gyroscopic coupling still conserves |L| exactly and simply tumbles wrongly -- so it is checked against the host reference on real GPU code. The spin starts near the INTERMEDIATE principal axis so the compared trajectory is the tumbling one; `movedCheck` asserts the body actually turned, since agreement on a body that barely moved would prove nothing.",
+    "amr": "AMR at N=2 (plans/3D.md M3), scored on the SAME analytic Beltrami flow as the dense gate. `refine=all` refines every block, so there is no coarse/fine interface anywhere: it validates the octree pool, the fine solver with DIRECT_GHOST, the ring, the coarse->fine interpolation, the fine->coarse restriction and the S_Advance schedule end to end, against an exact solution. It should be BETTER than the dense run of the same case, not merely equal -- the fine level resolves the mode at twice the resolution -- and it is: decay-rate error -1.22e-4 against dense's +9.38e-4. The RB=4 and RB=8 cases are bit-identical to each other, which is the evidence that the tile decomposition does not affect the answer. NOT GATED HERE: a partially-refined domain. See amr_interface_note."
   },
   "measurement": {
     "duct_steps": "settle_multiple x the (1,1) duct mode's time constant 2a^2/(nu pi^2), rounded per case at run time, so the same physical settling is used regardless of N or nu",
     "beltrami_checkpoints": "multiples of td = 1/(nu k^2), k = 2 pi / N",
     "decay_rate": "fit via -ln(rms(t_b)/rms(t_a))/(t_b - t_a) between the last two checkpoints, rms taken over the strided full-volume sample",
     "sphere_steps": "settle_convective x the convective time D/U, rounded per case. Cd was observed settled to three digits by ~20 D/U at every Re tested; the default 30 leaves margin.",
-    "sphere_cd": "Cd = Fx / (1/2 rho U^2 A), A = pi R^2, rho = 1 in lattice units. Fx is read back through the body state, which d3_physics.wgsl fills every step INCLUDING for a pinned body."
+    "sphere_cd": "Cd = Fx / (1/2 rho U^2 A), A = pi R^2, rho = 1 in lattice units. Fx is read back through the body state, which d3_physics.wgsl fills every step INCLUDING for a pinned body.",
+    "amr_checkpoints": "multiples of the Beltrami decay time td, as for the dense case, so the AMR and dense numbers are directly comparable"
   },
   "tolerances_note": "Set from measurement, 2026-09-09, RTX 4080. Observed duct L2rel spans 6.3e-5 (Q27, tau=0.933) to 1.7e-3 (tau=0.6); observed beltrami worst-checkpoint L2rel spans 9.4e-5 to 8.3e-3 and decay-rate relative error 1.2e-5 to 2.1e-3, converging at second order in N (2.08e-3 -> 9.38e-4 -> 5.60e-4 for N = 32, 48, 64), which is the expected O(k^2) lattice-viscosity correction. Tolerances sit a few times above the worst observed value: loose enough not to be a resolution-dependent tripwire, far tighter than any real defect. tau=0.9330127 is (1/2) + sqrt(3)/4, the BGK value at which the TRT magic parameter Lambda = (tau-1/2)^2 equals 3/16 and halfway bounce-back places the wall EXACTLY halfway between the last fluid cell and the first solid one -- which is the convention d3-scenarios.mjs's ductCoord() and shaders/common_d3_step.wgsl both assume. The tau=0.8 and tau=0.6 duct cases are deliberately off that value and are there to keep the wall-position error visible rather than tuned away.",
   "duct_cases": [
@@ -305,6 +307,61 @@
       ],
       "orientation_tol": 0.02,
       "l_tol": 1e-06
+    }
+  ],
+  "amr_interface_note": "OPEN ISSUE, measured 2026-09-09, RTX 4080. With a PARTIAL refinement the coarse/fine interface injects a per-step error that accumulates roughly linearly. Bucketing the field error by distance from the refined box (Beltrami, n=48, boxfrac=0.5): at t = 1,2,4,8,16,32,64 the coarse cells just OUTSIDE the refined region go 1.35e-3, 3.15e-3, 6.25e-3, 1.02e-2, 1.57e-2, 2.21e-2, 3.24e-2, while cells deep inside stay near 5e-3 and the same run with no interface at all holds 1.6e-3 flat. It is ~0 at t=1, localized to the seam, and linear in t -- a consistent per-step injection, not an addressing mistake (the addressing is separately verified against an independent route by tools/test-d3-amr.js). TESTED AND REJECTED: that substep B sees a ring half a coarse step stale. A second, time-blended ring refresh before substep B made it WORSE (nearOut 3.24e-2 -> 3.93e-2 at t=64), so staleness is not the cause; the TIME_BLEND override remains in the shader, defaulted off. The remaining candidate is that the interface is not CONSERVATIVE -- the coarse and fine solvers compute the flux across the seam independently and the two do not agree, so mass and momentum leak there at a constant rate. The fix is a flux correction (refluxing), which is real work and is NOT in M3. Until it lands, a partially-refined 3D run is not trustworthy for a quantitative number, and the sphere-with-AMR comparison against M2's dense Cd is deliberately NOT part of this suite.",
+  "amr_cases": [
+    {
+      "name": "amr-all-RB4",
+      "n": 48,
+      "tau": 0.8,
+      "u0": 0.04,
+      "q": 19,
+      "levels": 2,
+      "refine": "all",
+      "rb": 4,
+      "checkpoints": [
+        0.5,
+        1.5,
+        3.0
+      ],
+      "field_l2_tol": 0.01,
+      "decay_rate_tol": 0.005
+    },
+    {
+      "name": "amr-all-RB8",
+      "n": 48,
+      "tau": 0.8,
+      "u0": 0.04,
+      "q": 19,
+      "levels": 2,
+      "refine": "all",
+      "rb": 8,
+      "checkpoints": [
+        0.5,
+        1.5,
+        3.0
+      ],
+      "field_l2_tol": 0.01,
+      "decay_rate_tol": 0.005,
+      "matches": "amr-all-RB4"
+    },
+    {
+      "name": "amr-all-Q27",
+      "n": 48,
+      "tau": 0.8,
+      "u0": 0.04,
+      "q": 27,
+      "levels": 2,
+      "refine": "all",
+      "rb": 4,
+      "checkpoints": [
+        0.5,
+        1.5,
+        3.0
+      ],
+      "field_l2_tol": 0.01,
+      "decay_rate_tol": 0.005
     }
   ]
 }

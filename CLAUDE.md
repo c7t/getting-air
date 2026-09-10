@@ -208,7 +208,7 @@ comment above `N_LEVELS`, not this file, for what's current.
 
 ## The 3D fork (`plans/3D.md`)
 
-**M0, M1 and M2 are done**; M3 (the octree pool) is next. Read
+**M0, M1, M2 and M3 are done**; M4 is next. Read
 `plans/3D.md` before touching any of this — in particular its decision table
 at the top, which records what is settled so it does not get re-argued.
 Two things are settled and load-bearing:
@@ -245,6 +245,16 @@ Also settled, and worth knowing before adding a page:
   each carrying its own copy of the same bind groups, which is exactly the
   shape that produced 238e48c. Do not fork `main-3d.js`; add a scenario to
   `d3-scenarios.mjs`.
+
+- **The 3D AMR coarse/fine interface is NOT conservative** (M3's open
+  issue). With every block refined it is excellent -- better than the dense
+  run of the same case -- but a PARTIAL refinement injects a per-step error
+  at the seam that accumulates linearly (measured: 1.35e-3 -> 3.24e-2 over
+  t = 1..64 on the analytic Beltrami box case, against 1.6e-3 flat with no
+  interface). Time-staleness was tested and ruled out. The fix is a flux
+  correction and it is the first item of M4. **Until it lands, do not trust
+  a quantitative number from a partially-refined 3D run**, which is why
+  there is no sphere-with-AMR case in the suite.
 
 What exists today:
 
@@ -290,9 +300,17 @@ What exists today:
   Analytic PASS/FAIL for duct, Beltrami, spin and the bounce-back sphere;
   the 3D TGV only reports; the diffuse sphere cases are regression checks.
 
-      node tools/validate-3d.js                   # owns Chrome; 23 cases
+      node tools/validate-3d.js                   # owns Chrome; 26 cases
       node tools/validate-3d.js --cases=spin-N32
       node tools/validate-3d.js --skip=tgv,sphere,sphere-diffuse
+
+- `d3-amr.mjs` + `tools/test-d3-amr.js` — the octree pool's geometry and
+  addressing (`?levels=2`, `?rb=`, `?refine=all|box|body`). The neighbour
+  resolution is checked against an INDEPENDENT route -- global fine
+  coordinates, where ownership is one division with no ring and no offsets
+  -- rather than by re-running the same arithmetic. RB=4 and RB=8 must give
+  BIT-IDENTICAL results, and the suite asserts that exactly, not to a
+  tolerance: RB changes only how the domain is cut into tiles.
 
   **Read `benchmarks/d3.json`'s `tolerances_note` before re-baselining
   anything** -- the tolerances were set from measurement, and it records

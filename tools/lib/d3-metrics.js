@@ -57,6 +57,10 @@ function checkTol(label, measured, target, tol) {
 // scenario: the gates exercise the code path the interactive page uses.
 function caseUrl(baseUrl, scenario, c, extra) {
   const p = new URLSearchParams({ scenario, n: c.n, tau: c.tau, u0: c.u0, q: c.q || 19, live: '0' });
+  // AMR knobs, present only on the M3 cases.
+  if (c.levels) p.set('levels', c.levels);
+  if (c.refine) p.set('refine', c.refine);
+  if (c.rb) p.set('rb', c.rb);
   return `${baseUrl}/index-3d.html?${p}${extra ? `&${extra}` : ''}`;
 }
 
@@ -120,7 +124,8 @@ async function beltramiSample(Runtime, S, p, t) {
 async function runBeltramiCase(Runtime, opts, c, log) {
   const S = await scenarios();
   const p = await evalOrThrow(Runtime, 'window.__D3.getParams()', 20000, 'getParams');
-  if (log) log(`N=${p.N} tau=${p.tau} u0=${p.u0} Q${p.Q}: nu=${p.nu.toFixed(4)} td=${p.td.toFixed(0)} steps`);
+  if (log) log(`N=${p.N} tau=${p.tau} u0=${p.u0} Q${p.Q}: nu=${p.nu.toFixed(4)} td=${p.td.toFixed(0)} steps`
+    + (p.amr ? `  [AMR RB=${p.rb} FB=${p.fb} ${p.activeSlots}/${p.blocks} tiles, tauFine=${p.tauFine.toFixed(3)}]` : ''));
 
   // NOTHING is scored at t=0: the seed IS the reference there, so a t=0
   // check would pass no matter what the solver does. Checkpoints start at
@@ -145,6 +150,7 @@ async function runBeltramiCase(Runtime, opts, c, log) {
 
   return {
     N: p.N, tau: p.tau, u0: p.u0, Q: p.Q, td: p.td, samples, maxL2rel,
+    amr: !!p.amr, rb: p.rb, activeSlots: p.activeSlots,
     rateMeasured, rateAnalytic, rateRelErr,
     fieldCheck: checkTol('fieldL2rel', maxL2rel, 0, c.field_l2_tol),
     rateCheck: checkTol('decayRateRelErr', rateRelErr, 0, c.decay_rate_tol),

@@ -20,6 +20,14 @@
 //                in cells and the domain is sized from it
 //   ?re=         sphere Reynolds number (tau follows from it)
 //   ?bounceback  sharp momentum-exchange coupling instead of diffuse chi
+//   ?levels=2    turn on one fine AMR level (default 1 = dense only)
+//   ?rb=4        coarse cells per block edge; FB = 2*RB + 2*GHOST
+//   ?refine=     STATIC refinement region. `body` (default when there is
+//                one) refines blocks within ?margin= coarse cells of the
+//                surface; `box` refines a centred cube of ?boxfrac= of the
+//                domain; `all` refines everything (the noise floor -- no
+//                coarse/fine interface anywhere).
+//   ?margin=2  ?boxfrac=0.5
 //   ?q=19|27     velocity set, default 19
 //   ?tau=0.8     BGK relaxation time; nu = (tau - 1/2)/3
 //   ?u0=         scenario amplitude (duct: target peak velocity)
@@ -36,6 +44,7 @@ import { assembleShader } from './shader-loader.mjs';
 import { SUPPORTED_Q } from './lattice-3d.mjs';
 import { SCENARIOS, SCENARIO_NAMES, resolveScenario, nuFromTau } from './d3-scenarios.mjs';
 import { packBodyState, unpackBodyState, BODY_FIELDS } from './d3-body.mjs';
+import { makePool, refineWhere, refineNearBody, storageRatio, GHOST } from './d3-amr.mjs';
 
 const canvas   = document.getElementById('c');
 const statusEl = document.getElementById('status');
@@ -113,7 +122,8 @@ async function init() {
   // A parameter that is not one of this scenario's knobs is a typo, and
   // silently ignoring it is the failure above wearing a different hat.
   const PAGE_PARAMS = new Set(['scenario', 'q', 'axis', 'slice', 'mode', 'spf', 'live',
-    'uscale', 'vscale', 'vortGamma', 'bounceback', 'chiEps', 'vmax', 'omax']);
+    'uscale', 'vscale', 'vortGamma', 'bounceback', 'chiEps', 'vmax', 'omax',
+    'levels', 'rb', 'refine', 'margin', 'boxfrac']);
   for (const k of urlParams.keys()) {
     if (PAGE_PARAMS.has(k) || k in SCENARIOS[scenarioName].defaults) continue;
     throw new Error(`?${k}=: not a parameter of scenario "${scenarioName}" `
@@ -140,21 +150,101 @@ async function init() {
   // sphere, whose box is long and narrow.
   const N = params.n;
   const NCELLS = NX * NY * NZ;
+
+  // --- AMR pool (plans/3D.md M3) -------------------------------------------
+  // One fine level, STATIC refinement. Dynamic refinement and the 2:1
+  // balance cascade are M4 -- the plan splits them deliberately, because the
+  // 2D manager's own header documents three separately-found live bugs in
+  // the balance logic and there is no reason to debug that at the same time
+  // as the pool addressing underneath it.
+  const LEVELS = Math.max(1, Math.round(numParam('levels', 1)));
+  const RB = Math.max(2, Math.round(numParam('rb', 4)));
+  const AMR = LEVELS >= 2;
+  let pool = null, poolAlloc = null;
+  if (AMR) {
+    if ([NX, NY, NZ].some(n => n % RB !== 0)) {
+      statusEl.textContent = `error: ?rb=${RB} does not divide the ${NX}x${NY}x${NZ} domain`;
+      return;
+    }
+    // FB = 2*RB + 2*GHOST must be a multiple of the 4-thread workgroup z
+    // extent, because the pool kernels fold the slot into z as
+    // `fz = gid.z % FB; slot = gid.z / FB` -- with FB not divisible by 4 the
+    // fold straddles workgroups and threads land in the wrong tile. That
+    // needs RB even, which is worth failing loudly on rather than producing
+    // a subtly scrambled pool.
+    if ((2 * RB + 2 * GHOST) % 4 !== 0) {
+      statusEl.textContent = `error: ?rb=${RB} gives FB=${2 * RB + 2 * GHOST}, which must be a multiple of 4 (use an even RB)`;
+      return;
+    }
+    pool = makePool({ dims: [NX, NY, NZ], rb: RB });
+    const mode = urlParams.get('refine') || (params.body ? 'body' : 'box');
+    if (mode === 'all') {
+      poolAlloc = refineWhere(pool, () => true);
+    } else if (mode === 'box') {
+      // A centred cube. For a scenario with an ANALYTIC answer (beltrami)
+      // this is the whole point: a refined region in the middle of a flow
+      // whose exact solution is known, so any damage the coarse/fine
+      // interface does shows up directly as a field error.
+      const frac = numParam('boxfrac', 0.5);
+      const lo = [NX, NY, NZ].map(n => n * (1 - frac) / 2);
+      const hi = [NX, NY, NZ].map(n => n * (1 + frac) / 2);
+      poolAlloc = refineWhere(pool, ({ mid }) => mid.every((c, i) => c >= lo[i] && c < hi[i]));
+    } else if (mode === 'body') {
+      if (!params.body) throw new Error('?refine=body: this scenario has no body');
+      const sh = params.body.shape, bx = params.body.x;
+      const margin = numParam('margin', 2);
+      // Sphere-only for now, which is what M3's validation needs; a general
+      // SDF here would have to mirror d3-body.mjs's rotation handling and
+      // that belongs with dynamic refinement in M4.
+      poolAlloc = refineNearBody(pool, (q) => Math.hypot(q[0] - bx[0], q[1] - bx[1], q[2] - bx[2]) - sh.a, margin);
+    } else {
+      throw new Error(`?refine=${mode}: expected body, box or all`);
+    }
+  }
+
+
+
   const fBytes = NCELLS * Q * 4;
+  // The POOL, not the dense grid, is the largest binding once AMR is on: a
+  // tile stores (FB/RB)^3 cells per coarse cell covered, which is 27x at
+  // RB=4 (plans/3D.md sec 2.1's table). This has to be known BEFORE
+  // requestDevice, because a device is created with the SPEC MINIMUM limits
+  // unless asked otherwise -- and a 227 MiB pool binding on a device that
+  // only asked for 128 MiB fails validation at buffer creation, which
+  // presents as a fine level that silently never runs. It did exactly that
+  // during development.
+  const poolBytes = AMR ? Math.max(1, poolAlloc.activeSlots) * pool.tileCells * Q * 4 : 0;
+  const needBytes = Math.max(fBytes, poolBytes);
   const limit = Math.min(adapter.limits.maxStorageBufferBindingSize, adapter.limits.maxBufferSize);
-  if (fBytes > limit) {
-    statusEl.textContent = `error: ${NX}x${NY}x${NZ} D3Q${Q} needs a ${(fBytes / 1048576).toFixed(0)} MiB binding, this GPU's max is ${(limit / 1048576).toFixed(0)} MiB`;
+  if (needBytes > limit) {
+    const what = poolBytes > fBytes
+      ? `an L1 pool of ${poolAlloc.activeSlots} tiles x ${pool.tileCells} cells`
+      : `${NX}x${NY}x${NZ} D3Q${Q}`;
+    statusEl.textContent = `error: ${what} needs a ${(needBytes / 1048576).toFixed(0)} MiB binding, this GPU's max is ${(limit / 1048576).toFixed(0)} MiB`;
     return;
   }
   const device = await adapter.requestDevice({
     requiredLimits: {
-      maxStorageBufferBindingSize: Math.min(Math.max(fBytes, DEFAULT_MAX_STORAGE_BINDING), adapter.limits.maxStorageBufferBindingSize),
-      maxBufferSize: Math.min(Math.max(fBytes, DEFAULT_MAX_BUFFER_SIZE), adapter.limits.maxBufferSize),
+      maxStorageBufferBindingSize: Math.min(Math.max(needBytes, DEFAULT_MAX_STORAGE_BINDING), adapter.limits.maxStorageBufferBindingSize),
+      maxBufferSize: Math.min(Math.max(needBytes, DEFAULT_MAX_BUFFER_SIZE), adapter.limits.maxBufferSize),
     },
   });
   device.lost.then((info) => {
     if (info.reason === 'destroyed') return;
     statusEl.textContent = `error: GPU device lost (${info.reason}): ${info.message}`;
+  });
+  // WebGPU validation errors are NOT exceptions: an over-large buffer, a
+  // bind-group mismatch or a bad dispatch just makes the offending object
+  // invalid and every use of it a no-op. Without this the symptom is a
+  // kernel that silently does nothing -- which is precisely how the pool's
+  // own size limit presented before it was found. Surfacing it into #status
+  // puts it on the one channel tools/lib/browser-lifecycle.js's page watch
+  // and validate-all.js's boot smoke both read.
+  device.addEventListener('uncapturederror', (e) => {
+    console.error('[getting-air] WebGPU error:', e.error.message);
+    if (!/^error:/i.test(statusEl.textContent)) {
+      statusEl.textContent = `error: WebGPU: ${e.error.message.split('\n')[0]}`;
+    }
   });
 
   const ctx = canvas.getContext('webgpu');
@@ -175,6 +265,22 @@ async function init() {
   // 8 slots, not 6: forces[0..5] are fx,fy,fz,tx,ty,tz and the pad keeps the
   // clear kernel's one 8-lane workgroup exactly covering the buffer.
   const forceBuf = device.createBuffer({ size: 8 * 4, usage: U.STORAGE | U.COPY_SRC });
+
+  // Pool buffers. Sized to the slots actually allocated, not to maxSlots:
+  // static refinement knows its own answer up front, and a 3D pool sized for
+  // the whole domain would be (FB/RB)^3 = 27x the dense grid at RB=4.
+  let fPoolA = null, fPoolB = null, macPool = null, blockSlotBuf = null, slotToBlockBuf = null;
+  if (AMR) {
+    const slots = Math.max(1, poolAlloc.activeSlots);
+    const poolCells = slots * pool.tileCells;
+    fPoolA = device.createBuffer({ size: poolBytes, usage: U.STORAGE });
+    fPoolB = device.createBuffer({ size: poolBytes, usage: U.STORAGE });
+    macPool = device.createBuffer({ size: poolCells * 4 * 4, usage: U.STORAGE | U.COPY_SRC });
+    blockSlotBuf = device.createBuffer({ size: pool.nBlocks * 4, usage: U.STORAGE | U.COPY_DST });
+    slotToBlockBuf = device.createBuffer({ size: slots * 4, usage: U.STORAGE | U.COPY_DST });
+    device.queue.writeBuffer(blockSlotBuf, 0, poolAlloc.blockSlot);
+    device.queue.writeBuffer(slotToBlockBuf, 0, poolAlloc.slotToBlock.slice(0, slots));
+  }
 
   const computeBGL = device.createBindGroupLayout({ entries: [
     { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
@@ -271,6 +377,85 @@ async function init() {
     compute: { module: zeroModule, entryPoint: 'main' },
   }) : null;
 
+  // --- AMR pipelines --------------------------------------------------------
+  // tau_fine = 2*tau_coarse - 0.5 (the acoustic-scaling relation this
+  // project uses at every level). Derived HERE, once, and handed to the
+  // kernels as OMEGA_FINE / TAU_COARSE, so there is a single place that
+  // owns the level -> tau mapping rather than each shader re-deriving it.
+  const TAU_COARSE = params.tau;
+  const TAU_FINE = 2 * TAU_COARSE - 0.5;
+  let interpGhostPipe = null, interpFullPipe = null, step1Pipe = null, avgPipe = null;
+  let interpBG = null, step1BG_AB = null, step1BG_BA = null, avgBGA = null, avgBGB = null;
+  if (AMR) {
+    const poolConst = { NX, NY, NZ, RB };
+    const interpModule = device.createShaderModule({ code: await loadShader(`shaders/d3_amr_interp_q${Q}.wgsl`), label: `d3_amr_interp_q${Q}` });
+    const step1Module = device.createShaderModule({ code: await loadShader(`shaders/d3_amr_step1_q${Q}.wgsl`), label: `d3_amr_step1_q${Q}` });
+    const avgModule = device.createShaderModule({ code: await loadShader(`shaders/d3_amr_average_q${Q}.wgsl`), label: `d3_amr_average_q${Q}` });
+
+    const interpBGL = device.createBindGroupLayout({ entries: [
+      { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+      { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+      { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+      { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    ]});
+    const step1BGL = device.createBindGroupLayout({ entries: [
+      { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+      { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+      { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+      { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+      { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+      { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    ]});
+    const avgBGL = device.createBindGroupLayout({ entries: [
+      { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+      { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+      { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+      { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    ]});
+
+    const mk = (bgl, module, constants) => device.createComputePipelineAsync({
+      layout: device.createPipelineLayout({ bindGroupLayouts: [bgl] }),
+      compute: { module, entryPoint: 'main', constants },
+    });
+    // Two interp pipelines: the steady-state ring refresh, and the one-time
+    // full-tile fill at reset.
+    interpGhostPipe = await mk(interpBGL, interpModule, { ...poolConst, TAU_COARSE, GHOST_ONLY: 1, TIME_BLEND: 0.0 });
+    interpFullPipe = await mk(interpBGL, interpModule, { ...poolConst, TAU_COARSE, GHOST_ONLY: 0, TIME_BLEND: 0.0 });
+    step1Pipe = await mk(step1BGL, step1Module, {
+      ...poolConst,
+      OMEGA_FINE: 1 / TAU_FINE,
+      FORCE_X: params.force[0], FORCE_Y: params.force[1], FORCE_Z: params.force[2],
+      HAS_BODY, USE_BOUNCEBACK, CHI_EPS,
+      SPONGE_W: sponge.width, SPONGE_UX: sponge.u[0], SPONGE_UY: sponge.u[1], SPONGE_UZ: sponge.u[2],
+    });
+    avgPipe = await mk(avgBGL, avgModule, { ...poolConst, TAU_COARSE });
+
+    // interp needs BOTH coarse states (t and t+dt, which are simply the two
+    // ping-pong buffers once the coarse step runs first) and writes whichever
+    // pool buffer the next substep will READ -- so four bind groups:
+    // coarse parity x pool target. interpBG[coarseParity][poolTarget].
+    const mkInterp = (c0, c1, dst) => device.createBindGroup({ layout: interpBGL, entries: [
+      { binding: 0, resource: { buffer: c0 } }, { binding: 1, resource: { buffer: dst } },
+      { binding: 2, resource: { buffer: slotToBlockBuf } }, { binding: 3, resource: { buffer: c1 } }]});
+    interpBG = [
+      [mkInterp(fA, fB, fPoolA), mkInterp(fA, fB, fPoolB)],   // coarse t in fA
+      [mkInterp(fB, fA, fPoolA), mkInterp(fB, fA, fPoolB)],   // coarse t in fB
+    ];
+    const mkStep = (a, b) => device.createBindGroup({ layout: step1BGL, entries: [
+      { binding: 0, resource: { buffer: a } }, { binding: 1, resource: { buffer: b } },
+      { binding: 2, resource: { buffer: macPool } }, { binding: 3, resource: { buffer: bodyBuf } },
+      { binding: 4, resource: { buffer: slotToBlockBuf } }, { binding: 5, resource: { buffer: blockSlotBuf } }]});
+    step1BG_AB = mkStep(fPoolA, fPoolB);
+    step1BG_BA = mkStep(fPoolB, fPoolA);
+    // average writes the coarse buffer the COARSE step just wrote, so it
+    // also needs one per parity.
+    const mkAvg = (dst) => device.createBindGroup({ layout: avgBGL, entries: [
+      { binding: 0, resource: { buffer: fPoolA } }, { binding: 1, resource: { buffer: dst } },
+      { binding: 2, resource: { buffer: slotToBlockBuf } }, { binding: 3, resource: { buffer: mac } }]});
+    avgBGA = mkAvg(fA);
+    avgBGB = mkAvg(fB);
+  }
+
   const renderPipe = await device.createRenderPipelineAsync({
     layout: device.createPipelineLayout({ bindGroupLayouts: [renderBGL] }),
     vertex: { module: renderModule, entryPoint: 'vs_main', constants: dims },
@@ -339,17 +524,40 @@ async function init() {
       }));
     }
     const enc = device.createCommandEncoder();
+    // bgAB writes fB, bgBA writes fA -- both seeded, so the ping-pong parity
+    // after a reset does not matter. fA is written last, and it is what the
+    // pool interp below reads.
     for (const bg of [bgAB, bgBA]) {
       const p = enc.beginComputePass();
       p.setPipeline(initPipe); p.setBindGroup(0, bg);
       p.dispatchWorkgroups(disp[0], disp[1], disp[2]);
       p.end();
     }
+    // Seed the pool by interpolating the freshly-initialized coarse field
+    // into every tile, INTERIOR INCLUDED (GHOST_ONLY=0). There is no evolved
+    // fine state to preserve at reset, and starting the fine level from a
+    // coarse interpolation of the same initial condition is what makes an
+    // AMR run comparable to the dense run of the same scenario.
+    if (AMR) {
+      const ip = enc.beginComputePass();
+      ip.setPipeline(interpFullPipe);
+      ip.setBindGroup(0, interpBG[0][0]);     // reset always leaves state in fA
+      ip.dispatchWorkgroups(tileDisp[0], tileDisp[1], tileDisp[2]);
+      ip.end();
+    }
     device.queue.submit([enc.finish()]);
     // initEq READ mac and did not write it, so mac still holds the seed --
     // which is exactly the field the renderer should show at step 0.
     step = 0; useB = false;
   }
+
+  // Pool dispatch shapes. The slot is folded into z because 3D has no
+  // fourth dispatch dimension (plans/3D.md sec 2.4).
+  const tileDisp = AMR ? [Math.ceil(pool.FB / 4), Math.ceil(pool.FB / 4), (pool.FB / 4) * Math.max(1, poolAlloc.activeSlots)] : null;
+  const avgDisp = AMR ? (() => {
+    const per = Math.ceil(RB / 4);
+    return [per, per, per * Math.max(1, poolAlloc.activeSlots)];
+  })() : null;
 
   // ORDER PER MACRO-STEP: zero -> force -> physics -> step.
   //
@@ -375,11 +583,68 @@ async function init() {
         const pp = enc.beginComputePass();
         pp.setPipeline(physPipe); pp.setBindGroup(0, physicsBG); pp.dispatchWorkgroups(1); pp.end();
       }
+      // --- AMR, N=2 (S_Advance) --------------------------------------------
+      //
+      // Both levels start the macro-step at time t. The order is:
+      //
+      //   L0 x1    the coarse step, taking L0 to t + dt. FIRST, so that the
+      //            parent's state at BOTH ends of the step is available to
+      //            the ring interpolation below -- t in the buffer it read,
+      //            t + dt in the one it wrote.
+      //   interp   fill L1's ring from the parent at time t
+      //   L1 A     first fine substep, to t + dt/2
+      //   interp   refill L1's ring from the parent at t + dt/2, blended
+      //            between the two coarse states. Doing this ONCE per parent
+      //            step instead leaves substep B half a coarse step stale at
+      //            the seam, which is a first-order error that accumulates
+      //            linearly -- see common_d3_amr_interp.wgsl's TIME_BLEND.
+      //   L1 B     second fine substep, to t + dt
+      //   average  restrict L1 onto L0 in the refined region, both at t + dt
+      //
+      // The coarse step does redundant work under the refined region (its
+      // result is overwritten by average); that is the same trade the 2D
+      // solver makes, and avoiding it would need a per-cell refined-mask
+      // test in the hottest kernel there is.
+      const cp = useB ? 1 : 0;    // which buffer holds the coarse state at t
       const p = enc.beginComputePass();
       p.setPipeline(stepPipe);
       p.setBindGroup(0, useB ? bgBA : bgAB);
       p.dispatchWorkgroups(disp[0], disp[1], disp[2]);
       p.end();
+
+      if (AMR) {
+        // ONE ring refresh per parent step, from the parent at time t, then
+        // both fine substeps. Substep B's ring is what substep A advanced --
+        // the GHOST=2 self-advance (see common_d3_amr_step1.wgsl).
+        //
+        // A second refresh at the half step, time-blended between the
+        // parent's t and t+dt states, WAS built and measured, on the theory
+        // that substep B was seeing stale interface data. It made the seam
+        // error slightly WORSE (nearOut 3.24e-2 -> 3.93e-2 at t=64 on the
+        // Beltrami box case), so staleness is not what the seam error is,
+        // and the extra pass is not carried. The TIME_BLEND override stays
+        // in the shader, defaulted to a no-op, because it is the natural
+        // knob to re-try against a flux-corrected interface.
+        const ip = enc.beginComputePass();
+        ip.setPipeline(interpGhostPipe);
+        ip.setBindGroup(0, interpBG[cp][0]);
+        ip.dispatchWorkgroups(tileDisp[0], tileDisp[1], tileDisp[2]);
+        ip.end();
+        for (const bg of [step1BG_AB, step1BG_BA]) {
+          const sp = enc.beginComputePass();
+          sp.setPipeline(step1Pipe); sp.setBindGroup(0, bg);
+          sp.dispatchWorkgroups(tileDisp[0], tileDisp[1], tileDisp[2]);
+          sp.end();
+        }
+        const ap = enc.beginComputePass();
+        ap.setPipeline(avgPipe);
+        // The coarse step just wrote the OTHER buffer, which is where the
+        // restriction has to land.
+        ap.setBindGroup(0, useB ? avgBGA : avgBGB);
+        ap.dispatchWorkgroups(avgDisp[0], avgDisp[1], avgDisp[2]);
+        ap.end();
+      }
+
       useB = !useB;
     }
     step += n;
@@ -494,6 +759,42 @@ async function init() {
     };
   }
 
+  // Fine-level diagnostic: RMS speed over tile INTERIORS only (ring cells
+  // are filled, not solved, and including them would blur exactly the
+  // distinction this is for). Reported next to the coarse level's own RMS so
+  // "is the fine level advancing at all" is answerable rather than inferred.
+  const poolStaging = AMR ? device.createBuffer({
+    size: Math.max(1, poolAlloc.activeSlots) * pool.tileCells * 4 * 4,
+    usage: U.MAP_READ | U.COPY_DST,
+  }) : null;
+  async function readPoolStats() {
+    if (!AMR) return null;
+    const bytes = Math.max(1, poolAlloc.activeSlots) * pool.tileCells * 4 * 4;
+    const enc = device.createCommandEncoder();
+    enc.copyBufferToBuffer(macPool, 0, poolStaging, 0, bytes);
+    device.queue.submit([enc.finish()]);
+    await poolStaging.mapAsync(GPUMapMode.READ);
+    const m = new Float32Array(poolStaging.getMappedRange()).slice();
+    poolStaging.unmap();
+    const FB = pool.FB, plane = Math.max(1, poolAlloc.activeSlots) * pool.tileCells;
+    let sq = 0, n = 0, finite = true, rhoMin = Infinity, rhoMax = -Infinity;
+    for (let s = 0; s < poolAlloc.activeSlots; s++) {
+      for (let z = GHOST; z < GHOST + 2 * RB; z++) {
+        for (let y = GHOST; y < GHOST + 2 * RB; y++) {
+          for (let x = GHOST; x < GHOST + 2 * RB; x++) {
+            const c = s * pool.tileCells + (z * FB + y) * FB + x;
+            const rho = m[0 * plane + c], ux = m[1 * plane + c], uy = m[2 * plane + c], uz = m[3 * plane + c];
+            if (!Number.isFinite(rho + ux + uy + uz)) { finite = false; continue; }
+            sq += ux * ux + uy * uy + uz * uz; n++;
+            if (rho < rhoMin) rhoMin = rho;
+            if (rho > rhoMax) rhoMax = rho;
+          }
+        }
+      }
+    }
+    return { step, rms: Math.sqrt(sq / Math.max(n, 1)), cells: n, finite, rhoMin, rhoMax };
+  }
+
   // Body state and the force measured on it. Read back through the body
   // buffer rather than the force accumulator, because d3_physics.wgsl drains
   // that accumulator with atomicExchange every step and copies the values
@@ -548,7 +849,8 @@ async function init() {
   playBtn.textContent = live ? 'pause' : 'play';
   document.getElementById('hint').textContent =
     `${scenarioName}  ${NX}x${NY}x${NZ}  D3Q${Q}  tau=${params.tau.toFixed(4)}  nu=${params.nu.toFixed(4)}`
-    + (params.re ? `  Re=${params.re}` : '');
+    + (params.re ? `  Re=${params.re}` : '')
+    + (AMR ? `  levels=${LEVELS} RB=${RB} tiles=${poolAlloc.activeSlots}` : '');
 
   // The canvas box is given the SLICE's aspect ratio, so a sphere renders
   // round. The three axes can have very different extents (the sphere
@@ -579,8 +881,20 @@ async function init() {
     isLive: () => live,
     reset,
     getStep: () => step,
-    getParams: () => ({ ...params, Q, N, NX, NY, NZ, NCELLS, scenario: scenarioName, hasBody: !!HAS_BODY, bounceback: USE_BOUNCEBACK }),
-    readSubsampled, readDuctProfile, readStats, readBody,
+    getParams: () => ({
+      ...params, Q, N, NX, NY, NZ, NCELLS, scenario: scenarioName,
+      hasBody: !!HAS_BODY, bounceback: USE_BOUNCEBACK,
+      levels: LEVELS, amr: AMR,
+      ...(AMR ? {
+        rb: RB, fb: pool.FB, ghost: GHOST,
+        blocks: pool.nBlocks, activeSlots: poolAlloc.activeSlots,
+        refinedFraction: poolAlloc.activeSlots / pool.nBlocks,
+        tileCells: pool.tileCells,
+        storageRatio: storageRatio(pool),
+        tauCoarse: TAU_COARSE, tauFine: TAU_FINE,
+      } : {}),
+    }),
+    readSubsampled, readDuctProfile, readStats, readBody, readPoolStats,
     debugStepSync,
   };
 
@@ -602,7 +916,8 @@ async function init() {
         : scenarioName === 'duct' ? `  t/settle=${(step / params.settle).toFixed(2)}`
         : scenarioName === 'sphere' ? `  t/(D/U)=${(step / params.convective).toFixed(2)}`
           : params.re ? `  Re=${params.re.toFixed(0)}` : '';
-      statusEl.textContent = `${scenarioName}  D3Q${Q}  ${NX}x${NY}x${NZ}  step ${step}${t}\n`
+      const amrTxt = AMR ? `  L1 ${poolAlloc.activeSlots}/${pool.nBlocks} blocks (RB=${RB}, FB=${pool.FB})` : '';
+      statusEl.textContent = `${scenarioName}  D3Q${Q}  ${NX}x${NY}x${NZ}  step ${step}${t}${amrTxt}\n`
         + `${AXIS_NAMES[axis]}-slice ${slice}   ${live ? 'running' : 'paused'}`;
     }
     requestAnimationFrame(() => frame().catch(e => reportFatal(statusEl, e)));
