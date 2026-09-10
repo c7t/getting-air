@@ -220,6 +220,15 @@ explode the DEFAULT, is next and is a blast-radius decision rather than an
 evidence one: merging publishes, and the flip moves every recorded AMR
 number at once.
 
+- **The AMR invariant checker exists and is GREEN, but its 2:1 half is
+  VACUOUS until refinement is multi-level** (`tools/validate-d3-invariants.js`,
+  `d3-amr.mjs`'s `check21Balance` / `checkGeometryCoverage`). At `?levels=2` a
+  leaf's neighbour is level 1 or level 0 and both are legal, so the check
+  cannot fail; the tool says so rather than showing a green tick. Geometry
+  coverage IS real today. The pure functions are unit-tested on inputs that
+  VIOLATE the invariant (`make test`) -- a checker only ever run on valid
+  input is indistinguishable from one that returns nothing.
+
 - **Explode is not slower in any case that matters** (`tools/bench-d3-interface.js`,
   new). +2.9% per macro-step on a body-fitted shell, -4.5% at a larger
   refined fraction, +31% only for a small refined box in a small domain. All

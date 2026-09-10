@@ -176,3 +176,119 @@ export function fromGlobalFine(pool, g) {
 export function storageRatio(pool) {
   return Math.pow(pool.FB / pool.rb, 3);
 }
+
+// --- structural invariants (plans/3D.md M4.2, risk #2) ---------------------
+//
+// Ported from the 2D checker (tools/lib/amr-invariants.js and
+// main-cylinder-amr.js's debugCheck21Balance) and deliberately written as
+// PURE functions over block sets, so tools/test-d3-amr.js can exercise them
+// with no server, browser or GPU -- including on inputs that VIOLATE the
+// invariant, which is the only way to know a checker checks anything.
+//
+// WHY THIS LANDS BEFORE THE MANAGER. plans/3D.md sec 7 risk #2: the 2D
+// versions of manage/manage_pool carry three separately-documented
+// live-verified balance bugs. A checker written after the manager gets
+// written to agree with it; a checker written before is an independent
+// statement of what the manager must achieve.
+
+// The 4 (of 8) octant children covering one FACE of their parent: the face
+// on axis `a` in direction `s` is covered by the children whose octant bit
+// on `a` is (s > 0 ? 1 : 0). Recursing with the SAME face picks the correct
+// ever-deeper sliver along it, not the tile's maximum depth anywhere.
+function faceChildren(a, s) {
+  const want = s > 0 ? 1 : 0;
+  const out = [];
+  for (let k = 0; k < 8; k++) {
+    const q = [k & 1, (k >> 1) & 1, (k >> 2) & 1];
+    if (q[a] === want) out.push(q);
+  }
+  return out;
+}
+
+const FACES = [[0, -1], [0, 1], [1, -1], [1, 1], [2, -1], [2, 1]];
+
+// 2:1 BALANCE. `levelSets[m]` is a Set of "bx,by,bz" keys naming the blocks
+// active at level m (m >= 1); level 0 is the dense grid and is implicit.
+// `nbAt(m)` gives that level's block counts per axis, which double each
+// level. Every LEAF tile's face neighbour must sit within one level of it.
+//
+// WITH ONE REFINED LEVEL THIS CANNOT FAIL, and saying so is the point: a
+// level-1 leaf's neighbour is either level 1 or level 0, and |1 - 1| and
+// |1 - 0| are both <= 1. So a green result here today is evidence the
+// machinery runs, NOT evidence that balance holds -- there is nothing yet
+// that could break it. It becomes a real gate the moment M4.2 makes
+// refinement dynamic or M5 adds a level, which is exactly why it is written
+// now, against the shape those will have.
+export function check21Balance(levelSets, nbAt, { levels }) {
+  const has = (m, x, y, z) => m >= 1 && m < levels && levelSets[m] && levelSets[m].has(`${x},${y},${z}`);
+  const hasChild = (m, x, y, z) => has(m + 1, x * 2, y * 2, z * 2);
+
+  // The deepest level actually present at (x,y,z) walking UP from m.
+  const ancestorDepth = (m, x, y, z) => {
+    let lv = m, a = x, b = y, c = z;
+    while (lv >= 1) {
+      if (has(lv, a, b, c)) return lv;
+      a = Math.floor(a / 2); b = Math.floor(b / 2); c = Math.floor(c / 2);
+      lv--;
+    }
+    return 0;
+  };
+  // The deepest level present along one FACE of a tile, walking DOWN.
+  const faceMaxDepth = (m, x, y, z, a, s) => {
+    if (!hasChild(m, x, y, z)) return m;
+    let d = m;
+    for (const q of faceChildren(a, s)) {
+      d = Math.max(d, faceMaxDepth(m + 1, x * 2 + q[0], y * 2 + q[1], z * 2 + q[2], a, s));
+    }
+    return d;
+  };
+
+  const violations = [];
+  for (let m = 1; m < levels; m++) {
+    if (!levelSets[m]) continue;
+    const nb = nbAt(m);
+    for (const key of levelSets[m]) {
+      const [bx, by, bz] = key.split(',').map(Number);
+      if (hasChild(m, bx, by, bz)) continue;   // not a leaf; checked deeper
+      for (const [a, s] of FACES) {
+        const n = [bx, by, bz];
+        n[a] = ((n[a] + s) % nb[a] + nb[a]) % nb[a];   // the block grid is periodic
+        const nDepth = has(m, n[0], n[1], n[2])
+          ? faceMaxDepth(m, n[0], n[1], n[2], a, -s)   // the neighbour's facing side
+          : ancestorDepth(m, n[0], n[1], n[2]);
+        if (Math.abs(m - nDepth) > 1) {
+          violations.push({ level: m, block: [bx, by, bz], neighbour: n.slice(), nDepth, axis: a, dir: s });
+        }
+      }
+    }
+  }
+  return { violations, levels, counts: levelSets.map(s => (s ? s.size : 0)) };
+}
+
+// GEOMETRY-FORCED REFINEMENT, checked at CELL granularity against the SDF
+// directly. This is deliberately NOT refineNearBody's own test: that samples
+// a block's eight corners and centre, so it is the thing being checked, and
+// re-running it here would assert only that a function equals itself. Its
+// own header names the case it can miss -- a body small against a block --
+// and a cell-granular scan is precisely the independent route that would
+// catch it.
+//
+// The requirement: no coarse cell whose centre is within `margin` of the
+// body may sit in an unrefined block. Same sign convention as
+// refineNearBody, so cells INSIDE the body (phi < 0) are included.
+export function checkGeometryCoverage(pool, blockSlot, sdf, margin) {
+  const [NX, NY, NZ] = pool.dims;
+  const violations = [];
+  let required = 0;
+  for (let z = 0; z < NZ; z++) {
+    for (let y = 0; y < NY; y++) {
+      for (let x = 0; x < NX; x++) {
+        if (sdf([x, y, z]) > margin) continue;
+        required++;
+        const id = pool.blockId(Math.floor(x / pool.rb), Math.floor(y / pool.rb), Math.floor(z / pool.rb));
+        if (blockSlot[id] < 0 && violations.length < 32) violations.push({ cell: [x, y, z], block: id });
+      }
+    }
+  }
+  return { violations, required };
+}

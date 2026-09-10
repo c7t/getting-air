@@ -81,7 +81,8 @@ import { assembleShader } from './shader-loader.mjs';
 import { SUPPORTED_Q } from './lattice-3d.mjs';
 import { SCENARIOS, SCENARIO_NAMES, resolveScenario, nuFromTau, beltramiVelocityAt } from './d3-scenarios.mjs';
 import { packBodyState, unpackBodyState, BODY_FIELDS } from './d3-body.mjs';
-import { makePool, refineWhere, refineNearBody, storageRatio, GHOST } from './d3-amr.mjs';
+import { makePool, refineWhere, refineNearBody, storageRatio, GHOST,
+         check21Balance, checkGeometryCoverage } from './d3-amr.mjs';
 
 const canvas   = document.getElementById('c');
 const statusEl = document.getElementById('status');
@@ -199,6 +200,10 @@ async function init() {
   const RB = Math.max(2, Math.round(numParam('rb', 4)));
   const AMR = LEVELS >= 2;
   let pool = null, poolAlloc = null;
+  // The refinement mode, and -- when it is geometry-forced -- the SDF and
+  // margin that forced it, so debugCheckGeometryCoverage can restate the
+  // requirement independently.
+  let refineMode = null, geomForced = null;
   if (AMR) {
     if ([NX, NY, NZ].some(n => n % RB !== 0)) {
       statusEl.textContent = `error: ?rb=${RB} does not divide the ${NX}x${NY}x${NZ} domain`;
@@ -230,6 +235,7 @@ async function init() {
     }
     pool = makePool({ dims: [NX, NY, NZ], rb: RB });
     const mode = urlParams.get('refine') || (params.body ? 'body' : 'box');
+    refineMode = mode;
     if (mode === 'all') {
       poolAlloc = refineWhere(pool, () => true);
     } else if (mode === 'box') {
@@ -268,7 +274,12 @@ async function init() {
       // Sphere-only for now, which is what M3's validation needs; a general
       // SDF here would have to mirror d3-body.mjs's rotation handling and
       // that belongs with dynamic refinement in M4.
-      poolAlloc = refineNearBody(pool, (q) => Math.hypot(q[0] - bx[0], q[1] - bx[1], q[2] - bx[2]) - sh.a, margin);
+      // Kept so debugCheckGeometryCoverage can restate the requirement at
+      // CELL granularity against the same SDF -- an independent route from
+      // refineNearBody's block-corner sampling, which is the thing under
+      // test rather than the reference.
+      geomForced = { sdf: (q) => Math.hypot(q[0] - bx[0], q[1] - bx[1], q[2] - bx[2]) - sh.a, margin };
+      poolAlloc = refineNearBody(pool, geomForced.sdf, margin);
     } else {
       throw new Error(`?refine=${mode}: expected all, box, bar, slab or body`);
     }
@@ -349,7 +360,12 @@ async function init() {
     fPoolA = device.createBuffer({ size: poolBytes, usage: U.STORAGE });
     fPoolB = device.createBuffer({ size: poolBytes, usage: U.STORAGE });
     macPool = device.createBuffer({ size: poolCells * 4 * 4, usage: U.STORAGE | U.COPY_SRC });
-    blockSlotBuf = device.createBuffer({ size: pool.nBlocks * 4, usage: U.STORAGE | U.COPY_DST });
+    // COPY_SRC so debugCheck21Balance reads what the GPU HAS rather than the
+    // host's copy of what it once uploaded. Identical today, because
+    // refinement is static -- and exactly not identical the moment M4.2's
+    // manager starts writing this buffer from a kernel, which is when the
+    // checker has to already be right.
+    blockSlotBuf = device.createBuffer({ size: pool.nBlocks * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
     slotToBlockBuf = device.createBuffer({ size: slots * 4, usage: U.STORAGE | U.COPY_DST });
     device.queue.writeBuffer(blockSlotBuf, 0, poolAlloc.blockSlot);
     device.queue.writeBuffer(slotToBlockBuf, 0, poolAlloc.slotToBlock.slice(0, slots));
@@ -1100,6 +1116,66 @@ async function init() {
     return { step, rms: Math.sqrt(sq / Math.max(n, 1)), cells: n, finite, rhoMin, rhoMax };
   }
 
+  // --- AMR structural invariants (plans/3D.md M4.2, risk #2) ---------------
+  //
+  // The 3D siblings of the 2D debugCheck21Balance / debugCheckGeometryCoverage
+  // that tools/validate-amr-invariants.js drives. The LOGIC lives in
+  // d3-amr.mjs so tools/test-d3-amr.js can run it -- including on inputs that
+  // VIOLATE the invariant -- with no browser and no GPU; these are the thin
+  // wrappers that hand it the live state.
+  //
+  // They exist before the manager does, deliberately: plans/3D.md sec 7 risk
+  // #2 is that a checker written after a manager gets written to agree with
+  // it, and the 2D manager's three live-verified balance bugs all sat under a
+  // green suite.
+  const blockSlotStaging = AMR
+    ? device.createBuffer({ size: pool.nBlocks * 4, usage: U.MAP_READ | U.COPY_DST })
+    : null;
+  async function readBlockSlot() {
+    const enc = device.createCommandEncoder();
+    enc.copyBufferToBuffer(blockSlotBuf, 0, blockSlotStaging, 0, pool.nBlocks * 4);
+    device.queue.submit([enc.finish()]);
+    await blockSlotStaging.mapAsync(GPUMapMode.READ);
+    const v = new Int32Array(blockSlotStaging.getMappedRange()).slice();
+    blockSlotStaging.unmap();
+    return v;
+  }
+
+  async function debugCheck21Balance() {
+    if (!AMR) return { skipped: 'no pool (?levels=1)' };
+    const bs = await readBlockSlot();
+    const lv1 = new Set();
+    for (let id = 0; id < pool.nBlocks; id++) {
+      if (bs[id] >= 0) lv1.add(pool.blockOf(id).join(','));
+    }
+    // levelSets is indexed by level, level 0 being the dense grid; only level
+    // 1 exists until M5 adds the pool-parent path. nbAt doubles per level,
+    // which is the shape M5 will actually have.
+    const r = check21Balance([null, lv1], (m) => pool.nb.map(n => n * 2 ** (m - 1)),
+                             { levels: LEVELS });
+    return {
+      ok: r.violations.length === 0,
+      violations: r.violations.slice(0, 16),
+      nViolations: r.violations.length,
+      counts: r.counts,
+      // Said out loud so a green result is not over-read: with one refined
+      // level there is nothing that CAN violate 2:1. See check21Balance.
+      vacuous: LEVELS < 3,
+    };
+  }
+
+  async function debugCheckGeometryCoverage() {
+    if (!AMR) return { skipped: 'no pool (?levels=1)' };
+    // Only ?refine=body forces refinement from geometry. Every other mode
+    // refines a fixed region that owes the body nothing, so there is no
+    // requirement to check -- reported as SKIPPED, never as a pass.
+    if (!geomForced) return { skipped: `?refine=${refineMode} is not geometry-forced` };
+    const bs = await readBlockSlot();
+    const r = checkGeometryCoverage(pool, bs, geomForced.sdf, geomForced.margin);
+    return { ok: r.violations.length === 0, violations: r.violations.slice(0, 16),
+             nViolations: r.violations.length, required: r.required };
+  }
+
   // --- coarse/fine interface diagnostic ------------------------------------
   //
   // plans/3D.md M3 records an OPEN issue -- a partially-refined run grows a
@@ -1362,6 +1438,7 @@ async function init() {
       } : {}),
     }),
     readSubsampled, readDuctProfile, readStats, readBody, readPoolStats,
+    debugCheck21Balance, debugCheckGeometryCoverage,
     readInterfaceDiag, readFluxAcc,
     debugStepSync,
   };

@@ -35,6 +35,7 @@ const close = (a, b, tol, what) =>
   const {
     GHOST, fineToCoarseUnit, coarseUnitToFine, makePool, refineWhere,
     refineNearBody, resolveSource, toGlobalFine, fromGlobalFine, storageRatio,
+    check21Balance, checkGeometryCoverage,
   } = A;
 
   ok('pool geometry follows FB = 2*RB + 2*GHOST and rejects a non-dividing RB', () => {
@@ -229,6 +230,138 @@ const close = (a, b, tol, what) =>
         assert.strictEqual(blockSlot[id], -1, `block ${id} is far from the body but was refined`);
       }
     }
+  });
+
+
+  // --- structural invariants (plans/3D.md M4.2, risk #2) -------------------
+  //
+  // Every one of these feeds the checker an input that VIOLATES the
+  // invariant and asserts it is caught. A checker only ever run on valid
+  // input is indistinguishable from `return { violations: [] }`, and that is
+  // exactly the failure mode plans/3D.md sec 7 risk #2 is about: the 2D
+  // manager's three live-verified balance bugs all sat under a green suite.
+
+  const setOf = (...keys) => new Set(keys);
+
+  ok('2:1 balance passes a flat one-level refinement, and says why that is weak', () => {
+    const p = makePool({ dims: [32, 32, 32], rb: 4 });
+    const { blockSlot } = refineWhere(p, ({ bx }) => bx < 4);
+    const lv1 = new Set();
+    for (let id = 0; id < p.nBlocks; id++) if (blockSlot[id] >= 0) lv1.add(p.blockOf(id).join(','));
+    const r = check21Balance([null, lv1], () => p.nb, { levels: 2 });
+    assert.strictEqual(r.violations.length, 0);
+    // The honest half: with one refined level the check CANNOT fail, so this
+    // asserts the machinery runs, not that balance holds. If a future change
+    // makes a one-level domain able to violate 2:1, this assertion is the
+    // thing that should be revisited rather than the checker.
+    assert.strictEqual(r.levels, 2);
+  });
+
+  // These build SMALL, deliberately incomplete trees and assert about ONE
+  // named tile, filtering the violation list rather than demanding a
+  // globally legal arrangement. Building a fully balanced 3-level nest by
+  // hand is itself error-prone -- the first draft of these tests called
+  // three different arrangements "legal" and the checker was right about
+  // all three -- and a test whose premise is hard to get right is a test
+  // that will later be "fixed" by loosening the checker.
+  // Filter to ONE tile and ONE axis. These trees are deliberately extended
+  // along x only, so the y and z faces of every tile look out onto nothing
+  // and violate 2:1 by construction -- which is correct, and not what any of
+  // these tests is about.
+  const at = (r, bx, axis = 0) => r.violations.filter(v => v.block[0] === bx && v.axis === axis);
+
+  ok('2:1 balance CATCHES a level-3 leaf whose face neighbour resolves at level 1', () => {
+    const nbAt = (m) => [8 * 2 ** (m - 1), 8 * 2 ** (m - 1), 8 * 2 ** (m - 1)];
+    // A properly parented level-3 tile at (12,0,0): level-2 (6,0,0),
+    // level-1 (3,0,0). Its -x face neighbour is level-3 (11,0,0), absent;
+    // walking up gives level-2 (5,0,0).
+    const lv1 = setOf('3,0,0', '2,0,0');
+    const lv2 = setOf('6,0,0', '5,0,0');
+    const lv3 = setOf('12,0,0');
+    const ok3 = check21Balance([null, lv1, lv2, lv3], nbAt, { levels: 4 });
+    assert.strictEqual(at(ok3, 12).length, 0,
+      `level-3 (12,0,0) next to a level-2 tile is legal on x: ${JSON.stringify(at(ok3, 12)[0])}`);
+    // Remove that level-2 tile and the same face resolves at level 1 -- a
+    // gap of 2, which is exactly what 2:1 balance forbids.
+    const bad = check21Balance([null, lv1, setOf('6,0,0'), lv3], nbAt, { levels: 4 });
+    assert.ok(at(bad, 12).some(v => v.axis === 0 && v.dir === -1 && v.nDepth === 1),
+      `a 3-vs-1 gap on the -x face must be caught: ${JSON.stringify(bad.violations)}`);
+  });
+
+  ok('2:1 balance reads the SHARED FACE of a neighbour, not its deepest corner', () => {
+    // A level-1 leaf at (6,0,0). Its -x neighbour (5,0,0) is refined to
+    // level 2 (children at x = 10, 11). Refine the level-2 child on the FAR
+    // side (x=10) down to level 3: the shared face is still level 2, so this
+    // is legal. A checker that took the neighbour tile's maximum depth
+    // ANYWHERE would report a violation here -- and would then be loosened,
+    // which is how a real gap gets through later.
+    const nbAt = (m) => [8 * 2 ** (m - 1), 8 * 2 ** (m - 1), 8 * 2 ** (m - 1)];
+    const lv1 = setOf('6,0,0', '5,0,0');
+    const lv2 = setOf('10,0,0', '11,0,0');
+    const far = check21Balance([null, lv1, lv2, setOf('20,0,0')], nbAt, { levels: 4 });
+    assert.strictEqual(at(far, 6).length, 0,
+      `a level-3 sliver on the FAR side of the neighbour is legal on x: ${JSON.stringify(at(far, 6)[0])}`);
+    // Move it to the NEAR side (level-2 x=11, whose children are 22,23) and
+    // the level-1 tile is suddenly face-to-face with level 3.
+    const near = check21Balance([null, lv1, lv2, setOf('22,0,0')], nbAt, { levels: 4 });
+    assert.ok(near.violations.some(v => v.block[0] === 6 && v.axis === 0 && v.dir === -1 && v.nDepth === 3),
+      `a level-3 sliver on the SHARED face must be caught: ${JSON.stringify(near.violations)}`);
+  });
+
+  ok('2:1 balance wraps periodically, matching the block grid', () => {
+    // A level-3 tile at x = 0 has a -x face neighbour that WRAPS to the far
+    // side of the domain, where there is nothing. A checker that clamped
+    // instead of wrapping would miss every violation on the domain face.
+    const nbAt = (m) => [8 * 2 ** (m - 1), 8 * 2 ** (m - 1), 8 * 2 ** (m - 1)];
+    const r = check21Balance([null, setOf('0,0,0'), setOf('0,0,0'), setOf('0,0,0')], nbAt, { levels: 4 });
+    assert.ok(r.violations.some(v => v.block[0] === 0 && v.axis === 0 && v.dir === -1 && v.nDepth === 0),
+      `the periodic wrap must be checked, not clamped: ${JSON.stringify(r.violations)}`);
+  });
+
+  ok('geometry coverage passes a real refineNearBody result', () => {
+    const p = makePool({ dims: [32, 32, 32], rb: 4 });
+    const c = [16, 16, 16], R = 5, margin = 2;
+    const sdf = (q) => Math.hypot(q[0] - c[0], q[1] - c[1], q[2] - c[2]) - R;
+    const { blockSlot } = refineNearBody(p, sdf, margin);
+    const r = checkGeometryCoverage(p, blockSlot, sdf, margin);
+    assert.ok(r.required > 0, 'the test body must actually require refinement');
+    assert.strictEqual(r.violations.length, 0, JSON.stringify(r.violations.slice(0, 3)));
+  });
+
+  ok('geometry coverage CATCHES a hole punched in the refined shell', () => {
+    const p = makePool({ dims: [32, 32, 32], rb: 4 });
+    const c = [16, 16, 16], R = 5, margin = 2;
+    const sdf = (q) => Math.hypot(q[0] - c[0], q[1] - c[1], q[2] - c[2]) - R;
+    const { blockSlot } = refineNearBody(p, sdf, margin);
+    // Punch the hole in the block the body CENTRE sits in, not merely the
+    // first refined one: refineNearBody's block-corner test refines a wider
+    // set than the cell-granular requirement, so unrefining an outer block
+    // of the shell legitimately changes nothing and would make this test
+    // pass for the wrong reason.
+    const hole = p.blockId(...c.map(v => Math.floor(v / p.rb)));
+    assert.ok(blockSlot[hole] >= 0, 'the body centre must start out refined');
+    blockSlot[hole] = -1;
+    const r = checkGeometryCoverage(p, blockSlot, sdf, margin);
+    assert.ok(r.violations.length > 0, 'unrefining the block under the body must be caught');
+    assert.ok(r.violations.every(v => v.block === hole));
+  });
+
+  ok('geometry coverage is an INDEPENDENT route: it catches a body smaller than a block', () => {
+    // refineNearBody samples a block's corners and centre, so a body that
+    // fits between those samples refines nothing -- its own header says so.
+    // The cell-granular scan is what turns that from a comment into a
+    // failure, which is the whole reason it does not reuse that predicate.
+    const p = makePool({ dims: [32, 32, 32], rb: 4 });
+    // Centred ON a cell, so the cell scan sees it, but small enough to slip
+    // between the block's own corner and centre samples: block (0,0,0)
+    // spans cells 0..3, and both (0,0,0) and its centre (2,2,2) are sqrt(3)
+    // away, well outside R + margin.
+    const c = [1, 1, 1], R = 0.6, margin = 0.1;
+    const sdf = (q) => Math.hypot(q[0] - c[0], q[1] - c[1], q[2] - c[2]) - R;
+    const { blockSlot, activeSlots } = refineNearBody(p, sdf, margin);
+    assert.strictEqual(activeSlots, 0, 'the premise of this test is that the block test misses it');
+    const r = checkGeometryCoverage(p, blockSlot, sdf, margin);
+    assert.ok(r.violations.length > 0, 'the cell-granular scan must catch what the block test missed');
   });
 
   if (!process.exitCode) console.log(`\n${pass} check(s) passed`);
