@@ -35,11 +35,14 @@
 //                coupling: not conservative, but correct everywhere.
 //                `explode` is the Chen et al. 2006 explode/coalesce. Exactly
 //                conservative in mass AND momentum on every rung of the
-//                geometry ladder (all/slab/bar/box), and as of M4.1c its
-//                field error tracks the no-interface control to within
-//                8-10% -- there is no seam signature left to find. Still not
-//                the default only because it has no body coupling yet.
-//                plans/3D.md M4.1b-c; M4.1d is the switch-over.
+//                geometry ladder (all/slab/bar/box); as of M4.1c its field
+//                error tracks the no-interface control to within 8-10%, and
+//                as of M4.1d it carries a body -- a sphere in a refined
+//                shell reproduces the DENSE run's Cd to 0.07%. It is better
+//                than `interp` on every measure taken. It is not yet the
+//                DEFAULT only because flipping it moves every recorded AMR
+//                benchmark at once and main is the published site; that is a
+//                deliberate, separate change. plans/3D.md M4.1b-d.
 //   ?reflux=1    OPT-IN coarse/fine interface flux correction (M4). Makes
 //                the interface exactly conservative in mass and momentum,
 //                and on a seam with no convex corner (?refine=slab) halves
@@ -373,10 +376,22 @@ async function init() {
     { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
   ]});
+  // M4.1d: binding 3 is blockSlot, for the finest-wins mask. Bound on EVERY
+  // scenario with the same dummy the step kernel uses when there is no pool,
+  // so this layout does not fork -- the 238e48c failure surface is exactly a
+  // bind group that exists in two versions.
   const forceBGL = device.createBindGroupLayout({ entries: [
     { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+  ]});
+  // The fine-level force kernel: f_in, body, forces, slotToBlock.
+  const forcePoolBGL = device.createBindGroupLayout({ entries: [
+    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
   ]});
   const physicsBGL = device.createBindGroupLayout({ entries: [
     { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
@@ -402,9 +417,11 @@ async function init() {
   // pre-streaming, time-t data both formulas want, with no separate
   // buffer-timing bookkeeping. Same arrangement as the 2D main-cylinder.js.
   const forceBGA = device.createBindGroup({ layout: forceBGL, entries: [
-    { binding: 0, resource: { buffer: fA } }, { binding: 1, resource: { buffer: bodyBuf } }, { binding: 2, resource: { buffer: forceBuf } }]});
+    { binding: 0, resource: { buffer: fA } }, { binding: 1, resource: { buffer: bodyBuf } },
+    { binding: 2, resource: { buffer: forceBuf } }, { binding: 3, resource: { buffer: blockSlotBound } }]});
   const forceBGB = device.createBindGroup({ layout: forceBGL, entries: [
-    { binding: 0, resource: { buffer: fB } }, { binding: 1, resource: { buffer: bodyBuf } }, { binding: 2, resource: { buffer: forceBuf } }]});
+    { binding: 0, resource: { buffer: fB } }, { binding: 1, resource: { buffer: bodyBuf } },
+    { binding: 2, resource: { buffer: forceBuf } }, { binding: 3, resource: { buffer: blockSlotBound } }]});
   const physicsBG = device.createBindGroup({ layout: physicsBGL, entries: [
     { binding: 0, resource: { buffer: bodyBuf } }, { binding: 1, resource: { buffer: forceBuf } }]});
   const zeroBG = device.createBindGroup({ layout: zeroBGL, entries: [{ binding: 0, resource: { buffer: forceBuf } }]});
@@ -452,7 +469,12 @@ async function init() {
   const forcePipe = HAS_BODY ? await device.createComputePipelineAsync({
     layout: device.createPipelineLayout({ bindGroupLayouts: [forceBGL] }),
     compute: { module: forceModule, entryPoint: 'main', constants: {
-      ...dims, WGX: WG[0], WGY: WG[1], WGZ: WG[2], USE_BOUNCEBACK, CHI_EPS } },
+      ...dims, WGX: WG[0], WGY: WG[1], WGZ: WG[2], USE_BOUNCEBACK, CHI_EPS,
+      // Same source as the step kernel's, for the same reason the coupling
+      // constants above are: a mask mismatch would double-count or drop a
+      // whole region of the body.
+      HAS_POOL: stepConstants.HAS_POOL, RB: stepConstants.RB,
+      NBX: stepConstants.NBX, NBY: stepConstants.NBY, NBZ: stepConstants.NBZ } },
   }) : null;
   const physPipe = HAS_BODY ? await device.createComputePipelineAsync({
     layout: device.createPipelineLayout({ bindGroupLayouts: [physicsBGL] }),
@@ -491,6 +513,7 @@ async function init() {
   let fluxBGA = null, fluxBGB = null, refluxBG = null;
   let explodePipe = null, coalescePipe = null;
   let explodeBG = null, coalesceBG = null;
+  let forcePoolPipe = null, forcePoolBG = null;
 
   // M4's interface flux correction. OPT-IN (?reflux=1), and NOT the default
   // -- it does what it was built to do and that turned out not to be enough.
@@ -522,15 +545,12 @@ async function init() {
   const IFACE = urlParams.get('interface') || 'interp';
   if (!['explode', 'interp'].includes(IFACE)) throw new Error(`?interface=${IFACE}: expected explode or interp`);
   const EXPLODE = AMR && IFACE === 'explode';
-  // A body inside a refined region needs a FINE-level force reduction, and
-  // M2 only ever built the L0 one -- it worked before only because the coarse
-  // cells under refinement held restricted values for it to integrate. With
-  // the grid partitioned (M4.1a) there is nothing there to integrate, so this
-  // fails loudly rather than quietly reporting a force that is too small.
-  // The fine force pass is M4.1d's, alongside the sphere-with-AMR case.
-  if (EXPLODE && params.body) {
-    throw new Error('?interface=explode does not support a body yet: the L0 force reduction has no coarse field under a refined region, and there is no L1 force pass (plans/3D.md M4.1d). Use ?interface=interp.');
-  }
+  // M4.1d lifted the "explode cannot carry a body" restriction: the body
+  // force is now integrated on the level that OWNS each region -- the coarse
+  // kernel masks out cells a refined block covers and
+  // shaders/common_d3_force_pool.wgsl sums those at fine resolution. Before
+  // that, the L0 reduction under a refined region was reading whatever
+  // coalesce had not written, which is stale, not merely coarse.
 
   const REFLUX = (() => {
     if (!AMR) return 0;
@@ -590,6 +610,21 @@ async function init() {
       SPONGE_W: sponge.width, SPONGE_UX: sponge.u[0], SPONGE_UY: sponge.u[1], SPONGE_UZ: sponge.u[2],
     });
     avgPipe = await mk(avgBGL, avgModule, { ...poolConst, TAU_COARSE, DC_PRE });
+
+    // M4.1d: the fine level's own force/torque reduction. Created from the
+    // SAME USE_BOUNCEBACK/CHI_EPS the step and coarse-force pipelines got --
+    // three kernels over one pair of values, so a mismatch cannot arise from
+    // three separate copies of them.
+    if (HAS_BODY) {
+      const forcePoolModule = device.createShaderModule({
+        code: await loadShader(`shaders/d3_force_pool_q${Q}.wgsl`), label: `d3_force_pool_q${Q}` });
+      forcePoolPipe = await mk(forcePoolBGL, forcePoolModule, { ...poolConst, USE_BOUNCEBACK, CHI_EPS });
+      // Reads the pool buffer substep A will read, i.e. the fine level's
+      // time-t state, matching the coarse kernel's own pre-streaming read.
+      forcePoolBG = device.createBindGroup({ layout: forcePoolBGL, entries: [
+        { binding: 0, resource: { buffer: fPoolA } }, { binding: 1, resource: { buffer: bodyBuf } },
+        { binding: 2, resource: { buffer: forceBuf } }, { binding: 3, resource: { buffer: slotToBlockBuf } }]});
+    }
 
     // interp needs BOTH coarse states (t and t+dt, which are simply the two
     // ping-pong buffers once the coarse step runs first) and writes whichever
@@ -794,7 +829,7 @@ async function init() {
     return [per, per, per * Math.max(1, poolAlloc.activeSlots)];
   })() : null;
 
-  // ORDER PER MACRO-STEP: zero -> force -> physics -> step.
+  // ORDER PER MACRO-STEP: zero -> force (+ fine force) -> physics -> step.
   //
   // force runs BEFORE step and reads the same f_in step will, so its
   // populations are the pre-streaming time-t data both the momentum-exchange
@@ -815,6 +850,18 @@ async function init() {
         const fp = enc.beginComputePass();
         fp.setPipeline(forcePipe); fp.setBindGroup(0, useB ? forceBGB : forceBGA);
         fp.dispatchWorkgroups(disp[0], disp[1], disp[2]); fp.end();
+        // M4.1d: the fine level integrates the part of the body its own
+        // tiles cover, and the coarse kernel above masked exactly those
+        // cells out. Two kernels, one `forces` buffer, one atomic
+        // accumulation -- so this is a partition of the integral, not a
+        // second opinion on it. It goes in its own compute pass for the
+        // reason the block comment above gives, and BEFORE physics, which
+        // reads the total.
+        if (forcePoolPipe) {
+          const fpp = enc.beginComputePass();
+          fpp.setPipeline(forcePoolPipe); fpp.setBindGroup(0, forcePoolBG);
+          fpp.dispatchWorkgroups(tileDisp[0], tileDisp[1], tileDisp[2]); fpp.end();
+        }
         const pp = enc.beginComputePass();
         pp.setPipeline(physPipe); pp.setBindGroup(0, physicsBG); pp.dispatchWorkgroups(1); pp.end();
       }

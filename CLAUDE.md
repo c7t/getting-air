@@ -213,8 +213,12 @@ landed. The coarse/fine interface on the `?interface=explode` path is now
 exactly conservative in mass AND momentum, and its field error has fallen
 to the no-interface control's level -- a refined box tracks `refine=all` to
 within 8-10% at N = 32/48/64, against the default `interp` path's 3.6x.
-M4.1d is next: body coupling on the explode path, then making it the
-default.
+M4.1d has landed too -- the fine level now integrates the body force
+(`common_d3_force_pool.wgsl`, weight dx^(D-1) = dx^2, NOT dx^3) and a sphere
+in a refined shell reproduces the dense run's Cd to 0.07%. M4.1e, making
+explode the DEFAULT, is next and is a blast-radius decision rather than an
+evidence one: merging publishes, and the flip moves every recorded AMR
+number at once.
 Read `plans/3D.md` before touching any of this — in particular its decision
 table at the top, which records what is settled so it does not get
 re-argued. Two things are settled and load-bearing:

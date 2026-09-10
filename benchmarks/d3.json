@@ -294,6 +294,27 @@
       "lateral_tol": 0.02
     }
   ],
+  "sphere_amr_note": "SPHERE WITH AMR (plans/3D.md M4.1d) -- the case this suite never had, and the point of the whole M4 exercise. It is scored against the DENSE case's own measured Cd, not against Schiller-Naumann: what it tests is CROSS-LEVEL INVARIANCE, i.e. that the same physical body gives the same drag whether the region around it is refined or not. A literature comparison cannot see that -- the staircased bounce-back sphere sits +12.8% above S-N either way, and a level-weighting bug would hide inside that offset. It is also the only gate on shaders/common_d3_force_pool.wgsl's dx^(D-1) = dx^2 weighting: dropping the 1/dt factor (dx^3) would halve the fine contribution, and with a body-fitted shell the fine level owns ALL of it, so the error is a factor of two in Cd, not a subtlety. Measured 2026-09-10, RTX 4080: AMR Cd 2.9417 against the dense 2.9436, 0.06%. The tolerance is 0.5%, which is 8x the measured difference and 100x below the dx^3 bug. CONFIRMED TO FIRE, not merely to pass: rebuilt with DX_WEIGHT = 0.125 the case gives Cd 1.4708, exactly -50.0% -- the predicted factor of two, 100x over the bound. A gate that has never been shown to fail is a recorded number, not a gate.",
+  "sphere_amr_cases": [
+    {
+      "name": "sphere-amr-Re20-D16",
+      "n": 16,
+      "re": 20,
+      "u0": 0.05,
+      "q": 19,
+      "bounceback": true,
+      "levels": 2,
+      "rb": 4,
+      "refine": "body",
+      "interface": "explode",
+      "settle_convective": 30,
+      "cd_matches": "sphere-Re20-D16",
+      "cd_matches_tol": 0.005,
+      "cd_measured": 2.9416,
+      "cd_dense_reference": 2.9436,
+      "cd_with_dx3_weight": 1.4708
+    }
+  ],
   "spin_cases": [
     {
       "name": "spin-N32",
@@ -428,6 +449,31 @@
       "mom_measured": 0.0001625,
       "mass_with_leak": -858.7,
       "mom_with_leak": 11.17
+    }
+  ],
+  "amr_box_explode_note": "FIELD accuracy on the ?interface=explode path (plans/3D.md M4.1c), the companion to amr_conserve_cases' conservation bounds. The pair is deliberate: M4.1b was exactly conservative and still carried an O(1) seam defect, so a conservation gate alone demonstrably does not guard this interface. Scored against RECORDED values, like amr-box-RB4 -- but unlike amr-box-RB4 the number is no longer dominated by a known defect: it tracks the no-interface control (refine=all) to within 8-10% at N = 32/48/64, so what these bounds actually guard is 'the seam is still invisible'. Measured 2026-09-10, RTX 4080. If a change makes these RISE, the seam signature is back; do not widen them.",
+  "amr_box_explode_cases": [
+    {
+      "name": "amr-box-explode-field",
+      "n": 48,
+      "tau": 0.8,
+      "u0": 0.04,
+      "q": 19,
+      "levels": 2,
+      "refine": "box",
+      "boxfrac": 0.5,
+      "rb": 4,
+      "interface": "explode",
+      "checkpoints": [
+        0.25,
+        0.5
+      ],
+      "field_l2_tol": 0.0035,
+      "decay_rate_tol": 0.004,
+      "field_l2_measured": 0.002484,
+      "decay_rate_measured": 0.001826,
+      "field_l2_control_all": 0.002293,
+      "field_l2_interp_same_case": 0.009012
     }
   ]
 }

@@ -54,6 +54,13 @@ function caseUrl(baseUrl, scenario, c, extra) {
   if (c.tau != null) p.set('tau', c.tau);
   if (c.q != null) p.set('q', c.q);
   if (c.bounceback) p.set('bounceback', '1');
+  // AMR knobs, present only on the M4.1d sphere-with-AMR cases. The body
+  // scenarios drive the same page as everything else, so these are the same
+  // parameters an interactive run would pass.
+  if (c.levels) p.set('levels', c.levels);
+  if (c.rb) p.set('rb', c.rb);
+  if (c.refine) p.set('refine', c.refine);
+  if (c.interface) p.set('interface', c.interface);
   return `${baseUrl}/index-3d.html?${p}${extra ? `&${extra}` : ''}`;
 }
 

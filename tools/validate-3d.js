@@ -100,12 +100,21 @@ async function main() {
     // because nothing here scored mass and momentum: amr-box-RB4 is the
     // interp path and refine=all has no interface to leak at.
     { scenario: 'beltrami', key: 'amr-conserve', run: runConserveCase, cases: bench.amr_conserve_cases, gate: true },
+    // M4.1c. The FIELD half of the explode path, next to the conservation
+    // half above -- M4.1b was exactly conservative while carrying an O(1)
+    // seam defect, so one of these does not imply the other.
+    { scenario: 'beltrami', key: 'amr-box', run: runBeltramiCase, cases: bench.amr_box_explode_cases, gate: true },
     { scenario: 'tgv', run: runTgvReport, cases: bench.tgv_cases, gate: false },
     // M2. `spin` first: it is seconds long and it isolates the integrator,
     // so if it fails there is no point spending minutes on the sphere.
     { scenario: 'spin', run: runSpinCase, cases: bench.spin_cases, gate: true, body: true },
     { scenario: 'sphere', run: runSphereCase, cases: bench.sphere_cases, gate: true, body: true },
     { scenario: 'sphere', key: 'sphere-diffuse', run: runSphereCase, cases: bench.sphere_diffuse_cases, gate: true, body: true, diffuse: true },
+    // M4.1d. Sphere inside a refined shell, scored against the DENSE case's
+    // own Cd rather than literature -- see benchmarks/d3.json's
+    // sphere_amr_note. Ordered after the dense spheres because it reads one
+    // of their results.
+    { scenario: 'sphere', key: 'sphere-amr', run: runSphereCase, cases: bench.sphere_amr_cases, gate: true, body: true },
   ].filter(g => !opts.skip.includes(g.key || g.scenario))
    .map(g => ({ ...g, cases: g.cases.filter(c => wanted(c.name)) }))
    .filter(g => g.cases.length);
@@ -167,6 +176,26 @@ async function main() {
               res.matchCheck = { pass: same, label: `identical to ${c.matches}`,
                 measured: `${res.maxL2rel} vs ${other.res.maxL2rel}`, target: 'bit-identical' };
               console.log(`    vs ${c.matches}: ${same ? 'bit-identical' : 'DIFFERS'}`);
+            }
+          }
+          // CROSS-LEVEL INVARIANCE. The same physical body must give the
+          // same drag whether the region around it is refined or not, and
+          // that is a far sharper statement than any literature comparison:
+          // the staircased sphere sits +12.8% above Schiller-Naumann either
+          // way, so a level-weighting bug hides inside that offset while
+          // showing up here immediately.
+          if (c.cd_matches) {
+            const ref = report.find(r => r.name === c.cd_matches);
+            if (ref && ref.res) {
+              const rel = (res.cd - ref.res.cd) / ref.res.cd;
+              res.cdCheck = { pass: Math.abs(rel) <= c.cd_matches_tol, label: `CdVs${c.cd_matches}`,
+                              measured: rel, target: 0, tol: c.cd_matches_tol };
+              res.cdRef = ref.res.cd;
+              res.relErr = rel;
+              console.log(`    vs ${c.cd_matches}'s own Cd ${ref.res.cd.toFixed(4)} (not literature): ${(rel * 100).toFixed(2)}%`);
+            } else {
+              res.cdCheck = { pass: false, label: `CdVs${c.cd_matches}`, measured: null, target: 0, tol: c.cd_matches_tol };
+              console.log(`    !! ${c.cd_matches} did not run, so the invariance check cannot be made`);
             }
           }
           if (c.converges_from) {
