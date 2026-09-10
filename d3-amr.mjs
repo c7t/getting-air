@@ -217,6 +217,14 @@ function faceChildren(a, s) {
 
 const FACES = [[0, -1], [0, 1], [1, -1], [1, 1], [2, -1], [2, 1]];
 
+// All 27 block offsets including (0,0,0). The RING needs these, not just the
+// six faces -- see checkRingParentCoverage and cascade21.
+const NBR27 = (() => {
+  const out = [];
+  for (let dz = -1; dz <= 1; dz++) for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) out.push([dx, dy, dz]);
+  return out;
+})();
+
 // 2:1 BALANCE. `levelSets[m]` is a Set of "bx,by,bz" keys naming the blocks
 // active at level m (m >= 1); level 0 is the dense grid and is implicit.
 // `nbAt(m)` gives that level's block counts per axis, which double each
@@ -273,6 +281,60 @@ export function check21Balance(levelSets, nbAt, { levels }) {
     }
   }
   return { violations, levels, counts: levelSets.map(s => (s ? s.size : 0)) };
+}
+
+// RING PARENT COVERAGE -- an invariant 2:1 balance does NOT imply, and one
+// that does not exist at all until there is a pool parent (M5.2).
+//
+// THE REQUIREMENT. A tile's ring extends one PARENT cell beyond its block on
+// every one of the 26 sides. `explode` fills a ring cell from the parent cell
+// containing it, so that parent cell has to live in an allocated parent tile.
+// At level 1 this is free and invisible: the parent is the dense L0 grid,
+// which exists everywhere. At level >= 2 the parent is a pool, and a tile
+// that is not there cannot be read from.
+//
+// WHY THE FACES ARE NOT ENOUGH, concretely. Take child block b = (2p, 2p, z),
+// the lower octant on x and y. Its diagonal neighbour (2p-1, 2p-1, z) has
+// parent (p-1, p-1, ...). The face closure supplies parent(2p-1, 2p, z) =
+// (p-1, p, ...) and parent(2p, 2p-1, z) = (p, p-1, ...) and NOT (p-1, p-1).
+// So the corner ring cell's parent tile is absent.
+//
+// AND THAT CELL IS READ. common_d3_amr_step1.wgsl resolves a source against
+// the diagonal same-level neighbour tile (`nbrXYZ`) and falls back to the
+// ring when that tile is absent -- which is exactly the configuration where
+// the corner ring cell matters. `explode` skips ring cells sitting inside a
+// COVERED parent cell, so the cells it does write are precisely the ones the
+// step will read: the two agree, and both need the parent.
+//
+// This is NOT the "corner-balance refinement constraint" sec 2.1 cites as a
+// cost of ghost-free. That one is about SAME-LEVEL corner neighbours. This is
+// about the PARENT level, it is what keeping the ring costs at depth, and it
+// was found by reading step1's fallback rather than by a failing run --
+// which is the only way it could have been found, since the configuration
+// that exercises it cannot exist until levels >= 3.
+//
+// Written as its own checker rather than folded into check21Balance because
+// they are different claims: a tree can be perfectly 2:1 balanced and still
+// have a ring cell with nowhere to read from.
+export function checkRingParentCoverage(levelSets, nbAt, { levels }) {
+  const violations = [];
+  let required = 0;
+  for (let m = 2; m < levels; m++) {
+    const nb = nbAt(m);
+    const parent = levelSets[m - 1] || new Set();
+    for (const key of levelSets[m] || []) {
+      const b = key.split(',').map(Number);
+      for (const d of NBR27) {
+        const n = [0, 1, 2].map(a => ((b[a] + d[a]) % nb[a] + nb[a]) % nb[a]);
+        const p = `${n[0] >> 1},${n[1] >> 1},${n[2] >> 1}`;
+        required++;
+        if (!parent.has(p) && violations.length < 32) {
+          violations.push({ level: m, block: b.slice(), offset: d.slice(), missingParent: p });
+        }
+      }
+    }
+  }
+  return { violations, required };
 }
 
 // GEOMETRY-FORCED REFINEMENT, checked at CELL granularity against the SDF
@@ -400,14 +462,17 @@ export function cascade21(wantSets, nbAt, { levels }) {
     const nb = nbAt(m);
     for (const key of sets[m]) {
       const b = key.split(',').map(Number);
-      // The tree property first: a block with no parent is not a refinement
-      // of anything. The manager can produce one -- the criterion is
-      // evaluated per level and nothing in it looks up.
-      ensure(m - 1, [b[0] >> 1, b[1] >> 1, b[2] >> 1], { parentOf: b.slice(), level: m });
-      for (const [a, s] of FACES) {
-        const n = b.slice();
-        n[a] = ((n[a] + s) % nb[a] + nb[a]) % nb[a];   // periodic, like the checker
-        ensure(m - 1, [n[0] >> 1, n[1] >> 1, n[2] >> 1], { neighbourOf: b.slice(), level: m, axis: a, dir: s });
+      // ALL 27 OFFSETS, NOT THE SIX FACES -- d = (0,0,0) is the tree
+      // property (a block with no parent is not a refinement of anything),
+      // the faces are 2:1 balance, and the twelve edges and eight corners
+      // are the RING. See the header: face-only closure leaves a corner
+      // ring cell's parent tile unallocated, and step1 reads exactly that
+      // cell whenever the diagonal same-level neighbour is absent.
+      for (const d of NBR27) {
+        const n = [0, 1, 2].map(a => ((b[a] + d[a]) % nb[a] + nb[a]) % nb[a]);   // periodic, like the checker
+        ensure(m - 1, [n[0] >> 1, n[1] >> 1, n[2] >> 1],
+          d.every(c => c === 0) ? { parentOf: b.slice(), level: m }
+                                : { neighbourOf: b.slice(), level: m, offset: d.slice() });
       }
     }
   }

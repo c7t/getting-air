@@ -37,6 +37,7 @@ const close = (a, b, tol, what) =>
     refineNearBody, resolveSource, toGlobalFine, fromGlobalFine, storageRatio,
     check21Balance, checkGeometryCoverage, cascade21,
     poolAtLevel, parentOfBlock, octantOfBlock, octantOrigin, refineHierarchy,
+    checkRingParentCoverage,
   } = A;
 
   ok('pool geometry follows FB = 2*RB + 2*GHOST and rejects a non-dividing RB', () => {
@@ -639,8 +640,11 @@ const close = (a, b, tol, what) =>
     // these move, the closure changed -- and whether the new numbers are
     // right is a question for the minimality test above, not for this
     // assertion, which only makes the move visible.
-    assert.deepStrictEqual(c.counts.slice(1), [184, 704, 2432],
-      `balanced counts moved from the recorded 184/704/2432`);
+    assert.deepStrictEqual(c.counts.slice(1), [432, 1280, 2432],
+      `balanced counts moved from the recorded 432/1280/2432`);
+    // The ring's parents are there too, which is the other half of what the
+    // closure now serves.
+    assert.strictEqual(checkRingParentCoverage(c.sets, nbAt, { levels: 4 }).violations.length, 0);
   });
 
   ok('the cascade output is OCTET-COMPLETE, which is what the checker assumes', () => {
@@ -693,7 +697,43 @@ const close = (a, b, tol, what) =>
       for (const f of members) cut[f.level].delete(f.block.join(','));
       const bal = check21Balance(cut, nbAt3, { levels: 4 }).violations.length;
       const orp = orphans(cut, 4).length;
-      assert.ok(bal > 0 || orp > 0, `removing forced octet ${g} left a legal tree: it was not necessary`);
+      // THREE independent statements, because the closure now serves three
+      // requirements: 2:1 balance, the parent property, and RING PARENT
+      // COVERAGE. Some octets are forced by the last alone -- those are the
+      // twelve edges and eight corners, and without this term they would
+      // read as unnecessary and get "optimized" back out.
+      const ring = checkRingParentCoverage(cut, nbAt3, { levels: 4 }).violations.length;
+      assert.ok(bal > 0 || orp > 0 || ring > 0,
+        `removing forced octet ${g} left a legal tree: it was not necessary`);
+    }
+  });
+
+  ok('ring parent coverage CATCHES what 2:1 balance cannot see', () => {
+    // The finding that forced the closure from six faces to 27 offsets
+    // (plans/3D.md M5.2). Two checkers exist because they are two claims: a
+    // tree can be perfectly 2:1 balanced and still have a ring cell with
+    // nowhere to read its parent from.
+    const nbAt = (m) => Array(3).fill(4 * 2 ** (m - 1));
+    const child = new Set(['2,2,2']);          // parent (1,1,1), octant (0,0,0)
+    // Exactly what a FACE-only closure supplies: the block's own parent and
+    // the parents of its six face neighbours.
+    const faceOnly = new Set(['1,1,1', '0,1,1', '1,0,1', '1,1,0']);
+    const A = [null, faceOnly, child];
+    const ringA = checkRingParentCoverage(A, nbAt, { levels: 3 });
+    assert.ok(ringA.violations.some(v => v.missingParent === '0,0,0'),
+      `the corner parent must be reported missing: ${JSON.stringify(ringA.violations.slice(0, 3))}`);
+    // Add the four the corner and edges need and it goes quiet.
+    const B = [null, new Set([...faceOnly, '0,0,0', '0,0,1', '0,1,0', '1,0,0']), child];
+    assert.strictEqual(checkRingParentCoverage(B, nbAt, { levels: 3 }).violations.length, 0,
+      'the eight parents the ring needs must be enough');
+    // THE DISAGREEMENT. For that block, 2:1 balance reports nothing in
+    // EITHER tree -- it only ever looks at faces, so the missing corner
+    // parent is invisible to it. A closure gated on check21Balance alone
+    // would therefore have shipped the face-only version.
+    for (const [name, tree] of [['face-only', A], ['ring-covered', B]]) {
+      const bal = check21Balance(tree, nbAt, { levels: 3 });
+      assert.strictEqual(bal.violations.filter(v => v.level === 2).length, 0,
+        `${name}: 2:1 balance must be silent here, or this test proves nothing`);
     }
   });
 
@@ -749,6 +789,12 @@ const close = (a, b, tol, what) =>
       const bal = check21Balance(h.sets, nbAt, { levels });
       assert.strictEqual(bal.violations.length, 0,
         `levels=${levels}: ${bal.violations.length} violations, e.g. ${JSON.stringify(bal.violations[0])}`);
+      // And every ring cell has a parent tile to read from -- the invariant
+      // the pool-parent explode depends on and 2:1 balance does not imply.
+      const ring = checkRingParentCoverage(h.sets, nbAt, { levels });
+      assert.ok(ring.required > 0, `levels=${levels}: the ring check found nothing to check`);
+      assert.strictEqual(ring.violations.length, 0,
+        `levels=${levels}: ${ring.violations.length} ring cells have no parent tile, e.g. ${JSON.stringify(ring.violations[0])}`);
       // Every level is populated and properly parented: a hierarchy that
       // refined only the finest level would pass 2:1 above only if the
       // closure were broken, so this is the cross-check on that.

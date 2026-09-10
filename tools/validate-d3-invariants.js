@@ -150,7 +150,7 @@ async function runConfig(Runtime, o, c, log) {
   const p = await evalOrThrow(Runtime, `${G}.getParams()`, 20000, 'getParams');
   log(`N=${p.N} Q${p.Q} levels=${p.levels} RB=${p.rb} ${p.activeSlots}/${p.blocks} tiles`);
 
-  const res = { bal: [], cov: [], pool: [], finite: true, vacuous: null, covSkipped: null, blewUp: false };
+  const res = { bal: [], ring: [], cov: [], pool: [], finite: true, vacuous: null, covSkipped: null, blewUp: false };
   // A config may cap its own step count: the allocator cases only need a few
   // steps to change hands, and running them long is spending minutes on a
   // field that is deliberately wrong.
@@ -158,6 +158,7 @@ async function runConfig(Runtime, o, c, log) {
   let done = 0, firstInUse = null, firstBbox = null;
   while (done <= steps) {
     const bal = await evalOrThrow(Runtime, `${G}.debugCheck21Balance()`, 120000, 'debugCheck21Balance');
+    const ring = await evalOrThrow(Runtime, `${G}.debugCheckRingParents()`, 120000, 'debugCheckRingParents');
     const cov = await evalOrThrow(Runtime, `${G}.debugCheckGeometryCoverage()`, 300000, 'debugCheckGeometryCoverage');
     const ps = await evalOrThrow(Runtime, `${G}.debugPoolState()`, 300000, 'debugPoolState');
     const st = await evalOrThrow(Runtime, `${G}.readStats()`, 300000, 'readStats');
@@ -171,6 +172,8 @@ async function runConfig(Runtime, o, c, log) {
     if (cov.skipped) res.covSkipped = cov.skipped;
     if (c.skipCoverage) res.covSkipped = 'not gated (the manager margin is deliberately wrong here)';
     if (!bal.ok) res.bal.push({ at: done, n: bal.nViolations, first: bal.violations[0] });
+    res.ringVacuous = ring.vacuous;
+    if (ring.ok === false) res.ring.push({ at: done, n: ring.nViolations, first: ring.violations[0] });
     if (cov.ok === false && !c.skipCoverage) res.cov.push({ at: done, n: cov.nViolations, first: cov.violations[0] });
     if (cov.required != null) res.required = cov.required;
     if (st.finite === false || !Number.isFinite(st.ke)) {
@@ -181,6 +184,7 @@ async function runConfig(Runtime, o, c, log) {
       break;
     }
     log(`step ${done}: 2:1 ${bal.ok ? 'ok' : `${bal.nViolations} VIOLATIONS`}`
+      + `  ring ${ring.ok ? (ring.vacuous ? 'vacuous' : `ok (${ring.required})`) : `${ring.nViolations} VIOLATIONS`}`
       + `  coverage ${cov.skipped ? 'skipped' : (cov.ok ? `ok (${cov.required} cells required)` : `${cov.nViolations} VIOLATIONS`)}`
       + `  pool ${ps.ok ? `ok (${ps.inUse} in use, ${ps.free} free${ps.dynamic ? ', dynamic' : ''})` : `${ps.problems.length} PROBLEMS`}`
       + `  ke=${Number(st.ke).toExponential(3)}`);
@@ -253,23 +257,25 @@ async function main() {
     await teardown({ port: o.port, tabId, chrome, server, keepOpen: o.keepOpen });
   }
 
-  console.log('\n' + '='.repeat(88));
+  console.log('\n' + '='.repeat(104));
   console.log(`SUMMARY  ${o.steps} steps, checked every ${o.checkEvery}`);
-  console.log('='.repeat(88));
-  console.log(pad('config', 14) + pad('2:1 balance', 21) + pad('geometry coverage', 30) + pad('pool', 14) + padL('verdict', 9));
-  console.log('-'.repeat(88));
+  console.log('='.repeat(104));
+  console.log(pad('config', 14) + pad('2:1 balance', 21) + pad('ring parents', 18)
+    + pad('geometry coverage', 30) + pad('pool', 14) + padL('verdict', 9));
+  console.log('-'.repeat(104));
   let exitCode = 0;
   for (const r of report) {
-    if (r.error) { console.log(pad(r.name, 14) + pad('-', 21) + pad('-', 30) + pad('-', 14) + padL('ERROR', 9)); exitCode = 1; continue; }
+    if (r.error) { console.log(pad(r.name, 14) + pad('-', 21) + pad('-', 18) + pad('-', 30) + pad('-', 14) + padL('ERROR', 9)); exitCode = 1; continue; }
     const x = r.res;
     const balTxt = x.bal.length ? `${x.bal.length} checkpoints BAD` : (x.vacuous ? 'ok (VACUOUS N=2)' : 'ok');
     const covTxt = x.cov.length ? `${x.cov.length} checkpoints BAD`
       : (x.covSkipped ? 'skipped (not geometry-forced)' : `ok (${x.required} cells required)`);
     const poolTxt = x.pool.length ? `${x.pool.length} BAD`
       : (x.poolState ? `ok ${x.poolState.inUse}+${x.poolState.free}${x.blewUp ? '*' : ''}` : 'skipped');
-    const ok = !x.bal.length && !x.cov.length && !x.pool.length && x.finite;
+    const ringTxt = x.ring.length ? `${x.ring.length} checkpoints BAD` : (x.ringVacuous ? 'ok (VACUOUS N=2)' : 'ok');
+    const ok = !x.bal.length && !x.ring.length && !x.cov.length && !x.pool.length && x.finite;
     if (!ok) exitCode = 1;
-    console.log(pad(r.name, 14) + pad(balTxt, 21) + pad(covTxt, 30) + pad(poolTxt, 14) + padL(ok ? 'PASS' : 'FAIL', 9));
+    console.log(pad(r.name, 14) + pad(balTxt, 21) + pad(ringTxt, 18) + pad(covTxt, 30) + pad(poolTxt, 14) + padL(ok ? 'PASS' : 'FAIL', 9));
   }
   if (report.some(r => r.res && r.res.blewUp && r.res.finite)) {
     console.log('\n* the field blew up, EXPECTEDLY: that config allocates tiles nothing initializes');
@@ -284,13 +290,19 @@ async function main() {
     console.log('The cascade that will make it non-vacuous is d3-amr.mjs\'s cascade21, and it is');
     console.log('the identity at ?levels=2 for the same reason, so there is no balance pass in the');
     console.log('manager to exercise here (M4.2b-iv). make test is where that rule is gated.');
+    console.log('');
+    console.log('RING PARENTS is vacuous for a DIFFERENT reason worth keeping straight: level 1\'s');
+    console.log('parent is the DENSE L0 grid, which exists everywhere, so no parent tile can be');
+    console.log('missing. At levels>=3 it is a real gate and it is NOT implied by 2:1 balance --');
+    console.log('see d3-amr.mjs\'s checkRingParentCoverage, whose test asserts the two disagree.');
   }
-  const failed = report.filter(r => r.error || (r.res && (r.res.bal.length || r.res.cov.length || r.res.pool.length || !r.res.finite)));
+  const failed = report.filter(r => r.error || (r.res && (r.res.bal.length || r.res.ring.length || r.res.cov.length || r.res.pool.length || !r.res.finite)));
   if (failed.length) {
     console.log('\nDetails:');
     for (const r of failed) {
       if (r.error) { console.log(`  [${r.name}] ${r.error}`); continue; }
       for (const b of r.res.bal) console.log(`  [${r.name}] 2:1 at step ${b.at}: ${b.n} violations, e.g. ${JSON.stringify(b.first)}`);
+      for (const b of r.res.ring) console.log(`  [${r.name}] ring parents at step ${b.at}: ${b.n} violations, e.g. ${JSON.stringify(b.first)}`);
       for (const b of r.res.cov) console.log(`  [${r.name}] coverage at step ${b.at}: ${b.n} violations, e.g. ${JSON.stringify(b.first)}`);
       for (const b of r.res.pool) console.log(`  [${r.name}] pool at step ${b.at}: ${b.n} problems, e.g. ${JSON.stringify(b.first)}`);
       if (!r.res.finite) console.log(`  [${r.name}] field blew up`);

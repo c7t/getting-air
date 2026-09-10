@@ -79,7 +79,7 @@ import { SUPPORTED_Q } from './lattice-3d.mjs';
 import { SCENARIOS, SCENARIO_NAMES, resolveScenario, nuFromTau, beltramiVelocityAt } from './d3-scenarios.mjs';
 import { packBodyState, unpackBodyState, BODY_FIELDS } from './d3-body.mjs';
 import { makePool, refineHierarchy, nearBodyWant, storageRatio, GHOST,
-         check21Balance, checkGeometryCoverage } from './d3-amr.mjs';
+         check21Balance, checkGeometryCoverage, checkRingParentCoverage } from './d3-amr.mjs';
 
 const canvas   = document.getElementById('c');
 const statusEl = document.getElementById('status');
@@ -1515,12 +1515,11 @@ async function init() {
              bbox, initialActive: poolAlloc.activeSlots, dynamic: !!DYNAMIC };
   }
 
-  async function debugCheck21Balance() {
-    if (!AMR) return { skipped: 'no pool (?levels=1)' };
-    // EVERY level's map, read back from the GPU -- not the host's copy of
-    // what it once uploaded, and not level 1 alone. A checker fed one level
-    // of a three-level tree cannot fail, which is the same VACUOUS trap
-    // ?levels=3 used to spring before M5.0 refused it.
+  // EVERY level's map, read back from the GPU -- not the host's copy of what
+  // it once uploaded, and not level 1 alone. A checker fed one level of a
+  // three-level tree cannot fail, which is the same VACUOUS trap ?levels=3
+  // used to spring before M5.0 refused it.
+  async function readLevelSets() {
     const levelSets = [null];
     for (let m = 1; m < LEVELS; m++) {
       const bs = await readBlockSlot(m);
@@ -1529,10 +1528,36 @@ async function init() {
       for (let id = 0; id < lp.nBlocks; id++) if (bs[id] >= 0) set.add(lp.blockOf(id).join(','));
       levelSets[m] = set;
     }
-    // nbAt doubles per level, matching d3-amr.mjs's poolAtLevel -- the same
-    // block grid cascade21 and refineHierarchy are written against.
-    const r = check21Balance(levelSets, (m) => pool.nb.map(n => n * 2 ** (m - 1)),
-                             { levels: LEVELS });
+    return levelSets;
+  }
+  // nbAt doubles per level, matching d3-amr.mjs's poolAtLevel -- the same
+  // block grid cascade21 and refineHierarchy are written against.
+  const nbAtLevel = (m) => pool.nb.map(n => n * 2 ** (m - 1));
+
+  // RING PARENT COVERAGE (plans/3D.md M5.2a). Every ring cell's parent cell
+  // must sit in an allocated PARENT tile, or explode has nothing to read.
+  // Separate from 2:1 balance because it is a separate claim -- a perfectly
+  // balanced tree can still have a corner ring cell with no parent, and
+  // d3-amr.mjs's own test asserts the two checkers disagree on exactly that.
+  async function debugCheckRingParents() {
+    if (!AMR) return { skipped: 'no pool (?levels=1)' };
+    const r = checkRingParentCoverage(await readLevelSets(), nbAtLevel, { levels: LEVELS });
+    return {
+      ok: r.violations.length === 0,
+      violations: r.violations.slice(0, 16),
+      nViolations: r.violations.length,
+      required: r.required,
+      // Nothing to check with one refined level: level 1's parent is the
+      // dense L0 grid, which exists everywhere. Said out loud rather than
+      // reported as a green tick, same as the 2:1 line.
+      vacuous: LEVELS < 3,
+    };
+  }
+
+  async function debugCheck21Balance() {
+    if (!AMR) return { skipped: 'no pool (?levels=1)' };
+    const levelSets = await readLevelSets();
+    const r = check21Balance(levelSets, nbAtLevel, { levels: LEVELS });
     return {
       ok: r.violations.length === 0,
       violations: r.violations.slice(0, 16),
@@ -1852,7 +1877,7 @@ async function init() {
       } : {}),
     }),
     readSubsampled, readDuctProfile, readStats, readBody, readPoolStats,
-    debugCheck21Balance, debugCheckGeometryCoverage, debugPoolState,
+    debugCheck21Balance, debugCheckGeometryCoverage, debugCheckRingParents, debugPoolState,
     readInterfaceDiag, readFluxAcc,
     debugStepSync,
   };
