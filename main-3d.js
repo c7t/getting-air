@@ -31,18 +31,15 @@
 //                plans/3D.md M4; `all` refines everything (the noise floor
 //                -- no coarse/fine interface anywhere).
 //   ?margin=2  ?boxfrac=0.5
-//   ?interface=  `interp` (default) is the M3 trilinear-plus-Dupuis-Chopard
-//                coupling: not conservative, but correct everywhere.
-//                `explode` is the Chen et al. 2006 explode/coalesce. Exactly
-//                conservative in mass AND momentum on every rung of the
-//                geometry ladder (all/slab/bar/box); as of M4.1c its field
-//                error tracks the no-interface control to within 8-10%, and
-//                as of M4.1d it carries a body -- a sphere in a refined
-//                shell reproduces the DENSE run's Cd to 0.07%. It is better
-//                than `interp` on every measure taken. It is not yet the
-//                DEFAULT only because flipping it moves every recorded AMR
-//                benchmark at once and main is the published site; that is a
-//                deliberate, separate change. plans/3D.md M4.1b-d.
+//   ?interface=  `explode` (DEFAULT since M4.1e) is Chen et al. 2006's
+//                explode/coalesce: exactly conservative in mass AND momentum
+//                on every rung of the geometry ladder (all/slab/bar/box),
+//                field error within 8-10% of the no-interface control, and
+//                a sphere in a refined shell reproduces the DENSE run's Cd
+//                to 0.07%. `interp` is the M3 trilinear-plus-Dupuis-Chopard
+//                coupling it replaced: NOT conservative and 3.6x worse on
+//                the field, kept switchable so the conversion can be A/B'd
+//                in one build. plans/3D.md M4.1b-e.
 //   ?reflux=1    OPT-IN coarse/fine interface flux correction (M4). Makes
 //                the interface exactly conservative in mass and momentum,
 //                and on a seam with no convex corner (?refine=slab) halves
@@ -564,10 +561,19 @@ async function init() {
   //           own it, using a centred periodic wrap. With fewer than three
   //           blocks on an axis a tile's ring wraps onto itself and the wrap
   //           is ambiguous.
-  // M4.1b. `interp` is the M3 coupling and is kept switchable because it is
-  // the only way to A/B the conversion in one build -- not because it is a
-  // supported mode. It is NOT conservative.
-  const IFACE = urlParams.get('interface') || 'interp';
+  // M4.1e, 2026-09-10: `explode` is the DEFAULT. Chen et al. (2006)'s
+  // explode/coalesce is exactly conservative in mass and momentum where the
+  // M3 `interp` coupling is not, its field error tracks the no-interface
+  // control to within 8-10% where interp is 3.6x worse, it reproduces the
+  // dense sphere Cd to 0.07% where interp is 0.63%, and it costs +2.9% per
+  // macro-step on a body-fitted shell and less than nothing at larger
+  // refined fractions. plans/3D.md M4.1b-e has every number.
+  //
+  // `interp` is kept switchable because it is the only way to A/B the
+  // conversion in one build, and because benchmarks/d3.json's amr-box-RB4
+  // pins it as the control that says this work did not disturb the old
+  // path -- not because it is a recommended mode. It is NOT conservative.
+  const IFACE = urlParams.get('interface') || 'explode';
   if (!['explode', 'interp'].includes(IFACE)) throw new Error(`?interface=${IFACE}: expected explode or interp`);
   const EXPLODE = AMR && IFACE === 'explode';
   // M4.1d lifted the "explode cannot carry a body" restriction: the body
@@ -1395,23 +1401,47 @@ async function init() {
     + (params.re ? `  Re=${params.re}` : '')
     + (AMR ? `  levels=${LEVELS} RB=${RB} tiles=${poolAlloc.activeSlots}` : '');
 
-  // The canvas box is given the SLICE's aspect ratio, so a sphere renders
-  // round. The three axes can have very different extents (the sphere
-  // scenario's domain is 192x128x128) and a fixed square canvas stretched
-  // the x-long slices into ellipses -- which reads as a geometry bug on a
-  // page whose entire job is showing geometry.
+  // The canvas box is the LARGEST box with the slice's in-plane aspect that
+  // fits inside the container -- computed here, in pixels, rather than
+  // handed to CSS as a ratio.
+  //
+  // The three axes have very different extents (the sphere scenario's domain
+  // is 192x128x128), so a fixed square canvas renders a sphere as an
+  // ellipse. The first fix for that set `aspect-ratio` from here and left
+  // the stylesheet's `width: 100cqw; height: auto; max-height: 100cqh` in
+  // place, which trades one distortion for the other: `max-height` caps the
+  // height while the width stays pinned to the full container, so a slice
+  // TALLER than the container is squashed vertically by exactly the amount
+  // the cap bites. It looked correct from whichever view happened to be
+  // wider than it was tall, which is how it survived being called fixed.
+  //
+  // A ratio cannot survive a one-sided clamp. So fit BOTH dimensions: scale
+  // by the smaller of the two ratios (the standard "contain" fit) and set
+  // width and height explicitly. Symmetric in the two axes by construction,
+  // so it cannot compress in either direction.
   function planeExtent(a) {
+    // The in-plane axes for slice normal `a`, cyclically -- and this MUST
+    // agree with planeDims()/fs_main in shaders/d3_render_slice.wgsl, which
+    // maps the first component across the screen and the second down it.
     if (a === 0) return [NY, NZ];
     if (a === 1) return [NZ, NX];
     return [NX, NY];
   }
   function resize() {
     const [pw, ph] = planeExtent(axis);
-    canvas.style.aspectRatio = `${pw} / ${ph}`;
+    const box = canvas.parentElement.getBoundingClientRect();
+    // A container can be reported as zero-sized before first layout; fall
+    // back to the plane's own extent so the canvas is never 0x0 (which is a
+    // WebGPU error, not merely an ugly frame).
+    const bw = box.width || pw, bh = box.height || ph;
+    const scale = Math.min(bw / pw, bh / ph);
+    const w = Math.max(1, Math.floor(pw * scale));
+    const h = Math.max(1, Math.floor(ph * scale));
+    canvas.style.width = `${w}px`;
+    canvas.style.height = `${h}px`;
     const dpr = window.devicePixelRatio || 1;
-    const r = canvas.getBoundingClientRect();
-    canvas.width = Math.max(1, Math.round(r.width * dpr));
-    canvas.height = Math.max(1, Math.round(r.height * dpr));
+    canvas.width = Math.max(1, Math.round(w * dpr));
+    canvas.height = Math.max(1, Math.round(h * dpr));
   }
   resize();
   window.addEventListener('resize', resize);

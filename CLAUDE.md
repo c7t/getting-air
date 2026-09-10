@@ -287,17 +287,20 @@ Also settled, and worth knowing before adding a page:
   deliberately not fixed in the same change, because it would move the
   entire 2D benchmark surface at once and `main` is the published site.
 
-- **The 3D AMR coarse/fine interface IS conservative on the explode path,
-  as of M4.1b (`?interface=explode`)** — mass and momentum both, on every
-  rung of the geometry ladder (`?refine=all|slab|bar|box`). The DEFAULT
-  path (`?interface=interp`) is unchanged and still is not: a
-  partially-refined run there converges at FIRST order, whole-domain L2rel
-  1.36e-2 / 9.02e-3 / 7.04e-3 at N = 32/48/64 on the analytic Beltrami box
-  case, against no-interface controls at 4.6e-3 / 2.3e-3 / 2.0e-3. So **do
-  not trust a quantitative number from a partially-refined 3D run on the
-  default path**, which is why there is still no sphere-with-AMR case in
-  the suite. Explode is not the default yet because it has no body coupling
-  and its remaining seam error wants M4.1c.
+- **`?interface=explode` is the DEFAULT as of M4.1e (2026-09-10), and the
+  3D AMR coarse/fine interface is conservative.** Mass and momentum both, on
+  every rung of the geometry ladder (`?refine=all|slab|bar|box`), with a
+  field error that tracks the no-interface control to within 8-10% and a
+  sphere-in-a-refined-shell that reproduces the dense Cd to 0.07%. A
+  partially-refined 3D run is now trustworthy for a quantitative number,
+  which it was not before M4.
+  `?interface=interp` is the M3 coupling it replaced — NOT conservative,
+  first-order, 3.6x worse on the field (whole-domain L2rel 1.36e-2 /
+  9.02e-3 / 7.04e-3 at N = 32/48/64 against controls at 4.6e-3 / 2.3e-3 /
+  2.0e-3) — kept switchable only to A/B the conversion in one build.
+  `amr-box-RB4` is PINNED to it and must stay pinned: it is the control that
+  says M4 left the old path alone, and a control that tracks the default is
+  not a control.
 
 - **Explode/coalesce is Chen et al. 2006's scheme (the PowerFLOW
   algorithm), and it delivers by DESTINATION.** The interface coarse layer
