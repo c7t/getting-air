@@ -3577,7 +3577,17 @@ async function init() {
       refineGrantedLastIter: v[3],
       refineByCascadeLastIter: v[4],
       refinePoolExhausted: v[5],
-      converged: v[3] === 0 && v[5] === 0,
+      // converged: has the 2:1-BALANCE CASCADE stopped propagating, and did
+      // nothing starve? Deliberately NOT `granted === 0`. A criterion-driven
+      // grant in the final iteration is normal operation -- a block whose own
+      // vorticity newly crossed threshold -- and is the INPUT to the
+      // fixed-point process, not a failure of it. Measured: amr-N2-bounceback
+      // reports granted=1/byCascade=0 at step 2048 on main with 2:1-balance
+      // passing at that same checkpoint, so gating on `granted` would have
+      // turned a healthy config red. A CASCADE grant outstanding is different:
+      // it means balance was still spreading outward when the loop ran out of
+      // iterations.
+      converged: v[4] === 0 && v[5] === 0,
     };
   }
 

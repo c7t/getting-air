@@ -47,6 +47,12 @@ async function runInvariantSweep(Runtime, opts) {
     throw new Error(`${G}.debugCheck21Balance is not available -- wrong page, or it failed to initialize`);
   }
   const hasCoverage = await has('debugCheckGeometryCoverage');
+  // Refinement convergence. Only meaningful with ?diag=1: at DIAG=0 every
+  // counter stays 0 and `converged` reads TRUE VACUOUSLY, so asserting it
+  // without the flag would be a silent false pass -- exactly the failure mode
+  // that let a dead ?ghostfree path sit behind green checks. hasDiag gates the
+  // assertion, and a skipped check is REPORTED as skipped, never as OK.
+  const hasDiag = await has('debugReadDiag');
   const hasCardState = await has('debugReadCardState');
 
   await evalExpr(Runtime, `${G}.setLive(false)`);
@@ -65,6 +71,12 @@ async function runInvariantSweep(Runtime, opts) {
   // how much corner imbalance it is carrying -- which is the number that says
   // what corner balance would cost if it were ever made unconditional.
   const cornerViolations = [];
+  // A refine round whose 2:1-BALANCE CASCADE was still propagating when the
+  // fixed iteration count ran out. Not "still creating tiles" -- a
+  // criterion-driven grant in the final iteration is normal operation. See
+  // debugReadDiag()'s own comment on why gating on `granted` was wrong.
+  const convergenceViolations = [];
+  let diagEnabled = false;
   const coverageViolations = [];
   const fieldViolations = [];
   let stepsDone = 0;
@@ -80,6 +92,18 @@ async function runInvariantSweep(Runtime, opts) {
     if (!bal.result.value.ok) balanceViolations.push({ step: stepsDone, violations: bal.result.value.violations });
     if (bal.result.value.cornerOk === false) {
       cornerViolations.push({ step: stepsDone, count: bal.result.value.cornerViolations.length, violations: bal.result.value.cornerViolations.slice(0, 8) });
+    }
+
+    let diag = null;
+    if (hasDiag) {
+      const d = await evalExpr(Runtime, `${G}.debugReadDiag()`, 30000);
+      if (d.exceptionDetails) throw new Error(`debugReadDiag failed at step ${stepsDone}: ${d.exceptionDetails.text}`);
+      diag = d.result.value;
+      diagEnabled = diagEnabled || !!diag.diagEnabled;
+      if (diag.diagEnabled && !diag.converged) {
+        convergenceViolations.push({ step: stepsDone, granted: diag.refineGrantedLastIter,
+          byCascade: diag.refineByCascadeLastIter, poolExhausted: diag.refinePoolExhausted });
+      }
     }
 
     let cov = null;
@@ -101,15 +125,19 @@ async function runInvariantSweep(Runtime, opts) {
     // cov/bad are null (not empty) when this page doesn't expose that check,
     // so a caller renders "n/a" rather than the "OK" an empty result would
     // otherwise read as.
-    if (onCheckpoint) onCheckpoint(stepsDone, { bal: bal.result.value, cov, bad: hasCardState ? bad : null });
+    if (onCheckpoint) onCheckpoint(stepsDone, { diag, bal: bal.result.value, cov, bad: hasCardState ? bad : null });
 
     if (bad.length) break;
   }
 
   const cornerFails = requireCornerBalance ? cornerViolations.length > 0 : false;
+  // Convergence is a real invariant of the default path (measured
+  // converged=true at every checkpoint through 4096 steps), so it is asserted
+  // unconditionally -- but only when ?diag=1 actually made the counters live.
   const ok = balanceViolations.length === 0 && coverageViolations.length === 0
-    && fieldViolations.length === 0 && !cornerFails;
+    && fieldViolations.length === 0 && !cornerFails && convergenceViolations.length === 0;
   return { ok, stepsDone, balanceViolations, cornerViolations, requireCornerBalance,
+    convergenceViolations, convergenceChecked: hasDiag && diagEnabled,
     coverageViolations, fieldViolations, hasCoverage, hasCardState };
 }
 

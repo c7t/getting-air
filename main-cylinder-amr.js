@@ -3040,7 +3040,42 @@ async function init() {
     }));
   }
 
+  // ── ?diag=1 refinement convergence ───────────────────────────────────────
+  // Mirrors main-amr.js's. Reads AND ZEROES, so successive calls give
+  // per-interval counts. The refine counters describe the FINAL fixed-point
+  // iteration only (cleared just before it, see dispatchMacroStep), so
+  // converged=false means the loop was still creating tiles when its fixed
+  // iteration count ran out. If ?refineIters= (more rounds) does not fix it,
+  // it is an oscillation, not slow propagation.
+  async function debugReadDiag() {
+    const enc = device.createCommandEncoder();
+    enc.copyBufferToBuffer(diagBuf, 0, diagReadBuf, 0, 32);
+    device.queue.submit([enc.finish()]);
+    await diagReadBuf.mapAsync(GPUMapMode.READ);
+    const v = Array.from(new Uint32Array(diagReadBuf.getMappedRange().slice(0)));
+    diagReadBuf.unmap();
+    device.queue.writeBuffer(diagBuf, 0, new Uint32Array(8));
+    return {
+      diagEnabled: DIAG !== 0,
+      refineGrantedLastIter: v[3],
+      refineByCascadeLastIter: v[4],
+      refinePoolExhausted: v[5],
+      // converged: has the 2:1-BALANCE CASCADE stopped propagating, and did
+      // nothing starve? Deliberately NOT `granted === 0`. A criterion-driven
+      // grant in the final iteration is normal operation -- a block whose own
+      // vorticity newly crossed threshold -- and is the INPUT to the
+      // fixed-point process, not a failure of it. Measured: amr-N2-bounceback
+      // reports granted=1/byCascade=0 at step 2048 on main with 2:1-balance
+      // passing at that same checkpoint, so gating on `granted` would have
+      // turned a healthy config red. A CASCADE grant outstanding is different:
+      // it means balance was still spreading outward when the loop ran out of
+      // iterations.
+      converged: v[4] === 0 && v[5] === 0,
+    };
+  }
+
   window.__CYL = {
+    debugReadDiag,
     setLive: (v) => { liveMode = !!v; },
     isLive: () => liveMode,
     reset: resetSim,
