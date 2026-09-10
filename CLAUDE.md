@@ -9,6 +9,9 @@ step** — the source *is* the artifact; GitHub Pages serves it directly.
   `shaders/amr_*.wgsl`. **Most active work is here.**
 - `index-cylinder*.html` / `main-cylinder*.js` — cylinder-in-crossflow validation
   harness (base + AMR variants).
+- `index-3d-spike.html` / `main-3d-spike.js` — 3D D3Q19/D3Q27 bench page, the
+  M0 milestone of `plans/3D.md`. Not a solver: dense periodic grid, no body,
+  no AMR, no render. See "The 3D fork" below.
 - `shaders/` — all WGSL. `Makefile` — validation + release helpers.
 
 ## Validate before committing (no GPU needed)
@@ -17,7 +20,8 @@ Run `make check` and make it pass before committing shader/JS changes:
   shared `.mjs` modules were outside this glob until 2026-09-08.
 - `make test` — the GPU-free unit tests (`tools/test-*.js`): the shared
   card/regime parameterization, the AMR field reconstructor, the dense→AMR
-  injector, and the packed-`f` host/shader layout agreement. Add a `tools/test-<name>.js` and it is picked up
+  injector, the packed-`f` host/shader layout agreement, and the 3D lattice
+  tables. Add a `tools/test-<name>.js` and it is picked up
   automatically; each must run with no server/browser/GPU and exit nonzero
   on failure.
 - `make wgsl` — validate every `shaders/*.wgsl` with `naga` (needs `naga`;
@@ -197,6 +201,52 @@ Timing/measurement entry points:
 Current known-issue state (e.g. which `?levels=N` combinations are physics-
 validated) drifts with active work — see `main-cylinder-amr.js`'s own
 comment above `N_LEVELS`, not this file, for what's current.
+
+## The 3D fork (`plans/3D.md`)
+
+Scoped, and **M0 is done**; M1 (a dense 3D page) is not started. Read
+`plans/3D.md` before touching any of this — in particular its decision table
+at the top, which records what is settled so it does not get re-argued.
+Two things are settled and load-bearing:
+
+- **The coarse/fine interface uses the materialized RING. Ghost-free is not
+  being pursued** (2D measured it at 5-9% against a ~10% floor, it imposes a
+  corner-balance refinement constraint the codebase never had, and there is
+  memory headroom). See `plans/ghost-free.md` for the measurement and
+  `plans/3D.md` sec 2.1 for the decision.
+- **f32 registers are not a constraint**, measured, so nothing should be
+  restructured around avoiding them. `plans/3D.md` sec 2.4.
+
+What exists today:
+
+- `lattice-3d.mjs` — D3Q19/D3Q27 velocity sets, weights and bounce-back
+  pairing, **derived rather than typed**. D3Q19 is a strict index-prefix of
+  D3Q27, and `opp` is structural (each velocity is emitted immediately
+  followed by its own negation), so there is no table to transpose.
+- `shaders/common_d3q{19,27}_lattice.wgsl` — **generated** from it by
+  `node tools/gen-lattice-3d.js` and checked in (no build step). Do not
+  hand-edit; regenerate.
+- `tools/test-lattice-3d.js` (in `make test`) — guards them two ways: exact
+  drift against the generator, *and* the lattice moment conditions plus a
+  searched-not-assumed `opp` involution computed from the tables **parsed
+  back out of the WGSL**. The second half is what fails when the generator
+  and the checked-in file are wrong together.
+- `index-3d-spike.html` — the M0 bench page. Three kernel modes with
+  identical memory traffic (`full` / `stream` / `collide`), so they are
+  comparable in **GB/s and only in GB/s** — GLUPS necessarily falls by 27/19
+  between the velocity sets, and reading that as "Q27 is slow" is the
+  mistake. Wired into `validate-all.js` as `d3-spike-boot`.
+
+      node tools/spike-d3-registers.js            # owns Chrome; prints a verdict
+      node tools/spike-d3-registers.js --n=96 --peak=717 --wg=8,8,1
+
+  Measured 2026-09-09, RTX 4080, 128^3: D3Q19 **3.62 GLUPS / 551 GB/s (77% of
+  peak)**, D3Q27 **2.35 GLUPS / 508 GB/s**, with the full kernel matching its
+  own stream-only ceiling at both — i.e. purely bandwidth-bound, no spill.
+  Repeat spread 0.2%, so unlike the AMR Cd numbers above this harness is
+  reproducible to well under a percent — a build-vs-build claim here does
+  not need the same-build repeat those do (the tool takes one anyway and
+  prints the spread alongside its verdict).
 
 ## Branch model
 - **`main`** — canonical, always-buildable, default branch, **and the published

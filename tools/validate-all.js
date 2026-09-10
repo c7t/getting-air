@@ -120,6 +120,19 @@ function defaultConfigs(baseUrl) {
       url: `${baseUrl}/index-reentry-amr.html`,
       checkBoots: true,
     },
+    // The M0 3D spike page (plans/3D.md sec 5). It is a BENCH page with no
+    // physics check of its own, but it is the only consumer of
+    // shaders/d3_*.wgsl and of the generated lattice fragments, and
+    // plans/3D.md sec 6 item 4 says to add every 3D page here ON THE DAY IT
+    // IS CREATED rather than after it breaks -- which is the lesson 238e48c
+    // taught at the cost of a broken production page. `?n=32` keeps it
+    // cheap: the boot smoke asks whether the pipelines compile and the loop
+    // advances, not how fast it goes.
+    {
+      name: 'd3-spike-boot',
+      url: `${baseUrl}/index-3d-spike.html?n=32&steps=2&reps=1`,
+      checkBoots: true,
+    },
     // index-amr.html under the structural-invariant sweep. This is the page
     // the project SHIPS, it defaults to levels=3, and until now the sweep
     // only ever drove window.__CYL -- so the falling-card page's own 2:1
