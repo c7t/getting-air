@@ -69,6 +69,10 @@ const CONFIGS = [
   // No coarse/fine interface anywhere: the pool, fine solver, interp and
   // average all still run, so this isolates the INTERFACE from everything
   // else the AMR path does.
+  // A refined slab spanning y and z: the seam is two FLAT faces, no edge
+  // and no corner. The control that separates "the flux correction is
+  // wrong" from "the seam has convex corners the lattice cannot tile".
+  { name: 'slab', levels: 2, refine: 'slab' },
   { name: 'all', levels: 2, refine: 'all' },
   // No fine level at all: the coarse solver's own discretization error, the
   // floor everything else is measured against.
@@ -103,7 +107,7 @@ function parseArgs(argv) {
 function urlFor(o, c) {
   const p = new URLSearchParams({ scenario: 'beltrami', n: o.n, tau: o.tau, u0: o.u0, q: o.q, live: '0' });
   if (c.levels > 1) { p.set('levels', c.levels); p.set('rb', o.rb); p.set('refine', c.refine); }
-  if (c.refine === 'box') p.set('boxfrac', o.boxfrac);
+  if (c.refine === 'box' || c.refine === 'slab') p.set('boxfrac', o.boxfrac);
   return `${o.baseUrl}/index-3d.html?${p}${o.extra ? `&${o.extra}` : ''}`;
 }
 

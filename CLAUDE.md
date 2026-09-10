@@ -266,10 +266,22 @@ Also settled, and worth knowing before adding a page:
   at N = 32/48/64 on the analytic Beltrami box case, against no-interface
   controls at 4.6e-3 / 2.3e-3 / 2.0e-3. That is the composite-grid
   signature: the two sides compute the seam flux independently and disagree.
-  The fix is refluxing and it is the first item of M4 (plans/3D.md M3
-  sketches the shape). **Until it lands, do not trust a quantitative number
-  from a partially-refined 3D run**, which is why there is no
-  sphere-with-AMR case in the suite.
+  **Until this is solved, do not trust a quantitative number from a
+  partially-refined 3D run**, which is why there is no sphere-with-AMR case
+  in the suite.
+
+- **Refluxing is BUILT, exact, opt-in (`?reflux=1`) and NOT sufficient.**
+  It makes the interface exactly conservative -- the momentum leak stops
+  dead -- and on a corner-free seam (`?refine=slab`) halves the field error.
+  On a seam with a convex corner (`?refine=box`, and any body-fitted shell)
+  it is far worse than leaving it off. **The corner does not tile**: at a
+  convex corner the coarse grid crosses one full channel while the fine grid
+  crosses only two cells x two substeps = half of it, because D3Q19 has no
+  (1,1,±1). Fine channels tile a coarse FACE exactly and a coarse CORNER not
+  at all, which is the Berger-Colella assumption LBM breaks. Do not "fix"
+  this by re-deriving the accounting -- read `shaders/common_d3_amr_flux.wgsl`
+  and plans/3D.md M4 first, and use `?refine=slab` as the control that
+  separates a correction bug from the corner.
 
 - **`?refine=all` cannot see an interface bug**, so never treat it as
   coverage for one. With every block refined, the restriction's rescaled

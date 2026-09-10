@@ -25,9 +25,18 @@
 //   ?refine=     STATIC refinement region. `body` (default when there is
 //                one) refines blocks within ?margin= coarse cells of the
 //                surface; `box` refines a centred cube of ?boxfrac= of the
-//                domain; `all` refines everything (the noise floor -- no
-//                coarse/fine interface anywhere).
+//                domain; `slab` refines a ?boxfrac= band in x spanning all
+//                of y and z, so the seam is two FLAT faces with no edge or
+//                corner anywhere -- the control for interface work, see
+//                plans/3D.md M4; `all` refines everything (the noise floor
+//                -- no coarse/fine interface anywhere).
 //   ?margin=2  ?boxfrac=0.5
+//   ?reflux=1    OPT-IN coarse/fine interface flux correction (M4). Makes
+//                the interface exactly conservative in mass and momentum,
+//                and on a seam with no convex corner (?refine=slab) halves
+//                the field error. On one WITH a corner (?refine=box, and
+//                any body-fitted shell) it is much WORSE than leaving it
+//                off. Not the default for that reason -- plans/3D.md M4.
 //   ?dcpre=1     restore the PRE-collision Dupuis-Chopard fneq factor at the
 //                coarse/fine transfers. That is wrong for this solver's
 //                post-collision buffers and was the M3 interface bug; the
@@ -130,7 +139,7 @@ async function init() {
   // silently ignoring it is the failure above wearing a different hat.
   const PAGE_PARAMS = new Set(['scenario', 'q', 'axis', 'slice', 'mode', 'spf', 'live',
     'uscale', 'vscale', 'vortGamma', 'bounceback', 'chiEps', 'vmax', 'omax',
-    'levels', 'rb', 'refine', 'margin', 'boxfrac', 'dcpre']);
+    'levels', 'rb', 'refine', 'margin', 'boxfrac', 'dcpre', 'reflux']);
   for (const k of urlParams.keys()) {
     if (PAGE_PARAMS.has(k) || k in SCENARIOS[scenarioName].defaults) continue;
     throw new Error(`?${k}=: not a parameter of scenario "${scenarioName}" `
@@ -210,6 +219,16 @@ async function init() {
       const lo = [NX, NY, NZ].map(n => n * (1 - frac) / 2);
       const hi = [NX, NY, NZ].map(n => n * (1 + frac) / 2);
       poolAlloc = refineWhere(pool, ({ mid }) => mid.every((c, i) => c >= lo[i] && c < hi[i]));
+    } else if (mode === 'slab') {
+      // A refined SLAB spanning the full domain in y and z: periodic in
+      // both, so the seam is two FLAT faces with no edge and no corner
+      // anywhere. That is not a convenience geometry, it is the control for
+      // M4's flux correction -- see plans/3D.md. Where the seam is flat the
+      // fine channels crossing it tile the coarse one exactly; at a convex
+      // edge or corner they provably do not, and this separates the two.
+      const frac = numParam('boxfrac', 0.5);
+      const lo = NX * (1 - frac) / 2, hi = NX * (1 + frac) / 2;
+      poolAlloc = refineWhere(pool, ({ mid }) => mid[0] >= lo && mid[0] < hi);
     } else if (mode === 'body') {
       if (!params.body) throw new Error('?refine=body: this scenario has no body');
       const sh = params.body.shape, bx = params.body.x;
@@ -219,7 +238,7 @@ async function init() {
       // that belongs with dynamic refinement in M4.
       poolAlloc = refineNearBody(pool, (q) => Math.hypot(q[0] - bx[0], q[1] - bx[1], q[2] - bx[2]) - sh.a, margin);
     } else {
-      throw new Error(`?refine=${mode}: expected body, box or all`);
+      throw new Error(`?refine=${mode}: expected all, box, slab or body`);
     }
   }
 
@@ -291,6 +310,7 @@ async function init() {
   // static refinement knows its own answer up front, and a 3D pool sized for
   // the whole domain would be (FB/RB)^3 = 27x the dense grid at RB=4.
   let fPoolA = null, fPoolB = null, macPool = null, blockSlotBuf = null, slotToBlockBuf = null;
+  let fluxAccBuf = null;
   if (AMR) {
     const slots = Math.max(1, poolAlloc.activeSlots);
     const poolCells = slots * pool.tileCells;
@@ -301,6 +321,12 @@ async function init() {
     slotToBlockBuf = device.createBuffer({ size: slots * 4, usage: U.STORAGE | U.COPY_DST });
     device.queue.writeBuffer(blockSlotBuf, 0, poolAlloc.blockSlot);
     device.queue.writeBuffer(slotToBlockBuf, 0, poolAlloc.slotToBlock.slice(0, slots));
+    // Per coarse cell: the mass and momentum the FINE solver moved across
+    // the seam this macro step, in coarse-cell units. Written by the flux
+    // pass on substep A and added to on substep B; consumed by the reflux
+    // pass. Only seam-adjacent cells are ever written OR read (both passes
+    // share one reachability predicate), so it is deliberately not cleared.
+    fluxAccBuf = device.createBuffer({ size: NCELLS * 4 * 4, usage: U.STORAGE | U.COPY_SRC });
   }
 
   const computeBGL = device.createBindGroupLayout({ entries: [
@@ -413,6 +439,41 @@ async function init() {
   const DC_PRE = urlParams.get('dcpre') === '1' ? 1 : 0;
   let interpGhostPipe = null, interpFullPipe = null, step1Pipe = null, avgPipe = null;
   let interpBG = null, step1BG_AB = null, step1BG_BA = null, avgBGA = null, avgBGB = null;
+  let fluxPipeSet = null, fluxPipeAdd = null, refluxPipe = null;
+  let fluxBGA = null, fluxBGB = null, refluxBG = null;
+
+  // M4's interface flux correction. OPT-IN (?reflux=1), and NOT the default
+  // -- it does what it was built to do and that turned out not to be enough.
+  // It restores exact global conservation (measured: the momentum drift a
+  // partially-refined run leaks stops dead). On a seam with no convex corner
+  // it also halves the field error. On a seam WITH one it is much worse than
+  // no correction at all, because the fine lattice's diagonal channels
+  // cannot tile the coarse one across a corner -- see plans/3D.md M4 and
+  // shaders/common_d3_amr_flux.wgsl. Default off until that is solved.
+  //
+  // Two further situations make its accounting invalid rather than merely
+  // inaccurate, and both fail loudly:
+  //
+  //   walls   the balance assumes every coarse population goes exactly one
+  //           place. A wall bounce-back reflects instead, so a refined
+  //           region touching a walled face would be silently mis-counted.
+  //           No walled scenario uses AMR today; this is the guard for when
+  //           one does. (A BODY is handled differently -- the correction is
+  //           skipped near the surface rather than refused, since a refined
+  //           shell around a body has its seam in clean fluid. See
+  //           common_d3_amr_reflux.wgsl.)
+  //   nb < 3  the flux pass resolves a ring cell against a tile that may not
+  //           own it, using a centred periodic wrap. With fewer than three
+  //           blocks on an axis a tile's ring wraps onto itself and the wrap
+  //           is ambiguous.
+  const REFLUX = (() => {
+    if (!AMR) return 0;
+    if (urlParams.get('reflux') !== '1') return 0;
+    const walled = ['x', 'y', 'z'].some(a => params.walls.includes(a));
+    if (walled) throw new Error(`?reflux: not valid with walls (?walls=${params.walls}); pass ?reflux=0 to run without the flux correction`);
+    if (pool.nb.some(n => n < 3)) throw new Error(`?reflux: needs at least 3 blocks per axis, have ${pool.nb.join('x')} at ?rb=${RB}`);
+    return 1;
+  })();
   if (AMR) {
     const poolConst = { NX, NY, NZ, RB };
     const interpModule = device.createShaderModule({ code: await loadShader(`shaders/d3_amr_interp_q${Q}.wgsl`), label: `d3_amr_interp_q${Q}` });
@@ -481,6 +542,46 @@ async function init() {
       { binding: 2, resource: { buffer: slotToBlockBuf } }, { binding: 3, resource: { buffer: mac } }]});
     avgBGA = mkAvg(fA);
     avgBGB = mkAvg(fB);
+
+    // --- M4 interface flux correction ------------------------------------
+    if (REFLUX) {
+      const fluxModule = device.createShaderModule({ code: await loadShader(`shaders/d3_amr_flux_q${Q}.wgsl`), label: `d3_amr_flux_q${Q}` });
+      const refluxModule = device.createShaderModule({ code: await loadShader(`shaders/d3_amr_reflux_q${Q}.wgsl`), label: `d3_amr_reflux_q${Q}` });
+      const fluxBGL = device.createBindGroupLayout({ entries: [
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+        { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+      ]});
+      const refluxBGL = device.createBindGroupLayout({ entries: [
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+        { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+        { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+        { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+        { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+      ]});
+      // Two pipelines from one module: the substep-A pass WRITES, which is
+      // what clears the accumulator, and the substep-B pass ADDS.
+      fluxPipeSet = await mk(fluxBGL, fluxModule, { ...poolConst, ACCUM: 0 });
+      fluxPipeAdd = await mk(fluxBGL, fluxModule, { ...poolConst, ACCUM: 1 });
+      refluxPipe = await mk(refluxBGL, refluxModule, {
+        ...poolConst, HAS_BODY,
+        FORCE_X: params.force[0], FORCE_Y: params.force[1], FORCE_Z: params.force[2],
+      });
+      const mkFlux = (src) => device.createBindGroup({ layout: fluxBGL, entries: [
+        { binding: 0, resource: { buffer: src } }, { binding: 1, resource: { buffer: blockSlotBuf } },
+        { binding: 2, resource: { buffer: fluxAccBuf } }]});
+      // Each flux pass reads the pool buffer its substep STREAMS: substep A
+      // streams fPoolA, substep B streams what A wrote into fPoolB.
+      fluxBGA = mkFlux(fPoolA);
+      fluxBGB = mkFlux(fPoolB);
+      const mkReflux = (t0, t1) => device.createBindGroup({ layout: refluxBGL, entries: [
+        { binding: 0, resource: { buffer: t0 } }, { binding: 1, resource: { buffer: t1 } },
+        { binding: 2, resource: { buffer: mac } }, { binding: 3, resource: { buffer: blockSlotBuf } },
+        { binding: 4, resource: { buffer: fluxAccBuf } }, { binding: 5, resource: { buffer: bodyBuf } }]});
+      // [coarse parity]: which buffer holds t, which holds t + dt.
+      refluxBG = [mkReflux(fA, fB), mkReflux(fB, fA)];
+    }
   }
 
   const renderPipe = await device.createRenderPipelineAsync({
@@ -627,6 +728,14 @@ async function init() {
       //            linearly -- see common_d3_amr_interp.wgsl's TIME_BLEND.
       //   L1 B     second fine substep, to t + dt
       //   average  restrict L1 onto L0 in the refined region, both at t + dt
+      //   reflux   correct the unrefined coarse cells for the difference
+      //            between the flux the COARSE step moved across the seam
+      //            and the flux the FINE substeps actually moved (M4). Two
+      //            `flux` passes measure the latter, one per substep,
+      //            interleaved above because each reads the pool buffer its
+      //            substep streams. Without this the interface is not
+      //            conservative and the error is first order in dx --
+      //            shaders/common_d3_amr_reflux.wgsl has the accounting.
       //
       // The coarse step does redundant work under the refined region (its
       // result is overwritten by average); that is the same trade the 2D
@@ -657,12 +766,25 @@ async function init() {
         ip.setBindGroup(0, interpBG[cp][0]);
         ip.dispatchWorkgroups(tileDisp[0], tileDisp[1], tileDisp[2]);
         ip.end();
-        for (const bg of [step1BG_AB, step1BG_BA]) {
+        // M4 flux measurement, interleaved with the substeps rather than
+        // deferred: each pass reads the pool buffer its substep STREAMS, and
+        // substep B overwrites fPoolA, so the A measurement cannot wait.
+        const flux = (pipe, bg) => {
+          const fp = enc.beginComputePass();
+          fp.setPipeline(pipe); fp.setBindGroup(0, bg);
+          fp.dispatchWorkgroups(disp[0], disp[1], disp[2]);
+          fp.end();
+        };
+        if (REFLUX) flux(fluxPipeSet, fluxBGA);       // writes; also the clear
+        const substep = (bg) => {
           const sp = enc.beginComputePass();
           sp.setPipeline(step1Pipe); sp.setBindGroup(0, bg);
           sp.dispatchWorkgroups(tileDisp[0], tileDisp[1], tileDisp[2]);
           sp.end();
-        }
+        };
+        substep(step1BG_AB);
+        if (REFLUX) flux(fluxPipeAdd, fluxBGB);
+        substep(step1BG_BA);
         const ap = enc.beginComputePass();
         ap.setPipeline(avgPipe);
         // The coarse step just wrote the OTHER buffer, which is where the
@@ -670,6 +792,16 @@ async function init() {
         ap.setBindGroup(0, useB ? avgBGA : avgBGB);
         ap.dispatchWorkgroups(avgDisp[0], avgDisp[1], avgDisp[2]);
         ap.end();
+        // Reflux LAST: it corrects the unrefined coarse cells against the
+        // fine traffic just measured, and it reads the coarse field at t
+        // (still intact -- the step wrote the other buffer) alongside the
+        // t + dt field it corrects.
+        if (REFLUX) {
+          const rp = enc.beginComputePass();
+          rp.setPipeline(refluxPipe); rp.setBindGroup(0, refluxBG[cp]);
+          rp.dispatchWorkgroups(disp[0], disp[1], disp[2]);
+          rp.end();
+        }
       }
 
       useB = !useB;
@@ -917,6 +1049,33 @@ async function init() {
     return bucketOf;
   }
 
+  // The per-cell reflux correction actually applied, summarised. A correct
+  // correction is a DIFFERENCE of two nearly-equal seam fluxes, so it should
+  // be orders of magnitude below either one; a correction the size of a
+  // population means one of the two halves is not measuring what the other
+  // is.
+  const fluxStaging = AMR ? device.createBuffer({ size: NCELLS * 4 * 4, usage: U.MAP_READ | U.COPY_DST }) : null;
+  async function readFluxAcc() {
+    if (!AMR || !REFLUX) return null;
+    const enc = device.createCommandEncoder();
+    enc.copyBufferToBuffer(fluxAccBuf, 0, fluxStaging, 0, NCELLS * 4 * 4);
+    device.queue.submit([enc.finish()]);
+    await fluxStaging.mapAsync(GPUMapMode.READ);
+    const v = new Float32Array(fluxStaging.getMappedRange()).slice();
+    fluxStaging.unmap();
+    let n = 0, sumAbsM = 0, sumM = 0, maxAbsM = 0, sumAbsP = 0, maxAbsP = 0;
+    for (let c = 0; c < NCELLS; c++) {
+      const dm = v[4 * c], px = v[4 * c + 1], py = v[4 * c + 2], pz = v[4 * c + 3];
+      if (dm === 0 && px === 0 && py === 0 && pz === 0) continue;
+      const ap = Math.hypot(px, py, pz);
+      n++; sumM += dm; sumAbsM += Math.abs(dm); sumAbsP += ap;
+      if (Math.abs(dm) > maxAbsM) maxAbsM = Math.abs(dm);
+      if (ap > maxAbsP) maxAbsP = ap;
+    }
+    return { step, cells: n, sumM, sumAbsM, meanAbsM: sumAbsM / Math.max(n, 1), maxAbsM,
+             meanAbsP: sumAbsP / Math.max(n, 1), maxAbsP };
+  }
+
   async function readInterfaceDiag(t) {
     const m = await readMacro();
     const bk = interfaceDistance();
@@ -1053,11 +1212,11 @@ async function init() {
         refinedFraction: poolAlloc.activeSlots / pool.nBlocks,
         tileCells: pool.tileCells,
         storageRatio: storageRatio(pool),
-        tauCoarse: TAU_COARSE, tauFine: TAU_FINE,
+        tauCoarse: TAU_COARSE, tauFine: TAU_FINE, reflux: REFLUX,
       } : {}),
     }),
     readSubsampled, readDuctProfile, readStats, readBody, readPoolStats,
-    readInterfaceDiag,
+    readInterfaceDiag, readFluxAcc,
     debugStepSync,
   };
 
