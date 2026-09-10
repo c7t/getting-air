@@ -1,0 +1,90 @@
+# Plan: Multi-level AMR (N>2 levels), quadtree-structured L>0 pools over the existing dense L0 grid
+
+## Context
+
+`main-amr.js`/`shaders/amr_*.wgsl` implement a working 2-level AMR LBM (L0 = dense `NCELLS`-sized coarse grid, L1 = a sparse pool of `MAX_FINE_BLOCKS` fixed-capacity fine tiles, indirected via `blockSlot`/`slotToBlock`). AGAL's reference implementation gets arbitrary depth from C++ recursion (`Solver_LBM::S_Advance(L)` calls `S_Advance(L+1)` twice per level); `dispatchMacroStep` (main-amr.js:745-788) is the hand-flattened depth-2 special case of that recursion — there is no recursion in WebGPU command encoding, so depth 3+ needs a real generalization, not more hardcoded stanzas.
+
+Design decisions reached before this plan (see conversation, not re-litigated here):
+1. **L0 stays exactly as-is** — the dense buffer, `cellIndex()`-addressed, no ghost cells, direct periodic-wrap streaming (shaders/amr_step.wgsl:115-120). It's known-working and genuinely cheaper per-cell than a ghost-padded pool tile would be; folding it into the uniform abstraction only pays off in code simplicity, at a real per-cell overhead cost on what's usually the majority of live cells. Not worth it.
+2. **Every level L(m>0) uses one uniform tile abstraction**: identical tile shape (`RB` interior + `GHOST` ghost border on all sides, matching today's fine-pool tile) at every level ≥1, same shader modules reused across level-pairs (bound to different buffers/uniforms per level, not recompiled per level) — the *topology* has to change from today's footprint-preserving 1-parent→1-double-density-tile scheme (which can't be made level-shape-uniform, since a level-3 tile would need to be 4x the linear size of a level-1 tile to cover the same footprint) to a classic **quadtree: 1 parent tile → 4 same-shaped children**, each covering one quadrant of the parent's footprint.
+3. **Allocator works in quad units, never fragments below 4**: valid because refine/coarsen decisions are already made per-parent-tile, never per-child (today's `blockCriterion` is one value per block). Free list stores quad indices; `atomicAdd`/`atomicSub` by 1 on `freeCount` is unchanged from today's mechanism, just reinterpreted at 4-slot stride (`slot = quadSlot*4 + quadrant`).
+
+Considered and ruled out as a concern: whether quad-atomic refine/coarsen (decision 3) breaks the ability to have a non-uniform grid — by induction over levels, it doesn't; it only fixes the grain size of refinement to one quad (4 tiles), not the spatial resolution of non-uniformity (arbitrarily deep, arbitrarily localized refinement patterns are still fully expressible), and the coarsen-as-a-unit cost is a bounded perimeter-only inefficiency, same character as the existing hysteresis band.
+
+Aside, not blocking: `plans/AMR.md` is referenced by nearly every comment in main-amr.js (Milestones 0 through 4c) but `plans/` is gitignored and the file isn't present on disk or in git history — it's gone. This plan continues the milestone numbering at **5** for continuity with those comments, but can't verify their exact original content. Worth reconstructing separately; not part of this work.
+
+## Milestone 5 — Data-layout spec + level-generic buffer allocation (no shader changes, no behavior change)
+
+See `plans/AMR-multilevel-M5.md` for the full implementation-ready spec
+(exact buffer sizes per level, the L1-vs-L2+ addressing/allocation-
+granularity split, a JS refactor sketch, and the validation procedure).
+Summary below.
+
+Generalize the JS-side buffer setup (main-amr.js:287-311) into a loop over `levels = 1..N-1` (`N` from a new `?levels=` URL param, default 2 = today's behavior exactly), allocating one instance per level of: `finePoolF_a/b`, `finePoolVel`, `blockSlot` (**sized to that level's own logical block-grid extent** — see below), `slotToBlock`, `freeList`/`freeCount`, `blockCriterion`, `newlyActivated`. Same bind group *layouts* and pipeline objects reused across all L>0 levels; only the buffer bindings and a per-level uniform (`{dx_L, tau_L, RB, quadStride}`) differ per dispatch.
+
+Two addressing schemes coexist, not one — write this down explicitly since it's the one place "uniform" doesn't mean "identical":
+- **L0→L1 parent lookup**: source is the dense buffer, spatial `cellIndex()` addressing (today's `sampleCoarse`, shaders/amr_interp_c2f.wgsl:135-156) — kept as-is.
+- **L(m)→L(m+1) parent lookup, m≥1**: source is itself a pool tile at an indirected slot. A level-(m+1) quad needs to store **which level-m slot is its parent** (a `parentSlot` array, one entry per quad) plus which quadrant of the parent it occupies — position within the parent's own `RB×RB` interior falls out of the quadrant bits, not from spatial coordinates.
+- **Same-level neighbor lookup** (needed for the fine-fine ghost consultation that already exists at L1, shaders/amr_interp_c2f.wgsl:182-251) still needs *some* "spatial position → slot" structure at every level ≥1, because a tile's neighbor may belong to a different parent quad entirely. A dense `blockSlot` array sized to that level's full theoretical footprint (`NBX0*2^m` per axis) is fine for the 2-3 levels this plan targets; flag explicitly that this does not scale to deep hierarchies (would need a hash/sparse map) — out of scope here.
+- **A tile's own logical (bx,by) at its level**, needed to compute that same-level neighbor's spatial address in the first place. Today's L1 reuses L0's blockID directly (footprint-preserving 1:1 scheme, so the coordinate spaces coincide by construction). Under the quadtree scheme they don't: level (m+1)'s coordinate space is 4x finer than level m's, so a tile's own logical position has to be *derived*, not reused — `(bx,by)_{m+1} = (bx,by)_m * 2 + quadrant`, computed by walking the parent chain (or cached at allocation time, since it's fixed once a quad is created). Store it explicitly per quad at allocation rather than re-deriving it on every ghost-fill dispatch.
+
+**Validation:** `?levels=2` must allocate byte-identical buffer sizes/counts to today's build; run the existing amr-diff snapshot comparison against a pre-change baseline to confirm zero behavior change.
+
+## Milestone 6 — Generalize ghost interpolation, static/manual activation only
+
+Two new shader files, not one, per the addressing split above:
+- `shaders/amr_interp_dense_parent.wgsl`: today's `amr_interp_c2f.wgsl` logic, unchanged, used only for L0→L1.
+- `shaders/amr_interp_pool_parent.wgsl`: new — same coarse→fine interpolation math (bilinear + Dupuis-Chopard fneq rescale, shaders/amr_interp_c2f.wgsl:264-303) but sourcing from a parent pool tile via `parentSlot` instead of `cellIndex`. Reused unmodified for every L(m)→L(m+1), m≥1.
+
+Extend `debugActivateBlock`/`debugDeactivateBlock` (main-amr.js:869-926) to operate at **quad granularity** for L>0 (activate/deactivate all 4 children together) — required by decision 3, and needed now to construct test fixtures.
+
+**Validation:** manually activate an L1 quad, then an L2 quad nested inside one of its children, using `debugInjectSyntheticField`'s Taylor-Green field (main-amr.js:988-1015) as ground truth. Confirm interpolation is exact/consistent through both hops (L0→L1→L2), same tolerance the existing synthetic-field test already uses. No automatic dispatch scheduling yet — call pipelines by hand in the right order, once, from the console, matching how M4's fine pool was itself "staged" before automation (main-amr.js:792-794's own comment on this pattern).
+
+## Milestone 7 — Recursive dispatch schedule
+
+Replace `dispatchMacroStep`'s hardcoded 7-pass sequence with a generic function that walks levels top-down in AGAL's `S_Advance` order: step(L) → ghost-refresh → recurse into L+1 twice (fine-fine ghost refresh between the two) → average(L+1→L). At `N=2` (today's depth) this must reproduce the *exact* existing dispatch sequence and numerics — verify bit-for-bit (or float-tolerance) against the amr-diff tool before trusting it at depth 3. Then extend to `N=3` using Milestone 6's manually-verified fixture as the correctness target, this time driven by the generic scheduler instead of by-hand console calls.
+
+This is the highest-risk milestone for silent ordering bugs (the project has already been bitten once by a same-dispatch race in `amr_manage.wgsl`'s coarsen/refine split) — budget real time for it, don't fold it into Milestone 6 or 9.
+
+## Milestone 8 — Body/fluid coupling: per-level force integration + coverage guarantee
+
+What already generalizes for free: the actual penalization physics (`get_phi`/`get_chi`, the Guo-forcing `Si` term folded into collision) is evaluated independently in every level's own step kernel at that cell's own physical position (amr_step1.wgsl:84-101,158-199) — no new design needed, M5-M7's "same shader, per-level uniforms" pattern already covers it.
+
+What doesn't: force/torque integration, which feeds the body's own dynamics (`phyPL`). amr_step1.wgsl's own header says so directly (lines 13-16): *"force integration stays coarse-only this milestone."* Confirmed in main-amr.js — `frcBG` (main-amr.js:513-514) only ever binds `f_a`/`f_b`, dispatched at coarse shape; there is no fine-pool force pass today, even at 2 levels. This is a pre-existing, documented scope-cut, not something multi-level introduces — but multi-level turns it from "imprecise" into "wrong": in the end-state where L0 is very coarse and nearly all real resolution lives in refinement, the body's own `chi` transition band can be sampled at only a handful of coarse cell centers, aliasing the force/torque that drives the body's trajectory. This has to be fixed before M9's live-refinement validation is trustworthy, since that validation is judged by watching the body's trajectory.
+
+Three parts:
+1. **A per-level force pass**, generalizing `amr_force.wgsl` the same way `amr_step1.wgsl` generalized `amr_step.wgsl` — dispatched over each level's own pool tiles, same `get_phi`/`get_chi`/momentum-exchange math, each level's contribution `atomicAdd`-reduced into the same shared `forces[]` buffer `phyPL` already reads.
+2. **Finest-wins masking to avoid double-counting.** `average` keeps a parent's cells populated (if coarser) under an active child, so running every level's force pass unconditionally would sum the same physical drag twice — once crudely at the parent, once accurately at the child. Each level's force pass must skip any cell with an active child one level down. This is the same "which level owns this point" rule Milestone 10's render compositing needs — implement it once, share it, don't build it twice.
+3. **`epsilon` must scale with each level's own grid spacing (`epsilon_L ≈ K·dx_L`, K≈1.5-3), not remain the single hardcoded physical constant it is today.** `epsilon = 1.5f` is currently independently duplicated in five files (`lbm_collide.wgsl`, `lbm_force.wgsl`, `amr_step.wgsl`, `amr_step1.wgsl`, `amr_force.wgsl`), tied to neither `dx` nor the body's own scale (`A`/`B`). A fixed physical `epsilon` means refinement only ever improves *sampling* of an unchanging diffuse-boundary width (`epsilon/B` stays ~37.5% forever, however deep you refine) — it never improves the penalization's fidelity to the true sharp geometry. Scaling with local `dx_L` fixes both: the transition is always a few cells wide wherever it's evaluated, and deeper refinement genuinely sharpens the effective boundary, not just its sampling density. This is safe to do precisely *because* `chi`/`phi`/`Fx`/`Fy` are never interpolated or pooled across levels — `amr_interp_c2f.wgsl`/`amr_average_f2c.wgsl` only ever touch `rho`/`ux`/`uy`/`fneq`, never the geometry/penalization terms, which are recomputed from scratch in every level's own step kernel. A level-scaled `epsilon` therefore produces a smooth, monotonically-improving resolution-dependent gradient (same character as vorticity being more accurate where more resolved), not the kind of hard interpolation seam this project has already been bitten by with mismatched `f` values — don't conflate the two failure modes when reasoning about this.
+4. **Geometry-forced refinement's job simplifies accordingly.** With `epsilon_L` tied to whatever level currently owns a cell, "is the transition band adequately sampled" holds by construction at every level — there's no separate margin-vs-epsilon sizing formula to derive or maintain. What refinement near the body still has to guarantee is purely geometric: push the body's surface, and its immediate surroundings, onto the *finest configured level*, for as long as it sits there — because with `dx`-scaled `epsilon`, more resolution *is* more geometric fidelity, directly. Same underlying correctness requirement as before (avoid a resolution seam inside the penalization band), simpler justification, no extra numeric derivation needed. A gap here still puts a seam inside the penalization band — exactly the class of bug this project has already hit twice (the fine step missing the ALBC sponge; the level-inconsistent vorticity render) — so still treat it as a correctness requirement, not a threshold to retune later.
+
+**Validation:** on the cylinder harness (`main-cylinder-amr.js`), compare integrated force/torque against the dense reference (`main-cylinder.js`) at `N=3`, specifically at a deliberately coarse L0 (the aliasing regime this milestone exists to fix) — confirm the coarse-L0 case no longer diverges from the dense reference now that force integration runs at the finest available level. Confirm `chi`'s transition spans a consistent few-cell width at every level (not 1.5 cells at L0 and 6 at a hypothetical L2, today's actual numbers) once `epsilon_L` scaling lands. Also check invariance: the same physical configuration should integrate to the same force/torque regardless of how the AMR structure happens to be partitioned around it (a region being level 1 vs level 2 shouldn't change the answer, only its accuracy) — a good explicit regression test, not just an eyeball check.
+
+## Milestone 9 — Automatic refine/coarsen with 2:1 balance, designed together
+
+Originally split into "allocator first, balance constraint after" — that split doesn't work and isn't attempted here. The ghost-fill design (M6/M7) only ever queries same-level or one-hop-parent; it has no path to discover data more than one level away in either direction. "No same-level neighbor found" is silently *interpreted* as "the true data is one hop up," which is only a valid inference if 2:1 balance already holds. Running automatic refine/coarsen without the constraint enforced wouldn't just be less accurate — it would exercise neighbor configurations the lookup code was never built to resolve, and it would fail silently (a plausible but wrong ghost value, not a crash), the same class of bug this project has already paid for once (the diagonal-corner blowup, the missing fneq rescale factor). So 2:1 enforcement is a precondition for the allocator working at all, not a hardening pass on top of it — build them in the same milestone.
+
+Implement the quad allocator (decision 3) in `shaders/amr_manage.wgsl`'s generalized form, and per-level `blockCriterion` evaluation reading each level's own post-average field (same pattern as today's L0 criterion). The refine/coarsen decision itself enforces the invariant rather than checking it after the fact:
+- **Refine cascades**: a quad may only refine to level m+1 if its same-level (level-m) neighbors are already present; if a neighbor is more than one level coarser, force *that* neighbor to refine first (recursively, if the gap is >1) before granting this quad's own refine.
+- **Coarsen is blocked**: a level-m quad can't release if any same-level neighbor is at level m+1, until that neighbor coarsens first.
+
+This generalizes `amr_manage.wgsl`'s existing coarsen-fully-before-refine split (needed there to avoid a free-list race within one level, see its file header) to also be ordered *by level* — resolve coarsest-adjacent conflicts before finer ones, as a small fixed-point iteration (2-3 levels won't need many passes to converge before quiescing) rather than a single sweep.
+
+**Validation:** run with automatic refinement live at `N=3` on the existing card-falling scenario. Add a debug invariant check (walk all active tiles, confirm no same-level-neighbor pair differs by >1 level) and assert it every macro-step during development — this is cheap to leave permanently gated behind a debug flag as a live sanity check, not just a milestone-exit gate.
+
+## Milestone 10 — Cylinder validation, tuning, cleanup
+
+Run the existing cylinder harness (`main-cylinder-amr.js`, `tools/validate-cylinder.js`) at `N=3`, compare force/torque against both the current 2-level build and the dense reference (`main-cylinder.js`) — confirm no regression. Retune `REFINE_EVERY`/`REFINE_THRESH`/`COARSEN_THRESH`/`FORCE_REFINE_MARGIN` per level (a level-2 region right at the body surface, level-1 as the buffer shell 2:1 balance requires around it — likely different thresholds than today's single-tier values). Update:
+- Snapshot format (`debugSnapshotSave`/`Load`, main-amr.js:616-734): `pool` becomes an array indexed by level; bump `formatVersion`, reject old snapshots explicitly (matching the project's existing "fail loud on layout mismatch" convention rather than silently misreading).
+- `tools/amr-diff.js`/`amr-snapshot.js`: same array-of-pools shape.
+- `shaders/amr_render.wgsl`: composite finest-active-level-wins across N tiers instead of today's fixed two-tier overlay.
+
+## Critical files
+- `main-amr.js`
+- `shaders/amr_step.wgsl` (L0, unchanged)
+- `shaders/amr_interp_c2f.wgsl` (becomes L0→L1-only, renamed conceptually to the "dense parent" case)
+- `shaders/amr_step1.wgsl`, `amr_average_f2c.wgsl`, `amr_criterion.wgsl`, `amr_manage.wgsl`, `amr_force.wgsl` (generalize to be reused per-level, not per-file)
+- New: `shaders/amr_interp_pool_parent.wgsl`
+- `tools/amr-diff.js`, `tools/amr-snapshot.js`, `tools/validate-cylinder.js`
+- `main-cylinder-amr.js` (validation harness)
+- `index-amr.html`
