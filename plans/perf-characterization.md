@@ -467,6 +467,40 @@ the warm-up before the sweep started, and back to ~230 after.
 per coarse cell), the register rewrite did nothing, and it is *cheaper* on the
 phone (6.0%) than the desktop (12-16%).
 
+## The next lead: stop materializing the RING itself -- PLANNED
+
+`DIRECT_GHOST` removed the fine-fine ghost COPY PASS. The ring is still
+allocated and `interp` still fills it every macro-step, because a tile at a
+coarse/fine interface has no same-level neighbour and falls back to a clamped
+read of a parent-interpolated ghost. Removing the ring means replacing that
+stored value with an INLINE parent reconstruction in the gather, and
+`FB = 2*RB` exactly.
+
+**Full plan, mechanism, gates and measurement design: `plans/ghost-free.md`.**
+The short version of what this document contributes to it:
+
+- **The prize** is the steady-state `interp` pass -- 13.8-17.3% desktop,
+  19.2% phone, the largest remaining item after `step1`. Note it is the
+  `GHOST_ONLY=1` pipeline that goes; the `GHOST_ONLY=0` one-time fill on a
+  newly activated tile stays and is not in the per-macro-step budget.
+- **The give-back** is the fine step, and it will be worse than
+  `DIRECT_GHOST`'s +7.5%/+3.6%, because inline parent reconstruction is
+  materially more expensive per thread than the neighbour read that
+  substituted for. Honest expected net: **-5% to +15%**. Not a prediction.
+- **Do NOT justify it with the `FB` 20 -> 16 shrink.** `?benchSkip=step1-ring`
+  measured that at 0.2% desktop / 0.9% phone, and the traffic model's 10.5%
+  prediction was wrong by 10x. A real removal should beat 1% because it also
+  removes the reads, but that is a small number either way.
+- **Measure it as four configurations**, not one net figure -- ghost-free and
+  legacy, each with and without `benchSkip=step1` -- which is what made the
+  `DIRECT_GHOST` result legible rather than a single number hiding two
+  effects. `?ghostfree=1` goes in the `?bench=1` default sweep so the phone
+  can be done in one session.
+
+The other reason this is worth doing now is 3D (`plans/3D.md`): 2D is where
+the seam-validation apparatus already exists, so it answers the correctness
+question completely, and only the cost question partially.
+
 ## Superseded: what the levels=2 numbers said to do instead
 
 **Fuse the force accumulation into the step kernels.** It is the one change

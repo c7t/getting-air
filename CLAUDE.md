@@ -71,6 +71,18 @@ invariants the AMR machinery depends on:
   (1.908 at res=9 → 1.597 at res=10). The bounce-back variants of the same
   configs pass, which is consistent. Re-baseline against these numbers rather
   than assuming a red cell is yours.
+  **AMR Cd is only reproducible to ~+/-0.001; dense Cd is exact.** Measured
+  2026-09-09: two runs of the SAME build gave `amr-N2-diffuse` Cd 1.619 and
+  1.620, while `dense-reference` was bit-identical (1.950 / St 0.1258) across
+  every run. Cause: pool slots are handed out by an `atomicSub` free-list, so
+  block->slot assignment varies run to run, and `amr_force1*.wgsl` atomicAdds
+  one TRUNCATED i32 PER WORKGROUP -- regrouping the slots regroups the
+  partials, which truncate differently (see that file's own FSCALE header for
+  why the truncation is material, and `plans/ghost-free.md` for the full
+  trace). So a 4th-digit Cd move on an AMR config is NOT evidence of anything:
+  a build-vs-build claim there needs a same-build repeat, not a comparison
+  against a number recorded in another session. The dense configs remain
+  deterministic and usable as a strict check.
 - **`tools/validate-cylinder.js`** — physics: pinned cylinder in uniform
   crossflow, time-averaged Cd/Strouhal vs. literature values in
   `benchmarks/cylinder.json`. Assumes a Chrome + page are already up (see

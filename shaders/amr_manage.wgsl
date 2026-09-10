@@ -101,6 +101,21 @@
 // buffer per-stage limit, so a new buffer for this would not have fit.
 @group(0) @binding(7) var<storage, read>       blockCriterionL2 : array<f32>;
 @group(0) @binding(8) var<storage, read>       blockSlotL2      : array<i32>;
+// ── Refinement convergence counters (?diag=1) ────────────────────────────────
+// The refine round is a FIXED-POINT LOOP run a fixed N_LEVELS-1 times with no
+// convergence check -- it stops because the counter ran out, not because the
+// structure settled. amr_manage_pool.wgsl's own header records that this
+// "didn't always converge in time". These make the LAST iteration report
+// itself, so "what is left" is a number rather than something found later as
+// an artifact.
+//   [3] refines granted this iteration (any reason)
+//   [4] ... of which the CASCADE was the only reason -- i.e. 2:1 balance was
+//       still propagating outward when the loop stopped. The lag signal.
+//   [5] refines wanted but the pool was exhausted
+// Gated by DIAG: at 0 no atomic is touched.
+@group(0) @binding(9) var<storage, read_write> diag : array<atomic<u32>, 8>;
+
+override DIAG : u32 = 0u;
 
 override W : u32;
 override H : u32;
@@ -326,15 +341,24 @@ fn refine(@builtin(global_invocation_id) gid: vec3<u32>) {
       if (DEMAND_CASCADE != 0u && blockSlot[neighbors[i]] >= 0 && level2Wanted(neighbors[i])) { cascadeWanted = true; }
     }
   }
-  if (((desiredLevel(epsFor(blockID)) >= 1 && !inSpongeBand(blockID)) || isNearBody(blockID) || cascadeWanted) && currentSlot < 0) {
+  let ownReason = (desiredLevel(epsFor(blockID)) >= 1 && !inSpongeBand(blockID)) || isNearBody(blockID);
+  if ((ownReason || cascadeWanted) && currentSlot < 0) {
     let oldCount = atomicSub(&freeCount, 1);
     if (oldCount > 0) {
       let slot = freeList[u32(oldCount - 1)];
       blockSlot[blockID] = slot;
       slotToBlock[u32(slot)] = i32(blockID);
       newlyActivated[u32(slot)] = 1u;
+      if (DIAG != 0u) {
+        atomicAdd(&diag[3], 1u);
+        // Attributed to the cascade only when nothing else asked for it: a
+        // block its own criterion or geometry already wanted is not evidence
+        // that the balance cascade is still propagating.
+        if (cascadeWanted && !ownReason) { atomicAdd(&diag[4], 1u); }
+      }
     } else {
       atomicAdd(&freeCount, 1); // pool exhausted this round -- undo, stay coarse
+      if (DIAG != 0u) { atomicAdd(&diag[5], 1u); }
     }
   }
 }
