@@ -31,7 +31,7 @@ const {
   ensureServer, ensureChrome, openTab, firstTab, navigateTo, waitForGlobal,
   attachPageWatch, assertPageHealthy, teardown,
 } = require('./lib/browser-lifecycle');
-const { caseUrl, runDuctCase, runBeltramiCase, runTgvReport } = require('./lib/d3-metrics');
+const { caseUrl, runDuctCase, runBeltramiCase, runTgvReport, runConserveCase } = require('./lib/d3-metrics');
 const {
   caseUrl: bodyCaseUrl, runSphereCase, runSpinCase,
 } = require('./lib/d3-body-metrics');
@@ -61,6 +61,7 @@ function checksOf(r) {
   const x = r.res;
   if (r.scenario === 'duct') return [x.fieldCheck, x.peakCheck, x.xCheck];
   if (r.scenario === 'beltrami' || r.scenario === 'amr' || r.scenario === 'amr-box') return [x.fieldCheck, x.rateCheck, ...(x.matchCheck ? [x.matchCheck] : [])];
+  if (r.scenario === 'amr-conserve') return [x.massCheck, x.momCheck];
   if (r.scenario === 'tgv') return [x.finiteCheck];
   if (r.scenario === 'spin') return [x.angCheck, x.lCheck, x.qCheck, x.movedCheck];
   if (r.scenario.startsWith('sphere')) return [x.cdCheck, x.settledCheck, x.lateralCheck, ...(x.convergeCheck ? [x.convergeCheck] : [])];
@@ -93,6 +94,12 @@ async function main() {
     // collision rescale bug survived M3 -- refine=all is bit-identical
     // across it.
     { scenario: 'beltrami', key: 'amr-box', run: runBeltramiCase, cases: bench.amr_box_cases, gate: true },
+    // M4.1b. The ONLY cases that load ?interface=explode, and they gate
+    // CONSERVATION rather than a field error -- see benchmarks/d3.json's
+    // amr_conserve_note. The convex-edge mass leak shipped green precisely
+    // because nothing here scored mass and momentum: amr-box-RB4 is the
+    // interp path and refine=all has no interface to leak at.
+    { scenario: 'beltrami', key: 'amr-conserve', run: runConserveCase, cases: bench.amr_conserve_cases, gate: true },
     { scenario: 'tgv', run: runTgvReport, cases: bench.tgv_cases, gate: false },
     // M2. `spin` first: it is seconds long and it isolates the integrator,
     // so if it fails there is no point spending minutes on the sphere.
@@ -199,6 +206,8 @@ async function main() {
     } else if (r.scenario === 'beltrami' || r.scenario === 'amr' || r.scenario === 'amr-box') {
       c2 = `rate ${e3(x.rateRelErr)}`;
       c3 = x.amr ? `RB=${x.rb} ${x.activeSlots} tiles` : `td ${x.td.toFixed(0)}`;
+    } else if (r.scenario === 'amr-conserve') {
+      c2 = `d mom ${e3(x.momMax)}`; c3 = `RB=${x.rb} ${x.activeSlots} tiles`;
     } else if (r.scenario === 'spin') {
       c2 = `|L| drift ${e3(x.lCheck.measured)}`; c3 = `turned ${x.totalTurn.toFixed(2)} rad`;
       checks = [x.angCheck, x.lCheck, x.qCheck, x.movedCheck];
@@ -215,6 +224,7 @@ async function main() {
     if (!ok && !r.gate) exitCode = 1;   // tgv can still fail on non-finite
     console.log(pad(r.name, 22) + pad(r.scenario + (r.gate ? '' : ' (rep)'), 16)
       + padL(r.scenario === 'duct' ? e3(x.l2rel)
+             : r.scenario === 'amr-conserve' ? `d mass ${e3(x.massDrift)}`
              : (r.scenario === 'beltrami' || r.scenario === 'amr' || r.scenario === 'amr-box') ? e3(x.maxL2rel)
              : r.scenario === 'spin' ? `${e3(x.angCheck.measured)} rad`
              : r.scenario.startsWith('sphere') ? `ref ${x.cdRef.toFixed(3)}` : '-', 14)

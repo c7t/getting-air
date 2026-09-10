@@ -63,6 +63,7 @@ function caseUrl(baseUrl, scenario, c, extra) {
   if (c.boxfrac) p.set('boxfrac', c.boxfrac);
   if (c.rb) p.set('rb', c.rb);
   if (c.dcpre) p.set('dcpre', c.dcpre);
+  if (c.interface) p.set('interface', c.interface);
   return `${baseUrl}/index-3d.html?${p}${extra ? `&${extra}` : ''}`;
 }
 
@@ -161,6 +162,62 @@ async function runBeltramiCase(Runtime, opts, c, log) {
 
 // --- tgv (reports, does not gate) -----------------------------------------
 
+// --- conservation (plans/3D.md M4.1b) --------------------------------------
+//
+// THE GATE THE EXPLODE/COALESCE INTERFACE EXISTS TO PASS, and the one thing
+// the field gates cannot see. Beltrami is periodic, force-free and has no
+// body, so each level ALONE conserves mass and momentum exactly -- streaming
+// permutes populations and BGK preserves the first two moments. Any drift is
+// the coarse/fine interface and nothing else. That is what makes an absolute
+// bound meaningful here and meaningless on, say, the duct.
+//
+// WHY MASS AND MOMENTUM ARE SCORED DIFFERENTLY.
+//
+// Mass drift is NOT zero even with a perfect interface: it grows linearly in
+// t on every config, `refine=all` INCLUDED, because the readback sums 110592
+// f32 cells and the rounding accumulates. Measured 2026-09-09 at N=48 over
+// 256 steps: box 0.53, bar 0.57, slab 0.64, all 0.77 -- the no-interface
+// control is the LARGEST, which is the proof this floor is arithmetic and
+// not physics. So the bound is set well above it, and its job is to catch a
+// LEAK, which ran 1500x the floor rate when M4.1b first shipped
+// (-3.4 per step against ~2e-3).
+//
+// Momentum has no such floor on a converged interface -- it is FROZEN, not
+// slowly wandering -- so it is scored as drift from a WARMUP sample rather
+// than from t=0. There is a real one-time transient in the first few steps
+// as the coarse initial condition and the pool reconcile (box lands on
+// 6.94e-1 and then does not move for 1000 steps), and measuring from t=0
+// would score that startup offset instead of the leak. This is the sharp
+// half of the gate: the convex-edge leak moved momentum by 0.86 in 15 steps
+// while the fixed interface moves it by under 1e-3 in 1000.
+async function runConserveCase(Runtime, opts, c, log) {
+  const p = await evalOrThrow(Runtime, 'window.__D3.getParams()', 20000, 'getParams');
+  if (log) log(`N=${p.N} tau=${p.tau} Q${p.Q} ?interface=${c.interface} refine=${c.refine}: `
+    + `${p.activeSlots}/${p.blocks} tiles refined, warmup ${c.warmup} then ${c.steps} steps`);
+
+  const sample = async (t) => evalOrThrow(Runtime, `window.__D3.readInterfaceDiag(${t})`, 180000, 'readInterfaceDiag');
+  const t0 = await sample(0);
+  await evalOrThrow(Runtime, `window.__D3.debugStepSync(${c.warmup})`, (opts.timeout + 30) * 1000, 'debugStepSync');
+  const tw = await sample(c.warmup);
+  await evalOrThrow(Runtime, `window.__D3.debugStepSync(${c.steps - c.warmup})`, (opts.timeout + 30) * 1000, 'debugStepSync');
+  const tn = await sample(c.steps);
+
+  const massDrift = tn.mass - t0.mass;
+  const momDrift = tn.mom.map((v, a) => v - tw.mom[a]);
+  const momMax = Math.max(...momDrift.map(Math.abs));
+  if (log) {
+    log(`mass ${massDrift.toExponential(3)} over ${c.steps} steps (from t=0)`);
+    log(`momentum drift from t=${c.warmup}: ` + momDrift.map(v => v.toExponential(3)).join('  ')
+      + `   [startup offset ${tw.mom.map(v => v.toExponential(2)).join(' ')}]`);
+  }
+  return {
+    amr: true, rb: p.rb, activeSlots: p.activeSlots,
+    massDrift, momDrift, momMax, startupMom: tw.mom,
+    massCheck: checkTol('massDrift', massDrift, 0, c.mass_tol),
+    momCheck: checkTol('momentumDrift', momMax, 0, c.mom_tol),
+  };
+}
+
 async function runTgvReport(Runtime, opts, c, log) {
   const p = await evalOrThrow(Runtime, 'window.__D3.getParams()', 20000, 'getParams');
   if (log) log(`N=${p.N} tau=${p.tau} u0=${p.u0} Q${p.Q}: Re=${p.re.toFixed(0)} (L = N/2pi)`);
@@ -179,4 +236,4 @@ async function runTgvReport(Runtime, opts, c, log) {
   return { N: p.N, tau: p.tau, Q: p.Q, re: p.re, samples, finite, finiteCheck: { pass: finite, label: 'finite', measured: finite } };
 }
 
-module.exports = { evalExpr, checkTol, caseUrl, runDuctCase, runBeltramiCase, runTgvReport };
+module.exports = { evalExpr, checkTol, caseUrl, runDuctCase, runBeltramiCase, runTgvReport, runConserveCase };
