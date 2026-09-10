@@ -220,15 +220,30 @@ explode the DEFAULT, is next and is a blast-radius decision rather than an
 evidence one: merging publishes, and the flip moves every recorded AMR
 number at once.
 
-- **Dynamic refinement exists behind `?dynamic=1` (M4.2b-i), and a slot it
-  hands out is NOT yet initialized** (that is M4.2b-ii). It is refused unless
-  `?refine=body`. `coarsen` and `refine` are two SEPARATE passes and must
-  stay that way -- the 2D file records a live free-list race where two blocks
-  ended up sharing one slot. Two lessons worth carrying: a "nothing changed"
-  gate cannot tell a no-op manager from one that never ran (use
-  `?manageMargin=` to force it to act and watch `debugPoolState()`), and
-  `step` only advances after a whole `debugStepSync` batch, so any per-step
-  interval must use `step + s`.
+- **Dynamic refinement works behind `?dynamic=1` (M4.2b), refused unless
+  `?refine=body`.** A topology change is FIVE ORDERED PASSES -- decide,
+  drain, coarsen, refine, fill, clear -- and the order is the design, not
+  style. `drain` must precede `coarsen` (freeing first loses the fine
+  solution, since `refine` can re-hand the slot in the next pass); `fill`
+  must follow `refine`; `coarsen` and `refine` must stay separate passes (a
+  live 2D free-list race put two blocks on one slot); and `clear` is its own
+  pass because clearing the new-flag inside `fill` races the very test
+  `fill` uses to pick its work.
+
+- **A tile being born or absorbed IS an ordinary grid transfer, so it KEEPS
+  the Dupuis-Chopard rescale.** Chen's no-rescale applies to the interface,
+  where one state moves between two bookkeepings of one volume and the
+  a = (n-1)/2n offset absorbs tau. Creation and destruction are not that:
+  the two grids must carry the same rho, u and stress, and fneq carries the
+  stress. `interp` (`NEW_ONLY`) and `average` (`DYING_ONLY`) are the right
+  tools, rescale included. An earlier note in plans/3D.md said the opposite
+  and was wrong.
+
+- Two lessons worth carrying from that work: a "nothing changed" gate cannot
+  tell a no-op manager from one that never ran (use `?manageMargin=` to force
+  it to act, `?manageStart=` to place the event after the flow develops, and
+  watch `debugPoolState()`), and `step` only advances after a whole
+  `debugStepSync` batch, so any per-step interval must use `step + s`.
 
 - **The AMR invariant checker exists and is GREEN, but its 2:1 half is
   VACUOUS until refinement is multi-level** (`tools/validate-d3-invariants.js`,

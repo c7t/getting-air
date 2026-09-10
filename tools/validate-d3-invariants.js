@@ -90,15 +90,11 @@ const CONFIGS = [
   // exercises the out-of-slots path: the pop must restore the counter and
   // leave the block coarse rather than corrupt the list. Expect it to
   // saturate at the budget with free == 0.
-  // fieldWrongByDesign: this config hands out slots that NOTHING HAS
-  // INITIALIZED -- filling a new tile from the coarse field is M4.2b-ii --
-  // so the field blows up, and that is the expected consequence rather than
-  // a failure. Gating on it would encode a missing feature as a red cell.
-  // The STRUCTURAL claims still stand and are still gated: the allocator
-  // saturated the budget, restored the counter when it ran out, and left
-  // blockSlot and slotToBlock mutual inverses throughout. When 4.2b-ii
-  // lands, this flag comes off and the blowup must stop.
-  { name: 'body-refine', expectInUse: 'increase', steps: 8, fieldWrongByDesign: true,
+  // NO fieldWrongByDesign: M4.2b-ii initializes a newly-allocated tile from
+  // the coarse field, so allocating 80 of them must no longer destroy the
+  // run. Before it landed this config blew up and was flagged as expected;
+  // the flag coming off is the gate.
+  { name: 'body-refine', expectInUse: 'increase', steps: 8,
     url: 'scenario=sphere&n=16&re=20&u0=0.05&q=19&bounceback=1&live=0&levels=2&rb=4&refine=body&interface=explode&dynamic=1&manageEvery=1&manageMargin=6' },
 ];
 

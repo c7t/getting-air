@@ -160,7 +160,7 @@ async function init() {
     'uscale', 'vscale', 'vortGamma', 'bounceback', 'chiEps', 'vmax', 'omax',
     'levels', 'rb', 'refine', 'margin', 'boxfrac', 'dcpre', 'reflux', 'interface',
     'explin', 'orphans', 'dynamic', 'manageEvery', 'slotHeadroom',
-    'manageMargin']);
+    'manageMargin', 'manageStart']);
   for (const k of urlParams.keys()) {
     if (PAGE_PARAMS.has(k) || k in SCENARIOS[scenarioName].defaults) continue;
     throw new Error(`?${k}=: not a parameter of scenario "${scenarioName}" `
@@ -304,6 +304,14 @@ async function init() {
   // every step is pure cost on a body that moves a fraction of a cell per
   // step; the 2D manager re-evaluates on an interval for the same reason.
   const MANAGE_EVERY = Math.max(1, Math.round(numParam('manageEvery', 16)));
+  // The first step the manager may run on. Default 0, so it decides before
+  // anything moves. Its reason for existing is testability: with a PINNED
+  // body the wanted-set never changes after step 0, so an event placed at
+  // step 0 happens while the fine and coarse levels still hold the same
+  // initial condition -- and a drain that restricts one onto the other is
+  // then indistinguishable from doing nothing. Delaying the first event lets
+  // the flow develop first, which is the only way to see the drain work.
+  const MANAGE_START = Math.max(0, Math.round(numParam('manageStart', 0)));
   // Slot headroom. The pool is sized to the slots actually in use (a 3D pool
   // sized for the whole domain would be (FB/RB)^3 = 27x the dense grid at
   // RB=4), so a manager that can only ever hand back what it already has is
@@ -397,7 +405,7 @@ async function init() {
   // the whole domain would be (FB/RB)^3 = 27x the dense grid at RB=4.
   let fPoolA = null, fPoolB = null, macPool = null, blockSlotBuf = null, slotToBlockBuf = null;
   let fluxAccBuf = null;
-  let freeListBuf = null, freeCountBuf = null;
+  let freeListBuf = null, freeCountBuf = null, blockWantBuf = null, slotNewBuf = null;
   if (AMR) {
     const slots = MAX_SLOTS;
     const poolCells = slots * pool.tileCells;
@@ -428,6 +436,19 @@ async function init() {
     freeCountBuf = device.createBuffer({ size: 16, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
     device.queue.writeBuffer(freeListBuf, 0, freeInit);
     device.queue.writeBuffer(freeCountBuf, 0, new Int32Array([nFree, 0, 0, 0]));
+    // Always allocated, even when static: `blockWant` and `slotNew` are bound
+    // into the interp and average layouts, and a layout that exists in two
+    // versions is exactly the 238e48c failure surface. One dummy element is
+    // enough where there is no manager -- the pipelines that read them are
+    // never created, and NEW_ONLY/DYING_ONLY fold the reads out of the ones
+    // that are.
+    blockWantBuf = device.createBuffer({ size: (DYNAMIC ? pool.nBlocks : 1) * 4, usage: U.STORAGE | U.COPY_DST });
+    slotNewBuf = device.createBuffer({ size: (DYNAMIC ? slots : 1) * 4, usage: U.STORAGE | U.COPY_DST });
+    // The initial set is not "new": it was uploaded with real data by the
+    // host, and marking it new would have the fill pass overwrite every tile
+    // with a coarse interpolation on the first step.
+    device.queue.writeBuffer(slotNewBuf, 0, new Uint32Array(DYNAMIC ? slots : 1));
+    device.queue.writeBuffer(blockWantBuf, 0, new Uint32Array(DYNAMIC ? pool.nBlocks : 1));
     // Per coarse cell: the mass and momentum the FINE solver moved across
     // the seam this macro step, in coarse-cell units. Written by the flux
     // pass on substep A and added to on substep B; consumed by the reflux
@@ -599,6 +620,8 @@ async function init() {
   let explodeBG = null, coalesceBG = null;
   let forcePoolPipe = null, forcePoolBG = null;
   let manageCoarsenPipe = null, manageRefinePipe = null, manageBG = null;
+  let manageDecidePipe = null, manageClearPipe = null;
+  let fillPipe = null, drainPipe = null;
 
   // M4's interface flux correction. OPT-IN (?reflux=1), and NOT the default
   // -- it does what it was built to do and that turned out not to be enough.
@@ -669,6 +692,7 @@ async function init() {
       { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
       { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
       { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+      { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     ]});
     const step1BGL = device.createBindGroupLayout({ entries: [
       { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
@@ -683,6 +707,7 @@ async function init() {
       { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
       { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
       { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+      { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     ]});
 
     const mk = (bgl, module, constants) => device.createComputePipelineAsync({
@@ -704,6 +729,16 @@ async function init() {
       SPONGE_W: sponge.width, SPONGE_UX: sponge.u[0], SPONGE_UY: sponge.u[1], SPONGE_UZ: sponge.u[2],
     });
     avgPipe = await mk(avgBGL, avgModule, { ...poolConst, TAU_COARSE, DC_PRE });
+    // M4.2b-ii. Third pipelines over the SAME two modules and the same two
+    // layouts: a tile being born wants exactly interp's coarse->fine
+    // transfer, and one being absorbed wants exactly average's restriction.
+    // Separate shaders would be two more copies of transfers this file
+    // already has, which is how they drift apart.
+    if (DYNAMIC) {
+      fillPipe = await mk(interpBGL, interpModule,
+        { ...poolConst, TAU_COARSE, DC_PRE, GHOST_ONLY: 0, TIME_BLEND: 0.0, NEW_ONLY: 1 });
+      drainPipe = await mk(avgBGL, avgModule, { ...poolConst, TAU_COARSE, DC_PRE, DYING_ONLY: 1 });
+    }
 
     // M4.2b-i: the dynamic-refinement manager. TWO pipelines over ONE module
     // and ONE bind group -- the split is into separate PASSES, not separate
@@ -718,6 +753,8 @@ async function init() {
         { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
         { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
         { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+        { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+        { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
       ]});
       // MARGIN comes from the SAME value refineNearBody used to build the
       // static set, not from a second read of ?margin=: the bit-identical
@@ -729,14 +766,18 @@ async function init() {
         layout: device.createPipelineLayout({ bindGroupLayouts: [manageBGL] }),
         compute: { module: manageModule, entryPoint: entry, constants: manageConst },
       });
+      manageDecidePipe = await mkManage('decide');
       manageCoarsenPipe = await mkManage('coarsen');
       manageRefinePipe = await mkManage('refine');
+      manageClearPipe = await mkManage('clearNew');
       manageBG = device.createBindGroup({ layout: manageBGL, entries: [
         { binding: 0, resource: { buffer: blockSlotBuf } },
         { binding: 1, resource: { buffer: slotToBlockBuf } },
         { binding: 2, resource: { buffer: freeListBuf } },
         { binding: 3, resource: { buffer: freeCountBuf } },
-        { binding: 4, resource: { buffer: bodyBuf } }]});
+        { binding: 4, resource: { buffer: bodyBuf } },
+        { binding: 5, resource: { buffer: blockWantBuf } },
+        { binding: 6, resource: { buffer: slotNewBuf } }]});
     }
 
     // M4.1d: the fine level's own force/torque reduction. Created from the
@@ -760,7 +801,8 @@ async function init() {
     // coarse parity x pool target. interpBG[coarseParity][poolTarget].
     const mkInterp = (c0, c1, dst) => device.createBindGroup({ layout: interpBGL, entries: [
       { binding: 0, resource: { buffer: c0 } }, { binding: 1, resource: { buffer: dst } },
-      { binding: 2, resource: { buffer: slotToBlockBuf } }, { binding: 3, resource: { buffer: c1 } }]});
+      { binding: 2, resource: { buffer: slotToBlockBuf } }, { binding: 3, resource: { buffer: c1 } },
+      { binding: 4, resource: { buffer: slotNewBuf } }]});
     interpBG = [
       [mkInterp(fA, fB, fPoolA), mkInterp(fA, fB, fPoolB)],   // coarse t in fA
       [mkInterp(fB, fA, fPoolA), mkInterp(fB, fA, fPoolB)],   // coarse t in fB
@@ -775,7 +817,8 @@ async function init() {
     // also needs one per parity.
     const mkAvg = (dst) => device.createBindGroup({ layout: avgBGL, entries: [
       { binding: 0, resource: { buffer: fPoolA } }, { binding: 1, resource: { buffer: dst } },
-      { binding: 2, resource: { buffer: slotToBlockBuf } }, { binding: 3, resource: { buffer: mac } }]});
+      { binding: 2, resource: { buffer: slotToBlockBuf } }, { binding: 3, resource: { buffer: mac } },
+      { binding: 4, resource: { buffer: blockWantBuf } }]});
     avgBGA = mkAvg(fA);
     avgBGB = mkAvg(fB);
 
@@ -998,33 +1041,6 @@ async function init() {
         const pp = enc.beginComputePass();
         pp.setPipeline(physPipe); pp.setBindGroup(0, physicsBG); pp.dispatchWorkgroups(1); pp.end();
       }
-      // --- dynamic refinement (M4.2b-i) ------------------------------------
-      //
-      // BEFORE the levels advance, so the whole macro-step sees one topology
-      // -- explode, both fine substeps, coalesce and the coarse step all
-      // read the same blockSlot. Re-deciding mid-step would leave passes
-      // disagreeing about which blocks exist.
-      //
-      // COARSEN AND REFINE ARE TWO PASSES and must stay two passes; the
-      // shader's header has the free-list race that requires it.
-      // `step + s`, NOT `step`: step only advances after the whole batch
-      // (see debugStepSync's chunking), so testing `step` alone is constant
-      // across every iteration of this loop -- the manager would run on all
-      // 500 steps of one chunk and none of the next. A pinned body makes
-      // that indistinguishable from correct, because nothing changes either
-      // way, so the bit-identical gate below CANNOT catch it. Found by
-      // reading, not by testing, and worth saying out loud: an
-      // "it changed nothing" gate is blind to how often the nothing ran.
-      if (manageCoarsenPipe && ((step + s) % MANAGE_EVERY) === 0) {
-        const nbTot = pool.nb[0] * pool.nb[1] * pool.nb[2];
-        const wg = Math.ceil(nbTot / 64);
-        for (const pipe of [manageCoarsenPipe, manageRefinePipe]) {
-          const mp = enc.beginComputePass();
-          mp.setPipeline(pipe); mp.setBindGroup(0, manageBG);
-          mp.dispatchWorkgroups(wg); mp.end();
-        }
-      }
-
       // --- AMR, N=2 (S_Advance) --------------------------------------------
       //
       // Both levels start the macro-step at time t. There are two couplings
@@ -1060,6 +1076,59 @@ async function init() {
         gp.dispatchWorkgroups(disp[0], disp[1], disp[2]);
         gp.end();
       };
+
+      // --- dynamic refinement (M4.2b) ---------------------------------------
+      //
+      // BEFORE the levels advance, so the whole macro-step sees one topology
+      // -- explode, both fine substeps, coalesce and the coarse step all
+      // read the same blockSlot. Re-deciding mid-step would leave passes
+      // disagreeing about which blocks exist.
+      //
+      // COARSEN AND REFINE ARE TWO PASSES and must stay two passes; the
+      // shader's header has the free-list race that requires it.
+      // `step + s`, NOT `step`: step only advances after the whole batch
+      // (see debugStepSync's chunking), so testing `step` alone is constant
+      // across every iteration of this loop -- the manager would run on all
+      // 500 steps of one chunk and none of the next. A pinned body makes
+      // that indistinguishable from correct, because nothing changes either
+      // way, so the bit-identical gate below CANNOT catch it. Found by
+      // reading, not by testing, and worth saying out loud: an
+      // "it changed nothing" gate is blind to how often the nothing ran.
+      if (manageCoarsenPipe && (step + s) >= MANAGE_START && ((step + s - MANAGE_START) % MANAGE_EVERY) === 0) {
+        const nbTot = pool.nb[0] * pool.nb[1] * pool.nb[2];
+        const wgB = Math.ceil(nbTot / 64);
+        const wgS = Math.ceil(MAX_SLOTS / 64);
+        const blockPass = (pipe, n) => {
+          const mp = enc.beginComputePass();
+          mp.setPipeline(pipe); mp.setBindGroup(0, manageBG);
+          mp.dispatchWorkgroups(n); mp.end();
+        };
+        // FIVE PASSES, AND THE ORDER IS THE WHOLE DESIGN (M4.2b-ii).
+        //
+        //   decide   evaluate the criterion ONCE into blockWant, so every
+        //            pass below answers the same question. Two passes each
+        //            recomputing it is two chances to disagree.
+        //   drain    restrict a dying tile onto its coarse cells. MUST come
+        //            before coarsen: coarsen frees the slot and refine can
+        //            hand that same slot straight out in the next pass, by
+        //            which point the fine solution is gone.
+        //   coarsen  free the slots. Only writes to freeList.
+        //   refine   allocate. Only reads freeList -- see the manager's own
+        //            header for the race that forces this split.
+        //   fill     initialize the just-allocated tiles from the coarse
+        //            field. MUST come after refine: there is no slot to fill
+        //            until refine has handed one out.
+        //   clear    drop the just-filled flags, in its own pass because
+        //            clearing them inside fill is a race on the very test
+        //            fill uses to select its work.
+        blockPass(manageDecidePipe, wgB);
+        gridPass(drainPipe, cp === 0 ? avgBGA : avgBGB);
+        blockPass(manageCoarsenPipe, wgB);
+        blockPass(manageRefinePipe, wgB);
+        tilePass(fillPipe, interpBG[cp][0]);
+        blockPass(manageClearPipe, wgS);
+      }
+
 
       if (EXPLODE) {
         // M4.1b, Chen et al. 2006. The COARSE STEP RUNS LAST, and that is the

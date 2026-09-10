@@ -30,8 +30,33 @@
 // that was refined to improve it. The averaged moments are already in hand,
 // so this costs four stores.
 @group(0) @binding(3) var<storage, read_write> mac_coarse  : array<f32>;
+// The criterion's answer, per block. Always bound -- one dummy element when
+// there is no dynamic refinement -- so this layout does not fork. DYING_ONLY
+// folds it out.
+@group(0) @binding(4) var<storage, read>       blockWant   : array<u32>;
 
 override TAU_COARSE : f32 = 0.8f;
+
+// M4.2b-ii, the DRAIN pipeline. 1 restricts ONLY the tiles the manager is
+// about to release, and it must run BEFORE the coarsen pass frees them:
+// `refine` can hand the same slot straight back out in the next pass, and by
+// then the fine solution is gone.
+//
+// This is the mirror of interp's NEW_ONLY, and a third pipeline over this
+// same module for the same reason -- a tile being absorbed back into the
+// coarse grid wants exactly the restriction `average` already performs, and
+// a second copy of it is how the two would drift.
+//
+// THE DUPUIS-CHOPARD RESCALE IS CORRECT HERE. M4.2b-i's plan note said
+// reaching for `average` was the obvious move and was wrong, on the grounds
+// that Chen's scheme wants no rescale. That reasoning does not transfer:
+// Chen's no-rescale is about the INTERFACE, where one state is moved between
+// two bookkeepings of a single volume and the a = (n-1)/2n offset absorbs
+// the tau difference. A tile being destroyed is an ordinary GRID TRANSFER --
+// the coarse cell must carry the same rho, u and viscous stress the fine
+// cells did, and fneq carries the stress, so it scales. The note was wrong
+// and is corrected in plans/3D.md.
+override DYING_ONLY : u32 = 0u;
 
 @compute @workgroup_size(4, 4, 4)
 fn main(@builtin(local_invocation_id) lid: vec3<u32>,
@@ -51,6 +76,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 
   let blockID = slotToBlock[slot];
   if (blockID < 0) { return; }
+  if (DYING_ONLY != 0u && blockWant[u32(blockID)] != 0u) { return; }
   let b = blockXYZ(u32(blockID));
 
   let poolPlane = arrayLength(&f_pool) / QN;

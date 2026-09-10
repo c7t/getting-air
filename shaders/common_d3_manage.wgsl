@@ -44,6 +44,16 @@
 @group(0) @binding(2) var<storage, read_write> freeList    : array<i32>;
 @group(0) @binding(3) var<storage, read_write> freeCount   : atomic<i32>;
 @group(0) @binding(4) var<storage, read>       body        : BodyState3D;
+// The criterion's answer, computed ONCE by `decide` and read by every pass
+// after it. M4.2b-i evaluated blockWanted() separately in coarsen and in
+// refine, which is two chances to disagree about one question -- and once
+// the drain and fill passes also need the answer it becomes four. One
+// producer, three consumers.
+@group(0) @binding(5) var<storage, read_write> blockWant   : array<u32>;
+// Per SLOT: set by `refine` when it hands the slot out, cleared by the fill
+// pass once the tile has been initialized from the coarse field. A slot with
+// this set is holding whatever the last owner left behind.
+@group(0) @binding(6) var<storage, read_write> slotNew     : array<u32>;
 
 override MARGIN : f32 = 2.0f;
 // The body's own radius is baked into get_phi3, so the criterion needs
@@ -77,16 +87,32 @@ fn blockOfId(id: u32) -> vec3<u32> {
   return vec3<u32>(id % nx, (id / nx) % ny, id / (nx * ny));
 }
 
-// PASS 1. Release the slot of any refined block the criterion no longer
+// PASS 0. Evaluate the criterion, once, into blockWant. Everything after
+// this reads the answer rather than recomputing it -- see blockWant's own
+// note. It also fixes the answer for the whole topology change, so the drain
+// pass and the coarsen pass provably agree about which tiles are dying.
+@compute @workgroup_size(64)
+fn decide(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let id = gid.x;
+  if (id >= nbx() * nby() * nbz()) { return; }
+  blockWant[id] = select(0u, 1u, blockWanted(blockOfId(id)));
+}
+
+// PASS 2. Release the slot of any refined block the criterion no longer
 // wants. Only writes: each thread pushes at its own atomically-reserved
 // index, so no two threads touch one freeList entry.
+//
+// BY THE TIME THIS RUNS the drain pass has already restricted the tile onto
+// its coarse cells (M4.2b-ii). Freeing first and restricting later cannot
+// work: `refine` may hand the same slot out in the very next pass, and the
+// data would be gone.
 @compute @workgroup_size(64)
 fn coarsen(@builtin(global_invocation_id) gid: vec3<u32>) {
   let id = gid.x;
   if (id >= nbx() * nby() * nbz()) { return; }
   let slot = blockSlot[id];
   if (slot < 0) { return; }
-  if (blockWanted(blockOfId(id))) { return; }
+  if (blockWant[id] != 0u) { return; }
   blockSlot[id] = -1;
   slotToBlock[slot] = -1;
   // atomicAdd returns the OLD count, which is exactly the index to write.
@@ -94,14 +120,29 @@ fn coarsen(@builtin(global_invocation_id) gid: vec3<u32>) {
   freeList[at] = slot;
 }
 
-// PASS 2. Give a slot to any unrefined block the criterion now wants. Only
+// PASS 5, after the fill. Clears the just-filled flags, one thread per slot.
+//
+// This is a separate pass rather than a line at the end of the fill kernel
+// because clearing it there is a RACE: the fill kernel tests slotNew to
+// decide whether to touch a cell, and a thread that cleared it would make
+// every sibling that had not yet reached the test return early, leaving the
+// tile filled in part. Threads within a dispatch are not ordered, so there
+// is no "last" thread to do it from.
+@compute @workgroup_size(64)
+fn clearNew(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let slot = gid.x;
+  if (slot >= arrayLength(&slotNew)) { return; }
+  slotNew[slot] = 0u;
+}
+
+// PASS 3. Give a slot to any unrefined block the criterion now wants. Only
 // reads of freeList, at an index no longer being concurrently written.
 @compute @workgroup_size(64)
 fn refine(@builtin(global_invocation_id) gid: vec3<u32>) {
   let id = gid.x;
   if (id >= nbx() * nby() * nbz()) { return; }
   if (blockSlot[id] >= 0) { return; }
-  if (!blockWanted(blockOfId(id))) { return; }
+  if (blockWant[id] == 0u) { return; }
   // atomicSub returns the OLD count; the slot to take is freeList[old-1].
   let old = atomicSub(&freeCount, 1);
   if (old <= 0) {
@@ -117,4 +158,10 @@ fn refine(@builtin(global_invocation_id) gid: vec3<u32>) {
   let slot = freeList[old - 1];
   blockSlot[id] = slot;
   slotToBlock[slot] = i32(id);
+  // The tile holds whatever the previous owner left. The fill pass, which
+  // runs after this one, turns it into an interpolation of the coarse field
+  // and clears the flag. Until M4.2b-ii this was left set to nothing at all,
+  // and validate-d3-invariants.js's body-refine config blew the field up --
+  // deliberately, as the evidence that this line had to exist.
+  slotNew[slot] = 1u;
 }

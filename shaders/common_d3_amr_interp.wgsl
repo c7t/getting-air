@@ -38,9 +38,39 @@
 @group(0) @binding(1) var<storage, read_write> f_pool      : array<f32>;
 @group(0) @binding(2) var<storage, read>       slotToBlock : array<i32>;
 @group(0) @binding(3) var<storage, read>       f_coarse_t1 : array<f32>;
+// Per SLOT: 1 while the slot holds a tile the manager has just handed out
+// and nothing has initialized. READ-ONLY here, deliberately: clearing it
+// from this kernel is a race. Thread (0,0,0) of a tile would clear the flag
+// while its siblings had not yet reached their NEW_ONLY test, and every one
+// that read it afterwards would return early -- a tile filled in part and
+// left in part as whatever the previous owner had. Threads in a dispatch are
+// not ordered, so "one thread does it last" is not a thing that can be said.
+// common_d3_manage.wgsl's `clearNew` pass does it afterwards instead.
+// Always bound -- a single dummy element when there is no dynamic
+// refinement, exactly as common_d3_step.wgsl binds blockSlot -- so this
+// layout does not fork. NEW_ONLY folds it out.
+@group(0) @binding(4) var<storage, read>       slotNew     : array<u32>;
 
 override TAU_COARSE : f32 = 0.8f;
 override GHOST_ONLY : u32 = 1u;
+
+// M4.2b-ii, the FILL pipeline: GHOST_ONLY = 0 and NEW_ONLY = 1 fills only
+// the tiles the manager has just allocated, and clears their flag. The whole
+// point of a third pipeline over this same module rather than a new shader
+// is that the coarse->fine transfer stays in ONE place: a newly-refined tile
+// and a ring refresh want the identical interpolation, and a second copy of
+// it is how the two would drift.
+//
+// THE DUPUIS-CHOPARD RESCALE IS CORRECT HERE, and this is worth stating
+// because M4.2b-i's own plan note said the opposite. Chen's explode/coalesce
+// needs NO rescale, but that is a statement about the INTERFACE accounting:
+// there the same state is moved between two bookkeepings of one volume, and
+// the a = (n-1)/2n offset absorbs the tau difference. A tile being created
+// or destroyed is an ordinary GRID TRANSFER -- two grids with different tau
+// must represent the same rho, u and viscous stress, and fneq carries the
+// stress, so it scales by (tau_f - 1)/(tau_c - 1)/2. Skipping it here would
+// give a new tile the wrong stress at birth.
+override NEW_ONLY : u32 = 0u;
 
 // Where in the parent step this ring refresh is for: 0 = the parent's state
 // at time t, 0.5 = halfway. DEFAULT 0, AND CURRENTLY ALWAYS 0.
@@ -113,6 +143,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let blockID = slotToBlock[slot];
   if (blockID < 0) { return; }
   if (GHOST_ONLY != 0u && isInterior3(fi)) { return; }
+  if (NEW_ONLY != 0u && slotNew[slot] == 0u) { return; }
 
   let b = blockXYZ(u32(blockID));
   let origin = b * RB;
@@ -141,4 +172,5 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let cell = poolCell(slot, fi);
   let poolPlane = arrayLength(&f_pool) / QN;
   for (var i = 0u; i < QN; i++) { f_pool[i * poolPlane + cell] = fo[i]; }
+
 }
