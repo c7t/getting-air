@@ -281,7 +281,13 @@ Also settled, and worth knowing before adding a page:
   at all, which is the Berger-Colella assumption LBM breaks. Do not "fix"
   this by re-deriving the accounting -- read `shaders/common_d3_amr_flux.wgsl`
   and plans/3D.md M4 first, and use `?refine=slab` as the control that
-  separates a correction bug from the corner.
+  separates a correction bug from the corner. The literature's answer is to
+  change the formulation (volumetric: advection is a rigid-body translation
+  of a cell and mass moves by VOLUME OVERLAP, which tiles at corners
+  because overlaps partition space) rather than to patch the balance --
+  plans/3D.md M4 has both primary sources read and, importantly, the reason
+  Rohde 2006 alone is not enough: it is MASS conservative and our leak is
+  in MOMENTUM.
 
 - **`?refine=all` cannot see an interface bug**, so never treat it as
   coverage for one. With every block refined, the restriction's rescaled
