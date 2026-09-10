@@ -159,7 +159,8 @@ async function init() {
   const PAGE_PARAMS = new Set(['scenario', 'q', 'axis', 'slice', 'mode', 'spf', 'live',
     'uscale', 'vscale', 'vortGamma', 'bounceback', 'chiEps', 'vmax', 'omax',
     'levels', 'rb', 'refine', 'margin', 'boxfrac', 'dcpre', 'reflux', 'interface',
-    'explin', 'orphans']);
+    'explin', 'orphans', 'dynamic', 'manageEvery', 'slotHeadroom',
+    'manageMargin']);
   for (const k of urlParams.keys()) {
     if (PAGE_PARAMS.has(k) || k in SCENARIOS[scenarioName].defaults) continue;
     throw new Error(`?${k}=: not a parameter of scenario "${scenarioName}" `
@@ -293,7 +294,52 @@ async function init() {
   // only asked for 128 MiB fails validation at buffer creation, which
   // presents as a fine level that silently never runs. It did exactly that
   // during development.
-  const poolBytes = AMR ? Math.max(1, poolAlloc.activeSlots) * pool.tileCells * Q * 4 : 0;
+  // M4.2b-i. Dynamic refinement: the pool's block->slot map becomes writable
+  // by a kernel instead of uploaded once. OPT-IN, and only with
+  // ?refine=body, because that is the only criterion that can legitimately
+  // change during a run -- a fixed box has no reason to be re-decided, and
+  // letting it be re-decided would only add churn to test nothing.
+  const DYNAMIC = urlParams.get('dynamic') === '1' ? 1 : 0;
+  // How often the criterion is re-evaluated, in macro-steps. Re-deciding
+  // every step is pure cost on a body that moves a fraction of a cell per
+  // step; the 2D manager re-evaluates on an interval for the same reason.
+  const MANAGE_EVERY = Math.max(1, Math.round(numParam('manageEvery', 16)));
+  // Slot headroom. The pool is sized to the slots actually in use (a 3D pool
+  // sized for the whole domain would be (FB/RB)^3 = 27x the dense grid at
+  // RB=4), so a manager that can only ever hand back what it already has is
+  // not a manager. This is the fraction ABOVE the initial set it may grow
+  // into, and it costs real memory -- at the sphere case's 160 tiles, 1.5x
+  // is 63 MB against 42 MB.
+  const SLOT_HEADROOM = Math.max(1, numParam('slotHeadroom', 1.5));
+  // TEST HOOK. The margin the MANAGER's criterion uses, defaulting to the one
+  // that built the initial set -- so by default the two agree and the manager
+  // decides "no change", which is what M4.2b-i's bit-identical gate needs.
+  //
+  // Setting it DIFFERENT deliberately disagrees with the initial set, and
+  // that is the only way to prove the manager ran at all: a gate that shows
+  // "nothing changed" is equally consistent with a manager that never
+  // executed. Smaller than ?margin= makes the coarsen pass fire (blocks are
+  // released); larger makes refine fire (slots are popped). Both leave the
+  // FIELD wrong until M4.2b-ii initializes and restricts, so this is for
+  // STRUCTURAL checks only -- tools/validate-d3-invariants.js.
+  const MANAGE_MARGIN = numParam('manageMargin', NaN);
+
+  // Only ?refine=body has a criterion a kernel can re-evaluate. Every other
+  // mode is a fixed region chosen once, and re-deciding it would add
+  // allocation churn to test nothing.
+  if (DYNAMIC && !geomForced) {
+    throw new Error(`?dynamic=1 needs ?refine=body (a geometry-forced criterion); ?refine=${refineMode} is a fixed region`);
+  }
+
+  // The slot budget. Static refinement knows its own answer up front and
+  // allocates exactly that; dynamic refinement has to be able to GROW, so it
+  // pays for headroom above the initial set. See SLOT_HEADROOM.
+  const MAX_SLOTS = AMR
+    ? Math.min(pool.nBlocks, Math.max(1, DYNAMIC
+        ? Math.ceil(poolAlloc.activeSlots * SLOT_HEADROOM)
+        : poolAlloc.activeSlots))
+    : 0;
+  const poolBytes = AMR ? MAX_SLOTS * pool.tileCells * Q * 4 : 0;
   const needBytes = Math.max(fBytes, poolBytes);
   const limit = Math.min(adapter.limits.maxStorageBufferBindingSize, adapter.limits.maxBufferSize);
   if (needBytes > limit) {
@@ -351,8 +397,9 @@ async function init() {
   // the whole domain would be (FB/RB)^3 = 27x the dense grid at RB=4.
   let fPoolA = null, fPoolB = null, macPool = null, blockSlotBuf = null, slotToBlockBuf = null;
   let fluxAccBuf = null;
+  let freeListBuf = null, freeCountBuf = null;
   if (AMR) {
-    const slots = Math.max(1, poolAlloc.activeSlots);
+    const slots = MAX_SLOTS;
     const poolCells = slots * pool.tileCells;
     fPoolA = device.createBuffer({ size: poolBytes, usage: U.STORAGE });
     fPoolB = device.createBuffer({ size: poolBytes, usage: U.STORAGE });
@@ -363,9 +410,24 @@ async function init() {
     // manager starts writing this buffer from a kernel, which is when the
     // checker has to already be right.
     blockSlotBuf = device.createBuffer({ size: pool.nBlocks * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
-    slotToBlockBuf = device.createBuffer({ size: slots * 4, usage: U.STORAGE | U.COPY_DST });
+    // COPY_SRC on slotToBlock too: it is blockSlot's inverse, and cross-
+    // checking the two against each other is how the 2D free-list race was
+    // confirmed -- they disagreed for exactly the colliding slot.
+    slotToBlockBuf = device.createBuffer({ size: slots * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
+    const s2b = new Int32Array(slots).fill(-1);
+    s2b.set(poolAlloc.slotToBlock.slice(0, Math.min(slots, poolAlloc.activeSlots)));
     device.queue.writeBuffer(blockSlotBuf, 0, poolAlloc.blockSlot);
-    device.queue.writeBuffer(slotToBlockBuf, 0, poolAlloc.slotToBlock.slice(0, slots));
+    device.queue.writeBuffer(slotToBlockBuf, 0, s2b);
+    // The free list, a classic GPU stack: freeCount is how many slots are
+    // free, and the top of the stack lives at freeList[freeCount-1]. Slots
+    // [0, activeSlots) start in use; everything above is free.
+    const nFree = slots - poolAlloc.activeSlots;
+    const freeInit = new Int32Array(Math.max(1, slots));
+    for (let i = 0; i < nFree; i++) freeInit[i] = poolAlloc.activeSlots + i;
+    freeListBuf = device.createBuffer({ size: Math.max(1, slots) * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
+    freeCountBuf = device.createBuffer({ size: 16, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
+    device.queue.writeBuffer(freeListBuf, 0, freeInit);
+    device.queue.writeBuffer(freeCountBuf, 0, new Int32Array([nFree, 0, 0, 0]));
     // Per coarse cell: the mass and momentum the FINE solver moved across
     // the seam this macro step, in coarse-cell units. Written by the flux
     // pass on substep A and added to on substep B; consumed by the reflux
@@ -536,6 +598,7 @@ async function init() {
   let explodePipe = null, coalescePipe = null;
   let explodeBG = null, coalesceBG = null;
   let forcePoolPipe = null, forcePoolBG = null;
+  let manageCoarsenPipe = null, manageRefinePipe = null, manageBG = null;
 
   // M4's interface flux correction. OPT-IN (?reflux=1), and NOT the default
   // -- it does what it was built to do and that turned out not to be enough.
@@ -641,6 +704,40 @@ async function init() {
       SPONGE_W: sponge.width, SPONGE_UX: sponge.u[0], SPONGE_UY: sponge.u[1], SPONGE_UZ: sponge.u[2],
     });
     avgPipe = await mk(avgBGL, avgModule, { ...poolConst, TAU_COARSE, DC_PRE });
+
+    // M4.2b-i: the dynamic-refinement manager. TWO pipelines over ONE module
+    // and ONE bind group -- the split is into separate PASSES, not separate
+    // resources; see common_d3_manage.wgsl on why they must not share a
+    // dispatch.
+    if (DYNAMIC) {
+      const manageModule = device.createShaderModule({
+        code: await loadShader(`shaders/d3_manage_q${Q}.wgsl`), label: `d3_manage_q${Q}` });
+      const manageBGL = device.createBindGroupLayout({ entries: [
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+        { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+        { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+        { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+      ]});
+      // MARGIN comes from the SAME value refineNearBody used to build the
+      // static set, not from a second read of ?margin=: the bit-identical
+      // gate needs the two criteria to agree exactly, and two independent
+      // parses of one parameter is how they would silently stop agreeing.
+      const manageConst = { ...poolConst, HAS_BODY,
+        MARGIN: Number.isFinite(MANAGE_MARGIN) ? MANAGE_MARGIN : geomForced.margin };
+      const mkManage = (entry) => device.createComputePipelineAsync({
+        layout: device.createPipelineLayout({ bindGroupLayouts: [manageBGL] }),
+        compute: { module: manageModule, entryPoint: entry, constants: manageConst },
+      });
+      manageCoarsenPipe = await mkManage('coarsen');
+      manageRefinePipe = await mkManage('refine');
+      manageBG = device.createBindGroup({ layout: manageBGL, entries: [
+        { binding: 0, resource: { buffer: blockSlotBuf } },
+        { binding: 1, resource: { buffer: slotToBlockBuf } },
+        { binding: 2, resource: { buffer: freeListBuf } },
+        { binding: 3, resource: { buffer: freeCountBuf } },
+        { binding: 4, resource: { buffer: bodyBuf } }]});
+    }
 
     // M4.1d: the fine level's own force/torque reduction. Created from the
     // SAME USE_BOUNCEBACK/CHI_EPS the step and coarse-force pipelines got --
@@ -854,10 +951,15 @@ async function init() {
 
   // Pool dispatch shapes. The slot is folded into z because 3D has no
   // fourth dispatch dimension (plans/3D.md sec 2.4).
-  const tileDisp = AMR ? [Math.ceil(pool.FB / 4), Math.ceil(pool.FB / 4), (pool.FB / 4) * Math.max(1, poolAlloc.activeSlots)] : null;
+  // Over MAX_SLOTS, not the initial active count: a slot the manager hands
+  // out later must be stepped, and every pool kernel already returns early
+  // on slotToBlock[slot] < 0, so covering the unused tail is free of
+  // correctness risk and costs only the early-out. Identical to the old
+  // shape whenever MAX_SLOTS == activeSlots, i.e. always when static.
+  const tileDisp = AMR ? [Math.ceil(pool.FB / 4), Math.ceil(pool.FB / 4), (pool.FB / 4) * Math.max(1, MAX_SLOTS)] : null;
   const avgDisp = AMR ? (() => {
     const per = Math.ceil(RB / 4);
-    return [per, per, per * Math.max(1, poolAlloc.activeSlots)];
+    return [per, per, per * Math.max(1, MAX_SLOTS)];
   })() : null;
 
   // ORDER PER MACRO-STEP: zero -> force (+ fine force) -> physics -> step.
@@ -896,6 +998,33 @@ async function init() {
         const pp = enc.beginComputePass();
         pp.setPipeline(physPipe); pp.setBindGroup(0, physicsBG); pp.dispatchWorkgroups(1); pp.end();
       }
+      // --- dynamic refinement (M4.2b-i) ------------------------------------
+      //
+      // BEFORE the levels advance, so the whole macro-step sees one topology
+      // -- explode, both fine substeps, coalesce and the coarse step all
+      // read the same blockSlot. Re-deciding mid-step would leave passes
+      // disagreeing about which blocks exist.
+      //
+      // COARSEN AND REFINE ARE TWO PASSES and must stay two passes; the
+      // shader's header has the free-list race that requires it.
+      // `step + s`, NOT `step`: step only advances after the whole batch
+      // (see debugStepSync's chunking), so testing `step` alone is constant
+      // across every iteration of this loop -- the manager would run on all
+      // 500 steps of one chunk and none of the next. A pinned body makes
+      // that indistinguishable from correct, because nothing changes either
+      // way, so the bit-identical gate below CANNOT catch it. Found by
+      // reading, not by testing, and worth saying out loud: an
+      // "it changed nothing" gate is blind to how often the nothing ran.
+      if (manageCoarsenPipe && ((step + s) % MANAGE_EVERY) === 0) {
+        const nbTot = pool.nb[0] * pool.nb[1] * pool.nb[2];
+        const wg = Math.ceil(nbTot / 64);
+        for (const pipe of [manageCoarsenPipe, manageRefinePipe]) {
+          const mp = enc.beginComputePass();
+          mp.setPipeline(pipe); mp.setBindGroup(0, manageBG);
+          mp.dispatchWorkgroups(wg); mp.end();
+        }
+      }
+
       // --- AMR, N=2 (S_Advance) --------------------------------------------
       //
       // Both levels start the macro-step at time t. There are two couplings
@@ -1145,6 +1274,58 @@ async function init() {
     const v = new Int32Array(blockSlotStaging.getMappedRange()).slice();
     blockSlotStaging.unmap();
     return v;
+  }
+
+  // POOL BOOKKEEPING, read back from the GPU. blockSlot and slotToBlock are
+  // inverses of each other, and freeCount + inUse must equal the slot
+  // budget. Both statements are trivially true of an uploaded static map and
+  // stop being trivial the moment a kernel writes them -- and cross-checking
+  // blockSlot against its inverse is precisely how the 2D free-list race was
+  // CONFIRMED: they disagreed for exactly the colliding slot.
+  //
+  // This also answers a question M4.2b-i's bit-identical gate cannot: that
+  // gate shows the manager changed nothing, which is equally consistent with
+  // the manager never having run. `ran` here is a positive observation --
+  // freeCount is initialized by the host and only a kernel can move it, and
+  // the invariants below are checked against what the GPU actually holds.
+  const poolStateStaging = AMR ? device.createBuffer({
+    size: Math.max(16, MAX_SLOTS * 4), usage: U.MAP_READ | U.COPY_DST }) : null;
+  async function readI32(src, bytes) {
+    const enc = device.createCommandEncoder();
+    enc.copyBufferToBuffer(src, 0, poolStateStaging, 0, bytes);
+    device.queue.submit([enc.finish()]);
+    await poolStateStaging.mapAsync(GPUMapMode.READ, 0, bytes);
+    const v = new Int32Array(poolStateStaging.getMappedRange(0, bytes)).slice();
+    poolStateStaging.unmap();
+    return v;
+  }
+  async function debugPoolState() {
+    if (!AMR) return { skipped: 'no pool (?levels=1)' };
+    const bs = await readBlockSlot();
+    const s2b = await readI32(slotToBlockBuf, MAX_SLOTS * 4);
+    const free = DYNAMIC ? (await readI32(freeCountBuf, 16))[0] : (MAX_SLOTS - poolAlloc.activeSlots);
+    const problems = [];
+    let inUse = 0;
+    for (let id = 0; id < pool.nBlocks; id++) {
+      const slot = bs[id];
+      if (slot < 0) continue;
+      inUse++;
+      if (slot >= MAX_SLOTS) { if (problems.length < 16) problems.push({ kind: 'slotOutOfRange', block: id, slot }); continue; }
+      if (s2b[slot] !== id && problems.length < 16) problems.push({ kind: 'notInverse', block: id, slot, slotToBlock: s2b[slot] });
+    }
+    // And the other direction, which catches a slot handed out twice: two
+    // blocks pointing at one slot leaves slotToBlock naming only one of them,
+    // so the check above finds it -- but a slot marked in use that no block
+    // claims is the mirror leak and needs its own pass.
+    for (let slot = 0; slot < MAX_SLOTS; slot++) {
+      const id = s2b[slot];
+      if (id < 0) continue;
+      if (bs[id] !== slot && problems.length < 16) problems.push({ kind: 'orphanSlot', slot, block: id, blockSlot: bs[id] });
+    }
+    const budgetOk = inUse + free === MAX_SLOTS;
+    if (!budgetOk && problems.length < 16) problems.push({ kind: 'budget', inUse, free, maxSlots: MAX_SLOTS });
+    return { ok: problems.length === 0, problems, inUse, free, maxSlots: MAX_SLOTS,
+             initialActive: poolAlloc.activeSlots, dynamic: !!DYNAMIC };
   }
 
   async function debugCheck21Balance() {
@@ -1468,7 +1649,7 @@ async function init() {
       } : {}),
     }),
     readSubsampled, readDuctProfile, readStats, readBody, readPoolStats,
-    debugCheck21Balance, debugCheckGeometryCoverage,
+    debugCheck21Balance, debugCheckGeometryCoverage, debugPoolState,
     readInterfaceDiag, readFluxAcc,
     debugStepSync,
   };

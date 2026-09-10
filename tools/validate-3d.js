@@ -188,11 +188,20 @@ async function main() {
             const ref = report.find(r => r.name === c.cd_matches);
             if (ref && ref.res) {
               const rel = (res.cd - ref.res.cd) / ref.res.cd;
-              res.cdCheck = { pass: Math.abs(rel) <= c.cd_matches_tol, label: `CdVs${c.cd_matches}`,
-                              measured: rel, target: 0, tol: c.cd_matches_tol };
+              // cd_matches_exact demands EQUALITY, not a tolerance. It is
+              // for cases whose claim is "this machinery changed nothing"
+              // rather than "this agrees within measurement" -- a tolerance
+              // there would pass a manager that quietly perturbs the run.
+              res.cdCheck = c.cd_matches_exact
+                ? { pass: res.cd === ref.res.cd, label: `CdIdenticalTo${c.cd_matches}`,
+                    measured: `${res.cd} vs ${ref.res.cd}`, target: 'bit-identical' }
+                : { pass: Math.abs(rel) <= c.cd_matches_tol, label: `CdVs${c.cd_matches}`,
+                    measured: rel, target: 0, tol: c.cd_matches_tol };
               res.cdRef = ref.res.cd;
               res.relErr = rel;
-              console.log(`    vs ${c.cd_matches}'s own Cd ${ref.res.cd.toFixed(4)} (not literature): ${(rel * 100).toFixed(2)}%`);
+              console.log(c.cd_matches_exact
+                ? `    vs ${c.cd_matches}: ${res.cd === ref.res.cd ? 'bit-identical' : `DIFFERS (${res.cd} vs ${ref.res.cd})`}`
+                : `    vs ${c.cd_matches}'s own Cd ${ref.res.cd.toFixed(4)} (not literature): ${(rel * 100).toFixed(2)}%`);
             } else {
               res.cdCheck = { pass: false, label: `CdVs${c.cd_matches}`, measured: null, target: 0, tol: c.cd_matches_tol };
               console.log(`    !! ${c.cd_matches} did not run, so the invariance check cannot be made`);

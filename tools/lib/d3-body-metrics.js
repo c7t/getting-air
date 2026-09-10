@@ -61,6 +61,7 @@ function caseUrl(baseUrl, scenario, c, extra) {
   if (c.rb) p.set('rb', c.rb);
   if (c.refine) p.set('refine', c.refine);
   if (c.interface) p.set('interface', c.interface);
+  if (c.dynamic) p.set('dynamic', c.dynamic);
   return `${baseUrl}/index-3d.html?${p}${extra ? `&${extra}` : ''}`;
 }
 

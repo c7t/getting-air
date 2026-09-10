@@ -29,6 +29,11 @@
 //                 SDF -- an independent route from the block-corner
 //                 sampling refineNearBody uses to BUILD the set. Skipped,
 //                 never passed, where refinement is not geometry-forced.
+//   pool          blockSlot and slotToBlock are inverses, and inUse + free
+//                 equals the slot budget. Trivial of an uploaded static map;
+//                 not trivial once M4.2b's manager writes them, and cross-
+//                 checking the two is exactly how the 2D free-list race was
+//                 confirmed -- they disagreed for the colliding slot.
 //   finite        a NaN/blowup smoke check, so a run that has destroyed
 //                 itself is not reported as structurally sound.
 //
@@ -62,6 +67,39 @@ const CONFIGS = [
   // The only geometry-forced one, so the only one where the coverage check
   // is a check rather than a skip.
   { name: 'body', url: 'scenario=sphere&n=16&re=20&u0=0.05&q=19&bounceback=1&live=0&levels=2&rb=4&refine=body&interface=explode' },
+  // The same geometry with the M4.2b-i manager writing blockSlot/slotToBlock
+  // from a kernel every ?manageEvery= steps. The pool check is the one that
+  // earns its keep here: the body is pinned, so the manager decides "no
+  // change" and the FIELD is bit-identical either way -- which means the
+  // field gates cannot see the allocator at all.
+  { name: 'body-dynamic', url: 'scenario=sphere&n=16&re=20&u0=0.05&q=19&bounceback=1&live=0&levels=2&rb=4&refine=body&interface=explode&dynamic=1&manageEvery=4' },
+  // THE TWO THAT PROVE THE MANAGER RAN. `body-dynamic` above shows the pool
+  // unchanged, which is equally consistent with a manager that never
+  // executed -- so these give it a criterion that DISAGREES with the initial
+  // set (?manageMargin=) and require the pool to actually move.
+  //
+  // They are STRUCTURAL only: releasing a slot without restricting it, and
+  // handing one out without initializing it, both leave the FIELD wrong
+  // until M4.2b-ii. What is being checked is the allocator -- that
+  // blockSlot and slotToBlock stay mutual inverses and the budget balances
+  // while slots are changing hands, which is precisely the property the 2D
+  // free-list race broke.
+  { name: 'body-coarsen', expectInUse: 'decrease', skipCoverage: true, steps: 8,
+    url: 'scenario=sphere&n=16&re=20&u0=0.05&q=19&bounceback=1&live=0&levels=2&rb=4&refine=body&interface=explode&dynamic=1&manageEvery=1&manageMargin=0.5' },
+  // Deliberately asks for more than the headroom allows, so this also
+  // exercises the out-of-slots path: the pop must restore the counter and
+  // leave the block coarse rather than corrupt the list. Expect it to
+  // saturate at the budget with free == 0.
+  // fieldWrongByDesign: this config hands out slots that NOTHING HAS
+  // INITIALIZED -- filling a new tile from the coarse field is M4.2b-ii --
+  // so the field blows up, and that is the expected consequence rather than
+  // a failure. Gating on it would encode a missing feature as a red cell.
+  // The STRUCTURAL claims still stand and are still gated: the allocator
+  // saturated the budget, restored the counter when it ran out, and left
+  // blockSlot and slotToBlock mutual inverses throughout. When 4.2b-ii
+  // lands, this flag comes off and the blowup must stop.
+  { name: 'body-refine', expectInUse: 'increase', steps: 8, fieldWrongByDesign: true,
+    url: 'scenario=sphere&n=16&re=20&u0=0.05&q=19&bounceback=1&live=0&levels=2&rb=4&refine=body&interface=explode&dynamic=1&manageEvery=1&manageMargin=6' },
 ];
 
 function parseArgs(argv) {
@@ -94,30 +132,52 @@ async function runConfig(Runtime, o, c, log) {
   const p = await evalOrThrow(Runtime, `${G}.getParams()`, 20000, 'getParams');
   log(`N=${p.N} Q${p.Q} levels=${p.levels} RB=${p.rb} ${p.activeSlots}/${p.blocks} tiles`);
 
-  const res = { bal: [], cov: [], finite: true, vacuous: null, covSkipped: null, blewUp: false };
-  let done = 0;
-  while (done <= o.steps) {
+  const res = { bal: [], cov: [], pool: [], finite: true, vacuous: null, covSkipped: null, blewUp: false };
+  // A config may cap its own step count: the allocator cases only need a few
+  // steps to change hands, and running them long is spending minutes on a
+  // field that is deliberately wrong.
+  const steps = Math.min(o.steps, c.steps || o.steps);
+  let done = 0, firstInUse = null;
+  while (done <= steps) {
     const bal = await evalOrThrow(Runtime, `${G}.debugCheck21Balance()`, 120000, 'debugCheck21Balance');
     const cov = await evalOrThrow(Runtime, `${G}.debugCheckGeometryCoverage()`, 300000, 'debugCheckGeometryCoverage');
+    const ps = await evalOrThrow(Runtime, `${G}.debugPoolState()`, 300000, 'debugPoolState');
     const st = await evalOrThrow(Runtime, `${G}.readStats()`, 300000, 'readStats');
+    if (ps.ok === false) res.pool.push({ at: done, n: ps.problems.length, first: ps.problems[0] });
+    if (ps.inUse != null) { res.poolState = ps; if (firstInUse === null) firstInUse = ps.inUse; }
     if (bal.skipped) throw new Error(`2:1 balance unavailable: ${bal.skipped}`);
     res.vacuous = bal.vacuous;
     if (cov.skipped) res.covSkipped = cov.skipped;
+    if (c.skipCoverage) res.covSkipped = 'not gated (the manager margin is deliberately wrong here)';
     if (!bal.ok) res.bal.push({ at: done, n: bal.nViolations, first: bal.violations[0] });
-    if (cov.ok === false) res.cov.push({ at: done, n: cov.nViolations, first: cov.violations[0] });
+    if (cov.ok === false && !c.skipCoverage) res.cov.push({ at: done, n: cov.nViolations, first: cov.violations[0] });
     if (cov.required != null) res.required = cov.required;
     if (st.finite === false || !Number.isFinite(st.ke)) {
-      res.finite = false; res.blewUp = true;
-      log(`step ${done}: FIELD BLEW UP -- stopping, there is nothing structural left to learn`);
+      res.blewUp = true;
+      res.finite = !!c.fieldWrongByDesign;   // expected here, a failure anywhere else
+      log(`step ${done}: field blew up`
+        + (c.fieldWrongByDesign ? ' -- EXPECTED: this config allocates uninitialized tiles (M4.2b-ii)' : ' -- stopping'));
       break;
     }
     log(`step ${done}: 2:1 ${bal.ok ? 'ok' : `${bal.nViolations} VIOLATIONS`}`
       + `  coverage ${cov.skipped ? 'skipped' : (cov.ok ? `ok (${cov.required} cells required)` : `${cov.nViolations} VIOLATIONS`)}`
+      + `  pool ${ps.ok ? `ok (${ps.inUse} in use, ${ps.free} free${ps.dynamic ? ', dynamic' : ''})` : `${ps.problems.length} PROBLEMS`}`
       + `  ke=${Number(st.ke).toExponential(3)}`);
-    if (done === o.steps) break;
-    const k = Math.min(o.checkEvery, o.steps - done);
+    if (done === steps) break;
+    const k = Math.min(o.checkEvery, steps - done);
     await evalOrThrow(Runtime, `${G}.debugStepSync(${k})`, (o.timeout + 30) * 1000, 'debugStepSync');
     done += k;
+  }
+  // Did the manager actually do the thing the config exists to observe?
+  if (c.expectInUse && res.poolState) {
+    const moved = res.poolState.inUse - firstInUse;
+    const want = c.expectInUse === 'increase' ? moved > 0 : moved < 0;
+    res.expectation = { want: c.expectInUse, from: firstInUse, to: res.poolState.inUse, ok: want };
+    if (!want) {
+      res.pool.push({ at: 'end', n: 1,
+        first: { kind: 'managerDidNotAct', expected: c.expectInUse, inUse: `${firstInUse} -> ${res.poolState.inUse}` } });
+    }
+    log(`manager ${c.expectInUse}: inUse ${firstInUse} -> ${res.poolState.inUse} ${want ? 'ok' : 'DID NOT ACT'}`);
   }
   return res;
 }
@@ -164,18 +224,24 @@ async function main() {
   console.log('\n' + '='.repeat(88));
   console.log(`SUMMARY  ${o.steps} steps, checked every ${o.checkEvery}`);
   console.log('='.repeat(88));
-  console.log(pad('config', 12) + pad('2:1 balance', 22) + pad('geometry coverage', 30) + padL('verdict', 10));
+  console.log(pad('config', 14) + pad('2:1 balance', 21) + pad('geometry coverage', 30) + pad('pool', 14) + padL('verdict', 9));
   console.log('-'.repeat(88));
   let exitCode = 0;
   for (const r of report) {
-    if (r.error) { console.log(pad(r.name, 12) + pad('-', 22) + pad('-', 30) + padL('ERROR', 10)); exitCode = 1; continue; }
+    if (r.error) { console.log(pad(r.name, 14) + pad('-', 21) + pad('-', 30) + pad('-', 14) + padL('ERROR', 9)); exitCode = 1; continue; }
     const x = r.res;
-    const balTxt = x.bal.length ? `${x.bal.length} checkpoints BAD` : (x.vacuous ? 'ok (VACUOUS at N=2)' : 'ok');
+    const balTxt = x.bal.length ? `${x.bal.length} checkpoints BAD` : (x.vacuous ? 'ok (VACUOUS N=2)' : 'ok');
     const covTxt = x.cov.length ? `${x.cov.length} checkpoints BAD`
       : (x.covSkipped ? 'skipped (not geometry-forced)' : `ok (${x.required} cells required)`);
-    const ok = !x.bal.length && !x.cov.length && x.finite;
+    const poolTxt = x.pool.length ? `${x.pool.length} BAD`
+      : (x.poolState ? `ok ${x.poolState.inUse}+${x.poolState.free}${x.blewUp ? '*' : ''}` : 'skipped');
+    const ok = !x.bal.length && !x.cov.length && !x.pool.length && x.finite;
     if (!ok) exitCode = 1;
-    console.log(pad(r.name, 12) + pad(balTxt, 22) + pad(covTxt, 30) + padL(ok ? 'PASS' : 'FAIL', 10));
+    console.log(pad(r.name, 14) + pad(balTxt, 21) + pad(covTxt, 30) + pad(poolTxt, 14) + padL(ok ? 'PASS' : 'FAIL', 9));
+  }
+  if (report.some(r => r.res && r.res.blewUp && r.res.finite)) {
+    console.log('\n* the field blew up, EXPECTEDLY: that config allocates tiles nothing initializes');
+    console.log('  (M4.2b-ii). Its structural claims are still gated; only the field is excused.');
   }
   const anyVacuous = report.some(r => r.res && r.res.vacuous);
   if (anyVacuous) {
@@ -183,13 +249,14 @@ async function main() {
     console.log('neighbour is level 1 or level 0 and both are legal. It becomes a real gate when');
     console.log('M4.2 makes refinement dynamic or M5 adds a level. Do not read it as evidence yet.');
   }
-  const failed = report.filter(r => r.error || (r.res && (r.res.bal.length || r.res.cov.length || !r.res.finite)));
+  const failed = report.filter(r => r.error || (r.res && (r.res.bal.length || r.res.cov.length || r.res.pool.length || !r.res.finite)));
   if (failed.length) {
     console.log('\nDetails:');
     for (const r of failed) {
       if (r.error) { console.log(`  [${r.name}] ${r.error}`); continue; }
       for (const b of r.res.bal) console.log(`  [${r.name}] 2:1 at step ${b.at}: ${b.n} violations, e.g. ${JSON.stringify(b.first)}`);
       for (const b of r.res.cov) console.log(`  [${r.name}] coverage at step ${b.at}: ${b.n} violations, e.g. ${JSON.stringify(b.first)}`);
+      for (const b of r.res.pool) console.log(`  [${r.name}] pool at step ${b.at}: ${b.n} problems, e.g. ${JSON.stringify(b.first)}`);
       if (!r.res.finite) console.log(`  [${r.name}] field blew up`);
     }
   } else {

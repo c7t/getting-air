@@ -313,6 +313,24 @@
       "cd_measured": 2.9416,
       "cd_dense_reference": 2.9436,
       "cd_with_dx3_weight": 1.4708
+    },
+    {
+      "name": "sphere-amr-dynamic-Re20-D16",
+      "n": 16,
+      "re": 20,
+      "u0": 0.05,
+      "q": 19,
+      "bounceback": true,
+      "levels": 2,
+      "rb": 4,
+      "refine": "body",
+      "interface": "explode",
+      "settle_convective": 30,
+      "cd_matches": "sphere-amr-Re20-D16",
+      "cd_dense_reference": 2.9436,
+      "cd_with_dx3_weight": 1.4708,
+      "dynamic": 1,
+      "cd_matches_exact": true
     }
   ],
   "spin_cases": [
@@ -476,5 +494,6 @@
       "field_l2_control_all": 0.002293,
       "field_l2_interp_same_case": 0.009012
     }
-  ]
+  ],
+  "sphere_amr_dynamic_note": "M4.2b-i's gate, and it is an EXACT equality rather than a tolerance. ?dynamic=1 makes the pool's block->slot map writable by a kernel -- a free-list stack, a coarsen pass and a refine pass -- instead of uploaded once. The body in this case is PINNED, so the geometry criterion wants exactly the same 160 blocks at every re-evaluation, and a manager that decides 'no change' must therefore change NOTHING. Any drift at all means the machinery perturbs the run when it is not supposed to act, which is the one thing that has to be true before M4.2b-ii lets it act. Same reasoning as M4.1a's bit-identical gate: introduce the machinery against an unchanged answer, THEN make it load-bearing. The criterion in shaders/common_d3_manage.wgsl is deliberately character-for-character the one d3-amr.mjs's refineNearBody applies on the host -- same eight corners, same centre, same margin -- because a criterion that disagreed by one block would break this gate with no way to tell it from a real allocator defect."
 }

@@ -220,6 +220,16 @@ explode the DEFAULT, is next and is a blast-radius decision rather than an
 evidence one: merging publishes, and the flip moves every recorded AMR
 number at once.
 
+- **Dynamic refinement exists behind `?dynamic=1` (M4.2b-i), and a slot it
+  hands out is NOT yet initialized** (that is M4.2b-ii). It is refused unless
+  `?refine=body`. `coarsen` and `refine` are two SEPARATE passes and must
+  stay that way -- the 2D file records a live free-list race where two blocks
+  ended up sharing one slot. Two lessons worth carrying: a "nothing changed"
+  gate cannot tell a no-op manager from one that never ran (use
+  `?manageMargin=` to force it to act and watch `debugPoolState()`), and
+  `step` only advances after a whole `debugStepSync` batch, so any per-step
+  interval must use `step + s`.
+
 - **The AMR invariant checker exists and is GREEN, but its 2:1 half is
   VACUOUS until refinement is multi-level** (`tools/validate-d3-invariants.js`,
   `d3-amr.mjs`'s `check21Balance` / `checkGeometryCoverage`). At `?levels=2` a
