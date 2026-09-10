@@ -311,6 +311,18 @@ function defaultConfigs(baseUrl) {
       checkD3Physics: 'amr',
       d3Filter: c => c.name === 'amr-all-RB4',
     },
+    // The same pool with a REAL coarse/fine interface. `d3-amr` above cannot
+    // see an interface bug at all -- with every block refined the rescaled
+    // coarse f is discarded and the rings are never read -- which is how the
+    // pre/post-collision Dupuis-Chopard bug survived M3 with all three amr
+    // gates green and bit-identical. Scored against recorded values, not
+    // physics: benchmarks/d3.json's amr_box_note.
+    {
+      name: 'd3-amr-box',
+      url: `${baseUrl}/index-3d.html?scenario=beltrami&levels=2&refine=box`,
+      checkD3Physics: 'amr-box',
+      d3Filter: c => c.name === 'amr-box-RB4',
+    },
     {
       name: 'd3-spin',
       url: `${baseUrl}/index-3d.html?scenario=spin`,
@@ -480,9 +492,11 @@ async function runD3Physics(Page, Runtime, opts, config, watch) {
   const bench = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, 'benchmarks', 'd3.json'), 'utf8'));
   const kind = config.checkD3Physics;
   const key = { duct: 'duct_cases', beltrami: 'beltrami_cases', tgv: 'tgv_cases',
-                sphere: 'sphere_cases', spin: 'spin_cases', amr: 'amr_cases' }[kind];
+                sphere: 'sphere_cases', spin: 'spin_cases', amr: 'amr_cases',
+                'amr-box': 'amr_box_cases' }[kind];
   const run = { duct: runDuctCase, beltrami: runBeltramiCase, tgv: runTgvReport,
-                sphere: runSphereCase, spin: runSpinCase, amr: runBeltramiCase }[kind];
+                sphere: runSphereCase, spin: runSpinCase, amr: runBeltramiCase,
+                'amr-box': runBeltramiCase }[kind];
   // The M2 body cases build their URLs from a different set of knobs (Re,
   // bounceback) than the M1 fluid ones, so the URL builder follows the case
   // kind rather than being one function that knows about everything.
@@ -490,7 +504,7 @@ async function runD3Physics(Page, Runtime, opts, config, watch) {
   // beltrami runs with pool parameters, so the scenario they drive is
   // beltrami. Keeping the two separate is what lets a scenario be scored by
   // more than one kind of check.
-  const scenarioOf = { amr: 'beltrami' };
+  const scenarioOf = { amr: 'beltrami', 'amr-box': 'beltrami' };
   const urlFor = (c) => (kind === 'sphere' || kind === 'spin')
     ? d3BodyCaseUrl(opts.baseUrl, kind, c, opts.extra)
     : d3CaseUrl(opts.baseUrl, scenarioOf[kind] || kind, c, opts.extra);
@@ -506,7 +520,7 @@ async function runD3Physics(Page, Runtime, opts, config, watch) {
     results.push({ name: c.name, ...res });
   }
   const checksOf = (r) => (kind === 'duct' ? [r.fieldCheck, r.peakCheck, r.xCheck]
-    : (kind === 'beltrami' || kind === 'amr') ? [r.fieldCheck, r.rateCheck]
+    : (kind === 'beltrami' || kind === 'amr' || kind === 'amr-box') ? [r.fieldCheck, r.rateCheck]
     : kind === 'sphere' ? [r.cdCheck, r.settledCheck, r.lateralCheck]
     : kind === 'spin' ? [r.angCheck, r.lCheck, r.qCheck, r.movedCheck]
     : [r.finiteCheck]);

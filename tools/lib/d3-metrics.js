@@ -60,7 +60,9 @@ function caseUrl(baseUrl, scenario, c, extra) {
   // AMR knobs, present only on the M3 cases.
   if (c.levels) p.set('levels', c.levels);
   if (c.refine) p.set('refine', c.refine);
+  if (c.boxfrac) p.set('boxfrac', c.boxfrac);
   if (c.rb) p.set('rb', c.rb);
+  if (c.dcpre) p.set('dcpre', c.dcpre);
   return `${baseUrl}/index-3d.html?${p}${extra ? `&${extra}` : ''}`;
 }
 

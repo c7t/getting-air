@@ -7,12 +7,12 @@
 //
 //   rho  arithmetic mean of the 8 children -- exactly mass-conservative.
 //   u    mass-weighted mean -- exactly momentum-conservative.
-//   fneq mean, then rescaled by the INVERSE of the coarse->fine factor:
-//        (tau_coarse/tau_fine) * (dx_coarse/dx_fine) = (tau_coarse/tau_fine) * 2.
-//        The per-cell velocity gradient doubles going to the coarser grid,
-//        so fneq must be scaled UP by the refinement ratio. Dropping this
-//        leaves the same O(1) stress discontinuity at the interface that
-//        dropping the forward factor does, just in the other direction.
+//   fneq mean, then rescaled by the exact INVERSE of the coarse->fine
+//        factor -- dcRescaleF2C, whose derivation (and the post-collision
+//        correction that is NOT the textbook form) is in
+//        common_d3_pool.wgsl. Dropping it leaves the same O(1) stress
+//        discontinuity at the interface that dropping the forward factor
+//        does, just in the other direction.
 //
 // Conservation is the point: this is what keeps the coarse level's mass and
 // momentum consistent with the fine solution living inside it, and it is
@@ -82,8 +82,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
   let rhoAvg = rhoSum * 0.125f;
   let uAvg = momSum / max(rhoSum, 1e-6f);
 
-  let tauFine = 2.0f * TAU_COARSE - 0.5f;
-  let rescale = 2.0f * TAU_COARSE / tauFine;
+  let rescale = dcRescaleF2C(TAU_COARSE);
 
   var fo: array<f32, QN>;
   for (var i = 0u; i < QN; i++) {

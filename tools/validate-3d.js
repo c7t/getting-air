@@ -60,7 +60,7 @@ function checksOf(r) {
   if (!r.res) return [];
   const x = r.res;
   if (r.scenario === 'duct') return [x.fieldCheck, x.peakCheck, x.xCheck];
-  if (r.scenario === 'beltrami' || r.scenario === 'amr') return [x.fieldCheck, x.rateCheck, ...(x.matchCheck ? [x.matchCheck] : [])];
+  if (r.scenario === 'beltrami' || r.scenario === 'amr' || r.scenario === 'amr-box') return [x.fieldCheck, x.rateCheck, ...(x.matchCheck ? [x.matchCheck] : [])];
   if (r.scenario === 'tgv') return [x.finiteCheck];
   if (r.scenario === 'spin') return [x.angCheck, x.lCheck, x.qCheck, x.movedCheck];
   if (r.scenario.startsWith('sphere')) return [x.cdCheck, x.settledCheck, x.lateralCheck, ...(x.convergeCheck ? [x.convergeCheck] : [])];
@@ -85,6 +85,14 @@ async function main() {
     // against an exact solution. A PARTIALLY refined domain is deliberately
     // not gated -- see benchmarks/d3.json's amr_interface_note.
     { scenario: 'beltrami', key: 'amr', run: runBeltramiCase, cases: bench.amr_cases, gate: true },
+    // A PARTIALLY refined domain -- a real coarse/fine interface. Scored
+    // against RECORDED values, not physics: the interface is still
+    // first-order (benchmarks/d3.json's amr_box_note and amr_interface_note).
+    // It exists because before it did, nothing in this suite ever loaded a
+    // partially-refined 3D run, and that is precisely how the pre/post-
+    // collision rescale bug survived M3 -- refine=all is bit-identical
+    // across it.
+    { scenario: 'beltrami', key: 'amr-box', run: runBeltramiCase, cases: bench.amr_box_cases, gate: true },
     { scenario: 'tgv', run: runTgvReport, cases: bench.tgv_cases, gate: false },
     // M2. `spin` first: it is seconds long and it isolates the integrator,
     // so if it fails there is no point spending minutes on the sphere.
@@ -188,7 +196,7 @@ async function main() {
     if (r.scenario === 'duct') {
       c2 = `peak ${e3(x.peakRelErr)}`; c3 = `xspread ${e3(x.xSpreadRel)}`;
       checks = [x.fieldCheck, x.peakCheck, x.xCheck];
-    } else if (r.scenario === 'beltrami' || r.scenario === 'amr') {
+    } else if (r.scenario === 'beltrami' || r.scenario === 'amr' || r.scenario === 'amr-box') {
       c2 = `rate ${e3(x.rateRelErr)}`;
       c3 = x.amr ? `RB=${x.rb} ${x.activeSlots} tiles` : `td ${x.td.toFixed(0)}`;
     } else if (r.scenario === 'spin') {
@@ -207,7 +215,7 @@ async function main() {
     if (!ok && !r.gate) exitCode = 1;   // tgv can still fail on non-finite
     console.log(pad(r.name, 22) + pad(r.scenario + (r.gate ? '' : ' (rep)'), 16)
       + padL(r.scenario === 'duct' ? e3(x.l2rel)
-             : (r.scenario === 'beltrami' || r.scenario === 'amr') ? e3(x.maxL2rel)
+             : (r.scenario === 'beltrami' || r.scenario === 'amr' || r.scenario === 'amr-box') ? e3(x.maxL2rel)
              : r.scenario === 'spin' ? `${e3(x.angCheck.measured)} rad`
              : r.scenario.startsWith('sphere') ? `ref ${x.cdRef.toFixed(3)}` : '-', 14)
       + padL(c2, 20) + padL(c3, 20) + padL(ok ? 'PASS' : 'FAIL', 10));

@@ -61,17 +61,73 @@ struct CoarseSample3 {
   fneq: array<f32, QN>,
 }
 
-// Dupuis-Chopard non-equilibrium rescale, coarse -> fine. The factor is
-// (tau_fine/tau_coarse) * (dx_fine/dx_coarse) = (tau_fine/tau_coarse) * 1/2.
-// fneq scales as tau * (velocity gradient per lattice cell); the same
-// physical shear spans twice as many fine cells, so the per-cell gradient --
-// and hence fneq -- is halved. Omitting the 1/2 leaves an O(1)
-// non-equilibrium stress discontinuity at every interface, injecting
-// spurious vorticity there. Identical to the 2D form; this is one of the
-// pieces plans/3D.md sec 1.1 lists as transferring verbatim.
-fn dupuisChopardRescale3(tauCoarse: f32) -> f32 {
+// --- the Dupuis-Chopard non-equilibrium rescale ---------------------------
+//
+// THE STORED POPULATIONS ARE POST-COLLISION, and that changes the factor.
+// common_d3_step.wgsl and common_d3_amr_step1.wgsl are both fused
+// pull-stream + collide kernels: what lands in the buffer is f AFTER
+// collision, which is exactly what makes the next step's gather a pure
+// stream. Every grid transfer therefore reads post-collision f and must
+// write post-collision f.
+//
+// The textbook statement is about PRE-collision populations:
+//
+//   fneq_pre,f / fneq_pre,c = (tau_f/tau_c) * (dx_f/dx_c) = (tau_f/tau_c)/2
+//
+// -- fneq scales as tau times the velocity gradient per lattice cell, and
+// the same physical shear spans twice as many fine cells, so the per-cell
+// gradient, and hence fneq, is halved. Collision then multiplies fneq by
+// (1 - 1/tau), which is a DIFFERENT number on each level, so:
+//
+//   fneq_post,f     (1 - 1/tau_f)     tau_f    1     tau_f - 1    1
+//   -----------  =  -------------  *  ----- *  -  =  ---------  * -
+//   fneq_post,c     (1 - 1/tau_c)     tau_c    2     tau_c - 1    2
+//
+// At tau_c = 0.8 (so tau_f = 1.1) that is -0.25, against the pre-collision
+// form's +0.6875: a different magnitude AND the opposite sign, because
+// tau_c < 1 is over-relaxed and flips fneq through the collision while
+// tau_f > 1 does not.
+//
+// APPLYING THE PRE-COLLISION FACTOR TO POST-COLLISION POPULATIONS WAS THIS
+// SOLVER'S COARSE/FINE INTERFACE BUG (plans/3D.md M3). Its signature is
+// worth knowing, because it is what makes the class findable: it leaves
+// mass EXACTLY conserved -- fneq has no zeroth or first moment, so it
+// cannot perturb a mass flux at all -- while corrupting the viscous
+// stress, which IS the second moment and hence the momentum flux. So the
+// seam leaks momentum and not mass. tools/analyze-d3-interface.js measures
+// both and reads that asymmetry directly.
+//
+// AGAL, the reference implementation this port follows, uses the
+// pre-collision factor correctly: its S_Interpolate runs BEFORE S_Collide
+// (AGAL/src/solver_lbm/solver_lbm_advance.cu), so its buffers hold
+// post-STREAM, pre-collision f. The formula transferred; the convention it
+// belongs to did not.
+//
+// tau = 1 IS A REAL SINGULARITY, not a formula artifact. At omega = 1 the
+// post-collision populations ARE the equilibrium and carry no stress
+// whatsoever, so NO post-collision transfer can recover it -- the
+// information is gone, on either level. main-3d.js refuses a tau that puts
+// either level there instead of dividing by ~0 quietly.
+//
+// 1 restores the old, wrong pre-collision factor, so the defect can be
+// re-measured in the shipped build rather than reconstructed from a branch
+// -- the same arrangement as ?f16= and ?ghostcopy=. It is not a mode to
+// run physics in.
+override DC_PRE : u32 = 0u;
+
+fn dcRescaleC2F(tauCoarse: f32) -> f32 {
   let tauFine = 2.0f * tauCoarse - 0.5f;
-  return 0.5f * tauFine / tauCoarse;
+  if (DC_PRE != 0u) { return 0.5f * tauFine / tauCoarse; }
+  return 0.5f * (tauFine - 1.0f) / (tauCoarse - 1.0f);
+}
+
+// The exact inverse, so that a restriction immediately following an
+// interpolation is the identity on fneq. Written as its own expression
+// rather than 1/dcRescaleC2F so the two read as a matched pair.
+fn dcRescaleF2C(tauCoarse: f32) -> f32 {
+  let tauFine = 2.0f * tauCoarse - 0.5f;
+  if (DC_PRE != 0u) { return 2.0f * tauCoarse / tauFine; }
+  return 2.0f * (tauCoarse - 1.0f) / (tauFine - 1.0f);
 }
 
 // Trilinear blend of the 8 surrounding parent samples. `t` is the fine
@@ -97,7 +153,7 @@ fn interpCoarseToFine3(s: array<CoarseSample3, 8>, t: vec3<f32>, tauCoarse: f32)
     u += w[c] * s[c].u;
   }
 
-  let rescale = dupuisChopardRescale3(tauCoarse);
+  let rescale = dcRescaleC2F(tauCoarse);
   var fo: array<f32, QN>;
   for (var i = 0u; i < QN; i++) {
     var fneq = 0f;

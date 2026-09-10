@@ -28,6 +28,13 @@
 //                domain; `all` refines everything (the noise floor -- no
 //                coarse/fine interface anywhere).
 //   ?margin=2  ?boxfrac=0.5
+//   ?dcpre=1     restore the PRE-collision Dupuis-Chopard fneq factor at the
+//                coarse/fine transfers. That is wrong for this solver's
+//                post-collision buffers and was the M3 interface bug; the
+//                knob exists so the defect can be re-measured in the shipped
+//                build rather than reconstructed from a branch, exactly as
+//                ?f16= and ?ghostcopy= do on the 2D side. Not a mode to run
+//                physics in. See shaders/common_d3_pool.wgsl.
 //   ?q=19|27     velocity set, default 19
 //   ?tau=0.8     BGK relaxation time; nu = (tau - 1/2)/3
 //   ?u0=         scenario amplitude (duct: target peak velocity)
@@ -42,7 +49,7 @@
 import { reportFatal, reportNoWebGPU, reportNoAdapter } from './error-overlay.mjs';
 import { assembleShader } from './shader-loader.mjs';
 import { SUPPORTED_Q } from './lattice-3d.mjs';
-import { SCENARIOS, SCENARIO_NAMES, resolveScenario, nuFromTau } from './d3-scenarios.mjs';
+import { SCENARIOS, SCENARIO_NAMES, resolveScenario, nuFromTau, beltramiVelocityAt } from './d3-scenarios.mjs';
 import { packBodyState, unpackBodyState, BODY_FIELDS } from './d3-body.mjs';
 import { makePool, refineWhere, refineNearBody, storageRatio, GHOST } from './d3-amr.mjs';
 
@@ -123,7 +130,7 @@ async function init() {
   // silently ignoring it is the failure above wearing a different hat.
   const PAGE_PARAMS = new Set(['scenario', 'q', 'axis', 'slice', 'mode', 'spf', 'live',
     'uscale', 'vscale', 'vortGamma', 'bounceback', 'chiEps', 'vmax', 'omax',
-    'levels', 'rb', 'refine', 'margin', 'boxfrac']);
+    'levels', 'rb', 'refine', 'margin', 'boxfrac', 'dcpre']);
   for (const k of urlParams.keys()) {
     if (PAGE_PARAMS.has(k) || k in SCENARIOS[scenarioName].defaults) continue;
     throw new Error(`?${k}=: not a parameter of scenario "${scenarioName}" `
@@ -174,6 +181,20 @@ async function init() {
     // a subtly scrambled pool.
     if ((2 * RB + 2 * GHOST) % 4 !== 0) {
       statusEl.textContent = `error: ?rb=${RB} gives FB=${2 * RB + 2 * GHOST}, which must be a multiple of 4 (use an even RB)`;
+      return;
+    }
+    // A post-collision grid transfer cannot work at omega = 1 on either
+    // level: collision there maps f exactly onto its own equilibrium, so the
+    // stored populations carry NO non-equilibrium part and the stress the
+    // interface has to hand across simply is not in them. The rescale
+    // expresses that as a division by (tau - 1). This is a property of the
+    // physics, not of the formula, so it fails loudly rather than being
+    // clamped -- see shaders/common_d3_pool.wgsl.
+    const tauFine = 2 * params.tau - 0.5;
+    const nearOne = (t) => Math.abs(t - 1) < 0.02;
+    if (nearOne(params.tau) || nearOne(tauFine)) {
+      statusEl.textContent = `error: ?tau=${params.tau} gives tau_coarse=${params.tau}, tau_fine=${tauFine};`
+        + ' a level at tau = 1 carries no non-equilibrium part for the coarse/fine transfer to rescale';
       return;
     }
     pool = makePool({ dims: [NX, NY, NZ], rb: RB });
@@ -384,6 +405,12 @@ async function init() {
   // owns the level -> tau mapping rather than each shader re-deriving it.
   const TAU_COARSE = params.tau;
   const TAU_FINE = 2 * TAU_COARSE - 0.5;
+  // 1 puts the grid transfers back on the PRE-collision Dupuis-Chopard
+  // factor, which is wrong for this solver's post-collision buffers and was
+  // the M3 interface bug -- kept switchable so the defect can be measured
+  // in the shipped build (shaders/common_d3_pool.wgsl derives both, and
+  // tools/analyze-d3-interface.js is what drives the comparison).
+  const DC_PRE = urlParams.get('dcpre') === '1' ? 1 : 0;
   let interpGhostPipe = null, interpFullPipe = null, step1Pipe = null, avgPipe = null;
   let interpBG = null, step1BG_AB = null, step1BG_BA = null, avgBGA = null, avgBGB = null;
   if (AMR) {
@@ -419,8 +446,8 @@ async function init() {
     });
     // Two interp pipelines: the steady-state ring refresh, and the one-time
     // full-tile fill at reset.
-    interpGhostPipe = await mk(interpBGL, interpModule, { ...poolConst, TAU_COARSE, GHOST_ONLY: 1, TIME_BLEND: 0.0 });
-    interpFullPipe = await mk(interpBGL, interpModule, { ...poolConst, TAU_COARSE, GHOST_ONLY: 0, TIME_BLEND: 0.0 });
+    interpGhostPipe = await mk(interpBGL, interpModule, { ...poolConst, TAU_COARSE, DC_PRE, GHOST_ONLY: 1, TIME_BLEND: 0.0 });
+    interpFullPipe = await mk(interpBGL, interpModule, { ...poolConst, TAU_COARSE, DC_PRE, GHOST_ONLY: 0, TIME_BLEND: 0.0 });
     step1Pipe = await mk(step1BGL, step1Module, {
       ...poolConst,
       OMEGA_FINE: 1 / TAU_FINE,
@@ -428,7 +455,7 @@ async function init() {
       HAS_BODY, USE_BOUNCEBACK, CHI_EPS,
       SPONGE_W: sponge.width, SPONGE_UX: sponge.u[0], SPONGE_UY: sponge.u[1], SPONGE_UZ: sponge.u[2],
     });
-    avgPipe = await mk(avgBGL, avgModule, { ...poolConst, TAU_COARSE });
+    avgPipe = await mk(avgBGL, avgModule, { ...poolConst, TAU_COARSE, DC_PRE });
 
     // interp needs BOTH coarse states (t and t+dt, which are simply the two
     // ping-pong buffers once the coarse step runs first) and writes whichever
@@ -795,6 +822,141 @@ async function init() {
     return { step, rms: Math.sqrt(sq / Math.max(n, 1)), cells: n, finite, rhoMin, rhoMax };
   }
 
+  // --- coarse/fine interface diagnostic ------------------------------------
+  //
+  // plans/3D.md M3 records an OPEN issue -- a partially-refined run grows a
+  // seam error -- and quotes numbers no checked-in tool reproduced. This is
+  // that measurement, plus the one control that can tell the two candidate
+  // causes apart. tools/analyze-d3-interface.js drives it.
+  //
+  // It lives in the page because the reduction needs the WHOLE coarse field
+  // and 48^3 x 4 floats does not survive a CDP round trip (see
+  // readSubsampled's own note); only the summary crosses. The analytic
+  // reference is d3-scenarios.mjs's, i.e. the same function the validation
+  // tools score against -- not a second copy.
+  //
+  //   CONSERVATION. Total mass and total momentum over the coarse grid.
+  //     Under a refined block `mac` holds the RESTRICTED fine moments, and
+  //     the restriction is an exact arithmetic mean of rho and an exact
+  //     mass-weighted mean of u, so this sum IS the hybrid system's total
+  //     rather than an approximation of it. beltrami is periodic with no
+  //     body and no body force, so each level ALONE conserves both exactly
+  //     (streaming permutes populations; collision preserves the first two
+  //     moments): any drift is the interface and nothing else.
+  //
+  //     That makes it the discriminator the open issue needs. If mass and
+  //     momentum hold to the readback floor while the seam error grows,
+  //     the interface is CONSISTENT-but-inaccurate and refluxing -- which
+  //     restores conservation and nothing else -- is the wrong fix.
+  //
+  //   BUCKETED ERROR. Velocity error against the analytic solution, binned
+  //     by signed Chebyshev distance in coarse cells to the coarse/fine
+  //     interface: negative inside the refined region, positive outside,
+  //     0 meaning "adjacent to it". A seam defect is a profile that peaks
+  //     at |d| small and decays; a global accuracy problem is flat.
+  const MAXD = 8;
+  let bucketOf = null;      // per coarse cell, clamped signed distance
+  function interfaceDistance() {
+    if (bucketOf) return bucketOf;
+    const refined = new Uint8Array(NCELLS);
+    if (AMR) {
+      for (let bz = 0; bz < pool.nb[2]; bz++) {
+        for (let by = 0; by < pool.nb[1]; by++) {
+          for (let bx = 0; bx < pool.nb[0]; bx++) {
+            if (poolAlloc.blockSlot[pool.blockId(bx, by, bz)] < 0) continue;
+            for (let z = bz * RB; z < (bz + 1) * RB; z++)
+              for (let y = by * RB; y < (by + 1) * RB; y++)
+                for (let x = bx * RB; x < (bx + 1) * RB; x++) refined[(z * NY + y) * NX + x] = 1;
+          }
+        }
+      }
+    }
+    // Chebyshev distance to the opposite class, by BFS over the 26
+    // neighbourhood -- so d = 0 is "touching the interface" on either side
+    // and a diagonal neighbour counts, matching how a D3Q19/27 population
+    // actually reaches across a seam. The grid is periodic, as the solver's
+    // own streaming is.
+    const dist = new Int32Array(NCELLS).fill(-1);
+    let frontier = [];
+    const idx = (x, y, z) => (((z + NZ) % NZ) * NY + ((y + NY) % NY)) * NX + ((x + NX) % NX);
+    for (let z = 0; z < NZ; z++) {
+      for (let y = 0; y < NY; y++) {
+        for (let x = 0; x < NX; x++) {
+          const c = (z * NY + y) * NX + x;
+          let edge = false;
+          for (let dz = -1; dz <= 1 && !edge; dz++)
+            for (let dy = -1; dy <= 1 && !edge; dy++)
+              for (let dx = -1; dx <= 1 && !edge; dx++)
+                if (refined[idx(x + dx, y + dy, z + dz)] !== refined[c]) edge = true;
+          if (edge) { dist[c] = 0; frontier.push(c); }
+        }
+      }
+    }
+    let d = 0;
+    while (frontier.length) {
+      const next = [];
+      for (const c of frontier) {
+        const x = c % NX, y = Math.floor(c / NX) % NY, z = Math.floor(c / (NX * NY));
+        for (let dz = -1; dz <= 1; dz++)
+          for (let dy = -1; dy <= 1; dy++)
+            for (let dx = -1; dx <= 1; dx++) {
+              const n = idx(x + dx, y + dy, z + dz);
+              if (dist[n] < 0) { dist[n] = d + 1; next.push(n); }
+            }
+      }
+      frontier = next; d++;
+    }
+    bucketOf = new Int32Array(NCELLS);
+    for (let c = 0; c < NCELLS; c++) {
+      // dist is -1 everywhere when there is no interface at all (dense, or
+      // ?refine=all): every cell then falls in the far bucket, which is what
+      // makes those runs the flat control.
+      const k = dist[c] < 0 ? MAXD : Math.min(dist[c], MAXD);
+      bucketOf[c] = refined[c] ? -k : k;
+    }
+    return bucketOf;
+  }
+
+  async function readInterfaceDiag(t) {
+    const m = await readMacro();
+    const bk = interfaceDistance();
+    // Kahan, because the mass sum is ~NCELLS x 1 and the drift being looked
+    // for is orders of magnitude below that. rho - 1 rather than rho for the
+    // same reason.
+    const sums = [0, 0, 0, 0], comp = [0, 0, 0, 0];   // mass, then momentum xyz
+    const kadd = (a, v) => {
+      const y = v - comp[a], u = sums[a] + y;
+      comp[a] = (u - sums[a]) - y; sums[a] = u;
+    };
+    const nb = 2 * MAXD + 1;
+    const buckets = Array.from({ length: nb }, () => ({ n: 0, err2: 0, ref2: 0, sim2: 0 }));
+    const isBel = scenarioName === 'beltrami';
+    let i = 0;
+    for (let z = 0; z < NZ; z++) {
+      for (let y = 0; y < NY; y++) {
+        for (let x = 0; x < NX; x++, i++) {
+          const rho = m[4 * i], ux = m[4 * i + 1], uy = m[4 * i + 2], uz = m[4 * i + 3];
+          kadd(0, rho - 1);
+          kadd(1, rho * ux); kadd(2, rho * uy); kadd(3, rho * uz);
+          const b = buckets[bk[i] + MAXD];
+          b.n++;
+          b.sim2 += ux * ux + uy * uy + uz * uz;
+          if (isBel) {
+            const e = beltramiVelocityAt(x, y, z, N, params.u0, params.nu, t);
+            const dx = ux - e[0], dy = uy - e[1], dz = uz - e[2];
+            b.err2 += dx * dx + dy * dy + dz * dz;
+            b.ref2 += e[0] * e[0] + e[1] * e[1] + e[2] * e[2];
+          }
+        }
+      }
+    }
+    return {
+      step, t, cells: NCELLS, maxd: MAXD, scenario: scenarioName,
+      mass: sums[0], mom: [sums[1], sums[2], sums[3]], hasRef: isBel,
+      buckets: buckets.map((b, j) => ({ d: j - MAXD, ...b })).filter(b => b.n > 0),
+    };
+  }
+
   // Body state and the force measured on it. Read back through the body
   // buffer rather than the force accumulator, because d3_physics.wgsl drains
   // that accumulator with atomicExchange every step and copies the values
@@ -895,6 +1057,7 @@ async function init() {
       } : {}),
     }),
     readSubsampled, readDuctProfile, readStats, readBody, readPoolStats,
+    readInterfaceDiag,
     debugStepSync,
   };
 

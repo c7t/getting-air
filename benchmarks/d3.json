@@ -309,7 +309,7 @@
       "l_tol": 1e-06
     }
   ],
-  "amr_interface_note": "OPEN ISSUE, measured 2026-09-09, RTX 4080. With a PARTIAL refinement the coarse/fine interface injects a per-step error that accumulates roughly linearly. Bucketing the field error by distance from the refined box (Beltrami, n=48, boxfrac=0.5): at t = 1,2,4,8,16,32,64 the coarse cells just OUTSIDE the refined region go 1.35e-3, 3.15e-3, 6.25e-3, 1.02e-2, 1.57e-2, 2.21e-2, 3.24e-2, while cells deep inside stay near 5e-3 and the same run with no interface at all holds 1.6e-3 flat. It is ~0 at t=1, localized to the seam, and linear in t -- a consistent per-step injection, not an addressing mistake (the addressing is separately verified against an independent route by tools/test-d3-amr.js). TESTED AND REJECTED: that substep B sees a ring half a coarse step stale. A second, time-blended ring refresh before substep B made it WORSE (nearOut 3.24e-2 -> 3.93e-2 at t=64), so staleness is not the cause; the TIME_BLEND override remains in the shader, defaulted off. The remaining candidate is that the interface is not CONSERVATIVE -- the coarse and fine solvers compute the flux across the seam independently and the two do not agree, so mass and momentum leak there at a constant rate. The fix is a flux correction (refluxing), which is real work and is NOT in M3. Until it lands, a partially-refined 3D run is not trustworthy for a quantitative number, and the sphere-with-AMR comparison against M2's dense Cd is deliberately NOT part of this suite.",
+  "amr_interface_note": "The coarse/fine interface had TWO defects. One is FIXED (2026-09-09): the grid transfers applied the PRE-collision Dupuis-Chopard fneq factor (tau_f/tau_c)*dx_f/dx_c to POST-collision populations. This solver's step kernels are fused pull-stream+collide, so every buffer holds f AFTER collision, and the factor that applies is (tau_f-1)/(tau_c-1)/2 -- at tau=0.8 that is -0.25 against the +0.6875 the code used, wrong magnitude and opposite SIGN. It was found by measuring mass and momentum separately (tools/analyze-d3-interface.js): mass sat at the f32 readback floor while momentum leaked seven orders above its own floor, linearly in t. That asymmetry IS the diagnosis -- fneq has no zeroth or first moment so it cannot touch a mass flux, but the second moment is the viscous stress, i.e. the momentum flux. The amr-all cases could not see it (they are bit-identical across the fix: with every block refined the rescaled coarse f is discarded and the rings are never read), which is why amr-box-RB4 is now in this file. STILL OPEN: the interface is not CONSERVATIVE. With the rescale correct a partially-refined run still converges at FIRST order -- whole-domain L2rel at t=0.5*td is 1.36e-2 / 9.02e-3 / 7.04e-3 at N=32/48/64 (ratios 1.51, 1.28 against first order's 1.5, 1.33), while the no-interface controls sit at 4.6e-3 / 2.3e-3 / 2.0e-3. That is the classic composite-grid signature: the two sides compute the seam flux independently and disagree. The fix is refluxing and it is the first item of M4 (plans/3D.md M3 sketches the shape). Until it lands a partially-refined 3D run is not trustworthy for a quantitative number, and the sphere-with-AMR comparison against M2's dense Cd is deliberately NOT part of this suite -- it would report the seam, not the solver.",
   "amr_cases": [
     {
       "name": "amr-all-RB4",
@@ -362,6 +362,29 @@
       ],
       "field_l2_tol": 0.01,
       "decay_rate_tol": 0.005
+    }
+  ],
+  "amr_box_note": "REGRESSION BOUNDS, NOT PHYSICS TOLERANCES -- the same distinction sphere_diffuse_cases carries. This case has a real coarse/fine interface and the interface is still first-order (see amr_interface_note), so its error is dominated by a known defect and there is nothing to score it against except its own measured value. The tolerances are ~30% above what was measured on an RTX 4080 on 2026-09-09, which is tight enough to catch a factor-of-two regression and loose enough not to fire on driver noise. The point of the case is that BEFORE it existed nothing in this suite ever loaded a partially-refined 3D run, which is exactly how the pre/post-collision rescale bug survived M3. When refluxing lands these numbers should FALL and must be re-baselined, not widened. Checkpoints are deliberately short (0.25 and 0.5 decay times): the seam error spreads over the whole domain by 3 t_d, and a saturated field measures the pollution rather than the injection. Measured 2026-09-09, RTX 4080: field L2rel 9.012e-3 and decay-rate rel err 1.024e-2. The SAME case run with ?dcpre=1 -- the pre-collision factor, i.e. the bug -- gives 4.618e-2, so this case would have failed its own bound by 3.8x before the fix. That is what makes it a real guard rather than a recorded curiosity.",
+  "amr_box_cases": [
+    {
+      "name": "amr-box-RB4",
+      "n": 48,
+      "tau": 0.8,
+      "u0": 0.04,
+      "q": 19,
+      "levels": 2,
+      "refine": "box",
+      "boxfrac": 0.5,
+      "rb": 4,
+      "checkpoints": [
+        0.25,
+        0.5
+      ],
+      "field_l2_tol": 0.012,
+      "decay_rate_tol": 0.014,
+      "field_l2_measured": 0.009012,
+      "decay_rate_measured": 0.01024,
+      "field_l2_with_dcpre": 0.04618
     }
   ]
 }

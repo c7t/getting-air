@@ -45,27 +45,34 @@ override GHOST_ONLY : u32 = 1u;
 // Where in the parent step this ring refresh is for: 0 = the parent's state
 // at time t, 0.5 = halfway. DEFAULT 0, AND CURRENTLY ALWAYS 0.
 //
-// This exists because of a hypothesis that was TESTED AND REJECTED, and the
-// result is worth keeping. Interpolating the ring once per parent step and
-// using it for both fine substeps leaves substep B looking at interface data
-// half a coarse step stale, which is a plausible source of the seam error
-// this solver does have: on the analytic Beltrami flow with a refined box,
-// the coarse cells just outside the refined region grow a relative error of
-// 1.35e-3 -> 3.2e-3 -> 6.3e-3 -> 1.0e-2 at t = 1, 2, 4, 8 -- roughly linear
-// in t -- while the same run with NO coarse/fine interface (?refine=all)
-// holds 1.6e-3 flat.
+// This exists because of a hypothesis that was tested and rejected during
+// M3 -- and the rejection has since been RE-OPENED, which is why the knob
+// is still here.
 //
-// Adding a second, time-blended refresh before substep B made that error
-// slightly WORSE (nearOut 3.24e-2 -> 3.93e-2 at t=64), so staleness is not
-// the cause. The remaining candidate is that this interface is not
-// CONSERVATIVE: the coarse solver's flux across the seam and the fine
-// solver's flux across the same seam are computed independently and do not
-// agree, so mass and momentum leak there at a constant rate. Fixing that
-// needs a flux correction (refluxing), which is real work and is recorded
-// in plans/3D.md rather than guessed at here.
+// The hypothesis: interpolating the ring once per parent step and using it
+// for both fine substeps leaves substep B looking at interface data half a
+// coarse step stale. A second, time-blended refresh before substep B was
+// built and measured and made the seam error slightly WORSE (nearOut
+// 3.24e-2 -> 3.93e-2 at t=64), so staleness was recorded as not the cause.
 //
-// The knob stays because it is the natural thing to re-try once the
-// interface is conservative, and at 0 the second coarse read folds out.
+// That measurement was taken on top of a sign-flipped interface stress --
+// the grid transfers were applying the PRE-collision Dupuis-Chopard factor
+// to POST-collision populations (common_d3_pool.wgsl derives the correct
+// one; it is -0.25 here where the code used +0.6875). With that fixed the
+// seam error fell ~5x, and the staleness experiment has NOT been repeated
+// against the corrected interface. Treat it as untested, not as rejected.
+//
+// The prior for it staying rejected is still decent: the ring SELF-ADVANCES
+// through a real fine LBM step between the substeps (GHOST=2 is what pays
+// for that), so substep B sees an EVOLVED ring rather than a stale one, and
+// re-interpolating would replace a fine-level evolution with a coarse-level
+// guess. What remains genuinely open is that the interface is not
+// CONSERVATIVE -- with the rescale correct a partially-refined run still
+// converges at first order, which is the composite-grid signature and what
+// refluxing fixes. plans/3D.md M3 has the measurements and the design
+// sketch; benchmarks/d3.json's amr_interface_note has the numbers.
+//
+// At 0 the second coarse read folds out.
 override TIME_BLEND : f32 = 0.0f;
 
 // One coarse cell's macroscopic state and non-equilibrium part.

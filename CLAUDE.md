@@ -208,7 +208,8 @@ comment above `N_LEVELS`, not this file, for what's current.
 
 ## The 3D fork (`plans/3D.md`)
 
-**M0, M1, M2 and M3 are done**; M4 is next. Read
+**M0, M1, M2 and M3 are done**; M4 is next, and its first item is the
+interface flux correction (refluxing), not dynamic refinement. Read
 `plans/3D.md` before touching any of this — in particular its decision table
 at the top, which records what is settled so it does not get re-argued.
 Two things are settled and load-bearing:
@@ -246,15 +247,37 @@ Also settled, and worth knowing before adding a page:
   shape that produced 238e48c. Do not fork `main-3d.js`; add a scenario to
   `d3-scenarios.mjs`.
 
-- **The 3D AMR coarse/fine interface is NOT conservative** (M3's open
-  issue). With every block refined it is excellent -- better than the dense
-  run of the same case -- but a PARTIAL refinement injects a per-step error
-  at the seam that accumulates linearly (measured: 1.35e-3 -> 3.24e-2 over
-  t = 1..64 on the analytic Beltrami box case, against 1.6e-3 flat with no
-  interface). Time-staleness was tested and ruled out. The fix is a flux
-  correction and it is the first item of M4. **Until it lands, do not trust
-  a quantitative number from a partially-refined 3D run**, which is why
-  there is no sphere-with-AMR case in the suite.
+- **Every 3D grid transfer uses the POST-collision Dupuis-Chopard fneq
+  factor, `(tau_f - 1)/(tau_c - 1) / 2`, NOT the textbook
+  `(tau_f/tau_c) * dx_f/dx_c`.** The step kernels are fused
+  pull-stream + collide, so every buffer holds f after collision, and the
+  textbook form is for pre-collision populations. At tau=0.8 the two differ
+  in magnitude AND sign (-0.25 vs +0.6875). Using the wrong one was the
+  large half of M3's seam error, found 2026-09-09. `common_d3_pool.wgsl`
+  derives both; `?dcpre=1` restores the wrong one for re-measurement.
+  **The 2D solver still has this bug** (`common_interp.wgsl:44`,
+  `amr_average_f2c.wgsl:117`, `amr_average_pool_parent.wgsl:116`) --
+  deliberately not fixed in the same change, because it would move the
+  entire 2D benchmark surface at once and `main` is the published site.
+
+- **The 3D AMR coarse/fine interface is still NOT conservative** (M3's
+  remaining open issue). With the rescale corrected a partially-refined run
+  converges at FIRST order -- whole-domain L2rel 1.36e-2 / 9.02e-3 / 7.04e-3
+  at N = 32/48/64 on the analytic Beltrami box case, against no-interface
+  controls at 4.6e-3 / 2.3e-3 / 2.0e-3. That is the composite-grid
+  signature: the two sides compute the seam flux independently and disagree.
+  The fix is refluxing and it is the first item of M4 (plans/3D.md M3
+  sketches the shape). **Until it lands, do not trust a quantitative number
+  from a partially-refined 3D run**, which is why there is no
+  sphere-with-AMR case in the suite.
+
+- **`?refine=all` cannot see an interface bug**, so never treat it as
+  coverage for one. With every block refined, the restriction's rescaled
+  coarse `f` is consumed by a coarse step whose result is then discarded,
+  the rings DIRECT_GHOST never reads are the only thing interp writes, and
+  `mac` comes from moments the rescale does not touch. All three `amr-all`
+  gates are bit-identical across the rescale fix. `amr-box-RB4` /
+  `d3-amr-box` exist because of this.
 
 What exists today:
 
@@ -296,13 +319,31 @@ What exists today:
   brute-force nearest-point search, and asserts the tennis-racket theorem
   (a body spun about its intermediate axis must flip, one about a stable
   axis must not).
-- `tools/validate-3d.js` + `benchmarks/d3.json` — the M1 and M2 gates.
+- `tools/validate-3d.js` + `benchmarks/d3.json` — the M1, M2 and M3 gates.
   Analytic PASS/FAIL for duct, Beltrami, spin and the bounce-back sphere;
-  the 3D TGV only reports; the diffuse sphere cases are regression checks.
+  the 3D TGV only reports; the diffuse sphere cases and `amr-box-RB4` are
+  regression checks against recorded values (read `amr_box_note` before
+  re-baselining — when refluxing lands those numbers should FALL).
 
-      node tools/validate-3d.js                   # owns Chrome; 26 cases
+      node tools/validate-3d.js                   # owns Chrome; 27 cases
       node tools/validate-3d.js --cases=spin-N32
       node tools/validate-3d.js --skip=tgv,sphere,sphere-diffuse
+
+- `tools/analyze-d3-interface.js` — the coarse/fine interface diagnostic.
+  Reports, does not PASS/FAIL. Runs the refined box against its own
+  no-interface controls (`refine=all`, dense) in one invocation and prints
+  two things: the field error bucketed by signed distance to the seam, and
+  **total mass and total momentum drift**. The second is the discriminator,
+  and it is what found the rescale bug — Beltrami is periodic and
+  force-free so each level alone conserves both exactly, and fneq has no
+  zeroth or first moment, so "mass at the f32 floor while momentum leaks"
+  says the defect is in the non-equilibrium coupling and not in the
+  addressing or the flux scheme. Reach for it before building anything at
+  the interface.
+
+      node tools/analyze-d3-interface.js
+      node tools/analyze-d3-interface.js --n=64 --td=0.25,0.5
+      node tools/analyze-d3-interface.js --configs=box --extra=dcpre=1
 
 - `d3-amr.mjs` + `tools/test-d3-amr.js` — the octree pool's geometry and
   addressing (`?levels=2`, `?rb=`, `?refine=all|box|body`). The neighbour
