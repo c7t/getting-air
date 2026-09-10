@@ -35,7 +35,7 @@ const close = (a, b, tol, what) =>
   const {
     GHOST, fineToCoarseUnit, coarseUnitToFine, makePool, refineWhere,
     refineNearBody, resolveSource, toGlobalFine, fromGlobalFine, storageRatio,
-    check21Balance, checkGeometryCoverage,
+    check21Balance, checkGeometryCoverage, cascade21,
   } = A;
 
   ok('pool geometry follows FB = 2*RB + 2*GHOST and rejects a non-dividing RB', () => {
@@ -362,6 +362,213 @@ const close = (a, b, tol, what) =>
     assert.strictEqual(activeSlots, 0, 'the premise of this test is that the block test misses it');
     const r = checkGeometryCoverage(p, blockSlot, sdf, margin);
     assert.ok(r.violations.length > 0, 'the cell-granular scan must catch what the block test missed');
+  });
+
+
+  // --- the 2:1 cascade (plans/3D.md M4.2b-iv) ------------------------------
+  //
+  // cascade21 is scored against check21Balance, which was written first, in
+  // M4.2a, deliberately before there was a manager to be tempted to agree
+  // with. So these are two independently-written statements of one
+  // invariant run against each other: the cascade proposes a balanced set
+  // and the checker -- which knows nothing about the closure rule -- either
+  // finds a gap in it or does not.
+  //
+  // The trees below are FULL, not the deliberately-incomplete ones the
+  // checker's own tests use: the cascade's output is asserted to be
+  // globally balanced, so a tree whose y and z faces look out onto nothing
+  // would fail for reasons that are not about the cascade.
+
+  const nbAt3 = (m) => [4 * 2 ** (m - 1), 4 * 2 ** (m - 1), 4 * 2 ** (m - 1)];
+  // The eight children of the parent that contains `b` -- the smallest
+  // refinement the pool can actually hold at level >= 2.
+  const octet = (b) => {
+    const p = [b[0] >> 1, b[1] >> 1, b[2] >> 1], s = new Set();
+    for (let k = 0; k < 8; k++) s.add(`${p[0] * 2 + (k & 1)},${p[1] * 2 + ((k >> 1) & 1)},${p[2] * 2 + ((k >> 2) & 1)}`);
+    return s;
+  };
+  const keys = (sets) => sets.map(s => (s ? [...s].sort().join('|') : null));
+  // The tree property check21Balance does NOT make: every block's parent
+  // must exist. Needed by the minimality test below, because an orphaned
+  // sub-tree can be structurally illegal while still being 2:1 balanced.
+  const orphans = (sets, levels) => {
+    const out = [];
+    for (let m = 2; m < levels; m++) {
+      for (const k of sets[m] || []) {
+        const b = k.split(',').map(Number);
+        if (!sets[m - 1].has(`${b[0] >> 1},${b[1] >> 1},${b[2] >> 1}`)) out.push({ level: m, block: b });
+      }
+    }
+    return out;
+  };
+
+  ok('the cascade is the IDENTITY at levels=2, which is why there is no balance kernel', () => {
+    // The claim shaders/common_d3_manage.wgsl relies on: with one refined
+    // level the closure has nothing to close, because a level-1 block's
+    // parent level is the dense L0 grid and that is present everywhere. So
+    // the manager ships WITHOUT a balance pass rather than with a kernel
+    // that provably does nothing -- and this is the check on "provably".
+    const p = makePool({ dims: [32, 32, 32], rb: 4 });
+    let rng = 12345;
+    const rand = () => (rng = (rng * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+    for (let trial = 0; trial < 20; trial++) {
+      const lv1 = new Set();
+      for (let id = 0; id < p.nBlocks; id++) if (rand() < 0.3) lv1.add(p.blockOf(id).join(','));
+      const r = cascade21([null, lv1], () => p.nb, { levels: 2 });
+      assert.strictEqual(r.forced.length, 0, `trial ${trial}: forced ${JSON.stringify(r.forced[0])}`);
+      assert.deepStrictEqual(keys(r.sets), keys([null, lv1]), `trial ${trial}: the set changed`);
+    }
+  });
+
+  ok('the cascade CLOSES a 3-vs-1 gap the checker reports, and check21Balance agrees', () => {
+    // The same shape as the checker's own 3-vs-1 test, with the level-2 tile
+    // that would have made it legal left out. The checker must see the gap,
+    // the cascade must close it, and the checker must then see nothing.
+    const lv1 = new Set(['3,0,0']);
+    const lv2 = new Set(['6,0,0']);
+    const lv3 = new Set(['12,0,0']);
+    const before = check21Balance([null, lv1, lv2, lv3], nbAt3, { levels: 4 });
+    assert.ok(before.violations.length > 0, 'the premise: this tree is unbalanced');
+    const c = cascade21([null, lv1, lv2, lv3], nbAt3, { levels: 4 });
+    assert.ok(c.forced.length > 0, 'the cascade must have had work to do');
+    const after = check21Balance(c.sets, nbAt3, { levels: 4 });
+    assert.strictEqual(after.violations.length, 0,
+      `the cascade left ${after.violations.length} violations, e.g. ${JSON.stringify(after.violations[0])}`);
+    assert.strictEqual(orphans(c.sets, 4).length, 0, 'the cascade left an orphaned sub-tree');
+    // It grew the set rather than editing it: nothing the criterion asked
+    // for may be dropped, or the manager would be silently un-refining what
+    // geometry forced.
+    for (const k of lv3) assert.ok(c.sets[3].has(k), `dropped a wanted block ${k}`);
+  });
+
+  ok('the cascade materializes the parents of a block that has none', () => {
+    // The manager evaluates its criterion per level and nothing in it looks
+    // up, so a level-3 want with no level-2 or level-1 ancestor is a state
+    // it can genuinely produce.
+    const c = cascade21([null, new Set(), new Set(), new Set(['12,4,4'])], nbAt3, { levels: 4 });
+    assert.ok(c.sets[2].has('6,2,2'), `level-2 parent missing: ${[...c.sets[2]].join(' ')}`);
+    assert.ok(c.sets[1].has('3,1,1'), `level-1 grandparent missing: ${[...c.sets[1]].join(' ')}`);
+    assert.strictEqual(orphans(c.sets, 4).length, 0);
+    assert.strictEqual(check21Balance(c.sets, nbAt3, { levels: 4 }).violations.length, 0);
+  });
+
+  ok('the cascade is idempotent, so the single deepest-first sweep IS a fixed point', () => {
+    // The sweep runs once and relies on additions at level m-1 being made
+    // before the loop reaches m-1. That argument is easy to state and easy
+    // to get wrong, so it is checked rather than trusted.
+    const start = [null, new Set(['3,0,0']), new Set(['6,0,0']), new Set(['12,0,0', '13,5,2'])];
+    const once = cascade21(start, nbAt3, { levels: 4 });
+    const twice = cascade21(once.sets, nbAt3, { levels: 4 });
+    assert.strictEqual(twice.forced.length, 0, `a second sweep still forced ${JSON.stringify(twice.forced[0])}`);
+    assert.deepStrictEqual(keys(twice.sets), keys(once.sets));
+  });
+
+  ok('the cascade adds NOTHING to a uniformly refined tree', () => {
+    // Every block present at every level: balanced by construction, and the
+    // case a closure that over-fires would still get right -- included
+    // because the minimality test below is about a sparse tree and this one
+    // is about not touching a dense one.
+    const sets = [null];
+    for (let m = 1; m <= 3; m++) {
+      const nb = nbAt3(m), s = new Set();
+      for (let z = 0; z < nb[2]; z++) for (let y = 0; y < nb[1]; y++) for (let x = 0; x < nb[0]; x++) s.add(`${x},${y},${z}`);
+      sets.push(s);
+    }
+    const c = cascade21(sets, nbAt3, { levels: 4 });
+    assert.strictEqual(c.forced.length, 0, `forced ${JSON.stringify(c.forced[0])} on a uniform tree`);
+  });
+
+  ok('the cascade balances a REAL nested-shell refinement, not just a hand-built tree', () => {
+    // The shape M5 will actually produce: three geometry-driven shells
+    // around a sphere, each level's criterion evaluated independently. That
+    // is what makes it unbalanced -- nothing in a per-level distance test
+    // knows about the level above it, so a tight level-3 shell ends up face
+    // to face with level-1 territory. The hand-built trees above check ONE
+    // named tile; this checks that a whole realistic set comes out clean.
+    const nb1 = 8, R = 5, ctr = 16;          // 32^3 cells at RB=4
+    const nbAt = (m) => Array(3).fill(nb1 * 2 ** (m - 1));
+    const shell = (m, band) => {
+      const nb = nbAt(m)[0], w = 32 / nb, out = new Set();
+      for (let z = 0; z < nb; z++) for (let y = 0; y < nb; y++) for (let x = 0; x < nb; x++) {
+        const d = Math.hypot((x + 0.5) * w - ctr, (y + 0.5) * w - ctr, (z + 0.5) * w - ctr) - R;
+        if (Math.abs(d) <= band) out.add(`${x},${y},${z}`);
+      }
+      return out;
+    };
+    const sets = [null, shell(1, 6), shell(2, 3), shell(3, 2.5)];
+    const before = check21Balance(sets, nbAt, { levels: 4 });
+    assert.ok(before.violations.length > 0,
+      'the premise: independently-evaluated shells are NOT 2:1 balanced');
+    const c = cascade21(sets, nbAt, { levels: 4 });
+    const after = check21Balance(c.sets, nbAt, { levels: 4 });
+    assert.strictEqual(after.violations.length, 0,
+      `${after.violations.length} left, e.g. ${JSON.stringify(after.violations[0])}`);
+    assert.strictEqual(orphans(c.sets, 4).length, 0);
+    // Grew, never shrank: the criterion's own wants must all survive, or the
+    // manager would be quietly un-refining what geometry forced.
+    for (let m = 1; m < 4; m++) for (const k of sets[m]) assert.ok(c.sets[m].has(k), `dropped ${k} at level ${m}`);
+    // And it did not answer "balanced" by refining the world. RECORDED
+    // VALUES, measured 2026-09-10, not derived: 88/272/1680 wanted ->
+    // 184/704/2432 balanced, against 512/4096/32768 blocks per level. If
+    // these move, the closure changed -- and whether the new numbers are
+    // right is a question for the minimality test above, not for this
+    // assertion, which only makes the move visible.
+    assert.deepStrictEqual(c.counts.slice(1), [184, 704, 2432],
+      `balanced counts moved from the recorded 184/704/2432`);
+  });
+
+  ok('the cascade output is OCTET-COMPLETE, which is what the checker assumes', () => {
+    // check21Balance's hasChild tests octant (0,0,0) alone, so a parent
+    // holding only some of its children reads as a LEAF and the checker
+    // reports a violation that is not one. That is not a shortcut to be
+    // fixed: a tile is allocated per block and the 2D pool manager spawns a
+    // whole quad, so a partially-refined parent does not exist. This is the
+    // assertion that keeps the cascade on the same model.
+    const c = cascade21([null, new Set(), new Set(), new Set(['12,4,4'])], nbAt3, { levels: 4 });
+    for (let m = 2; m < 4; m++) {
+      for (const k of c.sets[m]) {
+        const b = k.split(',').map(Number);
+        const par = [b[0] >> 1, b[1] >> 1, b[2] >> 1];
+        for (let q = 0; q < 8; q++) {
+          const sib = `${par[0] * 2 + (q & 1)},${par[1] * 2 + ((q >> 1) & 1)},${par[2] * 2 + ((q >> 2) & 1)}`;
+          assert.ok(c.sets[m].has(sib), `level ${m} block ${k} is present without its sibling ${sib}`);
+        }
+      }
+    }
+  });
+
+  ok('every OCTET the cascade forces is NECESSARY -- it does not over-refine', () => {
+    // The failure this guards against is a closure that refines a halo
+    // "to be safe": it would pass every test above, since a superset of a
+    // balanced set is still balanced, and would cost slots for nothing.
+    //
+    // THE UNIT IS THE OCTET, NOT THE BLOCK, and that is the octet-
+    // completeness rule again rather than a weakening of the test: removing
+    // one child of a spawned octet does not describe any state the pool can
+    // be in. Removing the octet does. Each removal must break the tree --
+    // either 2:1 balance (check21Balance, written independently) or the
+    // parent property (orphans, above), both statements about the RESULT
+    // and not about the rule that produced it.
+    // The input is given OCTET-COMPLETE on purpose, so that every group
+    // below is something the CLOSURE decided rather than the octet rule
+    // restating the caller's own want. Testing "removing it breaks the
+    // tree" against a sibling the octet rule added would be a tautology.
+    const start = [null, new Set(), new Set(), octet([12, 4, 4])];
+    const c = cascade21(start, nbAt3, { levels: 4 });
+    const groups = new Map();
+    for (const f of c.forced) {
+      const g = `${f.level}:${f.octet ? f.octet.join(',') : f.block.join(',')}`;
+      if (!groups.has(g)) groups.set(g, []);
+      groups.get(g).push(f);
+    }
+    assert.ok(groups.size > 3, `only ${groups.size} octets to test`);
+    for (const [g, members] of groups) {
+      const cut = c.sets.map(x => (x ? new Set(x) : null));
+      for (const f of members) cut[f.level].delete(f.block.join(','));
+      const bal = check21Balance(cut, nbAt3, { levels: 4 }).violations.length;
+      const orp = orphans(cut, 4).length;
+      assert.ok(bal > 0 || orp > 0, `removing forced octet ${g} left a legal tree: it was not necessary`);
+    }
   });
 
   if (!process.exitCode) console.log(`\n${pass} check(s) passed`);

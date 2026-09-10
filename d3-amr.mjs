@@ -292,3 +292,114 @@ export function checkGeometryCoverage(pool, blockSlot, sdf, margin) {
   }
   return { violations, required };
 }
+
+// 2:1 CASCADE. Turns a WANTED set into the smallest superset of it that is
+// 2:1 balanced -- the manager's forced-refinement rule, and the exact
+// counterpart of check21Balance above: that one reports violations, this one
+// removes them, and tools/test-d3-amr.js runs them against each other rather
+// than against a transcription of either.
+//
+// ONE RULE, AND BOTH HALVES OF THE MILESTONE FALL OUT OF IT:
+//
+//     present(m, b)  =>  present(m-1, parent(n))  for each face neighbour
+//                        n of b at level m, and for b itself.
+//
+// Read forwards it is "refine forced by a neighbour that wants a deeper
+// child"; read backwards -- a block the criterion did NOT want, added back
+// -- it is "coarsen blocked by a neighbour that has one". They are not two
+// mechanisms. That is why this runs on the WANT set, between `decide` and
+// `drain`, instead of being a test bolted onto each of coarsen and refine:
+// by the time those passes run the answer is already balanced and they need
+// to know nothing about levels.
+//
+// WHY THAT RULE IS SUFFICIENT, since "add neighbours until it looks right"
+// is the shape of the three live balance bugs the 2D manager carries. Take
+// any leaf (m, b) and a face (a, s), neighbour n:
+//   - n absent at level m: check21Balance walks UP and finds the deepest
+//     ancestor. The rule put parent(n) there, so the gap is exactly 1.
+//   - n present at level m with a level-(m+2) grandchild g on the SHARED
+//     face: g's own face neighbour one step back across the seam is a
+//     level-(m+2) block inside b, so the rule demands its level-(m+1)
+//     parent, which is a child of b -- and then b is not a leaf, contrary
+//     to assumption. So no leaf can face a 2-level jump.
+// Deeper slivers are ruled out by applying the same argument at each level,
+// which is what the sweep below does.
+//
+// THAT SECOND CASE ONLY CLOSES BECAUSE REFINEMENT IS OCTET-COMPLETE, and
+// the first draft of this function was wrong for exactly that reason. It
+// added parent(g') as a single block, which can be any octant of b; the
+// checker's hasChild tests octant (0,0,0) alone, still called b a leaf, and
+// reported the violation the cascade was supposed to have removed. The
+// checker was right and the cascade was wrong -- see `ensure`.
+//
+// THE SWEEP IS DEEPEST-FIRST AND RUNS ONCE. An addition at level m-1 is
+// made before the loop reaches m-1, so its own closure is taken in the same
+// pass; there is no fixed-point iteration to get wrong. The test asserts
+// idempotence rather than trusting that argument.
+//
+// VACUOUS AT ?levels=2, PROVABLY: the loop starts at m = levels-1 and stops
+// above m = 1, because a level-1 block's parent level is the dense L0 grid,
+// which is present everywhere by definition. At levels=2 it therefore does
+// not execute at all and this function is the identity -- which is why
+// there is no `balance` entry point in shaders/common_d3_manage.wgsl today
+// rather than a kernel that provably does nothing. tools/test-d3-amr.js
+// asserts the identity on random one-level sets so that claim is checked
+// and not merely argued.
+export function cascade21(wantSets, nbAt, { levels }) {
+  const sets = [null];
+  for (let m = 1; m < levels; m++) sets[m] = new Set(wantSets[m] || []);
+  const forced = [];
+  // REFINEMENT IS OCTET-COMPLETE FROM LEVEL 2 DOWN, and getting this wrong
+  // is what the first draft did. A level-m block exists because its level-
+  // (m-1) parent SPAWNED IT along with its seven siblings -- the 2D pool
+  // manager says it outright ("a parent slot may only spawn a level-(m+1)
+  // quad"), because a tile is allocated per block and there is no such
+  // thing as a quarter-refined parent. check21Balance's hasChild leans on
+  // it too: it tests octant (0,0,0) alone and would read a parent holding
+  // only octant (1,0,0) as a LEAF, so a cascade that added single blocks
+  // produces a tree the checker then reports as unbalanced -- which is what
+  // it did, and the checker was right.
+  //
+  // Level 1 is the exception and not an inconsistency: its parent is the
+  // dense L0 grid, which is present everywhere, so level-1 blocks are
+  // refined individually. That is exactly what refineNearBody builds.
+  const ensure = (m, b, because) => {
+    const parent = [b[0] >> 1, b[1] >> 1, b[2] >> 1];
+    for (let k = 0; k < (m >= 2 ? 8 : 1); k++) {
+      const c = m >= 2
+        ? [parent[0] * 2 + (k & 1), parent[1] * 2 + ((k >> 1) & 1), parent[2] * 2 + ((k >> 2) & 1)]
+        : b;
+      const key = `${c[0]},${c[1]},${c[2]}`;
+      if (sets[m].has(key)) continue;
+      sets[m].add(key);
+      forced.push({ level: m, block: c, octet: m >= 2 ? parent : null, because });
+    }
+  };
+  for (let m = levels - 1; m >= 2; m--) {
+    // COMPLETE THIS LEVEL'S OCTETS FIRST. The criterion is evaluated per
+    // block and nothing in it looks sideways, so a want for one child with
+    // no siblings is a state the manager can genuinely produce -- and it is
+    // not a state the POOL can be in, for the same reason the header gives:
+    // the parent spawns the whole octet or none of it. Completing it here
+    // rather than rejecting it says what the want MEANS. Octets added at
+    // this level by the level below have already come through `ensure`, so
+    // this only ever finds the caller's own input.
+    for (const key of [...sets[m]]) {
+      ensure(m, key.split(',').map(Number), { siblingOf: key });
+    }
+    const nb = nbAt(m);
+    for (const key of sets[m]) {
+      const b = key.split(',').map(Number);
+      // The tree property first: a block with no parent is not a refinement
+      // of anything. The manager can produce one -- the criterion is
+      // evaluated per level and nothing in it looks up.
+      ensure(m - 1, [b[0] >> 1, b[1] >> 1, b[2] >> 1], { parentOf: b.slice(), level: m });
+      for (const [a, s] of FACES) {
+        const n = b.slice();
+        n[a] = ((n[a] + s) % nb[a] + nb[a]) % nb[a];   // periodic, like the checker
+        ensure(m - 1, [n[0] >> 1, n[1] >> 1, n[2] >> 1], { neighbourOf: b.slice(), level: m, axis: a, dir: s });
+      }
+    }
+  }
+  return { sets, forced, counts: sets.map((s, m) => (m === 0 ? null : s.size)) };
+}

@@ -208,17 +208,14 @@ comment above `N_LEVELS`, not this file, for what's current.
 
 ## The 3D fork (`plans/3D.md`)
 
-**M0-M3 are done, and M4 is in progress**: M4.1a, M4.1b and M4.1c have
-landed. The coarse/fine interface on the `?interface=explode` path is now
-exactly conservative in mass AND momentum, and its field error has fallen
-to the no-interface control's level -- a refined box tracks `refine=all` to
-within 8-10% at N = 32/48/64, against the default `interp` path's 3.6x.
-M4.1d has landed too -- the fine level now integrates the body force
+**M0-M4 are done; M5 (a third level, the pool-parent path) is next.** The
+coarse/fine interface on the `?interface=explode` path -- the DEFAULT since
+M4.1e -- is exactly conservative in mass AND momentum, and its field error
+has fallen to the no-interface control's level: a refined box tracks
+`refine=all` to within 8-10% at N = 32/48/64, against the old `interp`
+path's 3.6x. The fine level integrates the body force
 (`common_d3_force_pool.wgsl`, weight dx^(D-1) = dx^2, NOT dx^3) and a sphere
-in a refined shell reproduces the dense run's Cd to 0.07%. M4.1e, making
-explode the DEFAULT, is next and is a blast-radius decision rather than an
-evidence one: merging publishes, and the flip moves every recorded AMR
-number at once.
+in a refined shell reproduces the dense run's Cd to 0.07%.
 
 - **Dynamic refinement works behind `?dynamic=1` (M4.2b), refused unless
   `?refine=body`.** A topology change is FIVE ORDERED PASSES -- decide,
@@ -263,6 +260,28 @@ number at once.
   coverage IS real today. The pure functions are unit-tested on inputs that
   VIOLATE the invariant (`make test`) -- a checker only ever run on valid
   input is indistinguishable from one that returns nothing.
+
+- **The 2:1 forcing rule is ONE closure on the WANT set, and it ships as a
+  host function with NO kernel** (`d3-amr.mjs`'s `cascade21`, M4.2b-iv).
+  `present(m,b)` requires `present(m-1, parent(n))` for each face neighbour
+  n; read forwards that is "refine forced by a deeper neighbour", read
+  backwards it is "coarsen blocked by one", and they are not two mechanisms
+  -- which is why it belongs between `decide` and `drain` rather than as
+  tests inside coarsen and refine, where the 2D manager's three live balance
+  bugs live. At `?levels=2` the closure is the IDENTITY (a level-1 block's
+  parent level is the dense L0 grid), so `common_d3_manage.wgsl` has no
+  `balance` entry point on purpose: a kernel that provably writes nothing
+  back is untestable code. `make test` gates the rule against
+  `check21Balance` instead -- including minimality, without which "refine a
+  halo to be safe" passes everything.
+
+- **REFINEMENT IS OCTET-COMPLETE FROM LEVEL 2 DOWN: a parent spawns all
+  eight children or none.** `amr_manage_pool.wgsl` says it for the 2D quad,
+  a tile is allocated per block, and `check21Balance`'s `hasChild` tests
+  octant (0,0,0) alone because of it. The first `cascade21` added single
+  blocks; a parent holding only octant (1,0,0) still read as a LEAF and the
+  checker reported the violation the cascade was meant to remove. The
+  checker was right. M5 will meet this again.
 
 - **Explode is not slower in any case that matters** (`tools/bench-d3-interface.js`,
   new). +2.9% per macro-step on a body-fitted shell, -4.5% at a larger

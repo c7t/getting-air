@@ -23,7 +23,12 @@
 //                 is level 1 or level 0 and both are legal, so the check
 //                 CANNOT fail today. It says so rather than presenting a
 //                 green tick, because "the checker ran" and "the invariant
-//                 holds" are different claims.
+//                 holds" are different claims. Dynamic refinement does not
+//                 change that -- M4.2b moves tiles within ONE level -- so
+//                 the manager ships with no balance pass at all and the
+//                 forcing rule is gated on the host instead (d3-amr.mjs's
+//                 cascade21, tools/test-d3-amr.js). M5 is what makes both
+//                 this line and that pass real.
 //   geometry      no coarse cell within ?margin= of the body sits in an
 //                 unrefined block, checked at CELL granularity against the
 //                 SDF -- an independent route from the block-corner
@@ -273,8 +278,12 @@ async function main() {
   const anyVacuous = report.some(r => r.res && r.res.vacuous);
   if (anyVacuous) {
     console.log('\nVACUOUS means the 2:1 check ran and could not have failed: at ?levels=2 a leaf\'s');
-    console.log('neighbour is level 1 or level 0 and both are legal. It becomes a real gate when');
-    console.log('M4.2 makes refinement dynamic or M5 adds a level. Do not read it as evidence yet.');
+    console.log('neighbour is level 1 or level 0 and both are legal. It stays vacuous through all');
+    console.log('of M4.2b -- dynamic refinement moves tiles WITHIN one level -- and becomes a real');
+    console.log('gate when M5 adds a level. Do not read it as evidence yet.');
+    console.log('The cascade that will make it non-vacuous is d3-amr.mjs\'s cascade21, and it is');
+    console.log('the identity at ?levels=2 for the same reason, so there is no balance pass in the');
+    console.log('manager to exercise here (M4.2b-iv). make test is where that rule is gated.');
   }
   const failed = report.filter(r => r.error || (r.res && (r.res.bal.length || r.res.cov.length || r.res.pool.length || !r.res.finite)));
   if (failed.length) {

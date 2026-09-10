@@ -32,6 +32,31 @@
 // which blocks are wanted from step to step, which is exactly what the
 // bit-identical gate needs to not happen yet.
 //
+// THERE IS NO `balance` ENTRY POINT, AND ITS ABSENCE IS THE DELIVERABLE OF
+// M4.2b-iv rather than an omission. 2:1 balance forces refinement through
+// one closure -- a present block requires its face neighbours' PARENTS to
+// be present -- and that closure is the identity when there is only one
+// refined level, because a level-1 block's parent level is the dense L0
+// grid and L0 is present everywhere. So at ?levels=2 a balance kernel
+// could only ever be a dispatch that writes nothing back.
+//
+// The rule itself is written and tested: d3-amr.mjs's `cascade21`, with
+// tools/test-d3-amr.js scoring it against check21Balance -- a checker
+// written first, in M4.2a, deliberately before there was a manager to be
+// tempted to agree with. It runs on the WANT set, which is why it belongs
+// between `decide` and the drain and NOT as a test inside coarsen and
+// refine: "refine forced by a neighbour that wants a deeper child" and
+// "coarsen blocked by a neighbour that has one" are the same closure read
+// in two directions, and by the time those two passes run the answer is
+// already balanced. When M5 adds the pool-parent path, the pass goes
+// there, mirroring cascade21, and the gate is that
+// tools/validate-d3-invariants.js stops printing VACUOUS.
+//
+// One thing that WILL be needed and is easy to get wrong from the 2D file:
+// refinement is OCTET-COMPLETE from level 2 down. A parent spawns all eight
+// children or none, exactly as amr_manage_pool.wgsl spawns a whole quad,
+// and cascade21 records what happens to a closure that forgets it.
+//
 // WHAT THIS STAGE DOES NOT DO: a slot handed out here is NOT initialized,
 // and a slot released here is NOT restricted back to the coarse grid first.
 // Both are M4.2b-ii. So a criterion that actually FIRES produces an

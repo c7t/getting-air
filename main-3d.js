@@ -1117,6 +1117,11 @@ async function init() {
         //   decide   evaluate the criterion ONCE into blockWant, so every
         //            pass below answers the same question. Two passes each
         //            recomputing it is two chances to disagree.
+        //   (balance) the 2:1 closure would go HERE, on blockWant, before
+        //            anything acts on it -- M4.2b-iv. It is absent because
+        //            at ?levels=2 it is provably the identity: see
+        //            common_d3_manage.wgsl's header and d3-amr.mjs's
+        //            cascade21, which is the rule, written and tested.
         //   drain    restrict a dying tile onto its coarse cells. MUST come
         //            before coarsen: coarsen frees the slot and refine can
         //            hand that same slot straight out in the next pass, by
