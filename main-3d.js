@@ -329,11 +329,24 @@ async function init() {
     fluxAccBuf = device.createBuffer({ size: NCELLS * 4 * 4, usage: U.STORAGE | U.COPY_SRC });
   }
 
+  // `blockSlot` is bound to the coarse step on EVERY scenario so there is one
+  // bind-group layout, the same arrangement `body` uses. With no pool it is a
+  // single -1 element and HAS_POOL = 0 folds the lookup out at
+  // pipeline-creation time -- see common_d3_step.wgsl's coveredByFiner.
+  // Sec 6's 238e48c lesson is specifically about bind groups drifting between
+  // near-identical code paths, so the layout does not fork.
+  const blockSlotBound = blockSlotBuf ?? (() => {
+    const b = device.createBuffer({ size: 4, usage: U.STORAGE | U.COPY_DST });
+    device.queue.writeBuffer(b, 0, new Int32Array([-1]));
+    return b;
+  })();
+
   const computeBGL = device.createBindGroupLayout({ entries: [
     { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
     { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
     { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
   ]});
   const forceBGL = device.createBindGroupLayout({ entries: [
     { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
@@ -353,10 +366,12 @@ async function init() {
   ]});
   const bgAB = device.createBindGroup({ layout: computeBGL, entries: [
     { binding: 0, resource: { buffer: fA } }, { binding: 1, resource: { buffer: fB } },
-    { binding: 2, resource: { buffer: mac } }, { binding: 3, resource: { buffer: bodyBuf } }]});
+    { binding: 2, resource: { buffer: mac } }, { binding: 3, resource: { buffer: bodyBuf } },
+    { binding: 4, resource: { buffer: blockSlotBound } }]});
   const bgBA = device.createBindGroup({ layout: computeBGL, entries: [
     { binding: 0, resource: { buffer: fB } }, { binding: 1, resource: { buffer: fA } },
-    { binding: 2, resource: { buffer: mac } }, { binding: 3, resource: { buffer: bodyBuf } }]});
+    { binding: 2, resource: { buffer: mac } }, { binding: 3, resource: { buffer: bodyBuf } },
+    { binding: 4, resource: { buffer: blockSlotBound } }]});
   // The force kernel reads the SAME f_in the step kernel will read this
   // macro-step -- it is dispatched first -- so its populations are the
   // pre-streaming, time-t data both formulas want, with no separate
@@ -396,6 +411,10 @@ async function init() {
     WALL_Z: params.walls.includes('z') ? 1 : 0,
     HAS_BODY, USE_BOUNCEBACK, CHI_EPS,
     SPONGE_W: sponge.width, SPONGE_UX: sponge.u[0], SPONGE_UY: sponge.u[1], SPONGE_UZ: sponge.u[2],
+    // M4.1a: skip cells a refined block covers. Folds out entirely when
+    // there is no pool.
+    HAS_POOL: AMR ? 1 : 0,
+    RB, NBX: AMR ? pool.nb[0] : 1, NBY: AMR ? pool.nb[1] : 1, NBZ: AMR ? pool.nb[2] : 1,
   };
   const computePL = device.createPipelineLayout({ bindGroupLayouts: [computeBGL] });
   const initPipe = await device.createComputePipelineAsync({ layout: computePL, compute: { module: stepModule, entryPoint: 'initEq', constants: stepConstants } });

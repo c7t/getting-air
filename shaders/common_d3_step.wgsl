@@ -63,10 +63,50 @@
 // pipeline-overridable constants, so the whole solid-coupling path folds
 // out at pipeline-creation time for the M1 scenarios.
 @group(0) @binding(3) var<storage, read>       body : BodyState3D;
+// Level-1 block -> pool slot, or -1. Always bound (one bind-group layout for
+// every scenario, like `body`) and a single dummy -1 element when there is no
+// pool, which HAS_POOL = 0 folds out at pipeline-creation time.
+@group(0) @binding(4) var<storage, read>       blockSlot : array<i32>;
 
 override NX : u32;
 override NY : u32;
 override NZ : u32;
+
+// --- coarse/fine partitioning (plans/3D.md M4.1a) --------------------------
+//
+// THE COARSE GRID DOES NOT SOLVE UNDER A REFINED REGION. Chen et al. (2006)
+// -- the explode/coalesce scheme M4.1 converts this interface to -- treats
+// coarse and fine as a PARTITION: coarse voxels stop where fine ones start,
+// except for the one-voxel dual interface layer. This solver started as an
+// OVERLAP instead, with L0 solving everywhere and `average` overwriting its
+// result under refinement, and that redundancy is exactly what makes the
+// seam's mass balance ambiguous -- the same population is accounted on both
+// levels.
+//
+// Skipping a covered cell is numerically a NO-OP today, which is why this
+// lands as its own stage: `average` overwrites both `f_out` and `mac` at
+// every covered cell after this kernel runs, so the work being skipped was
+// already being discarded. What the stage actually buys is the per-cell mask
+// itself, in the kernel sec 2.4 measured at 77% of device peak, introduced
+// against a bit-identical gate rather than alongside a physics change. M4.1b
+// makes it load-bearing, when `average` becomes a coalesce that writes only
+// the interface layer and there is no longer anything overwriting the deep
+// interior.
+//
+// The test is per-BLOCK, not per-cell: refinement is always whole-block, so
+// one blockSlot load answers it for every cell in the block. Same shape as
+// the 2D `amr_force.wgsl:84` finest-wins mask.
+override HAS_POOL : u32 = 0u;
+override RB : u32 = 4u;
+override NBX : u32 = 1u;
+override NBY : u32 = 1u;
+override NBZ : u32 = 1u;
+
+fn coveredByFiner(x: u32, y: u32, z: u32) -> bool {
+  if (HAS_POOL == 0u) { return false; }
+  let b = ((z / RB) * NBY + (y / RB)) * NBX + (x / RB);
+  return blockSlot[b] >= 0;
+}
 
 override WGX : u32 = 4u;
 override WGY : u32 = 4u;
@@ -158,6 +198,7 @@ fn initEq(@builtin(global_invocation_id) gid: vec3<u32>) {
 fn step(@builtin(global_invocation_id) gid: vec3<u32>) {
   let x = gid.x; let y = gid.y; let z = gid.z;
   if (x >= NX || y >= NY || z >= NZ) { return; }
+  if (coveredByFiner(x, y, z)) { return; }
   let ncells = NX * NY * NZ;
   let cell = cellIndex(x, y, z);
 
