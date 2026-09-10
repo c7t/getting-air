@@ -33,10 +33,12 @@
 //   ?margin=2  ?boxfrac=0.5
 //   ?interface=  `interp` (default) is the M3 trilinear-plus-Dupuis-Chopard
 //                coupling: not conservative, but correct everywhere.
-//                `explode` is the M4.1b Chen et al. 2006 explode/coalesce --
-//                EXACTLY conservative on a flat seam and on ?refine=all, and
-//                it LEAKS MASS in proportion to convex EDGE length. Not the
-//                default until that is found. plans/3D.md M4.1b.
+//                `explode` is the M4.1b Chen et al. 2006 explode/coalesce.
+//                EXACTLY conservative in mass AND momentum on every rung of
+//                the geometry ladder (all/slab/bar/box) as of the orphan
+//                pass in common_d3_amr_coalesce.wgsl. Still not the default:
+//                it has no body coupling yet and its remaining seam error
+//                wants the linear explosion. plans/3D.md M4.1b, M4.1c-d.
 //   ?reflux=1    OPT-IN coarse/fine interface flux correction (M4). Makes
 //                the interface exactly conservative in mass and momentum,
 //                and on a seam with no convex corner (?refine=slab) halves

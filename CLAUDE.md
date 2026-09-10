@@ -208,11 +208,12 @@ comment above `N_LEVELS`, not this file, for what's current.
 
 ## The 3D fork (`plans/3D.md`)
 
-**M0, M1, M2 and M3 are done**; M4 is next, and its first item is the
-interface flux correction (refluxing), not dynamic refinement. Read
-`plans/3D.md` before touching any of this — in particular its decision table
-at the top, which records what is settled so it does not get re-argued.
-Two things are settled and load-bearing:
+**M0-M3 are done, and M4 is in progress**: M4.1a and M4.1b have landed, so
+the coarse/fine interface on the `?interface=explode` path is now exactly
+conservative in mass AND momentum. M4.1c (the linear explosion) is next.
+Read `plans/3D.md` before touching any of this — in particular its decision
+table at the top, which records what is settled so it does not get
+re-argued. Two things are settled and load-bearing:
 
 - **The coarse/fine interface uses the materialized RING. Ghost-free is not
   being pursued** (2D measured it at 5-9% against a ~10% floor, it imposes a
@@ -260,43 +261,56 @@ Also settled, and worth knowing before adding a page:
   deliberately not fixed in the same change, because it would move the
   entire 2D benchmark surface at once and `main` is the published site.
 
-- **The 3D AMR coarse/fine interface is still NOT conservative** (M3's
-  remaining open issue). With the rescale corrected a partially-refined run
-  converges at FIRST order -- whole-domain L2rel 1.36e-2 / 9.02e-3 / 7.04e-3
-  at N = 32/48/64 on the analytic Beltrami box case, against no-interface
-  controls at 4.6e-3 / 2.3e-3 / 2.0e-3. That is the composite-grid
-  signature: the two sides compute the seam flux independently and disagree.
-  **Until this is solved, do not trust a quantitative number from a
-  partially-refined 3D run**, which is why there is no sphere-with-AMR case
-  in the suite.
+- **The 3D AMR coarse/fine interface IS conservative on the explode path,
+  as of M4.1b (`?interface=explode`)** — mass and momentum both, on every
+  rung of the geometry ladder (`?refine=all|slab|bar|box`). The DEFAULT
+  path (`?interface=interp`) is unchanged and still is not: a
+  partially-refined run there converges at FIRST order, whole-domain L2rel
+  1.36e-2 / 9.02e-3 / 7.04e-3 at N = 32/48/64 on the analytic Beltrami box
+  case, against no-interface controls at 4.6e-3 / 2.3e-3 / 2.0e-3. So **do
+  not trust a quantitative number from a partially-refined 3D run on the
+  default path**, which is why there is still no sphere-with-AMR case in
+  the suite. Explode is not the default yet because it has no body coupling
+  and its remaining seam error wants M4.1c.
 
-- **Refluxing is BUILT, exact, opt-in (`?reflux=1`) and NOT sufficient.**
-  It makes the interface exactly conservative -- the momentum leak stops
-  dead -- and on a corner-free seam (`?refine=slab`) halves the field error.
-  On a seam with a convex corner (`?refine=box`, and any body-fitted shell)
-  it is far worse than leaving it off. **The corner does not tile**: at a
-  convex corner the coarse grid crosses one full channel while the fine grid
-  crosses only two cells x two substeps = half of it, because D3Q19 has no
-  (1,1,±1). Fine channels tile a coarse FACE exactly and a coarse CORNER not
-  at all, which is the Berger-Colella assumption LBM breaks. Do not "fix"
-  this by re-deriving the accounting -- read `shaders/common_d3_amr_flux.wgsl`
-  and plans/3D.md M4 first, and use `?refine=slab` as the control that
-  separates a correction bug from the corner. The literature's answer is to
-  change the formulation (volumetric: advection is a rigid-body translation
-  of a cell and mass moves by VOLUME OVERLAP, which tiles at corners
-  because overlaps partition space) rather than to patch the balance --
-  plans/3D.md M4 has all three primary sources read. **The scheme to build
-  is Chen et al. 2006's EXPLODE/COALESCE** (the PowerFLOW algorithm): the
-  interface coarse layer is subdivided so coarse and fine voxels overlap
-  the same volume, a state whose coarse neighbour does not exist is
-  exploded into the fine voxels and REMOVED from coarse dynamics, and the
-  matching fine states are coalesced back and removed from fine dynamics.
-  Mass goes exactly one place by construction, so the corner never arises.
-  Exact in mass, momentum and energy; second order with a LINEAR explosion,
-  which is conservation-free because our children are already symmetric
-  about the coarse centre. It removes the Dupuis-Chopard rescale entirely.
-  Rohde 2006 is the same family but MASS-only, and our leak is in
-  MOMENTUM.
+- **Explode/coalesce is Chen et al. 2006's scheme (the PowerFLOW
+  algorithm), and it delivers by DESTINATION.** The interface coarse layer
+  is subdivided so coarse and fine voxels overlap the same volume; a state
+  whose coarse neighbour does not exist is exploded into the fine voxels
+  and REMOVED from coarse dynamics, and the matching fine states are
+  coalesced back and removed from fine dynamics. Mass goes exactly one
+  place by construction, so the convex corner that defeated refluxing never
+  arises. No Dupuis-Chopard rescale anywhere on this path.
+
+  **The one trap, and it cost a full debugging cycle: a ring cell's content
+  is claimed by `coarse(p) - e_i`, and that cell is not always covered.**
+  The `t + dt/2` outflux has moved one FINE cell, so on a diagonal
+  direction `coarse(p)` advances on only some of `e_i`'s axes and
+  subtracting `e_i` steps back OUT of the refined region on the others. On
+  a flat face it lands on another covered cell (harmless, a lateral smear);
+  at a convex EDGE it lands on the diagonally-outside unrefined cell, so
+  nobody claimed it and the mass was dropped — measured -1.2e-2 per edge
+  coarse cell per macro-step against a predicted f/2 ~ 1.4e-2. The fix is
+  the ORPHAN PASS in `common_d3_amr_coalesce.wgsl`, which runs the same
+  claim test with the opposite sign on the unrefined cells and ADDS the
+  orphan to their own slot. **Do not "simplify" this into gathering by
+  ORIGIN** — that is also exactly conservative, is a smaller change, and
+  was measured 4.6x worse in the field, because at a convex corner it hands
+  a coarse cell mass that physically sits in a different neighbour.
+  Conservation is necessary and not sufficient.
+
+- **Refluxing (`?reflux=1`) is SUPERSEDED. Do not extend it.** It is what
+  measured the corner and is why explode/coalesce was found: it makes the
+  interface exactly conservative and on a corner-free seam (`?refine=slab`)
+  halves the field error, but on a seam with a convex corner (`?refine=box`,
+  and any body-fitted shell) it is far worse than leaving it off. **The
+  corner does not tile**: at a convex corner the coarse grid crosses one
+  full channel while the fine grid crosses only two cells x two substeps =
+  half of it, because D3Q19 has no (1,1,±1). Fine channels tile a coarse
+  FACE exactly and a coarse CORNER not at all, which is the Berger-Colella
+  assumption LBM breaks. `shaders/common_d3_amr_flux.wgsl` and plans/3D.md
+  M4 carry the full trace, and `?refine=slab` is the control that separates
+  a correction bug from the corner.
 
 - **`?refine=all` cannot see an interface bug**, so never treat it as
   coverage for one. With every block refined, the restriction's rescaled
