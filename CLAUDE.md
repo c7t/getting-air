@@ -9,9 +9,10 @@ step** — the source *is* the artifact; GitHub Pages serves it directly.
   `shaders/amr_*.wgsl`. **Most active work is here.**
 - `index-cylinder*.html` / `main-cylinder*.js` — cylinder-in-crossflow validation
   harness (base + AMR variants).
-- `index-3d.html` / `main-3d.js` — dense 3D LBM (D3Q19/D3Q27), no AMR, no
-  body, slice view. **One page, three scenarios** via `?scenario=duct|
-  beltrami|tgv`. Shaders: `shaders/d3_*.wgsl`. See "The 3D fork" below.
+- `index-3d.html` / `main-3d.js` — dense 3D LBM (D3Q19/D3Q27), no AMR,
+  slice view, with a 6-DOF rigid body. **One page, five scenarios** via
+  `?scenario=duct|beltrami|tgv|sphere|spin`. Shaders: `shaders/d3_*.wgsl`.
+  See "The 3D fork" below.
 - `index-3d-spike.html` / `main-3d-spike.js` — 3D bench page, the M0
   milestone of `plans/3D.md`. Not a solver: dense periodic grid, no body,
   no AMR, no render.
@@ -207,7 +208,7 @@ comment above `N_LEVELS`, not this file, for what's current.
 
 ## The 3D fork (`plans/3D.md`)
 
-**M0 and M1 are done**; M2 (the body) is next. Read
+**M0, M1 and M2 are done**; M3 (the octree pool) is next. Read
 `plans/3D.md` before touching any of this — in particular its decision table
 at the top, which records what is settled so it does not get re-argued.
 Two things are settled and load-bearing:
@@ -219,6 +220,23 @@ Two things are settled and load-bearing:
   `plans/3D.md` sec 2.1 for the decision.
 - **f32 registers are not a constraint**, measured, so nothing should be
   restructured around avoiding them. `plans/3D.md` sec 2.4.
+- **The 6-DOF body integrates angular MOMENTUM, not angular velocity**, and
+  takes a MIDPOINT step on the rotation group. Both are load-bearing: the
+  first makes |L| exactly conserved (measured 0.00e+0 over 12500 GPU steps)
+  and removes an explicit gyroscopic cross product; the second was worth
+  58.87% -> 0.0052% rotational-energy drift, and without it a body spun
+  about its MAJOR axis *flipped* — an instability that does not exist, which
+  no conservation check catches. `d3-body.mjs` is the reference
+  `shaders/d3_physics.wgsl` mirrors; the `spin` scenario compares them on
+  real GPU code.
+- **Bounce-back is the accurate solid coupling in 3D; diffuse (chi) is
+  not.** Sphere Cd measures +7..13% against Schiller-Naumann with
+  bounce-back, and +49..131% with diffuse — converging from above with
+  resolution, the same open diffuse-interface-width issue recorded above for
+  the 2D dense-reference cylinder, amplified because the frontal-area error
+  goes as (1+d/R)^2 in 3D rather than (1+d/R). The diffuse sphere cases are
+  REGRESSION checks against recorded values, not physics checks; do not
+  re-baseline them against literature.
 
 Also settled, and worth knowing before adding a page:
 
@@ -259,11 +277,22 @@ What exists today:
   to converge to it at second order, the Beltrami field against
   `curl(u) = k u` by finite differences — rather than against a
   transcription of the same formula.
-- `tools/validate-3d.js` + `benchmarks/d3.json` — the M1 gates. Two are
-  analytic and PASS/FAIL; the 3D TGV only reports.
+- `d3-body.mjs` — 6-DOF shapes, TRUE signed distances (sphere and rounded
+  box exact; spheroid via the 2D ellipse Newton in the meridional plane; a
+  triaxial ellipsoid deliberately absent, since an approximate one is the
+  trap `common_geometry.wgsl`'s header documents), inertia tensors,
+  quaternions, and the free-body integrator. `tools/test-d3-body.js` guards
+  the struct layout against the shader, asserts `|grad phi| = 1` and a
+  brute-force nearest-point search, and asserts the tennis-racket theorem
+  (a body spun about its intermediate axis must flip, one about a stable
+  axis must not).
+- `tools/validate-3d.js` + `benchmarks/d3.json` — the M1 and M2 gates.
+  Analytic PASS/FAIL for duct, Beltrami, spin and the bounce-back sphere;
+  the 3D TGV only reports; the diffuse sphere cases are regression checks.
 
-      node tools/validate-3d.js                   # owns Chrome; 13 cases
-      node tools/validate-3d.js --cases=duct-N48 --skip=tgv
+      node tools/validate-3d.js                   # owns Chrome; 23 cases
+      node tools/validate-3d.js --cases=spin-N32
+      node tools/validate-3d.js --skip=tgv,sphere,sphere-diffuse
 
   **Read `benchmarks/d3.json`'s `tolerances_note` before re-baselining
   anything** -- the tolerances were set from measurement, and it records

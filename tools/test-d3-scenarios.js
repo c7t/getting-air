@@ -80,7 +80,7 @@ const close = (a, b, tol, what) =>
   const {
     CS2, nuFromTau, tauFromNu, ductCoord, ductVelocityAt, ductPeakCoeff, ductForceForPeak,
     ductProfile, ductSettleTime, beltramiK, beltramiDecayTime, beltramiVelocityAt,
-    tgvVelocityAt, SCENARIOS, SCENARIO_NAMES, resolveScenario,
+    tgvVelocityAt, SCENARIOS, SCENARIO_NAMES, resolveScenario, schillerNaumann,
   } = S;
 
   // --- viscosity mapping ---------------------------------------------------
@@ -299,15 +299,19 @@ const close = (a, b, tol, what) =>
   });
 
   // --- scenario table ------------------------------------------------------
-  ok('every scenario resolves, derives a viscosity, and seeds a finite field', () => {
+  ok('every scenario resolves to explicit dims and seeds a finite field of that size', () => {
     for (const name of SCENARIO_NAMES) {
       const p = resolveScenario(name, { n: 16 });
       assert.ok(p.nu > 0, `${name}: nu must be positive`);
+      assert.ok(p.tau > 0.5, `${name}: tau must exceed 1/2 (nu > 0)`);
       assert.strictEqual(p.scenario, name);
-      const m = SCENARIOS[name].macro(16, p);
-      assert.strictEqual(m.length, 4 * 16 ** 3, `${name}: macro field is the wrong length`);
+      assert.ok(Array.isArray(p.dims) && p.dims.length === 3, `${name}: dims must be a 3-vector`);
+      assert.ok(p.dims.every(d => Number.isInteger(d) && d > 0), `${name}: dims must be positive integers, got ${p.dims}`);
+      const cells = p.dims[0] * p.dims[1] * p.dims[2];
+      const m = SCENARIOS[name].macro(p.dims, p);
+      assert.strictEqual(m.length, 4 * cells, `${name}: macro field is the wrong length for dims ${p.dims}`);
       assert.ok(m.every(Number.isFinite), `${name}: macro field has non-finite entries`);
-      for (let c = 0; c < 16 ** 3; c++) {
+      for (let c = 0; c < cells; c++) {
         assert.ok(m[4 * c] > 0.9 && m[4 * c] < 1.1, `${name}: seeded rho out of range at cell ${c}`);
       }
     }
@@ -315,7 +319,7 @@ const close = (a, b, tol, what) =>
 
   ok('duct scenario seeds a quiescent field (its reference is independent of its seed)', () => {
     const p = resolveScenario('duct', { n: 16 });
-    const m = SCENARIOS.duct.macro(16, p);
+    const m = SCENARIOS.duct.macro(p.dims, p);
     for (let c = 0; c < 16 ** 3; c++) {
       for (let i = 1; i < 4; i++) close(m[4 * c + i], 0, 0, `velocity component ${i} at cell ${c}`);
       close(m[4 * c], 1, 0, `rho at cell ${c}`);
@@ -332,12 +336,78 @@ const close = (a, b, tol, what) =>
   ok('beltrami macro seed matches the analytic field at t=0', () => {
     const n = 16;
     const p = resolveScenario('beltrami', { n });
-    const m = SCENARIOS.beltrami.macro(n, p);
+    const m = SCENARIOS.beltrami.macro(p.dims, p);
     for (const [x, y, z] of [[0, 0, 0], [5, 9, 13], [15, 15, 15]]) {
       const c = (z * n + y) * n + x;
       const want = beltramiVelocityAt(x, y, z, n, p.u0, p.nu, 0);
       for (let i = 0; i < 3; i++) close(m[4 * c + 1 + i], want[i], 1e-7, `component ${i} at (${x},${y},${z})`);
     }
+  });
+
+  // --- sphere (M2) ---------------------------------------------------------
+  ok('sphere: tau follows from the target Re, and the geometry is consistent', () => {
+    for (const [n, re, u0] of [[16, 100, 0.05], [24, 20, 0.04], [12, 200, 0.06]]) {
+      const p = resolveScenario('sphere', { n, re, u0 });
+      // Re = U D / nu is the DEFINITION, so this must hold by construction.
+      close(p.u0 * p.D / p.nu, re, 1e-9 * re, `Re at n=${n}`);
+      close(p.tau, tauFromNu(p.nu), 1e-12, 'tau/nu consistency');
+      assert.ok(p.tau > 0.5, `tau=${p.tau} must exceed 1/2`);
+      close(p.R, n / 2, 0, 'radius');
+      close(p.area, Math.PI * (n / 2) ** 2, 1e-9, 'frontal area');
+      // Body centred across the span, upstream along x.
+      close(p.body.x[1], p.dims[1] / 2, 0, 'body y');
+      close(p.body.x[2], p.dims[2] / 2, 0, 'body z');
+      assert.ok(p.body.x[0] > p.R * 2, 'body must sit clear of the inlet');
+      assert.ok(p.dims[0] - p.body.x[0] > 6 * p.R, 'wake needs room downstream');
+      assert.ok(p.blockage < 0.02, `blockage ${(p.blockage * 100).toFixed(2)}% should be small`);
+      assert.ok(p.pinned === true, 'the sphere gate measures force on a body that does not move');
+    }
+  });
+
+  ok('Schiller-Naumann matches the tabulated sphere drag curve over the range it is used in', () => {
+    // Standard-drag-curve values. The band is 5%, which is the correlation's
+    // own stated accuracy -- not a number chosen to make this pass.
+    //
+    // Re = 1 is deliberately absent. Schiller-Naumann is quoted for
+    // Re up to ~800 and is at its weakest at the Stokes end (it gives 27.6
+    // against a tabulated ~26.5 there, a 4% miss that says nothing about
+    // this implementation). Nothing in benchmarks/d3-sphere.json goes below
+    // Re = 20, so the test covers the range actually relied on.
+    for (const [re, cd] of [[10, 4.15], [20, 2.61], [50, 1.57], [100, 1.09], [200, 0.80]]) {
+      const got = schillerNaumann(re);
+      assert.ok(Math.abs(got - cd) / cd < 0.05, `Cd(Re=${re}) = ${got.toFixed(3)}, want ~${cd}`);
+    }
+    // Monotone decreasing over the range it is used in.
+    for (let re = 1; re < 500; re *= 1.5) {
+      assert.ok(schillerNaumann(re * 1.5) < schillerNaumann(re), `Cd must decrease with Re, fails near ${re}`);
+    }
+  });
+
+  ok('sphere seeds the uniform freestream, so there is no start-up transient to wait out', () => {
+    const p = resolveScenario('sphere', { n: 8 });
+    const m = SCENARIOS.sphere.macro(p.dims, p);
+    const cells = p.dims[0] * p.dims[1] * p.dims[2];
+    for (let c = 0; c < cells; c += 97) {
+      close(m[4 * c + 1], Math.fround(p.u0), 1e-7, `ux at cell ${c}`);
+      close(m[4 * c + 2], 0, 1e-9, `uy at cell ${c}`);
+    }
+  });
+
+  // --- spin (M2) -----------------------------------------------------------
+  ok('spin: a free tumbling body with the fluid force switched off', () => {
+    const p = resolveScenario('spin', { n: 32 });
+    assert.strictEqual(p.pinned, false);
+    assert.strictEqual(p.noFluidForce, true, 'the point of this scenario is to isolate the integrator');
+    // Near the INTERMEDIATE principal axis, so the compared trajectory is
+    // the tumbling one -- agreeing on a steady spin would be a weaker test.
+    const I = p.body.ibody;
+    assert.ok(I[0] < I[1] && I[1] < I[2], `expected ordered moments, got ${I.map(v => v.toExponential(2))}`);
+    const w = p.body.omega;
+    assert.ok(Math.abs(w[1]) > 100 * Math.abs(w[0]), 'spin should be about the intermediate (y) axis');
+    // Not axis-aligned: an orientation-handling bug that only shows up off
+    // the identity would otherwise hide.
+    assert.ok(Math.abs(p.body.q[0] - 1) > 1e-3, 'initial orientation should not be the identity');
+    assert.ok(p.body.x.every((c, i) => Math.abs(c - p.dims[i] / 2) < 1e-9), 'body should start centred');
   });
 
   ok('resolveScenario rejects an unknown name instead of falling back', () => {

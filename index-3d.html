@@ -14,7 +14,11 @@
       flex: 1; position: relative; display: flex; align-items: center;
       justify-content: center; background: #000; overflow: hidden; container-type: size;
     }
-    canvas { display: block; width: min(100cqw, 100cqh); height: min(100cqw, 100cqh); }
+    /* Aspect ratio is set from JS to the SLICE's in-plane extent, not fixed
+       square: the sphere scenario's domain is 192x128x128, and letting a
+       square canvas stretch it renders a sphere as an ellipse -- which reads
+       as a geometry bug in a page whose whole job is showing geometry. */
+    canvas { display: block; width: 100cqw; height: auto; max-height: 100cqh; }
     #status {
       position: absolute; top: 8px; left: 8px; font-size: 12px; color: #7f7;
       background: rgba(0,0,0,0.6); padding: 4px 8px; border-radius: 3px;

@@ -2,9 +2,12 @@
 // macroscopic-field output the renderer and the validation readbacks use.
 // plans/3D.md M1.
 //
-// Fragment only. Included by shaders/d3_step_q19.wgsl and
-// shaders/d3_step_q27.wgsl, each pairing it with a different
-// common_d3q{19,27}_lattice.wgsl -- that pairing is the ENTIRE difference
+// Fragment only, and fragments cannot themselves @include (shader-loader.mjs
+// splices one level, deliberately -- no cycle detection needed). So the
+// ENTRY files list every fragment this body needs: the lattice,
+// common_d3_geometry.wgsl and common_d3_sponge.wgsl. Included by
+// shaders/d3_step_q19.wgsl and shaders/d3_step_q27.wgsl, each pairing it
+// with a different common_d3q{19,27}_lattice.wgsl -- that pairing is the ENTIRE difference
 // between the velocity sets, so `?q=19|27` costs one extra entry file and
 // no branches (plans/3D.md sec 4). Nothing here names a Q; it speaks only
 // QN / ex / ey / ez / wt / opp / feqD3Q.
@@ -55,6 +58,11 @@
 // lesson is that optimizations here get measured, not assumed, and M1 has
 // no measurement apparatus for the 3D solver yet.
 @group(0) @binding(2) var<storage, read_write> mac : array<f32>;
+// Rigid body. Always bound (one bind-group layout for every scenario, see
+// main-3d.js), and completely inert when HAS_BODY is 0 -- these are
+// pipeline-overridable constants, so the whole solid-coupling path folds
+// out at pipeline-creation time for the M1 scenarios.
+@group(0) @binding(3) var<storage, read>       body : BodyState3D;
 
 override NX : u32;
 override NY : u32;
@@ -79,6 +87,30 @@ override FORCE_Z : f32 = 0.0f;
 override WALL_X : u32 = 0u;
 override WALL_Y : u32 = 0u;
 override WALL_Z : u32 = 0u;
+
+// --- solid body (M2) -------------------------------------------------------
+// 0 = no interior body at all; skip every get_phi3/chi evaluation. Default,
+// and exactly what the M1 scenarios (duct, beltrami, tgv) run.
+override HAS_BODY : u32 = 0u;
+
+// Sharp momentum-exchange bounce-back instead of the diffuse
+// (Brinkman/Guo) volume penalization. Same both-methods-live arrangement as
+// the 2D lbm_step.wgsl: direct comparison of the two needs both available,
+// and it changes the numerical method rather than a tunable within one.
+// MUST match d3_force.wgsl's own setting -- main-3d.js always creates the
+// pair together.
+override USE_BOUNCEBACK : u32 = 0u;
+
+// Width of the diffuse chi band, in lattice cells. 1.5 matches the 2D
+// dense kernel exactly.
+override CHI_EPS : f32 = 1.5f;
+
+// ALBC sponge: relax toward a uniform freestream within SPONGE_W cells of
+// every domain face. <= 0 disables it (the periodic and walled scenarios).
+override SPONGE_W : f32 = 0.0f;
+override SPONGE_UX : f32 = 0.0f;
+override SPONGE_UY : f32 = 0.0f;
+override SPONGE_UZ : f32 = 0.0f;
 
 fn cellIndex(x: u32, y: u32, z: u32) -> u32 {
   return (z * NY + y) * NX + x;
@@ -130,18 +162,36 @@ fn step(@builtin(global_invocation_id) gid: vec3<u32>) {
   let cell = cellIndex(x, y, z);
 
   // 1. Pull-stream, with bounce-back where the source is outside a wall.
+  let p = vec3<f32>(f32(x), f32(y), f32(z));
+  let phi = select(1e30f, get_phi3(p, body), HAS_BODY != 0u);
+  let us = select(vec3<f32>(0f), bodyVelocity3(p, body), HAS_BODY != 0u);
+
   var f : array<f32, QN>;
   for (var i = 0u; i < QN; i++) {
-    if ((WALL_X | WALL_Y | WALL_Z) != 0u && wallSourceOutside3(x, y, z, i)) {
+    let sxi = i32(x) - ex[i];
+    let syi = i32(y) - ey[i];
+    let szi = i32(z) - ez[i];
+    if (HAS_BODY != 0u && USE_BOUNCEBACK != 0u
+        && get_phi3(vec3<f32>(f32(sxi), f32(syi), f32(szi)), body) < 0f) {
+      // The streaming source is inside the solid: reflect this cell's own
+      // population that was heading toward it (opp[i], since direction i's
+      // source being solid puts the wall in direction opp[i] from here),
+      // with Ladd's moving-wall correction for the body's local velocity.
+      // rho = 1 in the correction -- the standard near-incompressible
+      // approximation for this term specifically, which avoids a circular
+      // dependency on this cell's own not-yet-gathered rho.
+      let corr = 2f * wt[i] * dot(vec3<f32>(f32(ex[i]), f32(ey[i]), f32(ez[i])), us) / CS2;
+      f[i] = f_in[opp[i] * ncells + cell] + corr;
+    } else if ((WALL_X | WALL_Y | WALL_Z) != 0u && wallSourceOutside3(x, y, z, i)) {
       // The source is inside the wall, so there is no fluid population to
       // pull: reflect this cell's OWN pre-streaming population that was
       // heading the other way. Direction i's source being solid means the
       // wall lies in direction opp[i] from here.
       f[i] = f_in[opp[i] * ncells + cell];
     } else {
-      let sx = u32((i32(x) - ex[i] + i32(NX)) % i32(NX));
-      let sy = u32((i32(y) - ey[i] + i32(NY)) % i32(NY));
-      let sz = u32((i32(z) - ez[i] + i32(NZ)) % i32(NZ));
+      let sx = u32((sxi + i32(NX)) % i32(NX));
+      let sy = u32((syi + i32(NY)) % i32(NY));
+      let sz = u32((szi + i32(NZ)) % i32(NZ));
       f[i] = f_in[i * ncells + cellIndex(sx, sy, sz)];
     }
   }
@@ -157,16 +207,32 @@ fn step(@builtin(global_invocation_id) gid: vec3<u32>) {
   let rhoDen = max(rho, 1e-6f);  // NaN-containment floor, parity with lbm_step
   let ux_star = mx / rhoDen; let uy_star = my / rhoDen; let uz_star = mz / rhoDen;
 
-  // 3. Guo forcing: the actual fluid velocity is u = u* + F/(2 rho).
-  let ux = ux_star + FORCE_X / (2.0f * rhoDen);
-  let uy = uy_star + FORCE_Y / (2.0f * rhoDen);
-  let uz = uz_star + FORCE_Z / (2.0f * rhoDen);
-  let u_sq = ux*ux + uy*uy + uz*uz;
+  // 3. Solid coupling and forcing.
+  //
+  // chi is forced to 0 under USE_BOUNCEBACK -- the sharp reflection in the
+  // gather above IS the entire boundary condition in that mode, and the
+  // penalty force below collapses to the uniform body force alone. Same
+  // arrangement as the 2D lbm_step.wgsl.
+  let chi = select(0f, chiFromPhiEps3(phi, CHI_EPS),
+                   HAS_BODY != 0u && USE_BOUNCEBACK == 0u);
+  let ustar = vec3<f32>(ux_star, uy_star, uz_star);
+  // Penalty force F = rho chi (Us - u*), plus the uniform body force.
+  let F = rho * chi * (us - ustar) + vec3<f32>(FORCE_X, FORCE_Y, FORCE_Z);
+
+  // Guo forcing: the actual fluid velocity is u = u* + F/(2 rho).
+  let u = ustar + F / (2.0f * rhoDen);
+  let ux = u.x; let uy = u.y; let uz = u.z;
+  let u_sq = dot(u, u);
 
   mac[4u * cell + 0u] = rho;
   mac[4u * cell + 1u] = ux;
   mac[4u * cell + 2u] = uy;
   mac[4u * cell + 3u] = uz;
+
+  let spongeW = spongeWeight3(
+    min(f32(x), f32(NX - 1u - x)),
+    min(f32(y), f32(NY - 1u - y)),
+    min(f32(z), f32(NZ - 1u - z)), SPONGE_W);
 
   // 4. Collide. Gathered whole and stored whole, matching lbm_step.wgsl --
   // see common_fpack.wgsl for why a per-plane store is not an option once
@@ -180,14 +246,19 @@ fn step(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Guo's source term:
     //   Si = (1 - 1/(2 tau)) wi [ (ei - u)/cs2 + (ei.u)/cs4 ei ] . F
     // with cs2 = 1/3 so 1/cs2 = 3 and 1/cs4 = 9.
-    let t1x = (exf - ux) * 3.0f;
-    let t1y = (eyf - uy) * 3.0f;
-    let t1z = (ezf - uz) * 3.0f;
-    let t2  = eu * 9.0f;
-    let Si = (1.0f - 0.5f * OMEGA) * wt[i]
-           * ((t1x + t2*exf)*FORCE_X + (t1y + t2*eyf)*FORCE_Y + (t1z + t2*ezf)*FORCE_Z);
+    let ei = vec3<f32>(exf, eyf, ezf);
+    let t1 = (ei - u) * 3.0f;
+    let t2 = eu * 9.0f;
+    let Si = (1.0f - 0.5f * OMEGA) * wt[i] * dot(t1 + t2 * ei, F);
 
-    fo[i] = f[i] - OMEGA * (f[i] - feq) + Si;
+    let fCollide = f[i] - OMEGA * (f[i] - feq) + Si;
+
+    // ALBC sponge: relax toward the uniform freestream equilibrium at
+    // rho = 1 near the domain faces. Folds out entirely at SPONGE_W <= 0.
+    let euFar = exf*SPONGE_UX + eyf*SPONGE_UY + ezf*SPONGE_UZ;
+    let uFarSq = SPONGE_UX*SPONGE_UX + SPONGE_UY*SPONGE_UY + SPONGE_UZ*SPONGE_UZ;
+    let fTarget = wt[i] * (1.0f + 3.0f*euFar + 4.5f*euFar*euFar - 1.5f*uFarSq);
+    fo[i] = mix(fCollide, fTarget, spongeW);
   }
 
   for (var i = 0u; i < QN; i++) {

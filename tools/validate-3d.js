@@ -20,7 +20,8 @@
 // Usage:
 //   node tools/validate-3d.js
 //   node tools/validate-3d.js --cases=duct-N48,bel-N48
-//   node tools/validate-3d.js --skip=tgv
+//   node tools/validate-3d.js --skip=tgv,sphere,sphere-diffuse
+//   node tools/validate-3d.js --cases=spin-N32
 //   node tools/validate-3d.js --extra=q=27      # append to every case URL
 
 const fs = require('fs');
@@ -31,6 +32,9 @@ const {
   attachPageWatch, assertPageHealthy, teardown,
 } = require('./lib/browser-lifecycle');
 const { caseUrl, runDuctCase, runBeltramiCase, runTgvReport } = require('./lib/d3-metrics');
+const {
+  caseUrl: bodyCaseUrl, runSphereCase, runSpinCase,
+} = require('./lib/d3-body-metrics');
 
 const REPO_ROOT = path.join(__dirname, '..');
 
@@ -49,6 +53,20 @@ function parseArgs(argv) {
   return opts;
 }
 
+// One place that knows which checks belong to which kind of case -- the
+// summary table, the exit code and the failure detail all read from here,
+// so a check cannot be enforced in one and silently dropped by another.
+function checksOf(r) {
+  if (!r.res) return [];
+  const x = r.res;
+  if (r.scenario === 'duct') return [x.fieldCheck, x.peakCheck, x.xCheck];
+  if (r.scenario === 'beltrami') return [x.fieldCheck, x.rateCheck];
+  if (r.scenario === 'tgv') return [x.finiteCheck];
+  if (r.scenario === 'spin') return [x.angCheck, x.lCheck, x.qCheck, x.movedCheck];
+  if (r.scenario.startsWith('sphere')) return [x.cdCheck, x.settledCheck, x.lateralCheck, ...(x.convergeCheck ? [x.convergeCheck] : [])];
+  return [];
+}
+
 const pad = (s, n) => String(s).padEnd(n);
 const padL = (s, n) => String(s).padStart(n);
 const e3 = (x) => (x == null || !isFinite(x) ? '-' : x.toExponential(3));
@@ -62,7 +80,12 @@ async function main() {
     { scenario: 'duct', run: runDuctCase, cases: bench.duct_cases, gate: true },
     { scenario: 'beltrami', run: runBeltramiCase, cases: bench.beltrami_cases, gate: true },
     { scenario: 'tgv', run: runTgvReport, cases: bench.tgv_cases, gate: false },
-  ].filter(g => !opts.skip.includes(g.scenario))
+    // M2. `spin` first: it is seconds long and it isolates the integrator,
+    // so if it fails there is no point spending minutes on the sphere.
+    { scenario: 'spin', run: runSpinCase, cases: bench.spin_cases, gate: true, body: true },
+    { scenario: 'sphere', run: runSphereCase, cases: bench.sphere_cases, gate: true, body: true },
+    { scenario: 'sphere', key: 'sphere-diffuse', run: runSphereCase, cases: bench.sphere_diffuse_cases, gate: true, body: true, diffuse: true },
+  ].filter(g => !opts.skip.includes(g.key || g.scenario))
    .map(g => ({ ...g, cases: g.cases.filter(c => wanted(c.name)) }))
    .filter(g => g.cases.length);
 
@@ -89,7 +112,8 @@ async function main() {
   try {
     for (const g of groups) {
       for (const c of g.cases) {
-        const url = caseUrl(opts.baseUrl, g.scenario, c, opts.extra);
+        const url = g.body ? bodyCaseUrl(opts.baseUrl, g.scenario, c, opts.extra)
+                           : caseUrl(opts.baseUrl, g.scenario, c, opts.extra);
         console.log(`\n=== ${c.name} (${url})`);
         try {
           await navigateTo(Page, url);
@@ -97,7 +121,30 @@ async function main() {
           await assertPageHealthy(Runtime, watch, c.name);
           const res = await g.run(Runtime, opts, c, s => console.log('    ' + s));
           await assertPageHealthy(Runtime, watch, c.name);
-          report.push({ name: c.name, scenario: g.scenario, gate: g.gate, res });
+          // A diffuse sphere case is scored against a RECORDED value, not
+          // against literature -- see benchmarks/d3.json's
+          // sphere_tolerances_note. Substituting the check here keeps that
+          // distinction in one place instead of forking the runner.
+          if (g.diffuse && c.cd_recorded != null) {
+            const rel = (res.cd - c.cd_recorded) / c.cd_recorded;
+            res.cdCheck = { pass: Math.abs(rel) <= c.cd_tol_rel_recorded, label: 'CdVsRecorded',
+                            measured: rel, target: 0, tol: c.cd_tol_rel_recorded };
+            res.recorded = c.cd_recorded;
+            console.log(`    against the RECORDED ${c.cd_recorded} (not literature): ${(rel * 100).toFixed(2)}%`);
+          }
+          // Refining must move Cd TOWARD the reference. A single tolerance
+          // can be satisfied by a body of the wrong size with a
+          // compensating error; a convergence trend cannot.
+          if (c.converges_from) {
+            const coarse = report.find(r => r.name === c.converges_from);
+            if (coarse && coarse.res) {
+              const improved = Math.abs(res.relErr) < Math.abs(coarse.res.relErr);
+              res.convergeCheck = { pass: improved, label: 'refinesTowardReference',
+                measured: `${(coarse.res.relErr * 100).toFixed(1)}% -> ${(res.relErr * 100).toFixed(1)}%`, target: 'closer' };
+              console.log(`    refinement: ${(coarse.res.relErr * 100).toFixed(1)}% -> ${(res.relErr * 100).toFixed(1)}% vs reference`);
+            }
+          }
+          report.push({ name: c.name, scenario: g.key || g.scenario, gate: g.gate, res });
         } catch (err) {
           console.error(`    FAILED: ${err.message}`);
           report.push({ name: c.name, scenario: g.scenario, gate: g.gate, error: err.message });
@@ -110,13 +157,13 @@ async function main() {
     await teardown({ port: opts.port, tabId, chrome, server, keepOpen: opts.keepOpen });
   }
 
-  console.log('\n' + '='.repeat(104));
+  console.log('\n' + '='.repeat(112));
   console.log('SUMMARY');
-  console.log('='.repeat(104));
-  console.log(pad('case', 18) + pad('kind', 12) + padL('field L2rel', 14) + padL('2nd metric', 20) + padL('3rd metric', 20) + padL('verdict', 10));
-  console.log('-'.repeat(104));
+  console.log('='.repeat(112));
+  console.log(pad('case', 22) + pad('kind', 16) + padL('field L2rel', 14) + padL('2nd metric', 20) + padL('3rd metric', 20) + padL('verdict', 10));
+  console.log('-'.repeat(112));
   for (const r of report) {
-    if (r.error) { console.log(pad(r.name, 18) + pad(r.scenario, 12) + padL('-', 14) + padL('-', 20) + padL('-', 20) + padL('ERROR', 10)); continue; }
+    if (r.error) { console.log(pad(r.name, 22) + pad(r.scenario, 16) + padL('-', 14) + padL('-', 20) + padL('-', 20) + padL('ERROR', 10)); continue; }
     const x = r.res;
     let c2 = '-', c3 = '-', checks = [];
     if (r.scenario === 'duct') {
@@ -125,29 +172,34 @@ async function main() {
     } else if (r.scenario === 'beltrami') {
       c2 = `rate ${e3(x.rateRelErr)}`; c3 = `td ${x.td.toFixed(0)}`;
       checks = [x.fieldCheck, x.rateCheck];
+    } else if (r.scenario === 'spin') {
+      c2 = `|L| drift ${e3(x.lCheck.measured)}`; c3 = `turned ${x.totalTurn.toFixed(2)} rad`;
+      checks = [x.angCheck, x.lCheck, x.qCheck, x.movedCheck];
+    } else if (r.scenario.startsWith('sphere')) {
+      c2 = `Cd ${x.cd.toFixed(4)} (${(x.relErr * 100).toFixed(1)}%)`;
+      c3 = `lat ${e3(x.lateral)}`;
+      checks = [x.cdCheck, x.settledCheck, x.lateralCheck, ...(x.convergeCheck ? [x.convergeCheck] : [])];
     } else {
       c2 = `eps ${e3(x.samples[x.samples.length - 1].dissipation)}`; c3 = `Re ${x.re.toFixed(0)}`;
       checks = [x.finiteCheck];
     }
-    const ok = checks.every(k => k.pass);
+    const ok = checksOf(r).every(k => k.pass);
     if (!ok && r.gate) exitCode = 1;
     if (!ok && !r.gate) exitCode = 1;   // tgv can still fail on non-finite
-    console.log(pad(r.name, 18) + pad(r.scenario + (r.gate ? '' : ' (rep)'), 12)
-      + padL(r.scenario === 'tgv' ? '-' : e3(r.scenario === 'duct' ? x.l2rel : x.maxL2rel), 14)
+    console.log(pad(r.name, 22) + pad(r.scenario + (r.gate ? '' : ' (rep)'), 16)
+      + padL(r.scenario === 'duct' ? e3(x.l2rel)
+             : r.scenario === 'beltrami' ? e3(x.maxL2rel)
+             : r.scenario === 'spin' ? `${e3(x.angCheck.measured)} rad`
+             : r.scenario.startsWith('sphere') ? `ref ${x.cdRef.toFixed(3)}` : '-', 14)
       + padL(c2, 20) + padL(c3, 20) + padL(ok ? 'PASS' : 'FAIL', 10));
   }
 
-  const failed = report.filter(r => r.error || (r.res && [
-    ...(r.scenario === 'duct' ? [r.res.fieldCheck, r.res.peakCheck, r.res.xCheck] : []),
-    ...(r.scenario === 'beltrami' ? [r.res.fieldCheck, r.res.rateCheck] : []),
-    ...(r.scenario === 'tgv' ? [r.res.finiteCheck] : []),
-  ].some(k => !k.pass)));
+  const failed = report.filter(r => r.error || (r.res && checksOf(r).some(k => !k.pass)));
   if (failed.length) {
     console.log('\nDetails for anything not PASS:');
     for (const r of failed) {
       if (r.error) { console.log(`  [${r.name}] ${r.error}`); continue; }
-      const checks = r.scenario === 'duct' ? [r.res.fieldCheck, r.res.peakCheck, r.res.xCheck]
-        : r.scenario === 'beltrami' ? [r.res.fieldCheck, r.res.rateCheck] : [r.res.finiteCheck];
+      const checks = checksOf(r);
       for (const k of checks) {
         if (k.pass) continue;
         console.log(`  [${r.name}] ${k.label}: ${e3(k.measured)} against a tolerance of ${e3(k.tol)}`);

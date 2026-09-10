@@ -41,6 +41,9 @@ const {
   caseUrl: d3CaseUrl, runDuctCase, runBeltramiCase, runTgvReport,
 } = require('./lib/d3-metrics');
 const {
+  caseUrl: d3BodyCaseUrl, runSphereCase, runSpinCase,
+} = require('./lib/d3-body-metrics');
+const {
   ensureServer, ensureChrome, openTab, firstTab, navigateTo, waitForGlobal, teardown,
   attachPageWatch, assertPageHealthy,
 } = require('./lib/browser-lifecycle');
@@ -286,6 +289,23 @@ function defaultConfigs(baseUrl) {
       checkD3Physics: 'beltrami',
       d3Filter: c => c.name === 'bel-N48',
     },
+    // M2, the body. `spin` is seconds long and isolates the 6-DOF
+    // integrator against its host reference on real GPU code -- the highest
+    // value per second in this whole file, since that is the hardest new
+    // code and its errors are the least visible (a wrong gyroscopic
+    // coupling conserves |L| perfectly and simply tumbles wrongly).
+    {
+      name: 'd3-spin',
+      url: `${baseUrl}/index-3d.html?scenario=spin`,
+      checkD3Physics: 'spin',
+      d3Filter: c => c.name === 'spin-N32',
+    },
+    {
+      name: 'd3-sphere',
+      url: `${baseUrl}/index-3d.html?scenario=sphere`,
+      checkD3Physics: 'sphere',
+      d3Filter: c => c.name === 'sphere-Re100-D16',
+    },
   ];
 }
 
@@ -441,21 +461,31 @@ async function runTgvPhysics(Page, Runtime, opts, config) {
 // d3-metrics.js entry points tools/validate-3d.js does.
 async function runD3Physics(Page, Runtime, opts, config, watch) {
   const bench = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, 'benchmarks', 'd3.json'), 'utf8'));
-  const key = { duct: 'duct_cases', beltrami: 'beltrami_cases', tgv: 'tgv_cases' }[config.checkD3Physics];
-  const run = { duct: runDuctCase, beltrami: runBeltramiCase, tgv: runTgvReport }[config.checkD3Physics];
+  const kind = config.checkD3Physics;
+  const key = { duct: 'duct_cases', beltrami: 'beltrami_cases', tgv: 'tgv_cases', sphere: 'sphere_cases', spin: 'spin_cases' }[kind];
+  const run = { duct: runDuctCase, beltrami: runBeltramiCase, tgv: runTgvReport, sphere: runSphereCase, spin: runSpinCase }[kind];
+  // The M2 body cases build their URLs from a different set of knobs (Re,
+  // bounceback) than the M1 fluid ones, so the URL builder follows the case
+  // kind rather than being one function that knows about everything.
+  const urlFor = (c) => (kind === 'sphere' || kind === 'spin')
+    ? d3BodyCaseUrl(opts.baseUrl, kind, c, opts.extra)
+    : d3CaseUrl(opts.baseUrl, kind, c, opts.extra);
   const cases = bench[key].filter(config.d3Filter || (() => true));
 
   const results = [];
   for (const c of cases) {
-    await navigateTo(Page, d3CaseUrl(opts.baseUrl, config.checkD3Physics, c, opts.extra));
+    await navigateTo(Page, urlFor(c));
     await waitForGlobal(Runtime, 'window.__D3', 60000);
     await assertPageHealthy(Runtime, watch, c.name);
     const res = await run(Runtime, { timeout: opts.physicsTimeout }, c, s => console.log('    ' + s));
     await assertPageHealthy(Runtime, watch, c.name);
     results.push({ name: c.name, ...res });
   }
-  const checksOf = (r) => (config.checkD3Physics === 'duct' ? [r.fieldCheck, r.peakCheck, r.xCheck]
-    : config.checkD3Physics === 'beltrami' ? [r.fieldCheck, r.rateCheck] : [r.finiteCheck]);
+  const checksOf = (r) => (kind === 'duct' ? [r.fieldCheck, r.peakCheck, r.xCheck]
+    : kind === 'beltrami' ? [r.fieldCheck, r.rateCheck]
+    : kind === 'sphere' ? [r.cdCheck, r.settledCheck, r.lateralCheck]
+    : kind === 'spin' ? [r.angCheck, r.lCheck, r.qCheck, r.movedCheck]
+    : [r.finiteCheck]);
   const ok = results.every(r => checksOf(r).every(k => k.pass));
   return { ok, results };
 }

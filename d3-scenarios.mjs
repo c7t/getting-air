@@ -40,6 +40,8 @@
 // Same browser+Node dual-consumption pattern as lattice-3d.mjs: imported
 // natively by the page, dynamically imported by the CommonJS tools.
 
+import { SHAPE, makeBodyState, qFromAxisAngle } from './d3-body.mjs';
+
 export const CS2 = 1 / 3;
 
 export function nuFromTau(tau) { return CS2 * (tau - 0.5); }
@@ -196,6 +198,26 @@ export function tgvVelocityAt(x, y, z, N, u0) {
 // which is the O(Ma^2) correction an equilibrium seed otherwise starts
 // with an error in.
 
+// Non-cubic form. M2's sphere scenario needs a long, narrow box; the M1
+// scenarios are all cubes and go through seedMacro() below.
+function seedMacro3(dims, velAt) {
+  const [NX, NY, NZ] = dims;
+  const out = new Float32Array(4 * NX * NY * NZ);
+  for (let z = 0; z < NZ; z++) {
+    for (let y = 0; y < NY; y++) {
+      for (let x = 0; x < NX; x++) {
+        const c = (z * NY + y) * NX + x;
+        const [ux, uy, uz] = velAt(x, y, z);
+        out[4 * c + 0] = 1 - (ux * ux + uy * uy + uz * uz) / (2 * CS2);
+        out[4 * c + 1] = ux;
+        out[4 * c + 2] = uy;
+        out[4 * c + 3] = uz;
+      }
+    }
+  }
+  return out;
+}
+
 function seedMacro(N, velAt) {
   const n3 = N * N * N;
   const out = new Float32Array(4 * n3);
@@ -214,6 +236,32 @@ function seedMacro(N, velAt) {
   return out;
 }
 
+// --- sphere: flow past a pinned sphere (the M2 gate) ----------------------
+//
+// Uniform crossflow along +x past a pinned sphere, with an ALBC sponge on
+// every face relaxing toward the freestream -- the 3D counterpart of this
+// project's 2D cylinder harness, and scored the same way: a time-averaged
+// drag coefficient against literature.
+//
+//   Cd = Fx / (1/2 rho U^2 A),   A = pi R^2
+//
+// The reference is the Schiller-Naumann correlation,
+//   Cd = 24/Re * (1 + 0.15 Re^0.687),
+// which is the standard fit for a sphere below Re ~ 1000 and is quoted as
+// good to a few percent. Below Re ~ 210 the wake is steady and
+// axisymmetric, so unlike the 2D cylinder there is no shedding to
+// time-average -- Cd simply settles, which makes this a cheaper and
+// sharper gate than the cylinder's Cd/St pair.
+export function schillerNaumann(re) {
+  return (24 / re) * (1 + 0.15 * Math.pow(re, 0.687));
+}
+
+// Domain shaped in units of the sphere diameter: long enough downstream for
+// the wake, wide enough that blockage is small. At the defaults below the
+// blockage ratio is pi*(D/2)^2 / (span*D)^2 = 1.2%, which moves Cd by well
+// under the tolerance.
+const SPHERE_DOMAIN = { length: 12, span: 8, upstream: 3 };
+
 export const SCENARIOS = {
   // Quiescent start, walls on y and z, driven to a steady analytic profile.
   // The initial condition is INDEPENDENT of the reference solution here
@@ -230,7 +278,7 @@ export const SCENARIOS = {
       const G = ductForceForPeak(u0, a, nu);
       return { nu, a, G, force: [G, 0, 0], settle: ductSettleTime(n, nu), uPeak: u0 };
     },
-    macro: (N) => seedMacro(N, () => [0, 0, 0]),
+    macro: (dims) => seedMacro3(dims, () => [0, 0, 0]),
   },
 
   beltrami: {
@@ -241,7 +289,7 @@ export const SCENARIOS = {
       const nu = nuFromTau(tau);
       return { nu, k: beltramiK(n), td: beltramiDecayTime(n, nu), force: [0, 0, 0] };
     },
-    macro: (N, { u0, nu }) => seedMacro(N, (x, y, z) => beltramiVelocityAt(x, y, z, N, u0, nu, 0)),
+    macro: (dims, { u0, nu }) => seedMacro3(dims, (x, y, z) => beltramiVelocityAt(x, y, z, dims[0], u0, nu, 0)),
   },
 
   tgv: {
@@ -253,8 +301,76 @@ export const SCENARIOS = {
       const L = n / (2 * Math.PI);           // the benchmark's length scale
       return { nu, L, re: u0 * L / nu, force: [0, 0, 0] };
     },
-    macro: (N, { u0 }) => seedMacro(N, (x, y, z) => tgvVelocityAt(x, y, z, N, u0)),
+    macro: (dims, { u0 }) => seedMacro3(dims, (x, y, z) => tgvVelocityAt(x, y, z, dims[0], u0)),
   },
+};
+
+SCENARIOS.sphere = {
+  name: 'sphere',
+  // `n` is the sphere DIAMETER in cells here, not the domain edge -- the
+  // resolution that matters for a body is how many cells span it.
+  defaults: { n: 16, tau: null, u0: 0.05, re: 100 },
+  walls: [],
+  dims: ({ n }) => [
+    Math.round(SPHERE_DOMAIN.length * n),
+    Math.round(SPHERE_DOMAIN.span * n),
+    Math.round(SPHERE_DOMAIN.span * n),
+  ],
+  derive: (p) => {
+    const { n, u0, re } = p;
+    // tau follows from the target Re, not the other way round: Re is the
+    // physical quantity a benchmark is stated in.
+    const nu = u0 * n / re;
+    const tau = tauFromNu(nu);
+    const d = SCENARIOS.sphere.dims(p);
+    const R = n / 2;
+    const centre = [SPHERE_DOMAIN.upstream * n, d[1] / 2, d[2] / 2];
+    const body = makeBodyState({ shape: { kind: SHAPE.SPHERE, a: R }, x: centre });
+    return {
+      nu, tau, re, R, D: n, dims: d, body, pinned: true,
+      area: Math.PI * R * R,
+      blockage: Math.PI * R * R / (d[1] * d[2]),
+      sponge: { width: Math.max(6, Math.round(n / 2)), u: [u0, 0, 0] },
+      force: [0, 0, 0],
+      // One convective time D/U, the natural unit for how long a run needs.
+      convective: n / u0,
+      cdReference: schillerNaumann(re),
+    };
+  },
+  // Started from the uniform freestream everywhere, including inside the
+  // body -- the penalization drives the interior to the body's velocity
+  // within a few hundred steps and starting from rest instead only adds an
+  // acoustic transient to wait out.
+  macro: (dims, p) => seedMacro3(dims, () => [p.u0, 0, 0]),
+};
+
+// --- spin: the 6-DOF integrator, with no fluid in the way ------------------
+//
+// A free body given an initial spin, with the fluid force switched off
+// (NO_FLUID_FORCE). Not a fluid case at all: it exists so that
+// shaders/d3_physics.wgsl -- the hardest new code in M2, and the one whose
+// errors are least visible -- can be compared step for step against
+// d3-body.mjs's stepFreeBody() on REAL GPU CODE, rather than being trusted
+// because the host reference it mirrors is well tested.
+//
+// The default spin is near the INTERMEDIATE principal axis, so the
+// trajectory being compared is the tumbling one: an integrator that agrees
+// on a steady spin but not on a flip would pass a gentler test.
+SCENARIOS.spin = {
+  name: 'spin',
+  defaults: { n: 32, tau: 0.8, u0: 0.02 },
+  walls: [],
+  dims: ({ n }) => [n, n, n],
+  derive: (p) => {
+    const shape = { kind: SHAPE.ROUNDBOX, a: p.n / 4, b: p.n / 8, c: p.n / 24, r: 0 };
+    const body = makeBodyState({
+      shape, x: [p.n / 2, p.n / 2, p.n / 2],
+      q: qFromAxisAngle([0.3, 0.5, 0.81], 0.4),   // a generic orientation, not axis-aligned
+      omega: [1e-4 * p.u0, p.u0, 1e-4 * p.u0],    // near the intermediate axis
+    });
+    return { nu: nuFromTau(p.tau), body, pinned: false, noFluidForce: true, force: [0, 0, 0], dims: [p.n, p.n, p.n] };
+  },
+  macro: (dims) => seedMacro3(dims, () => [0, 0, 0]),
 };
 
 export const SCENARIO_NAMES = Object.keys(SCENARIOS);
@@ -267,5 +383,10 @@ export function resolveScenario(name, overrides = {}) {
   const sc = SCENARIOS[name];
   if (!sc) throw new Error(`unknown scenario "${name}": expected one of ${SCENARIO_NAMES.join(', ')}`);
   const p = { ...sc.defaults, ...Object.fromEntries(Object.entries(overrides).filter(([, v]) => v != null)) };
-  return { scenario: sc.name, walls: sc.walls, ...p, ...sc.derive(p) };
+  const derived = sc.derive(p);
+  // Every scenario resolves to explicit dims. The M1 ones are cubes and say
+  // so rather than leaving the page to infer it, so there is exactly one
+  // place that decides a domain shape.
+  const dims = derived.dims || (sc.dims ? sc.dims(p) : [p.n, p.n, p.n]);
+  return { scenario: sc.name, walls: sc.walls, ...p, ...derived, dims };
 }

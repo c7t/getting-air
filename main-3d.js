@@ -16,7 +16,10 @@
 //
 // URL parameters:
 //   ?scenario=beltrami|duct|tgv   default beltrami
-//   ?n=48        cube edge (clamped down if the adapter cannot bind one f)
+//   ?n=48        cube edge; for ?scenario=sphere it is the sphere DIAMETER
+//                in cells and the domain is sized from it
+//   ?re=         sphere Reynolds number (tau follows from it)
+//   ?bounceback  sharp momentum-exchange coupling instead of diffuse chi
 //   ?q=19|27     velocity set, default 19
 //   ?tau=0.8     BGK relaxation time; nu = (tau - 1/2)/3
 //   ?u0=         scenario amplitude (duct: target peak velocity)
@@ -32,6 +35,7 @@ import { reportFatal, reportNoWebGPU, reportNoAdapter } from './error-overlay.mj
 import { assembleShader } from './shader-loader.mjs';
 import { SUPPORTED_Q } from './lattice-3d.mjs';
 import { SCENARIOS, SCENARIO_NAMES, resolveScenario, nuFromTau } from './d3-scenarios.mjs';
+import { packBodyState, unpackBodyState, BODY_FIELDS } from './d3-body.mjs';
 
 const canvas   = document.getElementById('c');
 const statusEl = document.getElementById('status');
@@ -92,11 +96,30 @@ function subsampleStride(N, maxPerAxis) {
 async function init() {
   const scenarioName = parseScenarioName();
   const Q = parseQ();
-  const params = resolveScenario(scenarioName, {
-    n: urlParams.has('n') ? parseInt(urlParams.get('n')) : null,
-    tau: urlParams.has('tau') ? parseFloat(urlParams.get('tau')) : null,
-    u0: urlParams.has('u0') ? parseFloat(urlParams.get('u0')) : null,
-  });
+  // Every scenario-level knob is forwarded, and the list is derived from the
+  // scenario's own defaults rather than hardcoded here. A parameter the page
+  // silently DROPPED would be worse than one it rejected: `?re=20` was
+  // ignored for exactly this reason during development, so a sweep that
+  // believed it was measuring Re=20 was measuring Re=100 and reporting the
+  // wrong reference alongside it. A validation harness that lies is worse
+  // than no harness.
+  const overrides = {};
+  for (const k of Object.keys(SCENARIOS[scenarioName].defaults)) {
+    if (!urlParams.has(k)) continue;
+    const v = parseFloat(urlParams.get(k));
+    if (!Number.isFinite(v)) throw new Error(`?${k}=${urlParams.get(k)}: expected a number`);
+    overrides[k] = v;
+  }
+  // A parameter that is not one of this scenario's knobs is a typo, and
+  // silently ignoring it is the failure above wearing a different hat.
+  const PAGE_PARAMS = new Set(['scenario', 'q', 'axis', 'slice', 'mode', 'spf', 'live',
+    'uscale', 'vscale', 'vortGamma', 'bounceback', 'chiEps', 'vmax', 'omax']);
+  for (const k of urlParams.keys()) {
+    if (PAGE_PARAMS.has(k) || k in SCENARIOS[scenarioName].defaults) continue;
+    throw new Error(`?${k}=: not a parameter of scenario "${scenarioName}" `
+      + `(its knobs are ${Object.keys(SCENARIOS[scenarioName].defaults).join(', ')})`);
+  }
+  const params = resolveScenario(scenarioName, overrides);
   const sc = SCENARIOS[scenarioName];
 
   if (!navigator.gpu) { reportNoWebGPU(statusEl); return; }
@@ -111,12 +134,16 @@ async function init() {
   // error if this GPU genuinely cannot.
   const DEFAULT_MAX_STORAGE_BINDING = 128 * 1024 * 1024;
   const DEFAULT_MAX_BUFFER_SIZE = 256 * 1024 * 1024;
+  const [NX, NY, NZ] = params.dims;
+  // `N` remains the scenario's own resolution parameter (cube edge, or the
+  // sphere's diameter); NX/NY/NZ are the domain. They differ only for the
+  // sphere, whose box is long and narrow.
   const N = params.n;
-  const NCELLS = N * N * N;
+  const NCELLS = NX * NY * NZ;
   const fBytes = NCELLS * Q * 4;
   const limit = Math.min(adapter.limits.maxStorageBufferBindingSize, adapter.limits.maxBufferSize);
   if (fBytes > limit) {
-    statusEl.textContent = `error: ${N}^3 D3Q${Q} needs a ${(fBytes / 1048576).toFixed(0)} MiB binding, this GPU's max is ${(limit / 1048576).toFixed(0)} MiB`;
+    statusEl.textContent = `error: ${NX}x${NY}x${NZ} D3Q${Q} needs a ${(fBytes / 1048576).toFixed(0)} MiB binding, this GPU's max is ${(limit / 1048576).toFixed(0)} MiB`;
     return;
   }
   const device = await adapter.requestDevice({
@@ -139,20 +166,55 @@ async function init() {
   const fB  = device.createBuffer({ size: fBytes, usage: U.STORAGE });
   const mac = device.createBuffer({ size: NCELLS * 4 * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
   const rpBuf = device.createBuffer({ size: 32, usage: U.UNIFORM | U.COPY_DST });
+  // Rigid body. Allocated for EVERY scenario, bodied or not, so there is one
+  // bind-group layout and one set of pipelines -- see this file's header on
+  // why the scenario is a parameter rather than a fork. HAS_BODY folds the
+  // solid coupling out of the kernels entirely when there is no body.
+  const HAS_BODY = params.body ? 1 : 0;
+  const bodyBuf = device.createBuffer({ size: BODY_FIELDS.length * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
+  // 8 slots, not 6: forces[0..5] are fx,fy,fz,tx,ty,tz and the pad keeps the
+  // clear kernel's one 8-lane workgroup exactly covering the buffer.
+  const forceBuf = device.createBuffer({ size: 8 * 4, usage: U.STORAGE | U.COPY_SRC });
 
   const computeBGL = device.createBindGroupLayout({ entries: [
     { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
     { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+  ]});
+  const forceBGL = device.createBindGroupLayout({ entries: [
+    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+  ]});
+  const physicsBGL = device.createBindGroupLayout({ entries: [
+    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+  ]});
+  const zeroBGL = device.createBindGroupLayout({ entries: [
+    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
   ]});
   const renderBGL = device.createBindGroupLayout({ entries: [
     { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
     { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
   ]});
   const bgAB = device.createBindGroup({ layout: computeBGL, entries: [
-    { binding: 0, resource: { buffer: fA } }, { binding: 1, resource: { buffer: fB } }, { binding: 2, resource: { buffer: mac } }]});
+    { binding: 0, resource: { buffer: fA } }, { binding: 1, resource: { buffer: fB } },
+    { binding: 2, resource: { buffer: mac } }, { binding: 3, resource: { buffer: bodyBuf } }]});
   const bgBA = device.createBindGroup({ layout: computeBGL, entries: [
-    { binding: 0, resource: { buffer: fB } }, { binding: 1, resource: { buffer: fA } }, { binding: 2, resource: { buffer: mac } }]});
+    { binding: 0, resource: { buffer: fB } }, { binding: 1, resource: { buffer: fA } },
+    { binding: 2, resource: { buffer: mac } }, { binding: 3, resource: { buffer: bodyBuf } }]});
+  // The force kernel reads the SAME f_in the step kernel will read this
+  // macro-step -- it is dispatched first -- so its populations are the
+  // pre-streaming, time-t data both formulas want, with no separate
+  // buffer-timing bookkeeping. Same arrangement as the 2D main-cylinder.js.
+  const forceBGA = device.createBindGroup({ layout: forceBGL, entries: [
+    { binding: 0, resource: { buffer: fA } }, { binding: 1, resource: { buffer: bodyBuf } }, { binding: 2, resource: { buffer: forceBuf } }]});
+  const forceBGB = device.createBindGroup({ layout: forceBGL, entries: [
+    { binding: 0, resource: { buffer: fB } }, { binding: 1, resource: { buffer: bodyBuf } }, { binding: 2, resource: { buffer: forceBuf } }]});
+  const physicsBG = device.createBindGroup({ layout: physicsBGL, entries: [
+    { binding: 0, resource: { buffer: bodyBuf } }, { binding: 1, resource: { buffer: forceBuf } }]});
+  const zeroBG = device.createBindGroup({ layout: zeroBGL, entries: [{ binding: 0, resource: { buffer: forceBuf } }]});
   const renderBG = device.createBindGroup({ layout: renderBGL, entries: [
     { binding: 0, resource: { buffer: mac } }, { binding: 1, resource: { buffer: rpBuf } }]});
 
@@ -162,10 +224,16 @@ async function init() {
   }));
   const stepModule = device.createShaderModule({ code: await loadShader(`shaders/d3_step_q${Q}.wgsl`), label: `d3_step_q${Q}` });
   const renderModule = device.createShaderModule({ code: await loadShader('shaders/d3_render_slice.wgsl'), label: 'd3_render_slice' });
+  const forceModule = HAS_BODY ? device.createShaderModule({ code: await loadShader(`shaders/d3_force_q${Q}.wgsl`), label: `d3_force_q${Q}` }) : null;
+  const physModule = HAS_BODY ? device.createShaderModule({ code: await loadShader('shaders/d3_physics.wgsl'), label: 'd3_physics' }) : null;
+  const zeroModule = HAS_BODY ? device.createShaderModule({ code: await loadShader('shaders/d3_zero_forces.wgsl'), label: 'd3_zero_forces' }) : null;
 
   const WG = [4, 4, 4];
-  const disp = [Math.ceil(N / WG[0]), Math.ceil(N / WG[1]), Math.ceil(N / WG[2])];
-  const dims = { NX: N, NY: N, NZ: N };
+  const disp = [Math.ceil(NX / WG[0]), Math.ceil(NY / WG[1]), Math.ceil(NZ / WG[2])];
+  const dims = { NX, NY, NZ };
+  const USE_BOUNCEBACK = urlParams.has('bounceback') ? 1 : 0;
+  const CHI_EPS = numParam('chiEps', 1.5);
+  const sponge = params.sponge || { width: 0, u: [0, 0, 0] };
   const stepConstants = {
     ...dims, WGX: WG[0], WGY: WG[1], WGZ: WG[2],
     OMEGA: 1 / params.tau,
@@ -173,10 +241,36 @@ async function init() {
     WALL_X: params.walls.includes('x') ? 1 : 0,
     WALL_Y: params.walls.includes('y') ? 1 : 0,
     WALL_Z: params.walls.includes('z') ? 1 : 0,
+    HAS_BODY, USE_BOUNCEBACK, CHI_EPS,
+    SPONGE_W: sponge.width, SPONGE_UX: sponge.u[0], SPONGE_UY: sponge.u[1], SPONGE_UZ: sponge.u[2],
   };
   const computePL = device.createPipelineLayout({ bindGroupLayouts: [computeBGL] });
   const initPipe = await device.createComputePipelineAsync({ layout: computePL, compute: { module: stepModule, entryPoint: 'initEq', constants: stepConstants } });
   const stepPipe = await device.createComputePipelineAsync({ layout: computePL, compute: { module: stepModule, entryPoint: 'step', constants: stepConstants } });
+  // USE_BOUNCEBACK and CHI_EPS are passed to the force kernel from the SAME
+  // constants the step kernel got. They are independent pipelines over the
+  // same overrides, and a mismatch would integrate a force the fluid never
+  // felt -- so they are created here as a pair, from one source, rather
+  // than each being given its own copy of the value.
+  const forcePipe = HAS_BODY ? await device.createComputePipelineAsync({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [forceBGL] }),
+    compute: { module: forceModule, entryPoint: 'main', constants: {
+      ...dims, WGX: WG[0], WGY: WG[1], WGZ: WG[2], USE_BOUNCEBACK, CHI_EPS } },
+  }) : null;
+  const physPipe = HAS_BODY ? await device.createComputePipelineAsync({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [physicsBGL] }),
+    compute: { module: physModule, entryPoint: 'main', constants: {
+      GX: (params.gravity || [0, 0, 0])[0],
+      GY: (params.gravity || [0, 0, 0])[1],
+      GZ: (params.gravity || [0, 0, 0])[2],
+      NO_FLUID_FORCE: params.noFluidForce ? 1 : 0,
+    } },
+  }) : null;
+  const zeroPipe = HAS_BODY ? await device.createComputePipelineAsync({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [zeroBGL] }),
+    compute: { module: zeroModule, entryPoint: 'main' },
+  }) : null;
+
   const renderPipe = await device.createRenderPipelineAsync({
     layout: device.createPipelineLayout({ bindGroupLayouts: [renderBGL] }),
     vertex: { module: renderModule, entryPoint: 'vs_main', constants: dims },
@@ -197,9 +291,15 @@ async function init() {
   let useB = false;               // true => the CURRENT field is in fB
   let live = urlParams.get('live') !== '0';
   let axis = parseAxis();
-  let slice = urlParams.has('slice') ? Math.min(N - 1, Math.max(0, parseInt(urlParams.get('slice')))) : (N >> 1);
+  const axisExtent = (a) => [NX, NY, NZ][a];
+  let slice = urlParams.has('slice')
+    ? Math.min(axisExtent(parseAxis()) - 1, Math.max(0, parseInt(urlParams.get('slice'))))
+    : (axisExtent(parseAxis()) >> 1);
   let mode = parseMode(scenarioName);
   const STEPS_PER_FRAME = Math.max(1, Math.round(numParam('spf', Math.max(1, Math.round(262144 / NCELLS * 8)))));
+  const uRefDefault = params.scenario === 'duct' ? params.uPeak
+    : params.scenario === 'sphere' ? params.u0 * 1.6      // the flow accelerates around the body
+    : 2 * params.u0;
   // Render normalizations, derived per scenario rather than inherited from
   // the 2D pages' constants. common_vortcolor.wgsl's tone curve is
   // calibrated for a shedding wake at |omega| ~ 0.05; every field here is
@@ -211,10 +311,11 @@ async function init() {
   //   beltrami  |u| reaches ~2.4*u0 (three components of sin+cos), and the
   //             field is Beltrami so |omega| = k|u| exactly.
   //   tgv       same wavenumber, amplitude u0 per component.
-  const U_SCALE = numParam('uscale', scenarioName === 'duct' ? params.uPeak : 2 * params.u0);
+  const U_SCALE = numParam('uscale', uRefDefault);
   const V_SCALE = numParam('vscale',
     scenarioName === 'duct' ? 2 * params.uPeak / params.a
-      : (params.k || 2 * Math.PI / N) * U_SCALE);
+      : scenarioName === 'sphere' ? 2 * params.u0 / params.R
+        : (params.k || 2 * Math.PI / N) * U_SCALE);
 
   function writeRenderParams() {
     const b = new ArrayBuffer(32);
@@ -227,7 +328,16 @@ async function init() {
   // GPU turn it into an equilibrium `f`. Both buffers are seeded so the
   // ping-pong parity does not matter after a reset.
   function reset() {
-    device.queue.writeBuffer(mac, 0, sc.macro(N, params));
+    device.queue.writeBuffer(mac, 0, sc.macro(params.dims, params));
+    if (HAS_BODY) {
+      device.queue.writeBuffer(bodyBuf, 0, packBodyState(params.body, {
+        pinned: !!params.pinned,
+        vMax: numParam('vmax', 0.2),
+        // Generous by default: o_max is a blowup limiter, not a physical
+        // limit, and a tumbling plate legitimately reaches high rates.
+        oMax: numParam('omax', 0.5),
+      }));
+    }
     const enc = device.createCommandEncoder();
     for (const bg of [bgAB, bgBA]) {
       const p = enc.beginComputePass();
@@ -241,15 +351,37 @@ async function init() {
     step = 0; useB = false;
   }
 
+  // ORDER PER MACRO-STEP: zero -> force -> physics -> step.
+  //
+  // force runs BEFORE step and reads the same f_in step will, so its
+  // populations are the pre-streaming time-t data both the momentum-exchange
+  // and the penalty formulas require. physics then integrates that force and
+  // publishes the new body state, which step reads for chi and the local
+  // solid velocity -- so the fluid always sees the body at the same instant
+  // the force was measured on it.
+  //
+  // Each pass gets its own compute pass rather than one pass with several
+  // pipelines, because a dispatch must observe the previous one's writes to
+  // the body and force buffers, and within a single pass WebGPU offers no
+  // such ordering.
   function encodeSteps(enc, n) {
-    const p = enc.beginComputePass();
-    p.setPipeline(stepPipe);
     for (let s = 0; s < n; s++) {
+      if (HAS_BODY) {
+        const zp = enc.beginComputePass();
+        zp.setPipeline(zeroPipe); zp.setBindGroup(0, zeroBG); zp.dispatchWorkgroups(1); zp.end();
+        const fp = enc.beginComputePass();
+        fp.setPipeline(forcePipe); fp.setBindGroup(0, useB ? forceBGB : forceBGA);
+        fp.dispatchWorkgroups(disp[0], disp[1], disp[2]); fp.end();
+        const pp = enc.beginComputePass();
+        pp.setPipeline(physPipe); pp.setBindGroup(0, physicsBG); pp.dispatchWorkgroups(1); pp.end();
+      }
+      const p = enc.beginComputePass();
+      p.setPipeline(stepPipe);
       p.setBindGroup(0, useB ? bgBA : bgAB);
       p.dispatchWorkgroups(disp[0], disp[1], disp[2]);
+      p.end();
       useB = !useB;
     }
-    p.end();
     step += n;
   }
 
@@ -294,10 +426,10 @@ async function init() {
     const m = await readMacro();
     const M = N / s;
     const out = { n: N, stride: s, m: M, rho: [], ux: [], uy: [], uz: [] };
-    for (let z = 0; z < N; z += s) {
-      for (let y = 0; y < N; y += s) {
-        for (let x = 0; x < N; x += s) {
-          const c = (z * N + y) * N + x;
+    for (let z = 0; z < NZ; z += s) {
+      for (let y = 0; y < NY; y += s) {
+        for (let x = 0; x < NX; x += s) {
+          const c = (z * NY + y) * NX + x;
           out.rho.push(m[4 * c]); out.ux.push(m[4 * c + 1]); out.uy.push(m[4 * c + 2]); out.uz.push(m[4 * c + 3]);
         }
       }
@@ -318,7 +450,7 @@ async function init() {
       for (let y = 0; y < N; y++) {
         let sum = 0, lo = Infinity, hi = -Infinity;
         for (let x = 0; x < N; x++) {
-          const v = m[4 * ((z * N + y) * N + x) + 1];
+          const v = m[4 * ((z * NY + y) * NX + x) + 1];
           sum += v; if (v < lo) lo = v; if (v > hi) hi = v;
         }
         prof[z * N + y] = sum / N;
@@ -335,12 +467,12 @@ async function init() {
   // than gates.
   async function readStats() {
     const m = await readMacro();
-    const at = (x, y, z, c) => m[4 * ((((z + N) % N) * N + ((y + N) % N)) * N + ((x + N) % N)) + 1 + c];
+    const at = (x, y, z, c) => m[4 * ((((z + NZ) % NZ) * NY + ((y + NY) % NY)) * NX + ((x + NX) % NX)) + 1 + c];
     let ke = 0, ens = 0, maxSpeed = 0, rhoMin = Infinity, rhoMax = -Infinity, finite = true;
-    for (let z = 0; z < N; z++) {
-      for (let y = 0; y < N; y++) {
-        for (let x = 0; x < N; x++) {
-          const c = (z * N + y) * N + x;
+    for (let z = 0; z < NZ; z++) {
+      for (let y = 0; y < NY; y++) {
+        for (let x = 0; x < NX; x++) {
+          const c = (z * NY + y) * NX + x;
           const rho = m[4 * c], ux = m[4 * c + 1], uy = m[4 * c + 2], uz = m[4 * c + 3];
           if (!Number.isFinite(rho + ux + uy + uz)) { finite = false; continue; }
           const sp2 = ux * ux + uy * uy + uz * uz;
@@ -362,27 +494,75 @@ async function init() {
     };
   }
 
+  // Body state and the force measured on it. Read back through the body
+  // buffer rather than the force accumulator, because d3_physics.wgsl drains
+  // that accumulator with atomicExchange every step and copies the values
+  // into the state -- including for a pinned body, which is the whole point
+  // of the sphere scenario.
+  const bodyStaging = device.createBuffer({ size: BODY_FIELDS.length * 4, usage: U.MAP_READ | U.COPY_DST });
+  async function readBody() {
+    if (!HAS_BODY) return null;
+    const enc = device.createCommandEncoder();
+    enc.copyBufferToBuffer(bodyBuf, 0, bodyStaging, 0, BODY_FIELDS.length * 4);
+    device.queue.submit([enc.finish()]);
+    await bodyStaging.mapAsync(GPUMapMode.READ);
+    const v = new Float32Array(bodyStaging.getMappedRange()).slice();
+    bodyStaging.unmap();
+    const b = unpackBodyState(v);
+    // Cd = Fx / (1/2 rho U^2 A), rho = 1 in lattice units. Reported only
+    // where a reference area and a freestream exist.
+    if (params.area && params.u0) {
+      b.cd = b.fx / (0.5 * params.u0 * params.u0 * params.area);
+      b.cl = b.fy / (0.5 * params.u0 * params.u0 * params.area);
+      b.cs = b.fz / (0.5 * params.u0 * params.u0 * params.area);
+    }
+    b.step = step;
+    return b;
+  }
+
   // --- controls ------------------------------------------------------------
   const sliceSlider = document.getElementById('slider-SLICE');
   const sliceVal = document.getElementById('val-SLICE');
   const axisSel = document.getElementById('sel-AXIS');
   const modeSel = document.getElementById('sel-MODE');
   const playBtn = document.getElementById('btn-PLAY');
-  sliceSlider.max = String(N - 1);
+  sliceSlider.max = String(axisExtent(axis) - 1);
   sliceSlider.value = String(slice);
   sliceVal.textContent = String(slice);
   axisSel.value = String(axis);
   modeSel.value = String(mode);
   sliceSlider.oninput = () => { slice = parseInt(sliceSlider.value); sliceVal.textContent = sliceSlider.value; writeRenderParams(); };
-  axisSel.onchange = () => { axis = parseInt(axisSel.value); writeRenderParams(); };
+  axisSel.onchange = () => {
+    axis = parseInt(axisSel.value);
+    // The three axes can have different extents (the sphere's box is long
+    // and narrow), so the slider's range follows the chosen normal.
+    sliceSlider.max = String(axisExtent(axis) - 1);
+    slice = Math.min(slice, axisExtent(axis) - 1);
+    sliceSlider.value = String(slice); sliceVal.textContent = String(slice);
+    resize();               // the new normal may have a different aspect
+    writeRenderParams();
+  };
   modeSel.onchange = () => { mode = parseInt(modeSel.value); writeRenderParams(); };
   playBtn.onclick = () => { live = !live; playBtn.textContent = live ? 'pause' : 'play'; };
   document.getElementById('btn-RESET').onclick = () => { reset(); };
   playBtn.textContent = live ? 'pause' : 'play';
   document.getElementById('hint').textContent =
-    `${scenarioName}  N=${N}  D3Q${Q}  tau=${params.tau}  nu=${params.nu.toFixed(4)}`;
+    `${scenarioName}  ${NX}x${NY}x${NZ}  D3Q${Q}  tau=${params.tau.toFixed(4)}  nu=${params.nu.toFixed(4)}`
+    + (params.re ? `  Re=${params.re}` : '');
 
+  // The canvas box is given the SLICE's aspect ratio, so a sphere renders
+  // round. The three axes can have very different extents (the sphere
+  // scenario's domain is 192x128x128) and a fixed square canvas stretched
+  // the x-long slices into ellipses -- which reads as a geometry bug on a
+  // page whose entire job is showing geometry.
+  function planeExtent(a) {
+    if (a === 0) return [NY, NZ];
+    if (a === 1) return [NZ, NX];
+    return [NX, NY];
+  }
   function resize() {
+    const [pw, ph] = planeExtent(axis);
+    canvas.style.aspectRatio = `${pw} / ${ph}`;
     const dpr = window.devicePixelRatio || 1;
     const r = canvas.getBoundingClientRect();
     canvas.width = Math.max(1, Math.round(r.width * dpr));
@@ -399,8 +579,8 @@ async function init() {
     isLive: () => live,
     reset,
     getStep: () => step,
-    getParams: () => ({ ...params, Q, N, NCELLS, scenario: scenarioName }),
-    readSubsampled, readDuctProfile, readStats,
+    getParams: () => ({ ...params, Q, N, NX, NY, NZ, NCELLS, scenario: scenarioName, hasBody: !!HAS_BODY, bounceback: USE_BOUNCEBACK }),
+    readSubsampled, readDuctProfile, readStats, readBody,
     debugStepSync,
   };
 
@@ -420,8 +600,9 @@ async function init() {
       lastStatus = now;
       const t = scenarioName === 'beltrami' ? `  t/td=${(step / params.td).toFixed(2)}`
         : scenarioName === 'duct' ? `  t/settle=${(step / params.settle).toFixed(2)}`
-        : `  Re=${params.re.toFixed(0)}`;
-      statusEl.textContent = `${scenarioName}  D3Q${Q}  ${N}^3  step ${step}${t}\n`
+        : scenarioName === 'sphere' ? `  t/(D/U)=${(step / params.convective).toFixed(2)}`
+          : params.re ? `  Re=${params.re.toFixed(0)}` : '';
+      statusEl.textContent = `${scenarioName}  D3Q${Q}  ${NX}x${NY}x${NZ}  step ${step}${t}\n`
         + `${AXIS_NAMES[axis]}-slice ${slice}   ${live ? 'running' : 'paused'}`;
     }
     requestAnimationFrame(() => frame().catch(e => reportFatal(statusEl, e)));
