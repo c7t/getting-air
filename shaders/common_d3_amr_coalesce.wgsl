@@ -62,6 +62,15 @@
 @group(0) @binding(3) var<storage, read>       mac_pool  : array<f32>;
 @group(0) @binding(4) var<storage, read_write> mac       : array<f32>;
 
+// TIMING ONLY (?orphans=0). Skips the orphan pass, which makes the interface
+// WRONG -- it reinstates M4.1b's convex-edge mass leak and its uniform-flow
+// inconsistency, both measured and both large. It exists so the pass can be
+// priced by differencing two runs of one build, which is the attribution
+// method plans/perf-characterization.md insists on: per-pass GPU timestamps
+// are not trustworthy at this granularity, so a pass is costed by removing
+// it. Never set this to run physics.
+override ORPHANS : u32 = 1u;
+
 fn coveredCoarse3(v: vec3<u32>) -> bool {
   return blockSlot[blockIdOf(blockOfCoarse(v))] >= 0;
 }
@@ -112,19 +121,39 @@ fn coveredCoarse3(v: vec3<u32>) -> bool {
 // by coarse(p) - e_i, and that cell is either covered (the coalesce proper)
 // or not (here). The two are the same test with opposite sign.
 fn coalesceOrphans(c: vec3<u32>) {
-  // A claimable p has an INTERIOR source one fine cell away, so a covered
-  // coarse cell is within one cell of c and a refined block within one
-  // block. 27 block-granular loads, against 19 x 8 pool addresses.
-  let b = blockOfCoarse(c);
-  let nb = vec3<u32>(nbx(), nby(), nbz());
+  if (ORPHANS == 0u) { return; }
+  // GUARD AT CELL GRANULARITY, NOT BLOCK. Both orphan kinds need a COVERED
+  // cell among c's own lattice neighbours, and the proof is the same for
+  // both. Write coarse(x + e_i) = coarse(x) + d, where d keeps e_i's
+  // component on the axes the child's parity carries across and zeroes the
+  // rest -- so d is a sub-vector of e_i, and every sub-vector of a lattice
+  // direction is itself a lattice direction (or zero).
+  //
+  //   IN  needs coarse(q + e_i) covered for a child q of c. That cell is
+  //       c + d; d = 0 would mean c itself, which is unrefined here.
+  //   OUT needs coarse(p - e_i) covered where coarse(p) = c + e_i. That
+  //       cell is c + (e_i - d), the complement, and it is zero only if the
+  //       covered cell is c again.
+  //
+  // So "some lattice neighbour of c is covered" is necessary for either.
+  // This costs the same QN loads the old 27-BLOCK test cost and admits ~5x
+  // fewer cells to the QN x 8 loop below: the old test let through every
+  // cell of every block touching the refined region -- a shell RB cells
+  // thick -- where only a shell ONE cell thick can hold an orphan.
+  //
+  // MEASURED AT WITHIN NOISE, and kept anyway. On a busy desktop
+  // tools/bench-d3-interface.js could not separate the two guards: an
+  // IDENTICAL build (?orphans=0, which compiles neither) moved 7% between
+  // back-to-back runs, which is the same size as the difference being
+  // claimed. It is kept because it is strictly less work for the same number
+  // of loads, not because a number says so -- and that distinction is
+  // recorded rather than dressed up as a measurement.
   var near = false;
-  for (var d = 0u; d < 27u; d++) {
-    let o = vec3<i32>(i32(d % 3u), i32((d / 3u) % 3u), i32(d / 9u)) - 1;
-    let nbb = vec3<u32>(
-      wrapu(i32(b.x) + o.x, nb.x),
-      wrapu(i32(b.y) + o.y, nb.y),
-      wrapu(i32(b.z) + o.z, nb.z));
-    near = near || (blockSlot[blockIdOf(nbb)] >= 0);
+  for (var i = 1u; i < QN; i++) {
+    near = near || coveredCoarse3(vec3<u32>(
+      wrapu(i32(c.x) + ex[i], NX),
+      wrapu(i32(c.y) + ey[i], NY),
+      wrapu(i32(c.z) + ez[i], NZ)));
   }
   if (!near) { return; }
 

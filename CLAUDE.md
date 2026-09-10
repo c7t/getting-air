@@ -219,6 +219,15 @@ in a refined shell reproduces the dense run's Cd to 0.07%. M4.1e, making
 explode the DEFAULT, is next and is a blast-radius decision rather than an
 evidence one: merging publishes, and the flip moves every recorded AMR
 number at once.
+
+- **Explode is not slower in any case that matters** (`tools/bench-d3-interface.js`,
+  new). +2.9% per macro-step on a body-fitted shell, -4.5% at a larger
+  refined fraction, +31% only for a small refined box in a small domain. All
+  of the cost is the coalesce ORPHAN pass -- `?orphans=0` lands on interp
+  everywhere -- and the linear explosion is free. Price a pass by REMOVING
+  it (`?orphans=0`, `?explin=0`, both physics-wrong), never by per-pass
+  timestamps. The desktop is noisy enough that the tool reports the MINIMUM
+  of its reps, not the median; treat sub-10% differences as noise.
 Read `plans/3D.md` before touching any of this — in particular its decision
 table at the top, which records what is settled so it does not get
 re-argued. Two things are settled and load-bearing:

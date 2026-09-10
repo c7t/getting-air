@@ -237,9 +237,23 @@ async function attachPageWatch(client, { label, onError } = {}) {
       a.description || (a.value !== undefined ? a.value : a.type)).join(' '));
   });
 
+  // Chrome asks every origin for /favicon.ico on its own, and none of these
+  // static pages ship one. That 404 is the BROWSER's request, not the page's,
+  // so reporting it fails a healthy page -- and it surfaces unpredictably,
+  // because Chrome asks once per origin per session, so whichever tool
+  // navigates first in a session wears it. It arrives on BOTH channels: a
+  // Network.responseReceived and the console's own "Failed to load resource".
+  // Nothing else is filtered -- a 404 for a shader or a module is exactly
+  // what this watch is for.
+  const browserOwned = (url) => /\/favicon\.ico(\?|$)/.test(String(url || ''));
+
   if (Log) {
     await Log.enable();
-    Log.entryAdded((e) => { if (e.entry.level === 'error') push('log', e.entry.text); });
+    Log.entryAdded((e) => {
+      if (e.entry.level !== 'error') return;
+      if (browserOwned(e.entry.url)) return;
+      push('log', e.entry.text);
+    });
   }
   if (Network) {
     await Network.enable();
@@ -249,7 +263,9 @@ async function attachPageWatch(client, { label, onError } = {}) {
       push('net', `${e.type} failed: ${e.errorText}`);
     });
     Network.responseReceived((e) => {
-      if (e.response.status >= 400) push('net', `HTTP ${e.response.status} for ${e.response.url}`);
+      if (e.response.status >= 400 && !browserOwned(e.response.url)) {
+        push('net', `HTTP ${e.response.status} for ${e.response.url}`);
+      }
     });
   }
 

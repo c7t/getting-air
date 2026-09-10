@@ -54,6 +54,10 @@
 //                F_i a central difference taken only on axes with two real
 //                coarse neighbours and projected orthogonal to c_i. Only
 //                meaningful with ?interface=explode.
+//   ?orphans=0   TIMING ONLY: drop the coalesce orphan pass. This makes the
+//                interface WRONG (it reinstates M4.1b's convex-edge mass
+//                leak); it exists so tools/bench-d3-interface.js can price
+//                the pass by differencing two runs of one build.
 //   ?dcpre=1     restore the PRE-collision Dupuis-Chopard fneq factor at the
 //                coarse/fine transfers. That is wrong for this solver's
 //                post-collision buffers and was the M3 interface bug; the
@@ -157,7 +161,7 @@ async function init() {
   const PAGE_PARAMS = new Set(['scenario', 'q', 'axis', 'slice', 'mode', 'spf', 'live',
     'uscale', 'vscale', 'vortGamma', 'bounceback', 'chiEps', 'vmax', 'omax',
     'levels', 'rb', 'refine', 'margin', 'boxfrac', 'dcpre', 'reflux', 'interface',
-    'explin']);
+    'explin', 'orphans']);
   for (const k of urlParams.keys()) {
     if (PAGE_PARAMS.has(k) || k in SCENARIOS[scenarioName].defaults) continue;
     throw new Error(`?${k}=: not a parameter of scenario "${scenarioName}" `
@@ -507,6 +511,11 @@ async function init() {
   // uniform one so the two can be A/B'd on the same GPU in the same session.
   // Only meaningful with ?interface=explode.
   const EXPLODE_LINEAR = urlParams.get('explin') === '0' ? 0 : 1;
+  // TIMING ONLY. ?orphans=0 drops the coalesce orphan pass, which makes the
+  // interface WRONG -- it reinstates M4.1b's convex-edge mass leak. It is here
+  // so tools/bench-d3-interface.js can price the pass by differencing two runs
+  // of one build, the way plans/perf-characterization.md requires.
+  const ORPHANS = urlParams.get('orphans') === '0' ? 0 : 1;
   let interpGhostPipe = null, interpFullPipe = null, step1Pipe = null, avgPipe = null;
   let interpBG = null, step1BG_AB = null, step1BG_BA = null, avgBGA = null, avgBGB = null;
   let fluxPipeSet = null, fluxPipeAdd = null, refluxPipe = null;
@@ -669,7 +678,7 @@ async function init() {
         { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
       ]});
       explodePipe = await mk(explodeBGL, explodeModule, { ...poolConst, EXPLODE_LINEAR });
-      coalescePipe = await mk(coalesceBGL, coalesceModule, poolConst);
+      coalescePipe = await mk(coalesceBGL, coalesceModule, { ...poolConst, ORPHANS });
       // Explode reads the coarse field at t and writes the ring of whichever
       // pool buffer substep A will read; coalesce writes back into that SAME
       // time-t coarse buffer, at the covered cells, so the coarse step gathers
