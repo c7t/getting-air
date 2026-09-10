@@ -31,6 +31,12 @@
 //                plans/3D.md M4; `all` refines everything (the noise floor
 //                -- no coarse/fine interface anywhere).
 //   ?margin=2  ?boxfrac=0.5
+//   ?interface=  `interp` (default) is the M3 trilinear-plus-Dupuis-Chopard
+//                coupling: not conservative, but correct everywhere.
+//                `explode` is the M4.1b Chen et al. 2006 explode/coalesce --
+//                EXACTLY conservative on a flat seam and on ?refine=all, and
+//                it LEAKS MASS in proportion to convex EDGE length. Not the
+//                default until that is found. plans/3D.md M4.1b.
 //   ?reflux=1    OPT-IN coarse/fine interface flux correction (M4). Makes
 //                the interface exactly conservative in mass and momentum,
 //                and on a seam with no convex corner (?refine=slab) halves
@@ -139,7 +145,7 @@ async function init() {
   // silently ignoring it is the failure above wearing a different hat.
   const PAGE_PARAMS = new Set(['scenario', 'q', 'axis', 'slice', 'mode', 'spf', 'live',
     'uscale', 'vscale', 'vortGamma', 'bounceback', 'chiEps', 'vmax', 'omax',
-    'levels', 'rb', 'refine', 'margin', 'boxfrac', 'dcpre', 'reflux']);
+    'levels', 'rb', 'refine', 'margin', 'boxfrac', 'dcpre', 'reflux', 'interface']);
   for (const k of urlParams.keys()) {
     if (PAGE_PARAMS.has(k) || k in SCENARIOS[scenarioName].defaults) continue;
     throw new Error(`?${k}=: not a parameter of scenario "${scenarioName}" `
@@ -229,6 +235,16 @@ async function init() {
       const frac = numParam('boxfrac', 0.5);
       const lo = NX * (1 - frac) / 2, hi = NX * (1 + frac) / 2;
       poolAlloc = refineWhere(pool, ({ mid }) => mid[0] >= lo && mid[0] < hi);
+    } else if (mode === 'bar') {
+      // Refined in x AND y, spanning all of z: four convex EDGES, no
+      // corner. The middle rung of the interface-geometry ladder --
+      // `slab` (flat only), `bar` (edges), `box` (edges and corners) --
+      // which is what separates "the coupling is wrong" from "the coupling
+      // is wrong where the seam turns". See plans/3D.md M4.1b.
+      const frac = numParam('boxfrac', 0.5);
+      const lo = [NX, NY].map(n => n * (1 - frac) / 2);
+      const hi = [NX, NY].map(n => n * (1 + frac) / 2);
+      poolAlloc = refineWhere(pool, ({ mid }) => [0, 1].every(i => mid[i] >= lo[i] && mid[i] < hi[i]));
     } else if (mode === 'body') {
       if (!params.body) throw new Error('?refine=body: this scenario has no body');
       const sh = params.body.shape, bx = params.body.x;
@@ -238,7 +254,7 @@ async function init() {
       // that belongs with dynamic refinement in M4.
       poolAlloc = refineNearBody(pool, (q) => Math.hypot(q[0] - bx[0], q[1] - bx[1], q[2] - bx[2]) - sh.a, margin);
     } else {
-      throw new Error(`?refine=${mode}: expected all, box, slab or body`);
+      throw new Error(`?refine=${mode}: expected all, box, bar, slab or body`);
     }
   }
 
@@ -460,6 +476,8 @@ async function init() {
   let interpBG = null, step1BG_AB = null, step1BG_BA = null, avgBGA = null, avgBGB = null;
   let fluxPipeSet = null, fluxPipeAdd = null, refluxPipe = null;
   let fluxBGA = null, fluxBGB = null, refluxBG = null;
+  let explodePipe = null, coalescePipe = null;
+  let explodeBG = null, coalesceBG = null;
 
   // M4's interface flux correction. OPT-IN (?reflux=1), and NOT the default
   // -- it does what it was built to do and that turned out not to be enough.
@@ -485,9 +503,29 @@ async function init() {
   //           own it, using a centred periodic wrap. With fewer than three
   //           blocks on an axis a tile's ring wraps onto itself and the wrap
   //           is ambiguous.
+  // M4.1b. `interp` is the M3 coupling and is kept switchable because it is
+  // the only way to A/B the conversion in one build -- not because it is a
+  // supported mode. It is NOT conservative.
+  const IFACE = urlParams.get('interface') || 'interp';
+  if (!['explode', 'interp'].includes(IFACE)) throw new Error(`?interface=${IFACE}: expected explode or interp`);
+  const EXPLODE = AMR && IFACE === 'explode';
+  // A body inside a refined region needs a FINE-level force reduction, and
+  // M2 only ever built the L0 one -- it worked before only because the coarse
+  // cells under refinement held restricted values for it to integrate. With
+  // the grid partitioned (M4.1a) there is nothing there to integrate, so this
+  // fails loudly rather than quietly reporting a force that is too small.
+  // The fine force pass is M4.1d's, alongside the sphere-with-AMR case.
+  if (EXPLODE && params.body) {
+    throw new Error('?interface=explode does not support a body yet: the L0 force reduction has no coarse field under a refined region, and there is no L1 force pass (plans/3D.md M4.1d). Use ?interface=interp.');
+  }
+
   const REFLUX = (() => {
     if (!AMR) return 0;
     if (urlParams.get('reflux') !== '1') return 0;
+    // The flux correction measures and patches a mismatch that
+    // explode/coalesce does not create. Running both would correct a seam
+    // that is already conservative.
+    if (EXPLODE) throw new Error('?reflux=1 needs ?interface=interp: explode/coalesce is conservative by construction');
     const walled = ['x', 'y', 'z'].some(a => params.walls.includes(a));
     if (walled) throw new Error(`?reflux: not valid with walls (?walls=${params.walls}); pass ?reflux=0 to run without the flux correction`);
     if (pool.nb.some(n => n < 3)) throw new Error(`?reflux: needs at least 3 blocks per axis, have ${pool.nb.join('x')} at ?rb=${RB}`);
@@ -530,6 +568,9 @@ async function init() {
     interpFullPipe = await mk(interpBGL, interpModule, { ...poolConst, TAU_COARSE, DC_PRE, GHOST_ONLY: 0, TIME_BLEND: 0.0 });
     step1Pipe = await mk(step1BGL, step1Module, {
       ...poolConst,
+      // Chen's coalesce averages advected-but-UNCOLLIDED interface states,
+      // so under explode/coalesce the ring advects and stores only.
+      COLLIDE_RING: EXPLODE ? 0 : 1,
       OMEGA_FINE: 1 / TAU_FINE,
       FORCE_X: params.force[0], FORCE_Y: params.force[1], FORCE_Z: params.force[2],
       HAS_BODY, USE_BOUNCEBACK, CHI_EPS,
@@ -561,6 +602,40 @@ async function init() {
       { binding: 2, resource: { buffer: slotToBlockBuf } }, { binding: 3, resource: { buffer: mac } }]});
     avgBGA = mkAvg(fA);
     avgBGB = mkAvg(fB);
+
+    // --- M4.1b explode / coalesce ----------------------------------------
+    if (EXPLODE) {
+      const explodeModule = device.createShaderModule({ code: await loadShader(`shaders/d3_amr_explode_q${Q}.wgsl`), label: `d3_amr_explode_q${Q}` });
+      const coalesceModule = device.createShaderModule({ code: await loadShader(`shaders/d3_amr_coalesce_q${Q}.wgsl`), label: `d3_amr_coalesce_q${Q}` });
+      const explodeBGL = device.createBindGroupLayout({ entries: [
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+        { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+        { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+      ]});
+      const coalesceBGL = device.createBindGroupLayout({ entries: [
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+        { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+        { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+        { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+      ]});
+      explodePipe = await mk(explodeBGL, explodeModule, poolConst);
+      coalescePipe = await mk(coalesceBGL, coalesceModule, poolConst);
+      // Explode reads the coarse field at t and writes the ring of whichever
+      // pool buffer substep A will read; coalesce writes back into that SAME
+      // time-t coarse buffer, at the covered cells, so the coarse step gathers
+      // it with no per-direction test. Both are indexed by coarse parity.
+      const mkExplode = (src) => device.createBindGroup({ layout: explodeBGL, entries: [
+        { binding: 0, resource: { buffer: src } }, { binding: 1, resource: { buffer: fPoolA } },
+        { binding: 2, resource: { buffer: slotToBlockBuf } }, { binding: 3, resource: { buffer: blockSlotBuf } }]});
+      explodeBG = [mkExplode(fA), mkExplode(fB)];
+      const mkCoalesce = (dst) => device.createBindGroup({ layout: coalesceBGL, entries: [
+        { binding: 0, resource: { buffer: fPoolA } }, { binding: 1, resource: { buffer: dst } },
+        { binding: 2, resource: { buffer: blockSlotBuf } }, { binding: 3, resource: { buffer: macPool } },
+        { binding: 4, resource: { buffer: mac } }]});
+      coalesceBG = [mkCoalesce(fA), mkCoalesce(fB)];
+    }
 
     // --- M4 interface flux correction ------------------------------------
     if (REFLUX) {
@@ -732,94 +807,77 @@ async function init() {
       }
       // --- AMR, N=2 (S_Advance) --------------------------------------------
       //
-      // Both levels start the macro-step at time t. The order is:
+      // Both levels start the macro-step at time t. There are two couplings
+      // and they want OPPOSITE pass orders, which is why this branches
+      // rather than sharing a sequence:
       //
-      //   L0 x1    the coarse step, taking L0 to t + dt. FIRST, so that the
-      //            parent's state at BOTH ends of the step is available to
-      //            the ring interpolation below -- t in the buffer it read,
-      //            t + dt in the one it wrote.
-      //   interp   fill L1's ring from the parent at time t
-      //   L1 A     first fine substep, to t + dt/2
-      //   interp   refill L1's ring from the parent at t + dt/2, blended
-      //            between the two coarse states. Doing this ONCE per parent
-      //            step instead leaves substep B half a coarse step stale at
-      //            the seam, which is a first-order error that accumulates
-      //            linearly -- see common_d3_amr_interp.wgsl's TIME_BLEND.
-      //   L1 B     second fine substep, to t + dt
-      //   average  restrict L1 onto L0 in the refined region, both at t + dt
-      //   reflux   correct the unrefined coarse cells for the difference
-      //            between the flux the COARSE step moved across the seam
-      //            and the flux the FINE substeps actually moved (M4). Two
-      //            `flux` passes measure the latter, one per substep,
-      //            interleaved above because each reads the pool buffer its
-      //            substep streams. Without this the interface is not
-      //            conservative and the error is first order in dx --
-      //            shaders/common_d3_amr_reflux.wgsl has the accounting.
+      //   explode/coalesce (M4.1b, default) puts the coarse step LAST,
+      //     because coalesce writes the fine outflux into the covered cells
+      //     of the time-t coarse buffer and the coarse gather then picks it
+      //     up with no per-direction test.
+      //   interp/average (M3, ?interface=interp) puts it FIRST, because the
+      //     restriction has to land in the buffer that step just wrote.
       //
-      // The coarse step does redundant work under the refined region (its
-      // result is overwritten by average); that is the same trade the 2D
-      // solver makes, and avoiding it would need a per-cell refined-mask
-      // test in the hottest kernel there is.
+      // The coarse step does NO work under a refined region either way
+      // (M4.1a).
       const cp = useB ? 1 : 0;    // which buffer holds the coarse state at t
-      const p = enc.beginComputePass();
-      p.setPipeline(stepPipe);
-      p.setBindGroup(0, useB ? bgBA : bgAB);
-      p.dispatchWorkgroups(disp[0], disp[1], disp[2]);
-      p.end();
+      const coarseStep = () => {
+        const p = enc.beginComputePass();
+        p.setPipeline(stepPipe);
+        p.setBindGroup(0, useB ? bgBA : bgAB);
+        p.dispatchWorkgroups(disp[0], disp[1], disp[2]);
+        p.end();
+      };
+      const tilePass = (pipe, bg) => {
+        const tp = enc.beginComputePass();
+        tp.setPipeline(pipe); tp.setBindGroup(0, bg);
+        tp.dispatchWorkgroups(tileDisp[0], tileDisp[1], tileDisp[2]);
+        tp.end();
+      };
+      const gridPass = (pipe, bg) => {
+        const gp = enc.beginComputePass();
+        gp.setPipeline(pipe); gp.setBindGroup(0, bg);
+        gp.dispatchWorkgroups(disp[0], disp[1], disp[2]);
+        gp.end();
+      };
 
-      if (AMR) {
-        // ONE ring refresh per parent step, from the parent at time t, then
-        // both fine substeps. Substep B's ring is what substep A advanced --
-        // the GHOST=2 self-advance (see common_d3_amr_step1.wgsl).
+      if (EXPLODE) {
+        // M4.1b, Chen et al. 2006. The COARSE STEP RUNS LAST, and that is the
+        // whole reason no per-direction test is needed in it: coalesce writes
+        // the fine outflux into the covered cells' slots of the time-t coarse
+        // buffer, so the ordinary pull picks it up.
         //
-        // A second refresh at the half step, time-blended between the
-        // parent's t and t+dt states, WAS built and measured, on the theory
-        // that substep B was seeing stale interface data. It made the seam
-        // error slightly WORSE (nearOut 3.24e-2 -> 3.93e-2 at t=64 on the
-        // Beltrami box case), so staleness is not what the seam error is,
-        // and the extra pass is not carried. The TIME_BLEND override stays
-        // in the shader, defaulted to a no-op, because it is the natural
-        // knob to re-try against a flux-corrected interface.
-        const ip = enc.beginComputePass();
-        ip.setPipeline(interpGhostPipe);
-        ip.setBindGroup(0, interpBG[cp][0]);
-        ip.dispatchWorkgroups(tileDisp[0], tileDisp[1], tileDisp[2]);
-        ip.end();
-        // M4 flux measurement, interleaved with the substeps rather than
-        // deferred: each pass reads the pool buffer its substep STREAMS, and
-        // substep B overwrites fPoolA, so the A measurement cannot wait.
-        const flux = (pipe, bg) => {
-          const fp = enc.beginComputePass();
-          fp.setPipeline(pipe); fp.setBindGroup(0, bg);
-          fp.dispatchWorkgroups(disp[0], disp[1], disp[2]);
-          fp.end();
-        };
-        if (REFLUX) flux(fluxPipeSet, fluxBGA);       // writes; also the clear
-        const substep = (bg) => {
-          const sp = enc.beginComputePass();
-          sp.setPipeline(step1Pipe); sp.setBindGroup(0, bg);
-          sp.dispatchWorkgroups(tileDisp[0], tileDisp[1], tileDisp[2]);
-          sp.end();
-        };
-        substep(step1BG_AB);
-        if (REFLUX) flux(fluxPipeAdd, fluxBGB);
-        substep(step1BG_BA);
-        const ap = enc.beginComputePass();
-        ap.setPipeline(avgPipe);
-        // The coarse step just wrote the OTHER buffer, which is where the
-        // restriction has to land.
-        ap.setBindGroup(0, useB ? avgBGA : avgBGB);
-        ap.dispatchWorkgroups(avgDisp[0], avgDisp[1], avgDisp[2]);
-        ap.end();
-        // Reflux LAST: it corrects the unrefined coarse cells against the
-        // fine traffic just measured, and it reads the coarse field at t
-        // (still intact -- the step wrote the other buffer) alongside the
-        // t + dt field it corrects.
-        if (REFLUX) {
-          const rp = enc.beginComputePass();
-          rp.setPipeline(refluxPipe); rp.setBindGroup(0, refluxBG[cp]);
-          rp.dispatchWorkgroups(disp[0], disp[1], disp[2]);
-          rp.end();
+        //   explode    L0 -> the ring, for the directions whose coarse target
+        //              is covered. Reads the parent at t; no interpolation,
+        //              no rescale.
+        //   L1 A, B    two fine substeps. The ring ADVECTS but does not
+        //              collide, which is what makes coalesce's average the
+        //              uncollided states the scheme requires.
+        //   coalesce   sum the ring back into the covered cells at t, and
+        //              republish `mac` under the refined region.
+        //   L0 x1      the coarse step, now gathering coalesced values as if
+        //              they were ordinary neighbours.
+        tilePass(explodePipe, explodeBG[cp]);
+        tilePass(step1Pipe, step1BG_AB);
+        tilePass(step1Pipe, step1BG_BA);
+        gridPass(coalescePipe, coalesceBG[cp]);
+        coarseStep();
+      } else {
+        // The M3 coupling, kept for A/B only (?interface=interp). NOT
+        // conservative -- see plans/3D.md M4.1b.
+        coarseStep();
+        if (AMR) {
+          tilePass(interpGhostPipe, interpBG[cp][0]);
+          if (REFLUX) gridPass(fluxPipeSet, fluxBGA);
+          tilePass(step1Pipe, step1BG_AB);
+          if (REFLUX) gridPass(fluxPipeAdd, fluxBGB);
+          tilePass(step1Pipe, step1BG_BA);
+          const ap = enc.beginComputePass();
+          ap.setPipeline(avgPipe);
+          ap.setBindGroup(0, useB ? avgBGA : avgBGB);
+          ap.dispatchWorkgroups(avgDisp[0], avgDisp[1], avgDisp[2]);
+          ap.end();
+          if (REFLUX) gridPass(refluxPipe, refluxBG[cp]);
         }
       }
 

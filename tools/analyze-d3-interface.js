@@ -73,6 +73,9 @@ const CONFIGS = [
   // and no corner. The control that separates "the flux correction is
   // wrong" from "the seam has convex corners the lattice cannot tile".
   { name: 'slab', levels: 2, refine: 'slab' },
+  // Refined in x and y, full z: four convex EDGES and no corner. The rung
+  // between slab and box.
+  { name: 'bar', levels: 2, refine: 'bar' },
   { name: 'all', levels: 2, refine: 'all' },
   // No fine level at all: the coarse solver's own discretization error, the
   // floor everything else is measured against.
@@ -107,7 +110,7 @@ function parseArgs(argv) {
 function urlFor(o, c) {
   const p = new URLSearchParams({ scenario: 'beltrami', n: o.n, tau: o.tau, u0: o.u0, q: o.q, live: '0' });
   if (c.levels > 1) { p.set('levels', c.levels); p.set('rb', o.rb); p.set('refine', c.refine); }
-  if (c.refine === 'box' || c.refine === 'slab') p.set('boxfrac', o.boxfrac);
+  if (['box', 'bar', 'slab'].includes(c.refine)) p.set('boxfrac', o.boxfrac);
   return `${o.baseUrl}/index-3d.html?${p}${o.extra ? `&${o.extra}` : ''}`;
 }
 

@@ -47,6 +47,22 @@ override USE_BOUNCEBACK : u32 = 0u;
 // here, so one number means one physical width at every level.
 override CHI_EPS : f32 = 1.5f;
 
+// M4.1b: collide the tile INTERIOR only. Chen et al. (2006)'s coalesce
+// averages the advected-but-UNCOLLIDED interface states, and the paper is
+// explicit that averaging collided ones instead "would invalidate the
+// correctness of non-equilibrium distributions on the coarse grid" -- the
+// a = (n-1)/2n offset that stands in for the Dupuis-Chopard rescale is
+// exactly the bookkeeping of NOT colliding here. So a ring cell advects and
+// stores, nothing more.
+//
+// The whole tile is still STEPPED, for the reason this file's header gives:
+// a substep that writes only interiors leaves the other ping-pong buffer's
+// ring uninitialized, and the next substep's interface gather reads it.
+// What changes is only whether the gathered value is collided before it is
+// stored. 0 restores the pre-M4.1b behaviour of colliding everything, which
+// is what `?interface=interp` needs to stay a faithful A/B.
+override COLLIDE_RING : u32 = 0u;
+
 override SPONGE_W : f32 = 0.0f;
 override SPONGE_UX : f32 = 0.0f;
 override SPONGE_UY : f32 = 0.0f;
@@ -221,6 +237,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     min(p.x, f32(NX - 1u) - p.x),
     min(p.y, f32(NY - 1u) - p.y),
     min(p.z, f32(NZ - 1u) - p.z), SPONGE_W);
+
+  // A ring cell advects and stores; see COLLIDE_RING.
+  if (COLLIDE_RING == 0u && !isInterior3(fi)) {
+    for (var i = 0u; i < QN; i++) { f_out[i * poolPlane + cell] = f[i]; }
+    return;
+  }
 
   var fo: array<f32, QN>;
   for (var i = 0u; i < QN; i++) {

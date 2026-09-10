@@ -90,34 +90,7 @@
 // 0 = overwrite (first substep, which is also the clear), 1 = accumulate.
 override ACCUM : u32 = 0u;
 
-fn fineDim() -> vec3<i32> { return vec3<i32>(i32(2u * NX), i32(2u * NY), i32(2u * NZ)); }
-
-fn wrapFine3(g: vec3<i32>) -> vec3<i32> {
-  let n = fineDim();
-  return vec3<i32>(
-    ((g.x % n.x) + n.x) % n.x,
-    ((g.y % n.y) + n.y) % n.y,
-    ((g.z % n.z) + n.z) % n.z);
-}
-
-fn blockOfFine(g: vec3<i32>) -> vec3<u32> {
-  let RB2 = 2u * RB;
-  return vec3<u32>(u32(g.x) / RB2, u32(g.y) / RB2, u32(g.z) / RB2);
-}
-
-// Tile-local index of GLOBAL FINE cell g inside the tile owning block b --
-// which need not be g's own block. g is at most one fine cell outside b's
-// interior (it is either interior to b, or a depth-1 ring cell of it), so
-// the result is always inside [0, FB). The centred wrap is what makes this
-// periodic; it needs at least 3 blocks on the axis, which main-3d.js checks
-// before enabling this path.
-fn localInTile(g: i32, b: u32, nFine: i32) -> i32 {
-  let RB2 = i32(2u * RB);
-  var d = g - i32(b) * RB2;
-  if (d < -nFine / 2) { d += nFine; }
-  if (d >  nFine / 2) { d -= nFine; }
-  return d + i32(GHOST);
-}
+// fineDim / wrapFine3 / blockOfFine / localInTile are common_d3_pool.wgsl's.
 
 fn slotOfFine(g: vec3<i32>) -> i32 {
   return blockSlot[blockIdOf(blockOfFine(g))];

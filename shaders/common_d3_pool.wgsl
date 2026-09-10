@@ -49,6 +49,62 @@ fn isInterior3(f: vec3<u32>) -> bool {
 
 fn wrapu(v: i32, n: u32) -> u32 { return u32(((v % i32(n)) + i32(n)) % i32(n)); }
 
+// --- GLOBAL FINE coordinates ----------------------------------------------
+//
+// The frame d3-amr.mjs calls GLOBAL FINE: integer fine cell over the whole
+// domain, [0, 2*NX) etc., where "which tile owns this cell" is one division
+// with no ring and no offsets. Everything that has to reason about a cell
+// belonging to one tile while being addressed through ANOTHER -- a ring cell
+// is exactly that -- goes through here rather than doing its own arithmetic.
+
+fn fineDim() -> vec3<i32> { return vec3<i32>(i32(2u * NX), i32(2u * NY), i32(2u * NZ)); }
+
+fn wrapFine3(g: vec3<i32>) -> vec3<i32> {
+  let n = fineDim();
+  return vec3<i32>(
+    ((g.x % n.x) + n.x) % n.x,
+    ((g.y % n.y) + n.y) % n.y,
+    ((g.z % n.z) + n.z) % n.z);
+}
+
+fn blockOfFine(g: vec3<i32>) -> vec3<u32> {
+  let RB2 = 2u * RB;
+  return vec3<u32>(u32(g.x) / RB2, u32(g.y) / RB2, u32(g.z) / RB2);
+}
+
+// The coarse cell a global fine cell sits in. Cell-centred refinement puts
+// fine cells 2c and 2c+1 inside coarse cell c, so this is one shift.
+fn coarseOfFine(g: vec3<i32>) -> vec3<u32> {
+  return vec3<u32>(u32(g.x) / 2u, u32(g.y) / 2u, u32(g.z) / 2u);
+}
+
+// Tile-local index of GLOBAL FINE cell g inside the tile owning block b --
+// which need NOT be g's own block. Callers use this where g is at most one
+// fine cell outside b's interior (a depth-1 ring cell of it) or inside it, so
+// the result always lands in [0, FB). The centred wrap is what makes it
+// periodic, and it needs at least 3 blocks on the axis; main-3d.js checks
+// that before enabling any path that calls this.
+fn localInTile(g: i32, b: u32, nFine: i32) -> i32 {
+  let RB2 = i32(2u * RB);
+  var d = g - i32(b) * RB2;
+  if (d < -nFine / 2) { d += nFine; }
+  if (d >  nFine / 2) { d -= nFine; }
+  return d + i32(GHOST);
+}
+
+fn localInTile3(g: vec3<i32>, b: vec3<u32>) -> vec3<u32> {
+  let n = fineDim();
+  return vec3<u32>(
+    u32(localInTile(g.x, b.x, n.x)),
+    u32(localInTile(g.y, b.y, n.y)),
+    u32(localInTile(g.z, b.z, n.z)));
+}
+
+// The block a coarse cell belongs to.
+fn blockOfCoarse(c: vec3<u32>) -> vec3<u32> {
+  return vec3<u32>(c.x / RB, c.y / RB, c.z / RB);
+}
+
 // --- coarse -> fine interpolation core ------------------------------------
 //
 // The 3D counterpart of common_interp.wgsl. rho/u are blended and fed to
