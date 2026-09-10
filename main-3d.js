@@ -78,7 +78,7 @@ import { assembleShader } from './shader-loader.mjs';
 import { SUPPORTED_Q } from './lattice-3d.mjs';
 import { SCENARIOS, SCENARIO_NAMES, resolveScenario, nuFromTau, beltramiVelocityAt } from './d3-scenarios.mjs';
 import { packBodyState, unpackBodyState, BODY_FIELDS } from './d3-body.mjs';
-import { makePool, refineWhere, refineNearBody, storageRatio, GHOST,
+import { makePool, refineHierarchy, nearBodyWant, storageRatio, GHOST,
          check21Balance, checkGeometryCoverage } from './d3-amr.mjs';
 
 const canvas   = document.getElementById('c');
@@ -214,7 +214,10 @@ async function init() {
     return;
   }
   const AMR = LEVELS >= 2;
-  let pool = null, poolAlloc = null;
+  // `pool` is the LEVEL-1 tiling; `hier.byLevel[m]` is level m's, from
+  // d3-amr.mjs's poolAtLevel. They coincide at m = 1 and diverge by a factor
+  // of two per level after it. M5.1c.
+  let pool = null, hier = null;
   // The refinement mode, and -- when it is geometry-forced -- the SDF and
   // margin that forced it, so debugCheckGeometryCoverage can restate the
   // requirement independently.
@@ -251,8 +254,13 @@ async function init() {
     pool = makePool({ dims: [NX, NY, NZ], rb: RB });
     const mode = urlParams.get('refine') || (params.body ? 'body' : 'box');
     refineMode = mode;
+    // ONE predicate, in L0 CELL UNITS, whatever the depth. refineHierarchy
+    // evaluates it at the FINEST level only and derives every coarser level
+    // from the 2:1 closure -- see its header for why that is the right
+    // reading of geometry-forced refinement rather than a shortcut.
+    let want = null;
     if (mode === 'all') {
-      poolAlloc = refineWhere(pool, () => true);
+      want = () => true;
     } else if (mode === 'box') {
       // A centred cube. For a scenario with an ANALYTIC answer (beltrami)
       // this is the whole point: a refined region in the middle of a flow
@@ -261,7 +269,7 @@ async function init() {
       const frac = numParam('boxfrac', 0.5);
       const lo = [NX, NY, NZ].map(n => n * (1 - frac) / 2);
       const hi = [NX, NY, NZ].map(n => n * (1 + frac) / 2);
-      poolAlloc = refineWhere(pool, ({ mid }) => mid.every((c, i) => c >= lo[i] && c < hi[i]));
+      want = ({ mid }) => mid.every((c, i) => c >= lo[i] && c < hi[i]);
     } else if (mode === 'slab') {
       // A refined SLAB spanning the full domain in y and z: periodic in
       // both, so the seam is two FLAT faces with no edge and no corner
@@ -271,7 +279,7 @@ async function init() {
       // edge or corner they provably do not, and this separates the two.
       const frac = numParam('boxfrac', 0.5);
       const lo = NX * (1 - frac) / 2, hi = NX * (1 + frac) / 2;
-      poolAlloc = refineWhere(pool, ({ mid }) => mid[0] >= lo && mid[0] < hi);
+      want = ({ mid }) => mid[0] >= lo && mid[0] < hi;
     } else if (mode === 'bar') {
       // Refined in x AND y, spanning all of z: four convex EDGES, no
       // corner. The middle rung of the interface-geometry ladder --
@@ -281,7 +289,7 @@ async function init() {
       const frac = numParam('boxfrac', 0.5);
       const lo = [NX, NY].map(n => n * (1 - frac) / 2);
       const hi = [NX, NY].map(n => n * (1 + frac) / 2);
-      poolAlloc = refineWhere(pool, ({ mid }) => [0, 1].every(i => mid[i] >= lo[i] && mid[i] < hi[i]));
+      want = ({ mid }) => [0, 1].every(i => mid[i] >= lo[i] && mid[i] < hi[i]);
     } else if (mode === 'body') {
       if (!params.body) throw new Error('?refine=body: this scenario has no body');
       const sh = params.body.shape, bx = params.body.x;
@@ -299,11 +307,17 @@ async function init() {
       // would pass a manager that refined a shell and then left it behind,
       // which is precisely the failure this is meant to catch.
       geomForced = { radius: sh.a, margin, sdfAt: (c) => (q) => Math.hypot(q[0] - c[0], q[1] - c[1], q[2] - c[2]) - sh.a };
-      poolAlloc = refineNearBody(pool, geomForced.sdfAt(bx), margin);
+      want = nearBodyWant(geomForced.sdfAt(bx), margin);
     } else {
       throw new Error(`?refine=${mode}: expected all, box, bar, slab or body`);
     }
+    hier = refineHierarchy(pool, { levels: LEVELS, want });
   }
+  // Level 1's allocation, which is what every depth-2 code path below still
+  // addresses directly. M5.3's recursive schedule is what removes the last
+  // of these; until then naming it once is better than `hier.byLevel[1]`
+  // scattered through the file.
+  const poolAlloc = AMR ? hier.byLevel[1] : null;
 
 
 
@@ -364,17 +378,34 @@ async function init() {
   // The slot budget. Static refinement knows its own answer up front and
   // allocates exactly that; dynamic refinement has to be able to GROW, so it
   // pays for headroom above the initial set. See SLOT_HEADROOM.
-  const MAX_SLOTS = AMR
-    ? Math.min(pool.nBlocks, Math.max(1, DYNAMIC
-        ? Math.ceil(poolAlloc.activeSlots * SLOT_HEADROOM)
-        : poolAlloc.activeSlots))
-    : 0;
-  const poolBytes = AMR ? MAX_SLOTS * pool.tileCells * Q * 4 : 0;
+  //
+  // PER LEVEL, and it has to be: measured on the sphere geometry, level 1
+  // holds 160 tiles at ?levels=2 and 304 at ?levels=3, because a deeper
+  // level demands a wider buffer shell around it. A budget derived from the
+  // depth-2 answer would under-allocate the coarser levels of every deeper
+  // run (plans/3D.md M5.1b).
+  const maxSlotsAt = (m) => {
+    const a = hier.byLevel[m];
+    return Math.min(a.pool.nBlocks, Math.max(1, DYNAMIC
+      ? Math.ceil(a.activeSlots * SLOT_HEADROOM)
+      : a.activeSlots));
+  };
+  const SLOTS = [null];
+  if (AMR) for (let m = 1; m < LEVELS; m++) SLOTS[m] = maxSlotsAt(m);
+  const MAX_SLOTS = AMR ? SLOTS[1] : 0;
+  // tileCells is the SAME at every level -- that is the uniform tile shape
+  // (plans/3D.md M5, and d3-amr.mjs's poolAtLevel) showing up as one number
+  // rather than a per-level one.
+  const levelBytes = (m) => SLOTS[m] * pool.tileCells * Q * 4;
+  let poolBytes = 0, biggestLevel = 1;
+  if (AMR) for (let m = 1; m < LEVELS; m++) {
+    if (levelBytes(m) > poolBytes) { poolBytes = levelBytes(m); biggestLevel = m; }
+  }
   const needBytes = Math.max(fBytes, poolBytes);
   const limit = Math.min(adapter.limits.maxStorageBufferBindingSize, adapter.limits.maxBufferSize);
   if (needBytes > limit) {
     const what = poolBytes > fBytes
-      ? `an L1 pool of ${poolAlloc.activeSlots} tiles x ${pool.tileCells} cells`
+      ? `an L${biggestLevel} pool of ${SLOTS[biggestLevel]} tiles x ${pool.tileCells} cells`
       : `${NX}x${NY}x${NZ} D3Q${Q}`;
     statusEl.textContent = `error: ${what} needs a ${(needBytes / 1048576).toFixed(0)} MiB binding, this GPU's max is ${(limit / 1048576).toFixed(0)} MiB`;
     return;
@@ -425,59 +456,83 @@ async function init() {
   // Pool buffers. Sized to the slots actually allocated, not to maxSlots:
   // static refinement knows its own answer up front, and a 3D pool sized for
   // the whole domain would be (FB/RB)^3 = 27x the dense grid at RB=4.
-  let fPoolA = null, fPoolB = null, macPool = null, blockSlotBuf = null, slotToBlockBuf = null;
   let fluxAccBuf = null;
-  let freeListBuf = null, freeCountBuf = null, blockWantBuf = null, slotNewBuf = null;
-  if (AMR) {
-    const slots = MAX_SLOTS;
+  // ONE ENTRY PER LEVEL (M5.1c). Everything the depth-2 code below still
+  // names directly is an alias onto L[1]; the loop is what M5.2 and M5.3
+  // extend, and building it now means those stages raise a level count
+  // rather than restructure allocation while also debugging a new coupling.
+  const L = [null];
+  const makeLevelBuffers = (m) => {
+    const alloc = hier.byLevel[m];
+    const slots = SLOTS[m];
     const poolCells = slots * pool.tileCells;
-    fPoolA = device.createBuffer({ size: poolBytes, usage: U.STORAGE });
-    fPoolB = device.createBuffer({ size: poolBytes, usage: U.STORAGE });
-    macPool = device.createBuffer({ size: poolCells * 4 * 4, usage: U.STORAGE | U.COPY_SRC });
+    const nBlocks = alloc.pool.nBlocks;
+    const lv = { level: m, pool: alloc.pool, alloc, slots, nBlocks };
+    lv.fA = device.createBuffer({ size: levelBytes(m), usage: U.STORAGE });
+    lv.fB = device.createBuffer({ size: levelBytes(m), usage: U.STORAGE });
+    lv.mac = device.createBuffer({ size: poolCells * 4 * 4, usage: U.STORAGE | U.COPY_SRC });
     // COPY_SRC so debugCheck21Balance reads what the GPU HAS rather than the
     // host's copy of what it once uploaded. Identical today, because
     // refinement is static -- and exactly not identical the moment M4.2's
     // manager starts writing this buffer from a kernel, which is when the
     // checker has to already be right.
-    blockSlotBuf = device.createBuffer({ size: pool.nBlocks * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
+    lv.blockSlot = device.createBuffer({ size: nBlocks * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
     // COPY_SRC on slotToBlock too: it is blockSlot's inverse, and cross-
     // checking the two against each other is how the 2D free-list race was
     // confirmed -- they disagreed for exactly the colliding slot.
-    slotToBlockBuf = device.createBuffer({ size: slots * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
+    lv.slotToBlock = device.createBuffer({ size: slots * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
     const s2b = new Int32Array(slots).fill(-1);
-    s2b.set(poolAlloc.slotToBlock.slice(0, Math.min(slots, poolAlloc.activeSlots)));
-    device.queue.writeBuffer(blockSlotBuf, 0, poolAlloc.blockSlot);
-    device.queue.writeBuffer(slotToBlockBuf, 0, s2b);
+    s2b.set(alloc.slotToBlock.slice(0, Math.min(slots, alloc.activeSlots)));
+    device.queue.writeBuffer(lv.blockSlot, 0, alloc.blockSlot);
+    device.queue.writeBuffer(lv.slotToBlock, 0, s2b);
     // The free list, a classic GPU stack: freeCount is how many slots are
     // free, and the top of the stack lives at freeList[freeCount-1]. Slots
     // [0, activeSlots) start in use; everything above is free.
-    const nFree = slots - poolAlloc.activeSlots;
+    const nFree = slots - alloc.activeSlots;
     const freeInit = new Int32Array(Math.max(1, slots));
-    for (let i = 0; i < nFree; i++) freeInit[i] = poolAlloc.activeSlots + i;
-    freeListBuf = device.createBuffer({ size: Math.max(1, slots) * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
-    freeCountBuf = device.createBuffer({ size: 16, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
-    device.queue.writeBuffer(freeListBuf, 0, freeInit);
-    device.queue.writeBuffer(freeCountBuf, 0, new Int32Array([nFree, 0, 0, 0]));
+    for (let i = 0; i < nFree; i++) freeInit[i] = alloc.activeSlots + i;
+    lv.freeList = device.createBuffer({ size: Math.max(1, slots) * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
+    lv.freeCount = device.createBuffer({ size: 16, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
+    device.queue.writeBuffer(lv.freeList, 0, freeInit);
+    device.queue.writeBuffer(lv.freeCount, 0, new Int32Array([nFree, 0, 0, 0]));
     // Always allocated, even when static: `blockWant` and `slotNew` are bound
     // into the interp and average layouts, and a layout that exists in two
     // versions is exactly the 238e48c failure surface. One dummy element is
     // enough where there is no manager -- the pipelines that read them are
     // never created, and NEW_ONLY/DYING_ONLY fold the reads out of the ones
     // that are.
-    blockWantBuf = device.createBuffer({ size: (DYNAMIC ? pool.nBlocks : 1) * 4, usage: U.STORAGE | U.COPY_DST });
-    slotNewBuf = device.createBuffer({ size: (DYNAMIC ? slots : 1) * 4, usage: U.STORAGE | U.COPY_DST });
+    lv.blockWant = device.createBuffer({ size: (DYNAMIC ? nBlocks : 1) * 4, usage: U.STORAGE | U.COPY_DST });
+    lv.slotNew = device.createBuffer({ size: (DYNAMIC ? slots : 1) * 4, usage: U.STORAGE | U.COPY_DST });
     // The initial set is not "new": it was uploaded with real data by the
     // host, and marking it new would have the fill pass overwrite every tile
     // with a coarse interpolation on the first step.
-    device.queue.writeBuffer(slotNewBuf, 0, new Uint32Array(DYNAMIC ? slots : 1));
-    device.queue.writeBuffer(blockWantBuf, 0, new Uint32Array(DYNAMIC ? pool.nBlocks : 1));
+    device.queue.writeBuffer(lv.slotNew, 0, new Uint32Array(DYNAMIC ? slots : 1));
+    device.queue.writeBuffer(lv.blockWant, 0, new Uint32Array(DYNAMIC ? nBlocks : 1));
+    return lv;
+  };
+  if (AMR) {
+    for (let m = 1; m < LEVELS; m++) L[m] = makeLevelBuffers(m);
     // Per coarse cell: the mass and momentum the FINE solver moved across
     // the seam this macro step, in coarse-cell units. Written by the flux
     // pass on substep A and added to on substep B; consumed by the reflux
     // pass. Only seam-adjacent cells are ever written OR read (both passes
     // share one reachability predicate), so it is deliberately not cleared.
+    // L0-sized, so it is not per-level: it is the COARSE side of the seam.
     fluxAccBuf = device.createBuffer({ size: NCELLS * 4 * 4, usage: U.STORAGE | U.COPY_SRC });
   }
+  // The depth-2 aliases. Every dispatch and bind group below still addresses
+  // level 1 by name; M5.3's recursive schedule is what replaces them with a
+  // walk over L. Naming them once here keeps that a localized change instead
+  // of a rename across the file.
+  const fPoolA = AMR ? L[1].fA : null;
+  const fPoolB = AMR ? L[1].fB : null;
+  const macPool = AMR ? L[1].mac : null;
+  const blockSlotBuf = AMR ? L[1].blockSlot : null;
+  const slotToBlockBuf = AMR ? L[1].slotToBlock : null;
+  const freeListBuf = AMR ? L[1].freeList : null;
+  const freeCountBuf = AMR ? L[1].freeCount : null;
+  const blockWantBuf = AMR ? L[1].blockWant : null;
+  const slotNewBuf = AMR ? L[1].slotNew : null;
 
   // `blockSlot` is bound to the coarse step on EVERY scenario so there is one
   // bind-group layout, the same arrangement `body` uses. With no pool it is a
@@ -1363,15 +1418,20 @@ async function init() {
   // #2 is that a checker written after a manager gets written to agree with
   // it, and the 2D manager's three live-verified balance bugs all sat under a
   // green suite.
+  // Sized to the DEEPEST level's block grid, which is the largest: the block
+  // count doubles per axis per level, so level 1's size would be 8x short at
+  // level 2 -- a readback that silently returns a prefix, and a checker that
+  // then reports a perfectly balanced tree because it never saw the rest.
   const blockSlotStaging = AMR
-    ? device.createBuffer({ size: pool.nBlocks * 4, usage: U.MAP_READ | U.COPY_DST })
+    ? device.createBuffer({ size: Math.max(...L.slice(1).map(l => l.nBlocks)) * 4, usage: U.MAP_READ | U.COPY_DST })
     : null;
-  async function readBlockSlot() {
+  async function readBlockSlot(m = 1) {
+    const bytes = L[m].nBlocks * 4;
     const enc = device.createCommandEncoder();
-    enc.copyBufferToBuffer(blockSlotBuf, 0, blockSlotStaging, 0, pool.nBlocks * 4);
+    enc.copyBufferToBuffer(L[m].blockSlot, 0, blockSlotStaging, 0, bytes);
     device.queue.submit([enc.finish()]);
-    await blockSlotStaging.mapAsync(GPUMapMode.READ);
-    const v = new Int32Array(blockSlotStaging.getMappedRange()).slice();
+    await blockSlotStaging.mapAsync(GPUMapMode.READ, 0, bytes);
+    const v = new Int32Array(blockSlotStaging.getMappedRange(0, bytes)).slice();
     blockSlotStaging.unmap();
     return v;
   }
@@ -1389,7 +1449,7 @@ async function init() {
   // freeCount is initialized by the host and only a kernel can move it, and
   // the invariants below are checked against what the GPU actually holds.
   const poolStateStaging = AMR ? device.createBuffer({
-    size: Math.max(16, MAX_SLOTS * 4), usage: U.MAP_READ | U.COPY_DST }) : null;
+    size: Math.max(16, ...L.slice(1).map(l => l.slots * 4)), usage: U.MAP_READ | U.COPY_DST }) : null;
   async function readI32(src, bytes) {
     const enc = device.createCommandEncoder();
     enc.copyBufferToBuffer(src, 0, poolStateStaging, 0, bytes);
@@ -1399,11 +1459,26 @@ async function init() {
     poolStateStaging.unmap();
     return v;
   }
+  // Per level, and the top-level fields still report LEVEL 1 so every
+  // existing caller reads what it always read (tools/validate-d3-invariants.js
+  // asserts on `inUse`, `free` and `bbox` directly). `byLevel` is the new
+  // surface; M5.6 is where the tools move onto it.
   async function debugPoolState() {
     if (!AMR) return { skipped: 'no pool (?levels=1)' };
-    const bs = await readBlockSlot();
-    const s2b = await readI32(slotToBlockBuf, MAX_SLOTS * 4);
-    const free = DYNAMIC ? (await readI32(freeCountBuf, 16))[0] : (MAX_SLOTS - poolAlloc.activeSlots);
+    const byLevel = [null];
+    for (let m = 1; m < LEVELS; m++) byLevel[m] = await poolStateAt(m);
+    const bad = byLevel.slice(1).flatMap((r, i) => r.problems.map(p => ({ level: i + 1, ...p })));
+    return { ...byLevel[1], problems: bad, ok: bad.length === 0, byLevel: byLevel.slice(1) };
+  }
+  async function poolStateAt(m) {
+    const lv = L[m];
+    const bs = await readBlockSlot(m);
+    const s2b = await readI32(lv.slotToBlock, lv.slots * 4);
+    const free = DYNAMIC ? (await readI32(lv.freeCount, 16))[0] : (lv.slots - lv.alloc.activeSlots);
+    // These deliberately SHADOW the file-level level-1 names, so the body
+    // below reads as it did before M5.1c while operating on level m. If you
+    // are reading one of them here, it is this level's, not level 1's.
+    const MAX_SLOTS = lv.slots, pool = lv.pool, poolAlloc = lv.alloc;
     const problems = [];
     let inUse = 0;
     for (let id = 0; id < pool.nBlocks; id++) {
@@ -1436,21 +1511,27 @@ async function init() {
     const bbox = inUse ? { lo, hi } : null;
     const budgetOk = inUse + free === MAX_SLOTS;
     if (!budgetOk && problems.length < 16) problems.push({ kind: 'budget', inUse, free, maxSlots: MAX_SLOTS });
-    return { ok: problems.length === 0, problems, inUse, free, maxSlots: MAX_SLOTS,
+    return { ok: problems.length === 0, problems, level: m, inUse, free, maxSlots: MAX_SLOTS,
              bbox, initialActive: poolAlloc.activeSlots, dynamic: !!DYNAMIC };
   }
 
   async function debugCheck21Balance() {
     if (!AMR) return { skipped: 'no pool (?levels=1)' };
-    const bs = await readBlockSlot();
-    const lv1 = new Set();
-    for (let id = 0; id < pool.nBlocks; id++) {
-      if (bs[id] >= 0) lv1.add(pool.blockOf(id).join(','));
+    // EVERY level's map, read back from the GPU -- not the host's copy of
+    // what it once uploaded, and not level 1 alone. A checker fed one level
+    // of a three-level tree cannot fail, which is the same VACUOUS trap
+    // ?levels=3 used to spring before M5.0 refused it.
+    const levelSets = [null];
+    for (let m = 1; m < LEVELS; m++) {
+      const bs = await readBlockSlot(m);
+      const set = new Set();
+      const lp = L[m].pool;
+      for (let id = 0; id < lp.nBlocks; id++) if (bs[id] >= 0) set.add(lp.blockOf(id).join(','));
+      levelSets[m] = set;
     }
-    // levelSets is indexed by level, level 0 being the dense grid; only level
-    // 1 exists until M5 adds the pool-parent path. nbAt doubles per level,
-    // which is the shape M5 will actually have.
-    const r = check21Balance([null, lv1], (m) => pool.nb.map(n => n * 2 ** (m - 1)),
+    // nbAt doubles per level, matching d3-amr.mjs's poolAtLevel -- the same
+    // block grid cascade21 and refineHierarchy are written against.
+    const r = check21Balance(levelSets, (m) => pool.nb.map(n => n * 2 ** (m - 1)),
                              { levels: LEVELS });
     return {
       ok: r.violations.length === 0,
@@ -1761,6 +1842,10 @@ async function init() {
         rb: RB, fb: pool.FB, ghost: GHOST,
         blocks: pool.nBlocks, activeSlots: poolAlloc.activeSlots,
         refinedFraction: poolAlloc.activeSlots / pool.nBlocks,
+        // Per level, ADDED rather than replacing the level-1 fields above,
+        // so every existing tool reads exactly what it read before.
+        levelTiles: L.slice(1).map(l => ({ level: l.level, tiles: l.alloc.activeSlots,
+                                           slots: l.slots, blocks: l.nBlocks })),
         tileCells: pool.tileCells,
         storageRatio: storageRatio(pool),
         tauCoarse: TAU_COARSE, tauFine: TAU_FINE, reflux: REFLUX,

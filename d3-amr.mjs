@@ -102,7 +102,17 @@ export function refineWhere(pool, predicate) {
 // body surface. The geometry-forced refinement of plans/3D.md sec 1.3, in
 // its static form: every leaf near the body must be at the finest level.
 export function refineNearBody(pool, sdf, margin) {
-  return refineWhere(pool, ({ lo, hi }) => {
+  return refineWhere(pool, nearBodyWant(sdf, margin));
+}
+
+// The same predicate as a value, so the STATIC set (refineWhere), the
+// HIERARCHY (refineHierarchy, which evaluates it at the finest level) and
+// main-3d.js all apply one test rather than three copies of it. The copy
+// that cannot be shared is shaders/common_d3_manage.wgsl's `blockWanted`,
+// which must agree with this character for character -- M4.2b-i's
+// bit-identical gate is what holds those two together.
+export function nearBodyWant(sdf, margin) {
+  return ({ lo, hi }) => {
     // Distance from the body to the block's box, evaluated at the closest
     // point of the box to the body centre is NOT enough for a general SDF,
     // so sample the box corners and centre and take the minimum |phi|. With
@@ -116,7 +126,7 @@ export function refineNearBody(pool, sdf, margin) {
     }
     best = Math.min(best, sdf([(lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, (lo[2] + hi[2]) / 2]));
     return best <= margin;
-  });
+  };
 }
 
 // --- neighbour resolution -------------------------------------------------
