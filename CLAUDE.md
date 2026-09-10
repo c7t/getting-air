@@ -9,9 +9,12 @@ step** — the source *is* the artifact; GitHub Pages serves it directly.
   `shaders/amr_*.wgsl`. **Most active work is here.**
 - `index-cylinder*.html` / `main-cylinder*.js` — cylinder-in-crossflow validation
   harness (base + AMR variants).
-- `index-3d-spike.html` / `main-3d-spike.js` — 3D D3Q19/D3Q27 bench page, the
-  M0 milestone of `plans/3D.md`. Not a solver: dense periodic grid, no body,
-  no AMR, no render. See "The 3D fork" below.
+- `index-3d.html` / `main-3d.js` — dense 3D LBM (D3Q19/D3Q27), no AMR, no
+  body, slice view. **One page, three scenarios** via `?scenario=duct|
+  beltrami|tgv`. Shaders: `shaders/d3_*.wgsl`. See "The 3D fork" below.
+- `index-3d-spike.html` / `main-3d-spike.js` — 3D bench page, the M0
+  milestone of `plans/3D.md`. Not a solver: dense periodic grid, no body,
+  no AMR, no render.
 - `shaders/` — all WGSL. `Makefile` — validation + release helpers.
 
 ## Validate before committing (no GPU needed)
@@ -20,8 +23,8 @@ Run `make check` and make it pass before committing shader/JS changes:
   shared `.mjs` modules were outside this glob until 2026-09-08.
 - `make test` — the GPU-free unit tests (`tools/test-*.js`): the shared
   card/regime parameterization, the AMR field reconstructor, the dense→AMR
-  injector, the packed-`f` host/shader layout agreement, and the 3D lattice
-  tables. Add a `tools/test-<name>.js` and it is picked up
+  injector, the packed-`f` host/shader layout agreement, the 3D lattice
+  tables, and the 3D analytic reference solutions. Add a `tools/test-<name>.js` and it is picked up
   automatically; each must run with no server/browser/GPU and exit nonzero
   on failure.
 - `make wgsl` — validate every `shaders/*.wgsl` with `naga` (needs `naga`;
@@ -204,7 +207,7 @@ comment above `N_LEVELS`, not this file, for what's current.
 
 ## The 3D fork (`plans/3D.md`)
 
-Scoped, and **M0 is done**; M1 (a dense 3D page) is not started. Read
+**M0 and M1 are done**; M2 (the body) is next. Read
 `plans/3D.md` before touching any of this — in particular its decision table
 at the top, which records what is settled so it does not get re-argued.
 Two things are settled and load-bearing:
@@ -216,6 +219,14 @@ Two things are settled and load-bearing:
   `plans/3D.md` sec 2.1 for the decision.
 - **f32 registers are not a constraint**, measured, so nothing should be
   restructured around avoiding them. `plans/3D.md` sec 2.4.
+
+Also settled, and worth knowing before adding a page:
+
+- **One 3D page, scenarios by URL parameter** — `index-3d.html?scenario=`,
+  not a page per scenario. The 2D side has four near-identical `main*.js`
+  each carrying its own copy of the same bind groups, which is exactly the
+  shape that produced 238e48c. Do not fork `main-3d.js`; add a scenario to
+  `d3-scenarios.mjs`.
 
 What exists today:
 
@@ -239,6 +250,29 @@ What exists today:
 
       node tools/spike-d3-registers.js            # owns Chrome; prints a verdict
       node tools/spike-d3-registers.js --n=96 --peak=717 --wg=8,8,1
+
+- `d3-scenarios.mjs` — the three scenarios AND their closed-form reference
+  solutions, shared by the page (which uses them to build initial
+  conditions) and by the validation tools (which score against them).
+  `tools/test-d3-scenarios.js` guards the references against the PDEs they
+  solve — the duct series against an independent SOR Poisson solve verified
+  to converge to it at second order, the Beltrami field against
+  `curl(u) = k u` by finite differences — rather than against a
+  transcription of the same formula.
+- `tools/validate-3d.js` + `benchmarks/d3.json` — the M1 gates. Two are
+  analytic and PASS/FAIL; the 3D TGV only reports.
+
+      node tools/validate-3d.js                   # owns Chrome; 13 cases
+      node tools/validate-3d.js --cases=duct-N48 --skip=tgv
+
+  **Read `benchmarks/d3.json`'s `tolerances_note` before re-baselining
+  anything** -- the tolerances were set from measurement, and it records
+  which cases are deliberately off the bounce-back "magic" tau so the
+  wall-position error stays visible instead of tuned away. All 13 cases
+  were green 2026-09-09: duct cross-section L2rel 6.3e-5..1.7e-3, Beltrami
+  decay-rate error 1.2e-5..2.1e-3 converging at second order in N. The
+  `?scenario=tgv` case deliberately has no tolerances and only reports --
+  the Re=1600 comparison needs literature data this project does not have.
 
   Measured 2026-09-09, RTX 4080, 128^3: D3Q19 **3.62 GLUPS / 551 GB/s (77% of
   peak)**, D3Q27 **2.35 GLUPS / 508 GB/s**, with the full kernel matching its

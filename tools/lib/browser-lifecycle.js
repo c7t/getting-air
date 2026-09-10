@@ -196,6 +196,98 @@ async function waitForGlobal(Runtime, globalExpr, timeoutMs) {
   if (!ok) throw new Error(`${globalExpr} never became available (page failed to load or WebGPU init failed)`);
 }
 
+// Attaches every channel a page can report a failure on, and collects them
+// into one list.
+//
+// WHY THIS EXISTS. Runtime.exceptionThrown -- which is what every tool here
+// listened to -- does NOT see the failures this project actually produces.
+// Each page wraps its own startup as `init().catch(handleErr)`, so a bad URL
+// parameter, a failed shader fetch or a bind-group mismatch becomes a
+// console.error plus an `error: ...` line in #status, and NOTHING is thrown
+// uncaught. tools/validate-all.js's boot smoke already knows this and polls
+// #status for exactly that reason; every other tool was blind to it, which
+// in practice meant a human noticed the red box on the page and pasted it
+// back. That is not a tool.
+//
+// So: exceptions, console.error/assert, browser log entries at error level,
+// failed subresource loads, and any 4xx/5xx response. Plus statusError()
+// below for the #status channel, which is the one none of the CDP domains
+// can see.
+//
+// Also disables the HTTP cache. https.py sends no cache headers, so Chrome
+// is free to reuse a main*.js from its memory cache across a navigation --
+// which means a tool can validate the PREVIOUS version of the file it was
+// asked about, and report a stale pass or a stale failure. Not a hypothetical.
+async function attachPageWatch(client, { label, onError } = {}) {
+  const { Runtime, Log, Network } = client;
+  const errors = [];
+  const push = (kind, text) => {
+    const e = { kind, text: String(text).trim(), label };
+    errors.push(e);
+    if (onError) onError(e);
+  };
+
+  Runtime.exceptionThrown((e) => {
+    const d = e.exceptionDetails;
+    push('exception', (d.exception && d.exception.description) || d.text);
+  });
+  Runtime.consoleAPICalled((e) => {
+    if (e.type !== 'error' && e.type !== 'assert') return;
+    push(`console.${e.type}`, e.args.map(a =>
+      a.description || (a.value !== undefined ? a.value : a.type)).join(' '));
+  });
+
+  if (Log) {
+    await Log.enable();
+    Log.entryAdded((e) => { if (e.entry.level === 'error') push('log', e.entry.text); });
+  }
+  if (Network) {
+    await Network.enable();
+    await Network.setCacheDisabled({ cacheDisabled: true });
+    Network.loadingFailed((e) => {
+      if (e.canceled) return;
+      push('net', `${e.type} failed: ${e.errorText}`);
+    });
+    Network.responseReceived((e) => {
+      if (e.response.status >= 400) push('net', `HTTP ${e.response.status} for ${e.response.url}`);
+    });
+  }
+
+  return {
+    errors,
+    // Everything seen since the last drain, then forget it -- so a
+    // per-config loop attributes failures to the config that caused them.
+    drain() { return errors.splice(0, errors.length); },
+    get count() { return errors.length; },
+  };
+}
+
+// The #status channel, which no CDP domain reports: every page writes
+// `error: ...` there on a caught init failure (see error-overlay.mjs, whose
+// overlay is deliberately additive to this line precisely so tools can keep
+// reading it). Returns the message, or null if the page is healthy.
+async function statusError(Runtime) {
+  const r = await evalExpr(Runtime, `(() => {
+    const el = document.getElementById('status');
+    return el ? el.textContent : null;
+  })()`);
+  if (r.exceptionDetails) return null;
+  const text = r.result.value;
+  return (typeof text === 'string' && /^error:/i.test(text)) ? text : null;
+}
+
+// One call for "did this page come up cleanly": both channels, formatted.
+// Throws, because every caller wants to stop rather than continue against a
+// page that failed to start.
+async function assertPageHealthy(Runtime, watch, what) {
+  const st = await statusError(Runtime);
+  const seen = watch ? watch.drain() : [];
+  const lines = [];
+  if (st) lines.push(`  #status: ${st}`);
+  for (const e of seen) lines.push(`  [${e.kind}] ${e.text.split('\n')[0]}`);
+  if (lines.length) throw new Error(`${what} reported errors:\n${lines.join('\n')}`);
+}
+
 // Cleans up whatever ensureServer/ensureChrome started (leaves alone anything
 // that was already running before this process touched it -- a run that
 // ADOPTED a Chrome must not kill it, since another run may be adopting the
@@ -227,5 +319,6 @@ async function teardown({ port, tabId, chrome, server, keepOpen }) {
 module.exports = {
   httpsGetOk, waitFor, ensureServer, chromeDebugOk, ensureChrome,
   openTab, firstTab, closeTab, navigateTo, evalExpr, waitForGlobal, teardown,
+  attachPageWatch, statusError, assertPageHealthy,
   PROFILE_ROOT, liveProfileDirs, sweepStaleProfiles, reapAllChromes,
 };

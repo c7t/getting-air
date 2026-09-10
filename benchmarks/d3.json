@@ -1,0 +1,33 @@
+{
+  "geometry": "Dense 3D LBM (index-3d.html), N^3 lattice. Two analytic gates and one reporting scenario -- see d3-scenarios.mjs's header for why these two and not the 3D Taylor-Green vortex at Re=1600 that plans/3D.md M1 originally named.",
+  "gates": {
+    "duct": "Square-duct Poiseuille flow: periodic in x, stationary no-slip walls on y and z, uniform Guo body force sized to a target peak velocity. Started from REST, so the initial condition is independent of the reference solution -- this gate cannot be passed by a shared mistake between the seed and the check. Scored on the steady u_x cross-section (averaged along x) against the classical series solution. `x_spread_tol` bounds the variation of u_x ALONG the periodic axis relative to the peak: a settled duct flow is x-invariant by construction, so a nonzero spread means either an unconverged run or something wrong with the periodic direction, and it is checked separately from the profile error rather than being allowed to hide inside it.",
+    "beltrami": "Decaying ABC (Beltrami) flow, triply periodic. curl(u) = k*u, so the nonlinear term is a pure gradient and u(t) = u0 * exp(-nu k^2 t) EXACTLY, with the spatial shape preserved. Genuinely three-dimensional and time-dependent -- an asymmetry between the axes (a transposed index, a dropped uz term in feq, a wrong ez entry) breaks shape preservation, which is what field_l2_tol measures, while decay_rate_tol measures the viscosity the solver actually realizes.",
+    "tgv": "3D Taylor-Green vortex. NOT a gate: the nonlinear term does not vanish, so there is no closed form, and the standard Re=1600 comparison is against digitized DNS dissipation curves at 256^3-512^3 that this project does not have. Present as the initial condition that comparison will need, and reported (kinetic energy, enstrophy, dissipation rate) so a regression in it is at least VISIBLE. Reported cases have no tolerances and never fail the suite."
+  },
+  "measurement": {
+    "duct_steps": "settle_multiple x the (1,1) duct mode's time constant 2a^2/(nu pi^2), rounded per case at run time, so the same physical settling is used regardless of N or nu",
+    "beltrami_checkpoints": "multiples of td = 1/(nu k^2), k = 2 pi / N",
+    "decay_rate": "fit via -ln(rms(t_b)/rms(t_a))/(t_b - t_a) between the last two checkpoints, rms taken over the strided full-volume sample"
+  },
+  "tolerances_note": "Set from measurement, 2026-09-09, RTX 4080. Observed duct L2rel spans 6.3e-5 (Q27, tau=0.933) to 1.7e-3 (tau=0.6); observed beltrami worst-checkpoint L2rel spans 9.4e-5 to 8.3e-3 and decay-rate relative error 1.2e-5 to 2.1e-3, converging at second order in N (2.08e-3 -> 9.38e-4 -> 5.60e-4 for N = 32, 48, 64), which is the expected O(k^2) lattice-viscosity correction. Tolerances sit a few times above the worst observed value: loose enough not to be a resolution-dependent tripwire, far tighter than any real defect. tau=0.9330127 is (1/2) + sqrt(3)/4, the BGK value at which the TRT magic parameter Lambda = (tau-1/2)^2 equals 3/16 and halfway bounce-back places the wall EXACTLY halfway between the last fluid cell and the first solid one -- which is the convention d3-scenarios.mjs's ductCoord() and shaders/common_d3_step.wgsl both assume. The tau=0.8 and tau=0.6 duct cases are deliberately off that value and are there to keep the wall-position error visible rather than tuned away.",
+  "duct_cases": [
+    { "name": "duct-N24",        "n": 24, "tau": 0.8,       "u0": 0.05, "q": 19, "settle_multiple": 12, "field_l2_tol": 0.005, "peak_tol": 0.005, "x_spread_tol": 1e-5 },
+    { "name": "duct-N48",        "n": 48, "tau": 0.8,       "u0": 0.05, "q": 19, "settle_multiple": 12, "field_l2_tol": 0.005, "peak_tol": 0.005, "x_spread_tol": 1e-5 },
+    { "name": "duct-N48-magic",  "n": 48, "tau": 0.9330127, "u0": 0.05, "q": 19, "settle_multiple": 12, "field_l2_tol": 0.002, "peak_tol": 0.002, "x_spread_tol": 1e-5 },
+    { "name": "duct-N48-tau06",  "n": 48, "tau": 0.6,       "u0": 0.05, "q": 19, "settle_multiple": 12, "field_l2_tol": 0.005, "peak_tol": 0.005, "x_spread_tol": 1e-5 },
+    { "name": "duct-N48-Q27",    "n": 48, "tau": 0.9330127, "u0": 0.05, "q": 27, "settle_multiple": 12, "field_l2_tol": 0.002, "peak_tol": 0.002, "x_spread_tol": 1e-5 }
+  ],
+  "beltrami_cases": [
+    { "name": "bel-N32",       "n": 32, "tau": 0.8, "u0": 0.04, "q": 19, "checkpoints": [0.5, 1.5, 3.0], "field_l2_tol": 0.02, "decay_rate_tol": 0.005 },
+    { "name": "bel-N48",       "n": 48, "tau": 0.8, "u0": 0.04, "q": 19, "checkpoints": [0.5, 1.5, 3.0], "field_l2_tol": 0.01, "decay_rate_tol": 0.005 },
+    { "name": "bel-N64",       "n": 64, "tau": 0.8, "u0": 0.04, "q": 19, "checkpoints": [0.5, 1.5, 3.0], "field_l2_tol": 0.01, "decay_rate_tol": 0.005 },
+    { "name": "bel-N48-tau06", "n": 48, "tau": 0.6, "u0": 0.04, "q": 19, "checkpoints": [0.5, 1.5, 3.0], "field_l2_tol": 0.02, "decay_rate_tol": 0.005 },
+    { "name": "bel-N48-tau10", "n": 48, "tau": 1.0, "u0": 0.04, "q": 19, "checkpoints": [0.5, 1.5, 3.0], "field_l2_tol": 0.01, "decay_rate_tol": 0.005 },
+    { "name": "bel-N48-u0hi",  "n": 48, "tau": 0.8, "u0": 0.08, "q": 19, "checkpoints": [0.5, 1.5, 3.0], "field_l2_tol": 0.02, "decay_rate_tol": 0.005 },
+    { "name": "bel-N48-Q27",   "n": 48, "tau": 0.8, "u0": 0.04, "q": 27, "checkpoints": [0.5, 1.5, 3.0], "field_l2_tol": 0.01, "decay_rate_tol": 0.005 }
+  ],
+  "tgv_cases": [
+    { "name": "tgv-N64-Re244", "n": 64, "tau": 0.51, "u0": 0.08, "q": 19, "checkpoints": [200, 600, 1200] }
+  ]
+}
