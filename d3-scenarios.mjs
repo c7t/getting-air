@@ -421,7 +421,26 @@ SCENARIOS.sphere = {
 SCENARIOS.fall = {
   name: 'fall',
   // `n` is the sphere DIAMETER in cells, as in `sphere`.
-  defaults: { n: 12, re: 100, u_t: 0.04, rho_b: 4, perturb: 0, seed: 12345 },
+  // `tow` > 0 replaces free fall with PRESCRIBED motion at that speed:
+  // gravity off, force measured and never applied. It is the reference the
+  // free fall is scored against (plans/3D.md M8.2b), and it is the same
+  // body in the same domain with the same sponge -- which is the whole
+  // point. Comparing a fall against Schiller-Naumann compares it against a
+  // different discretization AND a different domain at once; comparing it
+  // against a tow isolates the fall.
+  // Three modes, and the pair of them is the point (plans/3D.md M8.2b):
+  //   tow=U     the body MOVES at U through still fluid, force recorded and
+  //             never applied. This is the moving-body coupling under test.
+  //   stream=U  the body is PINNED in a freestream U -- the same relative
+  //             motion in the other Galilean frame, and the path every
+  //             validated sphere case in this suite already uses.
+  //   neither   free fall.
+  // Cd(tow) and Cd(stream) must AGREE, in the same domain with the same
+  // blockage and the same sponge, because they are the same flow seen from
+  // two frames. That isolates the moving-body coupling from resolution,
+  // blockage and the drag correlation all at once -- none of which a
+  // comparison against Schiller-Naumann can separate.
+  defaults: { n: 12, re: 100, u_t: 0.04, rho_b: 4, tow: 0, stream: 0, perturb: 0, seed: 12345 },
   walls: [],
   // Long in the fall direction and no longer than it needs to be across:
   // the body has to reach terminal velocity AND then travel far enough to
@@ -439,18 +458,31 @@ SCENARIOS.fall = {
     // The balance above, solved for the acceleration.
     const gEff = u_t * u_t * cd * area / (2 * rho_b * V);
     const shape = { kind: SHAPE.SPHERE, a: R };
-    const body = makeBodyState({ shape, x: [2 * n, d[1] / 2, d[2] / 2], density: rho_b });
+    // `v` at construction, not a vx assignment afterwards: packBodyState
+    // reads `s.v[0]`, so setting `body.vx` writes a field nothing packs and
+    // the body silently stays put. (It did, for one measurement.)
+    const body = makeBodyState({ shape, x: [2 * n, d[1] / 2, d[2] / 2], density: rho_b,
+                                 v: p.tow > 0 ? [p.tow, 0, 0] : [0, 0, 0] });
+    // A streamed body sits where the sphere scenario puts one: far enough
+    // upstream that its own wake is not the inlet condition.
+    const towed = p.tow > 0, streamed = p.stream > 0;
     return {
-      nu, tau, re, R, D: n, dims: d, body, pinned: false,
+      nu, tau, re, R, D: n, dims: d, body, pinned: streamed,
+      // A towed run integrates nothing: constant velocity, force recorded.
+      // A streamed run does not move the body at all.
+      noFluidForce: towed, tow: p.tow, stream: p.stream,
+      // The relative speed under test, whichever frame it is expressed in.
+      uRel: towed ? p.tow : (streamed ? p.stream : null),
       area, cd, rho_b, u_t,
       // FALLS ALONG +x, the long axis. Nothing about the solver prefers an
       // axis; the domain does.
-      gravity: [gEff, 0, 0],
+      gravity: towed ? [0, 0, 0] : [gEff, 0, 0],
       gEff,
       // Quiescent fluid, and a sponge that holds it there rather than at a
       // freestream -- this is a body falling through still fluid, not a body
       // held in a flow.
-      sponge: { width: Math.max(6, Math.round(n / 2)), u: [0, 0, 0] },
+      // Still fluid for a fall or a tow; the freestream for a streamed run.
+      sponge: { width: Math.max(6, Math.round(n / 2)), u: [streamed ? p.stream : 0, 0, 0] },
       force: [0, 0, 0],
       blockage: area / (d[1] * d[2]),
       // Time to terminal is ~U_T/g_eff; the natural unit for how long a run
@@ -460,7 +492,8 @@ SCENARIOS.fall = {
       cdReference: cd,
     };
   },
-  macro: (dims, p) => seedMacro3Perturbed(dims, () => [0, 0, 0], p.perturb * p.u_t, p.seed),
+  macro: (dims, p) => seedMacro3Perturbed(dims, () => [p.stream > 0 ? p.stream : 0, 0, 0],
+                                          p.perturb * p.u_t, p.seed),
 };
 
 // --- drift: a body that TRANSLATES, for the dynamic-refinement gate --------

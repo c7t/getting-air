@@ -165,7 +165,9 @@ async function init() {
     // M6: the resample volume.
     'vol', 'volbox', 'volBudget',
     // M8.2a: the solid-interior reset, ?solideq=0 to disable for A/B.
-    'solideq']);
+    'solideq',
+    // M8.2b: the fall scenario's two reference frames.
+    'tow', 'stream']);
   for (const k of urlParams.keys()) {
     if (PAGE_PARAMS.has(k) || k in SCENARIOS[scenarioName].defaults) continue;
     throw new Error(`?${k}=: not a parameter of scenario "${scenarioName}" `
