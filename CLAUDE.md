@@ -594,16 +594,19 @@ What exists today:
     same fall runs 40000 steps and 1681 cells through a 192-cell domain
     without leaving.
   - **Cd(tow) IS BELOW Cd(stream), AND THE GAP IS RESOLUTION.** -29.5% /
-    -25.2% / -17.3% at D = 12 / 16 / 24 at FIXED 2.18% blockage, closing from
-    BOTH sides (tow rising, stream falling) at roughly the first-order rate a
-    staircased bounce-back sphere converges at. That is the discriminator: a
-    missing momentum term in the moving-body coupling would go as A*U^2
-    against a drag of Cd*(1/2)*U^2*A and hold the RATIO fixed. Pinned, the
-    staircase is one fixed shape (hence this suite's standing +9..13% over
-    Schiller-Naumann); towed, its phase sweeps and the effective surface is
-    smoothed. So do NOT read the D = 12 number as a coupling defect -- D = 12
-    is coarser than every other case here. Extrapolated 7.0% at the target's
-    D = 64; not yet checked at D = 32, which needs ~2.9 GB of `f`.
+    -25.2% / -17.3% / -13.9% at D = 12 / 16 / 24 / 32 at FIXED 2.18%
+    blockage, closing from BOTH sides (tow rising, stream falling) at roughly
+    the first-order rate a staircased bounce-back sphere converges at. That
+    is the discriminator: a missing momentum term in the moving-body coupling
+    would go as A*U^2 against a drag of Cd*(1/2)*U^2*A and hold the RATIO
+    fixed. Pinned, the staircase is one fixed shape (hence this suite's
+    standing +9..13% over Schiller-Naumann); towed, its phase sweeps and the
+    effective surface is smoothed. **Both frames extrapolate to Cd = 1.22** (a
+    first-order Richardson on the tow gives 1.220/1.226/1.223 and the
+    stream's 16-24 pair 1.224), which is +11.7% over Schiller-Naumann -- the
+    suite's own pinned-sphere offset. So the gap goes to ZERO, not to a
+    floor, and the D = 12 number is not a coupling defect: D = 12 is coarser
+    than every other case here. ~8% residual at the target's D = 64.
 
       node tools/probe-d3-window.js                  # the Galilean pair + the no-window control
       node tools/probe-d3-window.js --legs=tow --td=60
