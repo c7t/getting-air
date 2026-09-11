@@ -10,3 +10,6 @@ https.py
 *.mp4
 *.log
 telemetry.log
+
+# Emacs lock files (dangling symlinks; never belong in a commit)
+.#*
