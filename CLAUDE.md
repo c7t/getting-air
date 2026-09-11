@@ -590,15 +590,20 @@ What exists today:
     Cd "collapse" from 1.24 to 0.30 over a run whose kinetic energy,
     enstrophy, max|u| and density range were constant to four digits.
     `tools/probe-d3-window.js` samples every step; `--sample=25` reproduces
-    the trap. Measured there: Cd(tow) = 0.963 converged against
-    Cd(stream) = 1.362, a real -29% in the moving-body coupling that is
-    M8.2c's to explain, and reproducible to 0.2% on a same-build repeat.
-    **The FREE FALL independently agrees with the TOW** -- terminal velocity
-    v/u_t = 1.104 means Cd = 0.894 at Re = 110 against the tow's 0.919
-    carried to the same Re, 2.8% apart by two different mechanisms -- so the
-    gap is the moving-body coupling and not the tow harness. The same fall
-    runs 40000 steps and 1681 cells through a 192-cell domain without
-    leaving.
+    the trap. The tow is reproducible to 0.2% on a same-build repeat, and the
+    same fall runs 40000 steps and 1681 cells through a 192-cell domain
+    without leaving.
+  - **Cd(tow) IS BELOW Cd(stream), AND THE GAP IS RESOLUTION.** -29.5% /
+    -25.2% / -17.3% at D = 12 / 16 / 24 at FIXED 2.18% blockage, closing from
+    BOTH sides (tow rising, stream falling) at roughly the first-order rate a
+    staircased bounce-back sphere converges at. That is the discriminator: a
+    missing momentum term in the moving-body coupling would go as A*U^2
+    against a drag of Cd*(1/2)*U^2*A and hold the RATIO fixed. Pinned, the
+    staircase is one fixed shape (hence this suite's standing +9..13% over
+    Schiller-Naumann); towed, its phase sweeps and the effective surface is
+    smoothed. So do NOT read the D = 12 number as a coupling defect -- D = 12
+    is coarser than every other case here. Extrapolated 7.0% at the target's
+    D = 64; not yet checked at D = 32, which needs ~2.9 GB of `f`.
 
       node tools/probe-d3-window.js                  # the Galilean pair + the no-window control
       node tools/probe-d3-window.js --legs=tow --td=60
