@@ -60,7 +60,10 @@
 @group(0) @binding(1) var<storage, read_write> f_coarse  : array<f32>;   // the TIME-t buffer
 @group(0) @binding(2) var<storage, read>       blockSlot : array<i32>;
 @group(0) @binding(3) var<storage, read>       mac_pool  : array<f32>;
-@group(0) @binding(4) var<storage, read_write> mac       : array<f32>;
+// binding 4 is the PARENT's macroscopic array, declared by whichever of
+// common_d3_parentmac_{dense,pool}.wgsl this module was assembled with --
+// the two have different layouts AND different types, and this body is
+// deliberately unable to name either. See those files.
 
 // TIMING ONLY (?orphans=0). Skips the orphan pass, which makes the interface
 // WRONG -- it reinstates M4.1b's convex-edge mass leak and its uniform-flow
@@ -252,14 +255,10 @@ fn coalesceAt(c: vec3<u32>) {
       mac_pool[2u * macPlane + fc],
       mac_pool[3u * macPlane + fc]);
   }
-  // parentMacIndex, not 4*cell+c: the dense L0 mac is interleaved and a pool
-  // mac_pool is planar. See either parent fragment's note -- assuming the
-  // dense layout at depth measured -8.0e+3 of mass drift.
-  let macOutPlane = arrayLength(&mac) / 4u;
-  mac[parentMacIndex(cell, 0u, macOutPlane)] = rhoSum * 0.125f;
-  mac[parentMacIndex(cell, 1u, macOutPlane)] = momSum.x / max(rhoSum, 1e-6f);
-  mac[parentMacIndex(cell, 2u, macOutPlane)] = momSum.y / max(rhoSum, 1e-6f);
-  mac[parentMacIndex(cell, 3u, macOutPlane)] = momSum.z / max(rhoSum, 1e-6f);
+  // One call, and this body cannot get the layout wrong because it cannot
+  // name the array. See common_d3_parentmac_dense.wgsl.
+  let inv = 1f / max(rhoSum, 1e-6f);
+  parentMacStore(cell, vec4<f32>(rhoSum * 0.125f, momSum.x * inv, momSum.y * inv, momSum.z * inv));
 
   // --- coalesce ------------------------------------------------------------
   for (var i = 0u; i < QN; i++) {

@@ -61,7 +61,7 @@
 
 @group(0) @binding(0) var<storage, read>       f_in      : array<f32>;   // coarse at t
 @group(0) @binding(1) var<storage, read_write> f_out     : array<f32>;   // coarse at t + dt
-@group(0) @binding(2) var<storage, read_write> mac       : array<f32>;
+@group(0) @binding(2) var<storage, read_write> mac       : array<vec4<f32>>;
 @group(0) @binding(3) var<storage, read>       blockSlot : array<i32>;
 @group(0) @binding(4) var<storage, read_write> fluxAcc   : array<f32>;
 @group(0) @binding(5) var<storage, read>       body      : BodyState3D;
@@ -159,8 +159,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   // scenario stays consistent; it folds out at zero force.
   let rhoDen = max(rho, 1e-6f);
   let u = m / rhoDen + vec3<f32>(FORCE_X, FORCE_Y, FORCE_Z) / (2.0f * rhoDen);
-  mac[4u * cell + 0u] = rho;
-  mac[4u * cell + 1u] = u.x;
-  mac[4u * cell + 2u] = u.y;
-  mac[4u * cell + 3u] = u.z;
+  // INTERLEAVED, and the vec4 type is what says so -- see
+  // common_d3_parentmac_dense.wgsl.
+  mac[cell] = vec4<f32>(rho, u.x, u.y, u.z);
 }

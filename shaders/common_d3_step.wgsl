@@ -57,7 +57,12 @@
 // Deliberately NOT built yet: plans/perf-characterization.md's standing
 // lesson is that optimizations here get measured, not assumed, and M1 has
 // no measurement apparatus for the 3D solver yet.
-@group(0) @binding(2) var<storage, read_write> mac : array<f32>;
+// INTERLEAVED, [rho,ux,uy,uz] per cell, and the vec4 type is what SAYS so.
+// Its pool counterpart (mac_pool) is planar, and confusing the two was a
+// real bug at depth 3 -- see common_d3_parentmac_dense.wgsl. vec4<f32> is
+// four consecutive floats with no padding, so the bytes, the host readbacks
+// and the bind-group layout are all unchanged.
+@group(0) @binding(2) var<storage, read_write> mac : array<vec4<f32>>;
 // Rigid body. Always bound (one bind-group layout for every scenario, see
 // main-3d.js), and completely inert when HAS_BODY is 0 -- these are
 // pipeline-overridable constants, so the whole solid-coupling path folds
@@ -184,10 +189,11 @@ fn initEq(@builtin(global_invocation_id) gid: vec3<u32>) {
   let ncells = NX * NY * NZ;
   let cell = cellIndex(x, y, z);
 
-  let rho = mac[4u * cell + 0u];
-  let ux  = mac[4u * cell + 1u];
-  let uy  = mac[4u * cell + 2u];
-  let uz  = mac[4u * cell + 3u];
+  let m0  = mac[cell];
+  let rho = m0.x;
+  let ux  = m0.y;
+  let uy  = m0.z;
+  let uz  = m0.w;
 
   for (var i = 0u; i < QN; i++) {
     f_out[i * ncells + cell] = feqD3Q(rho, ux, uy, uz, i);
@@ -265,10 +271,7 @@ fn step(@builtin(global_invocation_id) gid: vec3<u32>) {
   let ux = u.x; let uy = u.y; let uz = u.z;
   let u_sq = dot(u, u);
 
-  mac[4u * cell + 0u] = rho;
-  mac[4u * cell + 1u] = ux;
-  mac[4u * cell + 2u] = uy;
-  mac[4u * cell + 3u] = uz;
+  mac[cell] = vec4<f32>(rho, ux, uy, uz);
 
   let spongeW = spongeWeight3(
     min(f32(x), f32(NX - 1u - x)),

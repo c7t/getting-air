@@ -6,5 +6,6 @@
 // @include "common_d3q27_lattice.wgsl"
 // @include "common_d3_pool.wgsl"
 // @include "common_d3_parent_pool.wgsl"
+// @include "common_d3_parentmac_pool.wgsl"
 // @include "common_d3_amr_coalesce.wgsl"
 // @include "common_d3_amr_coalesce_main_pool.wgsl"

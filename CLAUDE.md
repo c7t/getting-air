@@ -275,6 +275,21 @@ in a refined shell reproduces the dense run's Cd to 0.07%.
   `check21Balance` instead -- including minimality, without which "refine a
   halo to be safe" passes everything.
 
+- **A BUFFER'S LAYOUT IS CARRIED BY ITS WGSL TYPE, not by convention.** The
+  dense `mac` is `array<vec4<f32>>` (interleaved); a pool's `mac_pool` is
+  `array<f32>` (planar, component-major). They were both `array<f32>` and
+  coalesce wrote the pool one in the dense layout at depth 3 -- every moment
+  landed in a different cell, mass drift -8.0e+3 against a bound of 5, and
+  it survived a first look because both are f32 arrays of exactly the right
+  length. The shared coalesce body now cannot NAME either array; it calls
+  `parentMacStore`, declared by `common_d3_parentmac_{dense,pool}.wgsl`.
+  Measured in Chrome: `vec4<f32>` is four consecutive floats with no padding
+  (so host readbacks and bind-group layouts are unchanged), a dynamic
+  component index `mac[i][k]` compiles and runs, and it costs nothing
+  (0.953x, inside noise). **`const_assert` does NOT work on `override`
+  expressions**, and nearly every shape here is an override -- so the type
+  is the only static check available.
+
 - **REFINEMENT IS OCTET-COMPLETE FROM LEVEL 2 DOWN: a parent spawns all
   eight children or none.** `amr_manage_pool.wgsl` says it for the 2D quad,
   a tile is allocated per block, and `check21Balance`'s `hasChild` tests

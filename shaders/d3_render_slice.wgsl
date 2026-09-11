@@ -23,7 +23,8 @@
 // eating all along.
 // @include "common_vortcolor.wgsl"
 
-@group(0) @binding(0) var<storage, read> mac : array<f32>;
+// INTERLEAVED -- see common_d3_parentmac_dense.wgsl on why the type says so.
+@group(0) @binding(0) var<storage, read> mac : array<vec4<f32>>;
 @group(0) @binding(1) var<uniform>       rp  : RParams;
 
 // axis: 0/1/2 = the slice's NORMAL is x/y/z. slice: index along it.
@@ -93,9 +94,9 @@ fn sampleUVW(a: i32, b: i32) -> vec3<f32> {
     uvw = vec3<u32>(0u, 1u, 2u);
   }
   return vec3<f32>(
-    mac[4u * cell + 1u + uvw.x],
-    mac[4u * cell + 1u + uvw.y],
-    mac[4u * cell + 1u + uvw.z],
+    mac[cell][1u + uvw.x],
+    mac[cell][1u + uvw.y],
+    mac[cell][1u + uvw.z],
   );
 }
 
