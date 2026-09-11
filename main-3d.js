@@ -2761,6 +2761,162 @@ async function init() {
              manageEvery: MANAGE_EVERY, inUse: poolInUse[LEVELS - 1], slots: lv.slots, ...r };
   }
 
+  // THE FALSE-NEGATIVE RATE OF THE CRITERION (plans/3D.md M8.4).
+  //
+  // THE PROBLEM THIS EXISTS FOR: under-refinement is SELF-CONCEALING. Fail to
+  // refine a vortex, numerical dissipation kills it, Q drops, and the
+  // criterion then correctly reports nothing there. It is stable rather than
+  // transient -- once lost it stays lost -- so no measurement taken inside a
+  // run that made the mistake can see it. Every honest detector has to give
+  // the run information it would not otherwise have.
+  //
+  // THIS ONE USES THE INFORMATION THAT IS ALREADY LYING AROUND. Wherever a
+  // level EXISTS, the field is in memory at two resolutions. The criterion
+  // reads the PARENT's (L0), so evaluating it on the CHILD's as well gives
+  // both the answer the criterion got and the answer it would have got with
+  // twice the resolution. A block where the CHILD says refine and the PARENT
+  // does not is a FALSE NEGATIVE the criterion would have made had that block
+  // not already been refined -- which is exactly the L0-resolution limitation
+  // the ladder carries, measured rather than argued.
+  //
+  // It is a rate on a SUBSET -- only where refinement already exists -- and
+  // that is the honest limit of it: it cannot speak about regions nothing
+  // refined. What it can do is say whether the criterion's view is adequate
+  // WHERE IT CAN BE CHECKED, which is the near wake, which is where the
+  // tightest vortices are.
+  //
+  // ON THE HOST, from the raw field, deliberately: a GPU pass reading the
+  // criterion buffer back would be scoring the criterion against its own
+  // answer. This recomputes Q from `mac_pool` by the same centred differences
+  // d3-criterion.mjs states, which is the independent route.
+  async function debugParentChildMiss(m = 1) {
+    if (!AMR || !Q_ON) return { skipped: 'needs ?levels>=2 and ?qthresh=' };
+    const lv = L[m];
+    const bytes = Math.max(1, lv.slots) * pool.tileCells * 4 * 4;
+    if (poolStagingBytes < bytes) {
+      if (poolStaging) poolStaging.destroy();
+      poolStaging = device.createBuffer({ size: bytes, usage: U.MAP_READ | U.COPY_DST });
+      poolStagingBytes = bytes;
+    }
+    const s2b = await readI32(lv.slotToBlock, lv.slots * 4);
+    // The body as the GPU currently has it, so the geometry split below uses
+    // where the body IS rather than where it started.
+    const body = (await readBody()) || { cx: 0, cy: 0, cz: 0 };
+    const enc = device.createCommandEncoder();
+    enc.copyBufferToBuffer(lv.mac, 0, poolStaging, 0, bytes);
+    // The parent's answer, as the criterion computed it this step.
+    enc.copyBufferToBuffer(critBuf, 0, critStaging, 0, critBuf.size);
+    device.queue.submit([enc.finish()]);
+    await poolStaging.mapAsync(GPUMapMode.READ, 0, bytes);
+    const mm = new Float32Array(poolStaging.getMappedRange(0, bytes)).slice();
+    poolStaging.unmap();
+    await critStaging.mapAsync(GPUMapMode.READ);
+    const qp = new Float32Array(critStaging.getMappedRange()).slice();
+    critStaging.unmap();
+
+    const FB = pool.FB, plane = Math.max(1, lv.slots) * pool.tileCells;
+    const uAt = (s, x, y, z) => {
+      const c = s * pool.tileCells + (z * FB + y) * FB + x;
+      return [mm[1 * plane + c], mm[2 * plane + c], mm[3 * plane + c]];
+    };
+    // THE LADDER'S BASE, and the child's value carries the physical-units
+    // shift the parent's does not: a level-m cell is 2^-m of an L0 cell, so
+    // Q_physical = Q_lattice * 4^m and eps = 0.5*log2(Q) + m. The `+ m` is
+    // what makes the two comparable AT ALL -- without it the child's Q is
+    // smaller by 4^m purely because its cells are smaller, and every block
+    // would look like an over-refinement.
+    const base = 0.5 * Math.log2(Math.max(Q_ABS, 1e-30));
+    const epsOf = (q, lvl) => 0.5 * Math.log2(Math.max(q, 1e-30)) + lvl;
+    // GEOMETRY-FORCED BLOCKS ARE A DIFFERENT POPULATION AND MUST BE COUNTED
+    // SEPARATELY. The body shell is refined whatever Q says, and SOLID_EQ
+    // holds the solid interior at feq(1, u_body), so the L0 field there is
+    // uniform and its Q is ZERO -- while the child resolves the boundary
+    // layer and asks for refinement. Every one of those scores as a "miss",
+    // and it is a miss that costs nothing: geometry already refined the
+    // block and the field criterion's opinion was never load-bearing there.
+    //
+    // Measured before splitting them: worstGap came out at 44 OCTAVES, a
+    // factor of 1e13, which is not an under-read of anything -- it is
+    // log2 of the zero floor. The number that answers the question is the
+    // rate over the blocks the FIELD criterion is solely responsible for,
+    // i.e. the wake.
+    const bodyNear = geomForced
+      ? nearBodyWant(geomForced.sdfAt([body.cx, body.cy, body.cz]), geomForced.margin)
+      : () => false;
+    let checked = 0, missed = 0, agreed = 0, over = 0, worstGap = 0;
+    let fieldChecked = 0, fieldMissed = 0, fieldWorst = 0, geomChecked = 0;
+    for (let sl = 0; sl < lv.slots; sl++) {
+      const blk = s2b[sl];
+      if (blk < 0) continue;
+      // THE FULL INTERIOR, [GHOST, GHOST + 2*RB), not one cell in from it.
+      // The +-1 the stencil needs is served by the RING, which is what GHOST=2
+      // is for -- and shaving a cell off each face instead biases the child's
+      // max LOW on every block, systematically, which reads as the parent
+      // over-flagging. Measured that way first: `over` came back at 104-152
+      // blocks against `missed` of 2, an asymmetry with no physical reading.
+      let qc = 0;
+      for (let z = GHOST; z < GHOST + 2 * RB; z++) {
+        for (let y = GHOST; y < GHOST + 2 * RB; y++) {
+          for (let x = GHOST; x < GHOST + 2 * RB; x++) {
+            const J = gradU(
+              [uAt(sl, x + 1, y, z), uAt(sl, x, y + 1, z), uAt(sl, x, y, z + 1)],
+              [uAt(sl, x - 1, y, z), uAt(sl, x, y - 1, z), uAt(sl, x, y, z - 1)], 1);
+            const q = qOfGrad(J);
+            if (q > qc) qc = q;
+          }
+        }
+      }
+      // The parent's grid is level 1's; a level-m block maps onto it by a
+      // shift, the same map `decide` uses.
+      const nb = lv.pool.nb;
+      const b = [blk % nb[0], Math.floor(blk / nb[0]) % nb[1], Math.floor(blk / (nb[0] * nb[1]))];
+      const sh = Math.max(m - 1, 0);
+      const c = [0, 1, 2].map(i => Math.min(b[i] >> sh, CRIT_NB[i] - 1));
+      const qParent = qp[(c[2] * CRIT_NB[1] + c[1]) * CRIT_NB[0] + c[0]];
+      const eC = epsOf(qc, m), eP = epsOf(qParent, 0);
+      checked++;
+      const childWants = eC >= base, parentWants = eP >= base;
+      const isMiss = childWants && !parentWants;
+      if (isMiss) { missed++; worstGap = Math.max(worstGap, eC - eP); }
+      else if (childWants && parentWants) agreed++;
+      else if (!childWants && parentWants) over++;
+      // The block's L0-cell box, for the geometry test -- the same shape
+      // nearBodyWant takes everywhere else.
+      const scale = 2 ** -(m - 1);
+      const lo = b.map(v => v * lv.pool.rb * scale);
+      const hi = lo.map(v => v + lv.pool.rb * scale);
+      if (bodyNear({ lo, hi, mid: lo.map((v, i) => (v + hi[i]) / 2) })) { geomChecked++; continue; }
+      fieldChecked++;
+      if (isMiss) { fieldMissed++; fieldWorst = Math.max(fieldWorst, eC - eP); }
+    }
+    return {
+      step, level: m, checked,
+      // THE COMPARISON IS ONLY FAIR AT ZERO LEAD, and the caller is told so
+      // rather than left to discover it. The criterion's per-block value is a
+      // max over the block DILATED by the convection lead, while the child's
+      // here is a max over the block itself -- so with a lead the parent is
+      // reading a strictly larger region and will look like it over-flags for
+      // a reason that has nothing to do with resolution.
+      lead: CRIT_LEAD, fairComparison: CRIT_LEAD === 0,
+      // The headline: of the blocks where both views can be compared, how
+      // often would the criterion's own (parent-resolution) view have said no
+      // while the finer view says yes.
+      missed, falseNegRate: checked ? missed / checked : 0,
+      agreed, over,
+      // In octaves of rotation rate -- i.e. how far the parent's view
+      // under-read the worst case, in the ladder's own units.
+      worstGapOctaves: worstGap,
+      // THE NUMBER THAT ANSWERS THE QUESTION: the same rate over the blocks
+      // the FIELD criterion alone is responsible for. Geometry-forced blocks
+      // are excluded because they are refined whatever Q says, so a miss
+      // there is free -- and because the solid interior's Q is identically
+      // zero, which dominates the unsplit statistic.
+      geomChecked, fieldChecked, fieldMissed,
+      fieldFalseNegRate: fieldChecked ? fieldMissed / fieldChecked : 0,
+      fieldWorstGapOctaves: fieldWorst,
+    };
+  }
+
   async function debugOccupancy(brick) {
     const B = Math.max(1, Math.round(brick || 8));
     const m = await readMacro();
@@ -3595,7 +3751,7 @@ async function init() {
       } : {}),
     }),
     readSubsampled, readDuctProfile, readStats, readBody, readPoolStats, debugCriterion,
-    debugPoolUsage, debugCheckQCoverage,
+    debugPoolUsage, debugCheckQCoverage, debugParentChildMiss,
     debugCheck21Balance, debugCheckGeometryCoverage, debugCheckRingParents, debugPoolState,
     debugRunBalance, debugSampleTree, debugCheckTreeSample, debugReadVolume,
     debugHotspot, debugRunAndCollect, debugOccupancy,
