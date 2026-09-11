@@ -23,9 +23,6 @@
 @group(0) @binding(2) var<storage, read_write> forces : array<atomic<i32>, 8>;
 // Level-1 block -> pool slot, or -1. Always bound with a single dummy -1
 // element when there is no pool, exactly as common_d3_step.wgsl binds it, so
-// one bind-group layout serves every scenario and HAS_POOL folds the lookup
-// out at pipeline-creation time.
-@group(0) @binding(3) var<storage, read>       blockSlot : array<i32>;
 
 override NX : u32;
 override NY : u32;
@@ -43,22 +40,17 @@ override CHI_EPS : f32 = 1.5f;
 // double-count the same physical volume -- the 2D sibling amr_force.wgsl:84
 // carries the same mask for the same reason.
 //
-// It is NOT merely a double-count guard on the explode path, it is a
-// correctness requirement: coalesce writes only the interface slots, so the
-// coarse `f` under a refined region is whatever was there last macro-step.
-// Integrating a force from it is integrating stale data, which is why
-// main-3d.js refused ?interface=explode with a body until this landed.
-override HAS_POOL : u32 = 0u;
-override RB : u32 = 4u;
-override NBX : u32 = 1u;
-override NBY : u32 = 1u;
-override NBZ : u32 = 1u;
-
-fn forceCoveredByFiner(x: u32, y: u32, z: u32) -> bool {
-  if (HAS_POOL == 0u) { return false; }
-  let b = ((z / RB) * NBY + (y / RB)) * NBX + (x / RB);
-  return blockSlot[b] >= 0;
-}
+// NO FINEST-WINS MASKING, and its absence is the deliberate half of M5.4b.
+// This kernel used to skip cells covered by the fine pool, so that the two
+// force passes partitioned the integral between them. The body now lives
+// ENTIRELY on the finest level as a hard requirement (plans/3D.md M5.4), so
+// there is nothing to partition: when refinement is on, the host does not
+// dispatch this kernel at all and the finest level's pass integrates the
+// whole body. When refinement is off, there is nothing finer to be covered
+// by. Either way the test was answering a question that can no longer be
+// asked -- and the coupling at a coarse/fine seam through a body, which the
+// partition would have had to get right, is now unreachable rather than
+// merely untested.
 
 // Fixed-point scale for the atomic reduction. 1e7, matching the 2D
 // force kernels -- see shaders/amr_force1_pool.wgsl's FSCALE header for why
@@ -91,7 +83,7 @@ fn main(
   var tb = vec3<f32>(0f);
 
   let x = gid.x; let y = gid.y; let z = gid.z;
-  if (x < NX && y < NY && z < NZ && !forceCoveredByFiner(x, y, z)) {
+  if (x < NX && y < NY && z < NZ) {
     let ncells = NX * NY * NZ;
     let cell = (z * NY + y) * NX + x;
     let p = vec3<f32>(f32(x), f32(y), f32(z));

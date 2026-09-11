@@ -570,11 +570,13 @@ async function init() {
   // scenario with the same dummy the step kernel uses when there is no pool,
   // so this layout does not fork -- the 238e48c failure surface is exactly a
   // bind group that exists in two versions.
+  // f_in, body, forces. No blockSlot: the coarse force kernel no longer masks
+  // cells covered by a finer level, because under AMR it is not dispatched at
+  // all -- the body lives entirely on the finest level (plans/3D.md M5.4b).
   const forceBGL = device.createBindGroupLayout({ entries: [
     { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-    { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
   ]});
   // The fine-level force kernel: f_in, body, forces, slotToBlock.
   const forcePoolBGL = device.createBindGroupLayout({ entries: [
@@ -608,10 +610,10 @@ async function init() {
   // buffer-timing bookkeeping. Same arrangement as the 2D main-cylinder.js.
   const forceBGA = device.createBindGroup({ layout: forceBGL, entries: [
     { binding: 0, resource: { buffer: fA } }, { binding: 1, resource: { buffer: bodyBuf } },
-    { binding: 2, resource: { buffer: forceBuf } }, { binding: 3, resource: { buffer: blockSlotBound } }]});
+    { binding: 2, resource: { buffer: forceBuf } }]});
   const forceBGB = device.createBindGroup({ layout: forceBGL, entries: [
     { binding: 0, resource: { buffer: fB } }, { binding: 1, resource: { buffer: bodyBuf } },
-    { binding: 2, resource: { buffer: forceBuf } }, { binding: 3, resource: { buffer: blockSlotBound } }]});
+    { binding: 2, resource: { buffer: forceBuf } }]});
   const physicsBG = device.createBindGroup({ layout: physicsBGL, entries: [
     { binding: 0, resource: { buffer: bodyBuf } }, { binding: 1, resource: { buffer: forceBuf } }]});
   const zeroBG = device.createBindGroup({ layout: zeroBGL, entries: [{ binding: 0, resource: { buffer: forceBuf } }]});
@@ -656,15 +658,13 @@ async function init() {
   // same overrides, and a mismatch would integrate a force the fluid never
   // felt -- so they are created here as a pair, from one source, rather
   // than each being given its own copy of the value.
+  // No pool overrides any more: the mask they fed is gone (M5.4b). Under AMR
+  // this pipeline is created but never dispatched -- the finest level's pass
+  // integrates the whole body.
   const forcePipe = HAS_BODY ? await device.createComputePipelineAsync({
     layout: device.createPipelineLayout({ bindGroupLayouts: [forceBGL] }),
     compute: { module: forceModule, entryPoint: 'main', constants: {
-      ...dims, WGX: WG[0], WGY: WG[1], WGZ: WG[2], USE_BOUNCEBACK, CHI_EPS,
-      // Same source as the step kernel's, for the same reason the coupling
-      // constants above are: a mask mismatch would double-count or drop a
-      // whole region of the body.
-      HAS_POOL: stepConstants.HAS_POOL, RB: stepConstants.RB,
-      NBX: stepConstants.NBX, NBY: stepConstants.NBY, NBZ: stepConstants.NBZ } },
+      ...dims, WGX: WG[0], WGY: WG[1], WGZ: WG[2], USE_BOUNCEBACK, CHI_EPS } },
   }) : null;
   const physPipe = HAS_BODY ? await device.createComputePipelineAsync({
     layout: device.createPipelineLayout({ bindGroupLayouts: [physicsBGL] }),
@@ -690,6 +690,16 @@ async function init() {
   // Level 0 is TAU_COARSE and each level down doubles the distance from 1/2,
   // which is the acoustic-scaling relation the depth-2 pair already encodes.
   const tauAtLevel = (m) => { let t = TAU_COARSE; for (let k = 0; k < m; k++) t = 2 * t - 0.5; return t; };
+  // A level-m pool kernel works in level-(m-1) CELL UNITS, because that is
+  // what fineToCoarseUnit3 returns; the body lives in L0 units. One rung is
+  // L0 = 0.5*u - 0.25 (refinement is cell-centred, so it is affine, not a
+  // scale), giving 2^-(m-1) and -0.5*(1 - 2^-(m-1)) over m-1 rungs. Identity
+  // at m = 1, which is why every depth-2 number is untouched by this.
+  const bodyFrameAt = (m) => ({
+    L0_SCALE: 2 ** -(m - 1),
+    L0_OFFSET: -0.5 * (1 - 2 ** -(m - 1)),
+    CHI_SCALE: 2 ** -m,
+  });
   // 1 puts the grid transfers back on the PRE-collision Dupuis-Chopard
   // factor, which is wrong for this solver's post-collision buffers and was
   // the M3 interface bug -- kept switchable so the defect can be measured
@@ -711,7 +721,7 @@ async function init() {
   let fluxBGA = null, fluxBGB = null, refluxBG = null;
   let explodePipe = null, coalescePipe = null;
   let explodeBG = null, coalesceBG = null;
-  let forcePoolPipe = null, forcePoolBG = null;
+  let forcePoolPipe = null, forcePoolBG = null, forcePoolDisp = null;
   let manageCoarsenPipe = null, manageRefinePipe = null, manageBG = null;
   let manageDecidePipe = null, manageClearPipe = null;
   let fillPipe = null, drainPipe = null;
@@ -765,10 +775,34 @@ async function init() {
       + ' (the pool-parent coupling exists only there, plans/3D.md M5.2b-ii)';
     return;
   }
-  if (LEVELS >= 3 && HAS_BODY) {
-    statusEl.textContent = `error: ?levels=${LEVELS} with a body needs per-level force`
-      + ' integration and finest-wins masking (plans/3D.md M5.4); not built yet';
+  // M5.4's HARD REQUIREMENT, as two preconditions. The body lives entirely on
+  // the finest level; these are what make that enforced rather than assumed.
+  //
+  // 1. A body with AMR must be GEOMETRY-REFINED. With ?refine=box the body
+  //    can sit wholly outside the refined region, and since the coarse force
+  //    pass is no longer dispatched under AMR, the integrated force would be
+  //    exactly ZERO -- silently. Refused instead.
+  if (AMR && HAS_BODY && !geomForced) {
+    statusEl.textContent = `error: a body with ?levels=${LEVELS} needs ?refine=body`
+      + ` (the body must live entirely on the finest level, plans/3D.md M5.4);`
+      + ` ?refine=${refineMode} is a fixed region that need not contain it`;
     return;
+  }
+  // 2. The margin must cover the force stencil's REACH. Bounce-back exchanges
+  //    momentum across links crossing the surface (one cell); the diffuse
+  //    penalty spans CHI_EPS. Both are in L0 cell units, and both must lie
+  //    inside the refined region or the finest level's pass would miss part
+  //    of the body. This gets SAFER with depth -- the finest cells shrink
+  //    while the margin stays in L0 units -- so it is checked at level 1's
+  //    scale, the tightest case.
+  if (AMR && HAS_BODY) {
+    const reach = USE_BOUNCEBACK ? 1 : CHI_EPS;
+    if (geomForced.margin < reach) {
+      statusEl.textContent = `error: ?margin=${geomForced.margin} is below the force stencil's`
+        + ` reach (${reach} coarse cells for ${USE_BOUNCEBACK ? 'bounce-back' : 'diffuse chi'});`
+        + ' part of the body would fall outside the finest level (plans/3D.md M5.4)';
+      return;
+    }
   }
   // UNREACHABLE TODAY and kept deliberately: ?dynamic=1 is itself refused
   // without ?refine=body, so the body refusal above always fires first. It
@@ -845,6 +879,7 @@ async function init() {
       // Chen's coalesce averages advected-but-UNCOLLIDED interface states,
       // so under explode/coalesce the ring advects and stores only.
       COLLIDE_RING: EXPLODE ? 0 : 1,
+      ...bodyFrameAt(1),
       OMEGA_FINE: 1 / TAU_FINE,
       FORCE_X: params.force[0], FORCE_Y: params.force[1], FORCE_Z: params.force[2],
       HAS_BODY, USE_BOUNCEBACK, CHI_EPS,
@@ -913,12 +948,30 @@ async function init() {
     if (HAS_BODY) {
       const forcePoolModule = device.createShaderModule({
         code: await loadShader(`shaders/d3_force_pool_q${Q}.wgsl`), label: `d3_force_pool_q${Q}` });
-      forcePoolPipe = await mk(forcePoolBGL, forcePoolModule, { ...poolConst, USE_BOUNCEBACK, CHI_EPS });
-      // Reads the pool buffer substep A will read, i.e. the fine level's
-      // time-t state, matching the coarse kernel's own pre-streaming read.
+      // THE FINEST LEVEL, and only it (plans/3D.md M5.4b). The body lives
+      // entirely there by hard requirement, so this one pass integrates the
+      // whole of it and there is nothing to mask or partition. DX_WEIGHT is
+      // 4^-m: the cross-level weight is dx^(D-1) = dx^2 and dx = 2^-m, so
+      // 0.25 at depth 2 and 0.0625 at depth 3. It used to be baked at L1's
+      // 0.25, which at depth 3 would have reported four times the drag.
+      const fine = L[LEVELS - 1];
+      const finePC = { NX: NX * 2 ** (LEVELS - 2), NY: NY * 2 ** (LEVELS - 2), NZ: NZ * 2 ** (LEVELS - 2), RB };
+      // L0_SCALE / L0_OFFSET convert this level's parent-unit positions into
+      // the L0 frame the body lives in -- the identity at level 1, affine
+      // below it because refinement is cell-centred. See the shader.
+      const m = LEVELS - 1;
+      forcePoolPipe = await mk(forcePoolBGL, forcePoolModule, {
+        ...finePC, USE_BOUNCEBACK, CHI_EPS, DX_WEIGHT: 4 ** -m, ...bodyFrameAt(m),
+      });
+      // Reads the pool buffer substep A will read, i.e. that level's time-t
+      // state, matching the coarse kernel's own pre-streaming read.
       forcePoolBG = device.createBindGroup({ layout: forcePoolBGL, entries: [
-        { binding: 0, resource: { buffer: fPoolA } }, { binding: 1, resource: { buffer: bodyBuf } },
-        { binding: 2, resource: { buffer: forceBuf } }, { binding: 3, resource: { buffer: slotToBlockBuf } }]});
+        { binding: 0, resource: { buffer: fine.fA } }, { binding: 1, resource: { buffer: bodyBuf } },
+        { binding: 2, resource: { buffer: forceBuf } }, { binding: 3, resource: { buffer: fine.slotToBlock } }]});
+      // Computed here rather than read from `fine.tileDisp`: the per-level
+      // dispatch shapes are assigned below this block, so that field is not
+      // populated yet. Same expression, same source (SLOTS).
+      forcePoolDisp = [pool.FB / 4, pool.FB / 4, (pool.FB / 4) * Math.max(1, SLOTS[LEVELS - 1])];
     }
 
     // interp needs BOTH coarse states (t and t+dt, which are simply the two
@@ -1025,6 +1078,7 @@ async function init() {
           ...pc,
           COLLIDE_RING: EXPLODE ? 0 : 1,
           HAS_CHILD: L[m + 1] ? 1 : 0,
+          ...bodyFrameAt(m),
           OMEGA_FINE: 1 / tauAtLevel(m),
           FORCE_X: params.force[0], FORCE_Y: params.force[1], FORCE_Z: params.force[2],
           HAS_BODY, USE_BOUNCEBACK, CHI_EPS,
@@ -1283,20 +1337,25 @@ async function init() {
       if (HAS_BODY) {
         const zp = enc.beginComputePass();
         zp.setPipeline(zeroPipe); zp.setBindGroup(0, zeroBG); zp.dispatchWorkgroups(1); zp.end();
-        const fp = enc.beginComputePass();
-        fp.setPipeline(forcePipe); fp.setBindGroup(0, useB ? forceBGB : forceBGA);
-        fp.dispatchWorkgroups(disp[0], disp[1], disp[2]); fp.end();
-        // M4.1d: the fine level integrates the part of the body its own
-        // tiles cover, and the coarse kernel above masked exactly those
-        // cells out. Two kernels, one `forces` buffer, one atomic
-        // accumulation -- so this is a partition of the integral, not a
-        // second opinion on it. It goes in its own compute pass for the
-        // reason the block comment above gives, and BEFORE physics, which
-        // reads the total.
+        // EXACTLY ONE FORCE PASS (plans/3D.md M5.4b), and which one depends
+        // only on whether there is a pool. The body lives entirely on the
+        // finest level as a hard requirement, so there is no partition to
+        // make and no masking to get right: with AMR the finest level's
+        // kernel integrates the whole body, without it the dense kernel
+        // does. Dispatching both would double-count, which is precisely
+        // what the mask used to prevent -- and what the requirement now
+        // makes impossible to need.
+        //
+        // Its own compute pass for the reason the block comment above gives,
+        // and BEFORE physics, which reads the total.
         if (forcePoolPipe) {
           const fpp = enc.beginComputePass();
           fpp.setPipeline(forcePoolPipe); fpp.setBindGroup(0, forcePoolBG);
-          fpp.dispatchWorkgroups(tileDisp[0], tileDisp[1], tileDisp[2]); fpp.end();
+          fpp.dispatchWorkgroups(forcePoolDisp[0], forcePoolDisp[1], forcePoolDisp[2]); fpp.end();
+        } else {
+          const fp = enc.beginComputePass();
+          fp.setPipeline(forcePipe); fp.setBindGroup(0, useB ? forceBGB : forceBGA);
+          fp.dispatchWorkgroups(disp[0], disp[1], disp[2]); fp.end();
         }
         const pp = enc.beginComputePass();
         pp.setPipeline(physPipe); pp.setBindGroup(0, physicsBG); pp.dispatchWorkgroups(1); pp.end();

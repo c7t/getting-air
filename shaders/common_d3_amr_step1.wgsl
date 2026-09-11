@@ -53,6 +53,32 @@ override USE_BOUNCEBACK : u32 = 0u;
 // here, so one number means one physical width at every level.
 override CHI_EPS : f32 = 1.5f;
 
+// --- THE PARENT-UNIT TO L0 CONVERSION (plans/3D.md M5.4b) -----------------
+//
+// fineToCoarseUnit3 returns a position in the PARENT LEVEL's cell units, and
+// the body lives in L0 units. At level 1 those coincide and these are the
+// identity; below level 1 they do not, and the map is AFFINE rather than a
+// pure scale because refinement is CELL-CENTRED: one rung is
+// L0 = 0.5*u - 0.25, so over (m-1) rungs
+//
+//     L0_SCALE  = 2^-(m-1)
+//     L0_OFFSET = -0.5 * (1 - 2^-(m-1))
+//
+// Its absence is why the first depth-3 sphere measured Cd EXACTLY 0.0000:
+// this kernel evaluated the SDF at coordinates twice too large per level, so
+// no cell at level 2 was ever inside the body, no bounce-back link ever
+// crossed a surface, and the force kernel downstream had nothing to find.
+// The force kernel needed the same fix, but it was NOT the cause -- the body
+// was simply not being imposed at that level at all. A zero that comes from
+// two places at once is worth saying out loud: fixing only the visible one
+// leaves the number at zero and looks like no progress.
+override L0_SCALE : f32 = 1.0f;
+override L0_OFFSET : f32 = 0.0f;
+
+// The chi band is a fixed number of CELLS at the level that resolves it, so
+// it scales with this level's cell size: 0.5 at level 1, 2^-m in general.
+override CHI_SCALE : f32 = 0.5f;
+
 // M4.1b: collide the tile INTERIOR only. Chen et al. (2006)'s coalesce
 // averages the advected-but-UNCOLLIDED interface states, and the paper is
 // explicit that averaging collided ones instead "would invalidate the
@@ -194,7 +220,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let p = vec3<f32>(
     fineToCoarseUnit3(i32(fi.x), origin.x),
     fineToCoarseUnit3(i32(fi.y), origin.y),
-    fineToCoarseUnit3(i32(fi.z), origin.z));
+    fineToCoarseUnit3(i32(fi.z), origin.z)) * L0_SCALE + L0_OFFSET;
   let phi = select(1e30f, get_phi3(p, body), HAS_BODY != 0u);
   let us = select(vec3<f32>(0f), bodyVelocity3(p, body), HAS_BODY != 0u);
 
@@ -212,7 +238,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       let sp = vec3<f32>(
         fineToCoarseUnit3(s.x, origin.x),
         fineToCoarseUnit3(s.y, origin.y),
-        fineToCoarseUnit3(s.z, origin.z));
+        fineToCoarseUnit3(s.z, origin.z)) * L0_SCALE + L0_OFFSET;
       if (get_phi3(sp, body) < 0f) {
         let corr = 2f * wt[i] * dot(vec3<f32>(f32(ei.x), f32(ei.y), f32(ei.z)), us) / CS2;
         f[i] = f_in[opp[i] * poolPlane + cell] + corr;
@@ -271,7 +297,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   // cells. Getting this wrong makes the solid boundary sharper or blurrier
   // on the refined level than on the level around it -- a discontinuity in
   // the body itself at the interface.
-  let chi = select(0f, chiFromPhiEps3(phi, CHI_EPS * 0.5f),
+  let chi = select(0f, chiFromPhiEps3(phi, CHI_EPS * CHI_SCALE),
                    HAS_BODY != 0u && USE_BOUNCEBACK == 0u);
   let F = rho * chi * (us - ustar) + vec3<f32>(FORCE_X, FORCE_Y, FORCE_Z);
   let u = ustar + F / (2.0f * rhoDen);

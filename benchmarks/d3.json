@@ -294,7 +294,7 @@
       "lateral_tol": 0.02
     }
   ],
-  "sphere_amr_note": "SPHERE WITH AMR (plans/3D.md M4.1d) -- the case this suite never had, and the point of the whole M4 exercise. It is scored against the DENSE case's own measured Cd, not against Schiller-Naumann: what it tests is CROSS-LEVEL INVARIANCE, i.e. that the same physical body gives the same drag whether the region around it is refined or not. A literature comparison cannot see that -- the staircased bounce-back sphere sits +12.8% above S-N either way, and a level-weighting bug would hide inside that offset. It is also the only gate on shaders/common_d3_force_pool.wgsl's dx^(D-1) = dx^2 weighting: dropping the 1/dt factor (dx^3) would halve the fine contribution, and with a body-fitted shell the fine level owns ALL of it, so the error is a factor of two in Cd, not a subtlety. Measured 2026-09-10, RTX 4080: AMR Cd 2.9417 against the dense 2.9436, 0.06%. The tolerance is 0.5%, which is 8x the measured difference and 100x below the dx^3 bug. CONFIRMED TO FIRE, not merely to pass: rebuilt with DX_WEIGHT = 0.125 the case gives Cd 1.4708, exactly -50.0% -- the predicted factor of two, 100x over the bound. A gate that has never been shown to fail is a recorded number, not a gate.",
+  "sphere_amr_note": "SPHERE WITH AMR (plans/3D.md M4.1d) -- the case this suite never had, and the point of the whole M4 exercise. It is scored against the DENSE case's own measured Cd, not against Schiller-Naumann: what it tests is CROSS-LEVEL INVARIANCE, i.e. that the same physical body gives the same drag whether the region around it is refined or not. A literature comparison cannot see that -- the staircased bounce-back sphere sits +12.8% above S-N either way, and a level-weighting bug would hide inside that offset. It is also the only gate on shaders/common_d3_force_pool.wgsl's dx^(D-1) = dx^2 weighting: dropping the 1/dt factor (dx^3) would halve the fine contribution, and with a body-fitted shell the fine level owns ALL of it, so the error is a factor of two in Cd, not a subtlety. Measured 2026-09-10, RTX 4080: AMR Cd 2.9417 against the dense 2.9436, 0.06%. The tolerance is 0.5%, which is 8x the measured difference and 100x below the dx^3 bug. CONFIRMED TO FIRE, not merely to pass: rebuilt with DX_WEIGHT = 0.125 the case gives Cd 1.4708, exactly -50.0% -- the predicted factor of two, 100x over the bound. A gate that has never been shown to fail is a recorded number, not a gate. DEPTH 3 (sphere-amr-L3-Re20-D16, plans/3D.md M5.4b) makes the same cross-level-invariance claim one rung deeper, and it is the ONLY gate on DX_WEIGHT being an override rather than L1's baked 0.25: the weight is dx^(D-1) = 4^-m, so a value left at 0.25 would report FOUR TIMES the drag at depth 3, the same shape of error as the dx^3 mistake recorded above but in the other direction. It also gates M5.4's hard requirement end to end -- with exactly one force pass at the finest level, a body that was NOT entirely inside that level would simply be missing part of its surface, and Cd would fall short rather than blow up.",
   "sphere_amr_cases": [
     {
       "name": "sphere-amr-Re20-D16",
@@ -311,6 +311,23 @@
       "cd_matches": "sphere-Re20-D16",
       "cd_matches_tol": 0.005,
       "cd_measured": 2.9416,
+      "cd_dense_reference": 2.9436,
+      "cd_with_dx3_weight": 1.4708
+    },
+    {
+      "name": "sphere-amr-L3-Re20-D16",
+      "n": 16,
+      "re": 20,
+      "u0": 0.05,
+      "q": 19,
+      "bounceback": true,
+      "levels": 3,
+      "rb": 4,
+      "refine": "body",
+      "interface": "explode",
+      "settle_convective": 30,
+      "cd_matches": "sphere-Re20-D16",
+      "cd_matches_tol": 0.005,
       "cd_dense_reference": 2.9436,
       "cd_with_dx3_weight": 1.4708
     },

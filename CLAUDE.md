@@ -275,6 +275,33 @@ in a refined shell reproduces the dense run's Cd to 0.07%.
   `check21Balance` instead -- including minimality, without which "refine a
   halo to be safe" passes everything.
 
+- **THE BODY LIVES ENTIRELY ON THE FINEST LEVEL. Hard requirement, not a
+  policy** (plans/3D.md M5.4). The geometry criterion is evaluated at the
+  finest level only and every coarser level is whatever `cascade21` requires,
+  so this holds by construction; M5.4 depends on it rather than defending
+  against it. Two consequences: exactly ONE force pass, at the finest level,
+  with no finest-wins masking anywhere; and NO COARSE/FINE SEAM EVER TOUCHES
+  THE BODY OR ITS MARGIN, so how an interface should behave with a body
+  crossing it is unreachable rather than merely unanswered. Enforced by two
+  refusals -- a body with AMR needs `?refine=body`, and `?margin=` must cover
+  the force stencil's reach -- and by M5.4a below.
+
+- **RUNNING OUT OF POOL SLOTS IS A HARD FAILURE** (M5.4a). Refinement is
+  geometry-forced, so a refused tile means a seam through the body; 2D
+  experience is that such a run does not drift, it diverges. The manager
+  records refusals in `freeCount[1]` and the host latches it, writes `error:`
+  into `#status` and stops advancing. `validate-d3-invariants.js`'s
+  `body-refine` config exists to prove it FIRES.
+
+- **A POOL KERNEL WORKS IN ITS PARENT LEVEL'S CELL UNITS, and the body lives
+  in L0 units.** `fineToCoarseUnit3` returns parent units; at level 1 those
+  coincide with L0 and below it they do not. The map is AFFINE
+  (L0 = 0.5u - 0.25 per rung) because refinement is cell-centred, hence
+  `L0_SCALE`/`L0_OFFSET`. It applies to EVERY position in a kernel --
+  `common_d3_amr_step1.wgsl` has two and `common_d3_force_pool.wgsl` has two
+  -- and missing the bounce-back link test's NEIGHBOUR position leaves the
+  integrated force at exactly zero while everything else looks right.
+
 - **A BUFFER'S LAYOUT IS CARRIED BY ITS WGSL TYPE, not by convention.** The
   dense `mac` is `array<vec4<f32>>` (interleaved); a pool's `mac_pool` is
   `array<f32>` (planar, component-major). They were both `array<f32>` and

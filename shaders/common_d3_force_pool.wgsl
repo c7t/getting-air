@@ -65,9 +65,54 @@
 override USE_BOUNCEBACK : u32 = 0u;
 override CHI_EPS : f32 = 1.5f;
 
+// --- THE PARENT-UNIT TO L0 CONVERSION (plans/3D.md M5.4b) -----------------
+//
+// fineToCoarseUnit3 returns a position in the PARENT LEVEL's cell units, and
+// the body lives in L0 units. At level 1 those coincide and these are the
+// identity; below level 1 they do not, and the map is AFFINE rather than a
+// pure scale, because refinement is CELL-CENTRED.
+//
+// One rung: a level-m global index g sits at parent-unit 0.5*g - 0.25, and a
+// parent cell index c sits at L0 position 0.5*c - 0.25 by the same formula
+// one level up. So L0 = 0.5*u - 0.25 per rung, and over (m-1) rungs
+//
+//     L0_SCALE  = 2^-(m-1)
+//     L0_OFFSET = -0.5 * (1 - 2^-(m-1))
+//
+// Checked by hand at depth 3: L0 cell 0 has level-2 children at +-0.375 and
+// +-0.125, and 0.25*g - 0.375 gives exactly those for g = 0..3.
+//
+// IT APPLIES TO EVERY POSITION IN THIS KERNEL, and the bounce-back branch
+// has TWO: the cell's own, and the NEIGHBOUR's, which is what the link test
+// asks about. Fixing only the first leaves the answer at exactly zero --
+// every cell still fails "has a solid neighbour" -- which looks identical to
+// not having fixed anything at all. It cost a debugging cycle here for that
+// reason; the same transform appears twice in common_d3_amr_step1.wgsl for
+// the same reason.
+//
+// WITHOUT THIS the kernel evaluates the body's SDF at coordinates twice too
+// large per level, so every sample misses the body and the integrated force
+// is EXACTLY ZERO -- which is what sphere-amr-L3 measured before it existed,
+// Cd 0.0000. Silent, and indistinguishable from a body that fell outside the
+// refined region, which is why that case gates both.
+override L0_SCALE : f32 = 1.0f;
+override L0_OFFSET : f32 = 0.0f;
+
+// The chi band is a fixed number of CELLS at the level that resolves it, so
+// it scales with this level's cell size: 0.5 at level 1, 2^-m in general.
+// Only the diffuse path reads it; bounce-back is the gated coupling.
+override CHI_SCALE : f32 = 0.5f;
+
+
 // dx^2 for L1, i.e. 0.5^2. See the header -- this is the volume measure AND
 // the timestep, not the volume measure alone.
-const DX_WEIGHT = 0.25f;
+//
+// M5.4b: AN OVERRIDE, not a constant. It was baked at L1's 0.25 because L1
+// was the only level that ever ran this kernel. The body now lives entirely
+// on the FINEST level whatever that is (plans/3D.md M5.4), so the weight is
+// 4^-m and the host sets it -- 0.25 at m=1, 0.0625 at m=2. A baked 0.25 at
+// depth 3 would report four times the drag.
+override DX_WEIGHT : f32 = 0.25f;
 
 // Same fixed-point scale as the coarse kernel, and the reason it is 1e7
 // rather than 1e4 bites HARDER here: the reduction atomicAdds one TRUNCATED
@@ -113,7 +158,7 @@ fn main(
     let p = vec3<f32>(
       fineToCoarseUnit3(i32(fi.x), origin.x),
       fineToCoarseUnit3(i32(fi.y), origin.y),
-      fineToCoarseUnit3(i32(fi.z), origin.z));
+      fineToCoarseUnit3(i32(fi.z), origin.z)) * L0_SCALE + L0_OFFSET;
     let phi = get_phi3(p, body);
     let r = p - vec3<f32>(body.cx, body.cy, body.cz);
     let us = bodyVelocity3(p, body);
@@ -131,7 +176,7 @@ fn main(
           let sp = vec3<f32>(
             fineToCoarseUnit3(i32(fi.x) - ex[i], origin.x),
             fineToCoarseUnit3(i32(fi.y) - ey[i], origin.y),
-            fineToCoarseUnit3(i32(fi.z) - ez[i], origin.z));
+            fineToCoarseUnit3(i32(fi.z) - ez[i], origin.z)) * L0_SCALE + L0_OFFSET;
           if (get_phi3(sp, body) < 0f) {
             let fOpp = f_in[opp[i] * poolPlane + cell];
             let corr = 2f * wt[i] * dot(ei, us) / CS2;
@@ -141,7 +186,7 @@ fn main(
         tb = cross(r, fb);
       }
     } else {
-      let chi = chiFromPhiEps3(phi, CHI_EPS * 0.5f);
+      let chi = chiFromPhiEps3(phi, CHI_EPS * CHI_SCALE);
       if (chi >= 1e-6f) {
         // Pull-gather from upstream neighbours, matching the fine step
         // kernel's streaming, for the reason the coarse kernel's own note

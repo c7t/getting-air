@@ -1,0 +1,166 @@
+Generate claude code transcripts or journals of each conversation
+
+uvx claude-code-transcripts -o transcripts
+
+
+hey there, we're running a proven and performant LBM sim against a new
+VPM sim that's recently been migrated to the GPU. the GPU results from
+the default "live" run don't visually match the results from
+compare.js. there is a skill to run a webgpu browser that'll help run
+tests. the whole thing is self-contained code, rooted in index.html.
+
+can you make a comparison between the CPU code in compare.js against
+the GPU implementation in live mode, and debug the GPU mode in live to
+make it match the CPU implementation?
+
+in general, taking screenshots is a poor solution for comparing, so
+also think about how to build a principled "fluid state" summary and
+"diff" (or better yet, check what's done by practitioners).
+
+---
+
+vpm branch has hints for debugging (taking a snapshot of fluid state)
+and profiling (getting on-GPU timing), and a shin-bark bug where the
+wrong buffer declaration silently discards CPU<->GPU transfers. Also,
+remember to check GPU error state, that's another source of silent
+failures.
+
+we have a nice tidy standalone LBM fluid sim in index.html and
+main.js. we'd like to extend it to use the AMR techniques in
+amr-lbm.pdf (demonstrated in AGAL in a sub-repo). let's build a plan
+to do this in steps, with verification along the way (keeping the
+ability to run the current sim alongside the one in development). the
+goal is to keep performance and small memory footprint, but continue
+to allow realtime performance on desktop and mobile devices, but with
+larger fluid extents to see the sparse wake of our elliptical falling
+card.
+
+---
+
+we have a pair of standalone webgpu apps in index.html+main.js and
+index-amr.html and main-amr.js. both implement an LBM fluid
+simulation. the amr versions implement a simple two-level scheme
+inspired by amr-lbm.pdf and it's code in AGAL. the motivation for the
+AMR is to reduce the memory and compute footprint of the dense LBM
+scheme.
+
+unfortunately the structure of the current two-level code has provided
+for an increase of resolution, rather than a savings of resources. i
+think the fix is a simple tweak to parameters: make the rigid body
+coordinates in refined-level units. then the coarse grid become truly
+coarser relative to the current physics and a physically larger field
+can be simulated with today's default resolution.
+
+can you check my reasoning and write a plan to do this?
+
+---
+
+10752 shows excellent errors on top and right sides
+
+---
+
+cw's patch seems to "fix" things for now
+
+things to nail down:
+ - correctness tests
+   - simple setups reusing existing code
+     - circle + fixed velocity -> karman vortex street
+ - cell coordinate naming and conventions
+   - center-tapped or corner-tapped
+   - fine/coarse are relative
+   - L0, L1 ?
+   - physical size vs. grid cell size
+
+---
+
+2048**2 blows up at 270k steps (tau=0.501)
+
+2048**2 blows up at 970k (tau=0.501, I*=0.17)
+
+---
+
+we have a pair of standalone webgpu apps in index.html+main.js and
+index-amr.html and main-amr.js. both implement an LBM fluid
+simulation. the amr versions implement a simple two-level scheme
+inspired by amr-lbm.pdf and it's code in AGAL. the motivation for the
+AMR is to reduce the memory and compute footprint of the dense LBM
+scheme.
+
+the above is all working, but i can see that we have some
+artifacts. how can we validate either sim? are there standard
+confurations with known geometries? we could use the code we have here
+to set up a cylinder in a constant velocity flow and compare the two
+sims, for example. is there a reference to look at?
+
+---
+
+we have a pair of standalone webgpu apps in index.html+main.js and
+index-amr.html and main-amr.js. both implement an LBM fluid
+simulation. the amr versions implement a simple two-level scheme
+inspired by amr-lbm.pdf and it's code in AGAL. the motivation for the
+AMR is to reduce the memory and compute footprint of the dense LBM
+scheme.
+
+the above is all working. it's time to increase the number of AMR
+levels. in AGAL (which is written in C++ and CUDA), this is done with
+a recursive formulation. this might be hard to do in the current
+structure. can you take a look at the code and come up with a list of
+the difficult issues to tackle in the current code to move toward a
+multi-level scheme.
+
+---
+
+we're through M9 in plans/AMR-multilevel.md and working through
+M10. using the webgpu skill and this project's debugging and
+benchmarking tools, we've found a regression in Cd relative to
+published numbers. let's dig into that.
+
+GOOGLE_CLOUD_PROJECT
+
+OPENCODE_GEMINI_PROJECT_ID
+
+`provider.google.options.projectId` in opencode config
+
+ https://console.developers.google.com/apis/api/cloudaicompanion.googleapis.com/overview?project=gen-lang-client-0014337291
+
+---
+
+we have a new diagnostic that can run a driven geometry in a constant
+velocity flow, and compare a single-level LBM fluid field against an
+AMR-refined version of the flow. can you run a test of
+index-reentry.html at 256^2 vs index-reentry-amr.html?res=7&levels=3
+and check that the interpolated fluid state is correct. the rendering
+is showing quite a few artifacts around cell boundaries. when
+comparing rendering output, please use chrome remote debugger to pull
+the image and compare directly, rather than taking screenshots (and
+set quad outlines and refinement overlay sliders to 0). also check my
+math that setting levels=3 and res=7 results in the same rigid body
+scaling (same resolution for the bounceback surface interface). (the
+latter is that i cannot seem to match the visual scale of the card of
+the single-level baseline sim while sweeping the res and levels
+parameters). the ovarall goal is to use AMR to achieve a computation
+savings for a given fluid behavior resolution across a comparible
+physical extent.
+
+---
+
+levels=3, r=256, levels=3 (some lumpiness and puffiness, but fast AF:
+10ms sometimes, blew up at ~500k steps) acutally looked pretty good
+for a bit
+
+after it runs for a while, or after a reload, it's slow (back to
+~70ms), need to drop to 0.17 for the good flippy behavior
+
+as L0 res goes down, sponge effects look bigger (sponge is thicker,
+vorticity that comes off is more pronounced)
+
+---
+
+flat phone at 256**2 is hitting 50MLUPS (80 sometimes 100) -- want the same on AMR!
+
+AMR is < 1 or 1.xx
+
+reporting or real?
+
+also attribution -- z jane wang, paper authors (at least 3) (links)
+
