@@ -587,3 +587,55 @@ export function refineHierarchy(pool, { levels, want, maxSlots }) {
   }
   return { levels, byLevel, sets: closed.sets, forced: closed.forced };
 }
+
+// --- the viewer's frame (plans/3D.md M6) ------------------------------------
+//
+// WHERE A CONTINUOUS POINT LANDS, at any level. The host statement of what
+// shaders/common_d3_tree_sample.wgsl does, written here so it can be unit
+// tested with no GPU and scored against the shader on real data -- the same
+// discipline cascade21 and check21Balance are held to, and for the same
+// reason: a sampler written only once is a sampler nothing disagrees with.
+//
+// THE FRAME IS L0 CELL UNITS WITH CELL CENTRES AT INTEGERS. That is not a
+// choice made here; it is what fineToCoarseUnit already means. It places the
+// two children of parent cell `origin` at origin -+ 1/4, so `origin` is the
+// parent cell's CENTRE and the cell spans [origin - 1/2, origin + 1/2).
+//
+// A level-m cell is 2^-m L0 units across and its centres continue the same
+// convention, so centre(g, m) = (g + 1/2) * 2^-m - 1/2, and inverting gives
+// the one line below. Check it at the ends: m = 0 is floor(p + 1/2), the
+// dense cell containing p; m = 1 puts fine cells 2c and 2c+1 inside coarse
+// cell c, at c -+ 1/4, which is fineToCoarseUnit read backwards.
+export function cellAtLevel(p, m, dims, rb) {
+  const s = 2 ** m;
+  const g = p.map((c, a) => {
+    const n = dims[a] * s;
+    return ((Math.floor((c + 0.5) * s) % n) + n) % n;
+  });
+  if (m === 0) return { g, block: null, local: null };
+  // The block that OWNS the cell -- one division, no ring and no offsets --
+  // so the local index lands in the tile's INTERIOR by construction. That is
+  // the whole reason a viewer works in this frame: it cannot reach a ring
+  // cell, which holds a value the level never solved.
+  const rb2 = 2 * rb;
+  const block = g.map(c => Math.floor(c / rb2));
+  const local = g.map((c, a) => c - block[a] * rb2 + GHOST);
+  return { g, block, local };
+}
+
+// The finest level with a tile covering p, and 0 (the dense grid, present
+// everywhere) when there is none. `present(m, block)` is the caller's view of
+// blockSlot at level m -- read back from the GPU by the tools, built by hand
+// by the unit test.
+//
+// DEEPEST FIRST, stopping at the first hit, and deliberately NOT leaning on
+// 2:1 balance or octet completeness: the question is only whether a tile
+// exists at this level here, so the answer stays right on a hierarchy the
+// manager is halfway through rebuilding. The renderer has no lock.
+export function finestLevelAt(p, { levels, dims, rb, present }) {
+  for (let m = levels - 1; m >= 1; m--) {
+    const { block } = cellAtLevel(p, m, dims, rb);
+    if (present(m, block)) return m;
+  }
+  return 0;
+}

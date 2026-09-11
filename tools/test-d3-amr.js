@@ -37,7 +37,7 @@ const close = (a, b, tol, what) =>
     refineNearBody, resolveSource, toGlobalFine, fromGlobalFine, storageRatio,
     check21Balance, checkGeometryCoverage, cascade21,
     poolAtLevel, parentOfBlock, octantOfBlock, octantOrigin, refineHierarchy,
-    checkRingParentCoverage,
+    checkRingParentCoverage, cellAtLevel, finestLevelAt,
   } = A;
 
   ok('pool geometry follows FB = 2*RB + 2*GHOST and rejects a non-dividing RB', () => {
@@ -846,6 +846,93 @@ const close = (a, b, tol, what) =>
     assert.ok(r.required > 0, 'the body must require cells at the finest level');
     assert.strictEqual(r.violations.length, 0,
       `${r.violations.length} cells within the margin sit outside the finest level, e.g. ${JSON.stringify(r.violations[0])}`);
+  });
+
+  // --- the viewer's frame (plans/3D.md M6) ---------------------------------
+
+  ok('cellAtLevel agrees with the PER-RUNG AFFINE MAP, at three depths', () => {
+    // THE INDEPENDENT ROUTE, and it is one the solver already depends on:
+    // CLAUDE.md records that a pool kernel works in its PARENT level's cell
+    // units and that the map down a rung is AFFINE, L0 = 0.5u - 0.25,
+    // because refinement is cell-centred -- it is common_d3_force_pool's
+    // L0_SCALE/L0_OFFSET, and missing it there left the integrated force at
+    // exactly zero. Walking that map m times gives a level-m cell's centre
+    // in L0 units by a route that shares no arithmetic with cellAtLevel's
+    // single closed form, and the two must agree.
+    const dims = [16, 16, 16], rb = 4;
+    for (const m of [1, 2, 3]) {
+      for (const g of [0, 1, 2, 7, 8, 15, 16, 31, 63]) {
+        if (g >= dims[0] * 2 ** m) continue;
+        let c = g;                                  // level-m units
+        for (let k = m; k >= 1; k--) c = 0.5 * c - 0.25;
+        const r = cellAtLevel([c, c, c], m, dims, rb);
+        assert.strictEqual(r.g[0], g, `level ${m} cell ${g}: centre ${c} landed in ${r.g[0]}`);
+        // ...and the local index is in the tile INTERIOR, never the ring.
+        // A viewer that reached a ring cell would be reading a value the
+        // level never solved, and it is the OWNING-block division that
+        // makes that unreachable rather than a bounds test.
+        assert.ok(r.local[0] >= GHOST && r.local[0] < GHOST + 2 * rb,
+          `level ${m} cell ${g}: local ${r.local[0]} is not interior`);
+      }
+    }
+  });
+
+  ok('cellAtLevel is the dense cell at m = 0 and wraps periodically', () => {
+    const dims = [16, 8, 4], rb = 4;
+    assert.deepStrictEqual(cellAtLevel([0, 0, 0], 0, dims, rb).g, [0, 0, 0]);
+    assert.deepStrictEqual(cellAtLevel([0.49, 0, 0], 0, dims, rb).g, [0, 0, 0]);
+    assert.deepStrictEqual(cellAtLevel([0.51, 0, 0], 0, dims, rb).g, [1, 0, 0]);
+    // Cell i spans [i - 1/2, i + 1/2), so the FIRST cell's lower half wraps
+    // to the last -- the domain is periodic and the viewer must be too.
+    assert.deepStrictEqual(cellAtLevel([-0.6, -0.6, -0.6], 0, dims, rb).g, [15, 7, 3]);
+    assert.deepStrictEqual(cellAtLevel([15.6, 0, 0], 0, dims, rb).g, [0, 0, 0]);
+    // Same point, 4x the cells: the wrap is against the LEVEL's dims, not
+    // L0's, which is the thing a single shared `dims` would get wrong.
+    assert.strictEqual(cellAtLevel([15.6, 0, 0], 2, dims, rb).g[0], 0);
+    assert.strictEqual(cellAtLevel([-0.6, 0, 0], 1, dims, rb).g[0], 2 * 16 - 1);
+  });
+
+  ok('finestLevelAt picks the deepest COVERING level, not the deepest existing one', () => {
+    // A hierarchy where level 2 covers only part of level 1's region, which
+    // is the only configuration where "deepest that exists" and "deepest
+    // that covers" differ -- and it is the whole claim the sampler makes.
+    //
+    // A block spans 2*rb of its own level's cells, so 8 * 2^-m L0 units:
+    // 4 at level 1, 2 at level 2. Level-2 block 0 therefore covers L0
+    // x in [-0.5, 1.5).
+    const dims = [16, 16, 16], rb = 4, levels = 3;
+    const present = (m, b) => (m === 1 ? true : b[0] === 0 && b[1] === 0 && b[2] === 0);
+    const at = (x) => finestLevelAt([x, 0, 0], { levels, dims, rb, present });
+    assert.strictEqual(at(0), 2);
+    assert.strictEqual(at(1.4), 2);
+    assert.strictEqual(at(1.6), 1, 'x=1.6 is outside level-2 block 0 and must fall back');
+    assert.strictEqual(finestLevelAt([12, 12, 12], { levels, dims, rb, present }), 1);
+    // With nothing refined it is the dense grid, which is present everywhere
+    // and is therefore the only level that never has to be checked.
+    assert.strictEqual(finestLevelAt([1.4, 0, 0], { levels, dims, rb, present: () => false }), 0);
+  });
+
+  ok('the viewer frame breaks under an off-by-one, a lost half-cell and a wrong scale', () => {
+    // MUTATION-CHECKED, because a formula agreeing with a route written
+    // alongside it proves nothing. Each of these is a plausible slip in
+    // cellAtLevel's one line, and each must be caught.
+    const dims = [16, 16, 16], rb = 4, n = (m) => dims[0] * 2 ** m;
+    const wrap = (v, m) => ((v % n(m)) + n(m)) % n(m);
+    const mutants = {
+      'dropped the +1/2 (cell corners, not centres)': (p, m) => Math.floor(p * 2 ** m),
+      'rounded instead of floored': (p, m) => Math.round((p + 0.5) * 2 ** m),
+      'scaled by 2^(m-1), the PARENT frame': (p, m) => Math.floor((p + 0.5) * 2 ** (m - 1)),
+    };
+    for (const [name, mut] of Object.entries(mutants)) {
+      let differs = false;
+      for (const m of [1, 2]) {
+        for (let i = 0; i < 40; i++) {
+          const p = i * 0.37;
+          if (cellAtLevel([p, p, p], m, dims, rb).g[0] !== wrap(mut(p, m), m)) differs = true;
+        }
+      }
+      assert.ok(differs, `mutant "${name}" was not caught -- the check cannot see it`);
+    }
   });
 
   if (!process.exitCode) console.log(`\n${pass} check(s) passed`);

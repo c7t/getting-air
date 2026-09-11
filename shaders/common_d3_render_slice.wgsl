@@ -1,5 +1,11 @@
-// Axis-aligned slice view of the dense 3D macroscopic field (plans/3D.md
-// M1's visual, sec 1.3 rendering option 1).
+// Axis-aligned slice view of the macroscopic field (plans/3D.md M1's
+// visual, sec 1.3 rendering option 1), sampling the FINEST level that
+// covers each pixel (M6.0b). Fragment only; the entry files list every
+// include -- and they are per-Q, like every other kernel here, because
+// common_d3_tree_sample.wgsl brings common_d3_pool.wgsl's tile layout with
+// it and that in turn references the lattice. None of the lattice is
+// reachable from this shader today; naming the WRONG one anyway is the kind
+// of latent mismatch this project keeps finding the expensive way.
 //
 // Deliberately the cheapest thing that works, and deliberately first: it
 // reuses shaders/common_vortcolor.wgsl verbatim, it is what you actually
@@ -21,10 +27,11 @@
 // SCENARIO-DERIVED reference (see main-3d.js's vRef/uRef) and passes a
 // dimensionless ratio here, which is what the tone curve should have been
 // eating all along.
-// @include "common_vortcolor.wgsl"
 
-// INTERLEAVED -- see common_d3_parentmac_dense.wgsl on why the type says so.
-@group(0) @binding(0) var<storage, read> mac : array<vec4<f32>>;
+// Binding 0 (the dense L0 `mac`) and bindings 2-9 (every pool level's `mac`
+// and `blockSlot`) belong to common_d3_tree_sample.wgsl, which is where this
+// view's sampling now comes from -- see its header. This file owns only
+// binding 1.
 @group(0) @binding(1) var<uniform>       rp  : RParams;
 
 // axis: 0/1/2 = the slice's NORMAL is x/y/z. slice: index along it.
@@ -42,9 +49,8 @@ struct RParams {
   _pad2 : f32,
 }
 
-override NX : u32;
-override NY : u32;
-override NZ : u32;
+// NX/NY/NZ come from common_d3_pool.wgsl, which the tree sampler needs
+// anyway for poolCell and the tile layout. One declaration, not two.
 
 struct VSOut {
   @builtin(position) pos : vec4<f32>,
@@ -74,30 +80,33 @@ fn planeDims() -> vec2<u32> {
   return vec2<u32>(NX, NY);
 }
 
-// Velocity at in-plane integer coordinates (a, b), wrapped. Returns the
-// three components rotated into (in-plane u, in-plane v, out-of-plane w)
-// so the caller never has to re-derive the axis permutation.
-fn sampleUVW(a: i32, b: i32) -> vec3<f32> {
-  let d = planeDims();
-  let ai = u32((a + i32(d.x) * 64) % i32(d.x));
-  let bi = u32((b + i32(d.y) * 64) % i32(d.y));
-  var cell : u32;
-  var uvw : vec3<u32>;
-  if (rp.axis == 0u) {
-    cell = (bi * NY + ai) * NX + rp.slice;      // (y, z) plane at x = slice
-    uvw = vec3<u32>(1u, 2u, 0u);
-  } else if (rp.axis == 1u) {
-    cell = (ai * NY + rp.slice) * NX + bi;      // (z, x) plane at y = slice
-    uvw = vec3<u32>(2u, 0u, 1u);
-  } else {
-    cell = (rp.slice * NY + bi) * NX + ai;      // (x, y) plane at z = slice
-    uvw = vec3<u32>(0u, 1u, 2u);
-  }
-  return vec3<f32>(
-    mac[cell][1u + uvw.x],
-    mac[cell][1u + uvw.y],
-    mac[cell][1u + uvw.z],
-  );
+// The 3D point at in-plane CONTINUOUS coordinates (a, b) on the current
+// slice, in L0 cell units with cell centres at integers -- the frame
+// common_d3_tree_sample.wgsl documents. Continuous rather than an integer
+// cell index because that is the whole point of M6: the pixel asks where it
+// is and the tree answers at whatever resolution it has there, instead of
+// the view quantising to L0 before it ever looks.
+fn planePoint(a: f32, b: f32) -> vec3<f32> {
+  let sl = f32(rp.slice);
+  if (rp.axis == 0u) { return vec3<f32>(sl, a, b); }   // (y, z) plane at x = slice
+  if (rp.axis == 1u) { return vec3<f32>(b, sl, a); }   // (z, x) plane at y = slice
+  return vec3<f32>(a, b, sl);                          // (x, y) plane at z = slice
+}
+
+// A sampled velocity rotated into (in-plane u, in-plane v, out-of-plane w),
+// so the caller never has to re-derive the axis permutation. The cyclic
+// order is what makes the out-of-plane vorticity right-handed on all three
+// views -- see planeDims.
+fn rotateUVW(u: vec3<f32>) -> vec3<f32> {
+  if (rp.axis == 0u) { return vec3<f32>(u.y, u.z, u.x); }
+  if (rp.axis == 1u) { return vec3<f32>(u.z, u.x, u.y); }
+  return u;
+}
+
+// Velocity at in-plane continuous coordinates, from the finest level that
+// covers the point.
+fn sampleUVW(a: f32, b: f32) -> vec3<f32> {
+  return rotateUVW(sampleTree(planePoint(a, b)).v.yzw);
 }
 
 // Dark-blue -> cyan -> yellow ramp for unsigned magnitudes. Distinct from
@@ -113,19 +122,34 @@ fn magColor(t: f32) -> vec3<f32> {
 @fragment
 fn fs_main(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> {
   let d = planeDims();
-  let fa = uv.x * f32(d.x);
-  let fb = (1.0 - uv.y) * f32(d.y);
-  let ia = i32(fa); let ib = i32(fb);
+  // uv -> L0 cell units. Cell i spans [i - 1/2, i + 1/2), so the -0.5 is
+  // what makes floor(p + 1/2) reproduce the integer index this used to
+  // compute directly, at every zoom level.
+  let pa = uv.x * f32(d.x) - 0.5f;
+  let pb = (1.0 - uv.y) * f32(d.y) - 0.5f;
 
-  let s = sampleUVW(ia, ib);
+  let t = sampleTree(planePoint(pa, pb));
+  let s = rotateUVW(t.v.yzw);
 
   if (rp.mode == 1u) {
     // Out-of-plane vorticity: d(v)/d(a) - d(u)/d(b) with (a,b) the in-plane
-    // axes. Central differences over one cell, same 0.5 factor as the 2D
-    // dense view, so common_vortcolor's tone curve is calibrated the same.
-    let omega = (sampleUVW(ia + 1, ib).y - sampleUVW(ia - 1, ib).y) * 0.5f
-              - (sampleUVW(ia, ib + 1).x - sampleUVW(ia, ib - 1).x) * 0.5f;
-    return vec4(vorticityColor(omega / max(rp.vScale, 1e-12f)), 1.0);
+    // axes, by central differences.
+    //
+    // THE STEP IS THE LOCAL CELL SIZE, not a fixed one, and that is forced
+    // rather than chosen. A fixed step of one L0 cell would throw away
+    // exactly the resolution this view was changed to show; a fixed step of
+    // one FINEST cell would sample the same coarse cell twice outside the
+    // refined region and paint it flat zero -- which is not a small error,
+    // it is the whole coarse field reading as irrotational. So the
+    // difference is taken over the cell size of the level that answered,
+    // which is a true local gradient estimate on either side of a seam.
+    //
+    // Across a seam one arm can land on a coarser cell, and the staircase
+    // that produces is not hidden: this is the view for looking at seams.
+    let h = t.h;
+    let omega = (sampleUVW(pa + h, pb).y - sampleUVW(pa - h, pb).y)
+              - (sampleUVW(pa, pb + h).x - sampleUVW(pa, pb - h).x);
+    return vec4(vorticityColor(omega / (2f * h) / max(rp.vScale, 1e-12f)), 1.0);
   }
   if (rp.mode == 2u) {
     // Signed velocity along the slice normal, on the same ramp so the sign

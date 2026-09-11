@@ -79,7 +79,8 @@ import { SUPPORTED_Q } from './lattice-3d.mjs';
 import { SCENARIOS, SCENARIO_NAMES, resolveScenario, nuFromTau, beltramiVelocityAt } from './d3-scenarios.mjs';
 import { packBodyState, unpackBodyState, BODY_FIELDS } from './d3-body.mjs';
 import { makePool, refineHierarchy, nearBodyWant, storageRatio, GHOST,
-         check21Balance, checkGeometryCoverage, checkRingParentCoverage } from './d3-amr.mjs';
+         check21Balance, checkGeometryCoverage, checkRingParentCoverage,
+         cellAtLevel, finestLevelAt } from './d3-amr.mjs';
 
 const canvas   = document.getElementById('c');
 const statusEl = document.getElementById('status');
@@ -429,10 +430,30 @@ async function init() {
     statusEl.textContent = `error: ${what} needs a ${(needBytes / 1048576).toFixed(0)} MiB binding, this GPU's max is ${(limit / 1048576).toFixed(0)} MiB`;
     return;
   }
+  // M6's tree sampler spans levels, so it binds the dense `mac` plus one
+  // (mac, blockSlot) pair per pool level -- nine storage buffers at
+  // MAX_SAMPLE_LEVELS = 4 -- and the probe that scores it against the host
+  // adds an input and an output on top, for eleven in a COMPUTE stage. The
+  // WebGPU spec MINIMUM is 8, which is not a real GPU limit: main-amr.js
+  // already requests 16 for the 2D pool manager and runs on the phone.
+  //
+  // Same treatment as maxStorageBufferBindingSize above: ask for what is
+  // needed, and fail LOUD rather than let the device come back with the
+  // default and every affected pipeline turn into a cryptic
+  // "Invalid PipelineLayout is invalid due to a previous error" -- which is
+  // exactly how this was found, since a bind-group-layout failure is not an
+  // exception, it just poisons everything downstream.
+  const NEEDED_STORAGE_BUFFERS_PER_STAGE = 12;
+  if (NEEDED_STORAGE_BUFFERS_PER_STAGE > adapter.limits.maxStorageBuffersPerShaderStage) {
+    statusEl.textContent = `error: needs ${NEEDED_STORAGE_BUFFERS_PER_STAGE} storage buffers per shader stage,`
+      + ` this GPU's max is ${adapter.limits.maxStorageBuffersPerShaderStage}`;
+    return;
+  }
   const device = await adapter.requestDevice({
     requiredLimits: {
       maxStorageBufferBindingSize: Math.min(Math.max(needBytes, DEFAULT_MAX_STORAGE_BINDING), adapter.limits.maxStorageBufferBindingSize),
       maxBufferSize: Math.min(Math.max(needBytes, DEFAULT_MAX_BUFFER_SIZE), adapter.limits.maxBufferSize),
+      maxStorageBuffersPerShaderStage: NEEDED_STORAGE_BUFFERS_PER_STAGE,
     },
   });
   device.lost.then((info) => {
@@ -616,10 +637,25 @@ async function init() {
   const zeroBGL = device.createBindGroupLayout({ entries: [
     { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
   ]});
-  const renderBGL = device.createBindGroupLayout({ entries: [
-    { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
-    { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
-  ]});
+  // 0 = the dense L0 `mac`, 1 = the render params, and 2..9 = up to FOUR
+  // pool levels as (mac, blockSlot) pairs -- common_d3_tree_sample.wgsl's
+  // layout. FIXED IN NUMBER because WebGPU has no array of buffers; levels
+  // the run does not have get a 4-byte dummy and SAMPLE_LEVELS folds them
+  // out of the walk, which is the same shape the manager's child-want
+  // binding uses and for the same reason.
+  const MAX_SAMPLE_LEVELS = 4;
+  // ONE DESCRIPTION OF THE SAMPLER'S BINDINGS, handed to both consumers --
+  // the slice view's fragment stage and the probe's compute stage -- because
+  // two copies of a ten-entry layout that must match one WGSL file is
+  // exactly the shape of 238e48c.
+  const renderBGL_entries = [
+    { binding: 0, buffer: { type: 'read-only-storage' } },
+    { binding: 1, buffer: { type: 'uniform' } },
+    ...Array.from({ length: 2 * MAX_SAMPLE_LEVELS }, (_, i) => (
+      { binding: 2 + i, buffer: { type: 'read-only-storage' } })),
+  ];
+  const renderBGL = device.createBindGroupLayout({
+    entries: renderBGL_entries.map(e => ({ ...e, visibility: GPUShaderStage.FRAGMENT })) });
   const bgAB = device.createBindGroup({ layout: computeBGL, entries: [
     { binding: 0, resource: { buffer: fA } }, { binding: 1, resource: { buffer: fB } },
     { binding: 2, resource: { buffer: mac } }, { binding: 3, resource: { buffer: bodyBuf } },
@@ -641,15 +677,37 @@ async function init() {
   const physicsBG = device.createBindGroup({ layout: physicsBGL, entries: [
     { binding: 0, resource: { buffer: bodyBuf } }, { binding: 1, resource: { buffer: forceBuf } }]});
   const zeroBG = device.createBindGroup({ layout: zeroBGL, entries: [{ binding: 0, resource: { buffer: forceBuf } }]});
-  const renderBG = device.createBindGroup({ layout: renderBGL, entries: [
-    { binding: 0, resource: { buffer: mac } }, { binding: 1, resource: { buffer: rpBuf } }]});
+  // How deep the viewer can see. Clamped to the bindings that exist rather
+  // than refused: running out of render bindings is no reason to refuse a
+  // solve, and a run deeper than this is already past anything validated.
+  // It is SAID OUT LOUD in #status when it bites, because a view that
+  // quietly stops at level 4 of 6 looks exactly like a tree that stops
+  // there.
+  const SAMPLE_LEVELS = Math.min(MAX_SAMPLE_LEVELS, AMR ? LEVELS - 1 : 0);
+  // Said out loud, every frame, for as long as it is true. A viewer that
+  // silently stops one level short of the solver is the exact shape of thing
+  // M5.0 refused ?levels=3 over: it renders a plausible picture of a
+  // hierarchy that is not the one being solved.
+  const viewDepthNote = AMR && SAMPLE_LEVELS < LEVELS - 1
+    ? `   [view samples to L${SAMPLE_LEVELS} of L${LEVELS - 1}]` : '';
+  const sampleDummy = device.createBuffer({ size: 4, usage: U.STORAGE });
+  const treeSampleEntries = () => [
+    { binding: 0, resource: { buffer: mac } }, { binding: 1, resource: { buffer: rpBuf } },
+    ...Array.from({ length: MAX_SAMPLE_LEVELS }, (_, i) => {
+      const lv = i + 1 <= SAMPLE_LEVELS ? L[i + 1] : null;
+      return [
+        { binding: 2 + 2 * i, resource: { buffer: lv ? lv.mac : sampleDummy } },
+        { binding: 3 + 2 * i, resource: { buffer: lv ? lv.blockSlot : sampleDummy } },
+      ];
+    }).flat()];
+  const renderBG = device.createBindGroup({ layout: renderBGL, entries: treeSampleEntries() });
 
   const loadShader = (p) => assembleShader(p, (f) => fetch(f).then(r => {
     if (!r.ok) throw new Error(`failed to fetch ${f}: ${r.status}`);
     return r.text();
   }));
   const stepModule = device.createShaderModule({ code: await loadShader(`shaders/d3_step_q${Q}.wgsl`), label: `d3_step_q${Q}` });
-  const renderModule = device.createShaderModule({ code: await loadShader('shaders/d3_render_slice.wgsl'), label: 'd3_render_slice' });
+  const renderModule = device.createShaderModule({ code: await loadShader(`shaders/d3_render_slice_q${Q}.wgsl`), label: `d3_render_slice_q${Q}` });
   const forceModule = HAS_BODY ? device.createShaderModule({ code: await loadShader(`shaders/d3_force_q${Q}.wgsl`), label: `d3_force_q${Q}` }) : null;
   const physModule = HAS_BODY ? device.createShaderModule({ code: await loadShader('shaders/d3_physics.wgsl'), label: 'd3_physics' }) : null;
   const zeroModule = HAS_BODY ? device.createShaderModule({ code: await loadShader('shaders/d3_zero_forces.wgsl'), label: 'd3_zero_forces' }) : null;
@@ -752,6 +810,9 @@ async function init() {
   // below.
   let manageBG = null, manageDecidePipe = null;
   let fillPipe = null, drainPipe = null;
+  // Per level, created only when there is a pool. See common_d3_moments.wgsl
+  // for why a seeded level needs its `mac` filled explicitly.
+  let momentsPipe = null;
 
   // M4's interface flux correction. OPT-IN (?reflux=1), and NOT the default
   // -- it does what it was built to do and that turned out not to be enough.
@@ -917,6 +978,26 @@ async function init() {
       SPONGE_W: sponge.width, SPONGE_UX: sponge.u[0], SPONGE_UY: sponge.u[1], SPONGE_UZ: sponge.u[2],
     });
     avgPipe = await mk(avgBGL, avgModule, { ...poolConst, TAU_COARSE, DC_PRE });
+    // A level's `mac` from its own `f`. ONE pipeline for every level: the
+    // kernel addresses a pool slot and nothing in it reads NX/NY/NZ, so
+    // unlike the manager's passes there is no per-level frame to get wrong.
+    // The bind group is per level because the buffers are.
+    {
+      const momentsModule = device.createShaderModule({
+        code: await loadShader(`shaders/d3_moments_q${Q}.wgsl`), label: `d3_moments_q${Q}` });
+      const momentsBGL = device.createBindGroupLayout({ entries: [
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+        { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+      ]});
+      momentsPipe = await mk(momentsBGL, momentsModule, poolConst);
+      for (let m = 1; m < LEVELS; m++) {
+        const lv = L[m];
+        lv.momentsBG = device.createBindGroup({ layout: momentsBGL, entries: [
+          { binding: 0, resource: { buffer: lv.fA } }, { binding: 1, resource: { buffer: lv.mac } },
+          { binding: 2, resource: { buffer: lv.slotToBlock } }]});
+      }
+    }
     // M4.2b-ii. Third pipelines over the SAME two modules and the same two
     // layouts: a tile being born wants exactly interp's coarse->fine
     // transfer, and one being absorbed wants exactly average's restriction.
@@ -1313,7 +1394,7 @@ async function init() {
     layout: device.createPipelineLayout({ bindGroupLayouts: [renderBGL] }),
     vertex: { module: renderModule, entryPoint: 'vs_main', constants: dims },
     fragment: { module: renderModule, entryPoint: 'fs_main', targets: [{ format }], constants: {
-      ...dims,
+      ...dims, RB, SAMPLE_LEVELS,
       // Pinned to 1 because the page pre-normalizes -- see U_SCALE/V_SCALE.
       VORT_SCALE: 1.0,
       // Below 1 lifts weak structure toward the top of the ramp instead of
@@ -1323,6 +1404,60 @@ async function init() {
     } },
     primitive: { topology: 'triangle-list' },
   });
+
+  // --- M6: the tree sampler, reachable from the host -----------------------
+  //
+  // The renderer's other consumer of common_d3_tree_sample.wgsl, and the
+  // only one whose output a check can score: same function, same bindings,
+  // reached from a compute pass. Created always -- including on a dense run,
+  // where SAMPLE_LEVELS is 0 and the answer must be "level 0 everywhere",
+  // which is a claim worth being able to make.
+  const PROBE_MAX = 4096;
+  const probeInBuf = device.createBuffer({ size: PROBE_MAX * 16, usage: U.STORAGE | U.COPY_DST });
+  const probeOutBuf = device.createBuffer({ size: PROBE_MAX * 32, usage: U.STORAGE | U.COPY_SRC });
+  const probeStaging = device.createBuffer({ size: PROBE_MAX * 32, usage: U.MAP_READ | U.COPY_DST });
+  const probeBGL = device.createBindGroupLayout({ entries: [
+    ...renderBGL_entries.map(e => ({ ...e, visibility: GPUShaderStage.COMPUTE })),
+    { binding: 10, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 11, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+  ]});
+  const probePipe = await device.createComputePipelineAsync({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [probeBGL] }),
+    compute: {
+      module: device.createShaderModule({
+        code: await loadShader(`shaders/d3_tree_probe_q${Q}.wgsl`), label: `d3_tree_probe_q${Q}` }),
+      entryPoint: 'main',
+      constants: { ...dims, RB, SAMPLE_LEVELS },
+    },
+  });
+  const probeBG = device.createBindGroup({ layout: probeBGL, entries: [
+    ...treeSampleEntries(),
+    { binding: 10, resource: { buffer: probeInBuf } },
+    { binding: 11, resource: { buffer: probeOutBuf } }]});
+
+  // Points are in L0 CELL UNITS with cell centres at integers -- the frame
+  // d3-amr.mjs's cellAtLevel documents and tests. Returns, per point, the
+  // level the sampler chose, that level's cell size, and the value.
+  async function debugSampleTree(points) {
+    if (points.length > PROBE_MAX) throw new Error(`debugSampleTree: ${points.length} points exceeds ${PROBE_MAX}`);
+    const src = new Float32Array(points.length * 4);
+    points.forEach((p, i) => { src[4 * i] = p[0]; src[4 * i + 1] = p[1]; src[4 * i + 2] = p[2]; });
+    device.queue.writeBuffer(probeInBuf, 0, src);
+    const enc = device.createCommandEncoder();
+    const pp = enc.beginComputePass();
+    pp.setPipeline(probePipe); pp.setBindGroup(0, probeBG);
+    pp.dispatchWorkgroups(Math.ceil(points.length / 64)); pp.end();
+    const bytes = points.length * 32;
+    enc.copyBufferToBuffer(probeOutBuf, 0, probeStaging, 0, bytes);
+    device.queue.submit([enc.finish()]);
+    await probeStaging.mapAsync(GPUMapMode.READ, 0, bytes);
+    const v = new Float32Array(probeStaging.getMappedRange(0, bytes)).slice();
+    probeStaging.unmap();
+    return points.map((_, i) => ({
+      level: v[8 * i + 4], h: v[8 * i + 5],
+      rho: v[8 * i], u: [v[8 * i + 1], v[8 * i + 2], v[8 * i + 3]],
+    }));
+  }
 
   // --- state ---------------------------------------------------------------
   let step = 0;
@@ -1425,6 +1560,17 @@ async function init() {
         lp.setBindGroup(0, L[m].interpSeedBG);
         lp.dispatchWorkgroups(pool.FB / 4, pool.FB / 4, (pool.FB / 4) * Math.max(1, SLOTS[m]));
         lp.end();
+      }
+      // ...and give every level the MOMENTS of what was just seeded. `mac`
+      // is derived, and until the first substep runs nothing else writes it
+      // -- so without this a freshly reset pool reads as rho = 0, u = 0 to
+      // anything that looks (readPoolStats, and the slice view's sampler).
+      // After the seed, because it reads the `f` the seed wrote.
+      for (let m = 1; m < LEVELS; m++) {
+        const mp = enc.beginComputePass();
+        mp.setPipeline(momentsPipe); mp.setBindGroup(0, L[m].momentsBG);
+        mp.dispatchWorkgroups(pool.FB / 4, pool.FB / 4, (pool.FB / 4) * Math.max(1, SLOTS[m]));
+        mp.end();
       }
     }
     device.queue.submit([enc.finish()]);
@@ -2092,6 +2238,67 @@ async function init() {
   // block grid cascade21 and refineHierarchy are written against.
   const nbAtLevel = (m) => pool.nb.map(n => n * 2 ** (m - 1));
 
+  // M6. THE TREE SAMPLER, SCORED AGAINST THE HOST. The GPU walks the
+  // hierarchy in shaders/common_d3_tree_sample.wgsl; d3-amr.mjs's
+  // finestLevelAt walks it here from a blockSlot readback, with arithmetic
+  // that shares nothing with the shader's. Two independent statements of
+  // "finest active level wins", run against each other on real data -- the
+  // same shape as debugRunBalance, and for the same reason.
+  //
+  // THE LEVEL IS THE CLAIM. Which level owns a point is a statement about
+  // blockSlot alone, so the host can answer it exactly. Turning a point into
+  // a value, given the level, is poolCell on an owning block, which
+  // tools/test-d3-amr.js covers from both directions; what is checked here
+  // is that the value is finite and that a refined region really does report
+  // a refined level, because a sampler that silently fell back to L0
+  // everywhere would otherwise agree with a host that did the same.
+  async function debugCheckTreeSample(n) {
+    if (!probePipe) return { skipped: 'no probe pipeline' };
+    // A deterministic lattice at irrational-ish strides, so points land on
+    // cell centres, on cell boundaries, and in both refined and unrefined
+    // regions without being chosen to. Plus the wrap: negatives and points
+    // past the far face must come back inside, since the domain is periodic
+    // and a viewer that clamped instead would show a smeared edge.
+    const k = Math.max(2, Math.round(Math.cbrt(n || 1728)));
+    const pts = [];
+    for (let i = 0; i < k; i++) {
+      for (let j = 0; j < k; j++) {
+        for (let l = 0; l < k; l++) {
+          pts.push([(i + 0.37) * NX / k - 1.0, (j + 0.63) * NY / k, (l + 0.5) * NZ / k + 0.25]);
+        }
+      }
+    }
+    const gpu = await debugSampleTree(pts);
+    const sets = AMR ? await readLevelSets() : [null];
+    const present = (m, b) => sets[m].has(b.join(','));
+    const dims = [NX, NY, NZ];
+    // The sampler sees SAMPLE_LEVELS pool levels, which is LEVELS - 1 unless
+    // the run is deeper than it has bindings for. Scoring against LEVELS
+    // there would report a disagreement that is the CLAMP, which is
+    // announced in #status and is not a defect.
+    const levels = SAMPLE_LEVELS + 1;
+    let differ = 0, nonFinite = 0, first = null;
+    const hist = new Array(levels).fill(0);
+    for (let i = 0; i < pts.length; i++) {
+      const want = AMR ? finestLevelAt(pts[i], { levels, dims, rb: RB, present }) : 0;
+      const got = gpu[i].level;
+      hist[Math.min(got, levels - 1)]++;
+      if (got !== want) { differ++; if (!first) first = { p: pts[i], got, want }; }
+      if (!Number.isFinite(gpu[i].rho) || !gpu[i].u.every(Number.isFinite)) {
+        nonFinite++; if (!first) first = { p: pts[i], kind: 'nonFinite', got };
+      }
+      // The cell size must be the level's, or a finite difference taken
+      // from it is scaled wrongly -- silently, and only in refined regions.
+      if (gpu[i].h !== 2 ** -got) { differ++; if (!first) first = { p: pts[i], kind: 'h', got, h: gpu[i].h }; }
+    }
+    return { ok: differ === 0 && nonFinite === 0, points: pts.length, differ, nonFinite, first,
+             byLevel: hist, sampleLevels: SAMPLE_LEVELS,
+             // A run with a pool where EVERY point came back level 0 is the
+             // failure this exists to catch, and it is not a mismatch --
+             // the host would have to be wrong the same way to hide it.
+             refinedHits: hist.slice(1).reduce((a, b) => a + b, 0) };
+  }
+
   // RING PARENT COVERAGE (plans/3D.md M5.2a). Every ring cell's parent cell
   // must sit in an allocated PARENT tile, or explode has nothing to read.
   // Separate from 2:1 balance because it is a separate claim -- a perfectly
@@ -2441,7 +2648,7 @@ async function init() {
   // so it cannot compress in either direction.
   function planeExtent(a) {
     // The in-plane axes for slice normal `a`, cyclically -- and this MUST
-    // agree with planeDims()/fs_main in shaders/d3_render_slice.wgsl, which
+    // agree with planeDims()/fs_main in common_d3_render_slice.wgsl, which
     // maps the first component across the screen and the second down it.
     if (a === 0) return [NY, NZ];
     if (a === 1) return [NZ, NX];
@@ -2478,6 +2685,10 @@ async function init() {
       ...params, Q, N, NX, NY, NZ, NCELLS, scenario: scenarioName,
       hasBody: !!HAS_BODY, bounceback: USE_BOUNCEBACK,
       levels: LEVELS, amr: AMR,
+      // How deep the VIEWER can see, which is LEVELS - 1 unless the run is
+      // deeper than the sampler has bindings for. Reported so a tool scores
+      // the sampler against the depth it actually has rather than assume.
+      sampleLevels: SAMPLE_LEVELS,
       ...(AMR ? {
         rb: RB, fb: pool.FB, ghost: GHOST,
         blocks: pool.nBlocks, activeSlots: poolAlloc.activeSlots,
@@ -2493,7 +2704,7 @@ async function init() {
     }),
     readSubsampled, readDuctProfile, readStats, readBody, readPoolStats,
     debugCheck21Balance, debugCheckGeometryCoverage, debugCheckRingParents, debugPoolState,
-    debugRunBalance,
+    debugRunBalance, debugSampleTree, debugCheckTreeSample,
     readInterfaceDiag, readFluxAcc,
     debugStepSync,
   };
@@ -2528,7 +2739,7 @@ async function init() {
           + ` blocks (RB=${RB}, FB=${pool.FB})`
         : '';
       statusEl.textContent = `${scenarioName}  D3Q${Q}  ${NX}x${NY}x${NZ}  step ${step}${t}${amrTxt}\n`
-        + `${AXIS_NAMES[axis]}-slice ${slice}   ${live ? 'running' : 'paused'}`;
+        + `${AXIS_NAMES[axis]}-slice ${slice}   ${live ? 'running' : 'paused'}${viewDepthNote}`;
     }
     requestAnimationFrame(() => frame().catch(e => reportFatal(statusEl, e)));
   }

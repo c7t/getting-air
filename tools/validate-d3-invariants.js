@@ -113,7 +113,7 @@ const CONFIGS = [
   // The body travels u0 * steps = 0.02 * 1200 = 24 coarse cells = 6 blocks
   // at RB=4, so the shell's leading edge must move about that far. 4 is a
   // floor with margin, not a prediction: the point is that it moved at all.
-  { name: 'drift', expectBboxMove: 4, steps: 1200,
+  { name: 'drift', expectBboxMove: 4, steps: 1200, startsAtRest: true,
     url: 'scenario=drift&n=24&live=0&levels=2&rb=4&refine=body&margin=2&interface=explode&dynamic=1&manageEvery=4' },
   // THE M5.5b GATE: a moving body at DEPTH, where the allocator has to run
   // at every level and in the order the tree requires. It is the row where
@@ -138,7 +138,7 @@ const CONFIGS = [
   // allocator, and it does not get truer with more cells. The body still
   // travels u0 * steps = 0.02 * 600 = 12 coarse cells, which is 6 blocks at
   // the FINEST level -- where a block spans 2 L0 cells at RB=4.
-  { name: 'drift3', expectBboxMove: 4, steps: 600,
+  { name: 'drift3', expectBboxMove: 4, steps: 600, startsAtRest: true,
     url: 'scenario=drift&n=12&live=0&levels=3&rb=4&refine=body&margin=2&interface=explode&dynamic=1&manageEvery=4' },
   // DEPTH 3 (plans/3D.md M5.3). These are the configs that make the 2:1 and
   // ring-parent checks REAL for the first time -- at ?levels=2 both are
@@ -268,16 +268,18 @@ async function runConfig(Runtime, o, c, log) {
       // not advancing -- the shape an unseeded pool has, and what
       // M5.2b-ii's bug looked like before the blowup reached L0.
       //
-      // NOT AT done === 0, and the reason is worth knowing rather than
-      // working around: a pool's `mac` is a DERIVED buffer, written by the
-      // step and coalesce kernels, and reset() seeds `f` only. So every
-      // level reads rms 0 at step 0 even on a case whose L0 kinetic energy
-      // is nonzero, and it is correct by the first substep. `drift` also
-      // genuinely starts from rest.
+      // FROM STEP 0, and that is a claim about reset() rather than a
+      // loosened check. A pool's `mac` is DERIVED -- written by the step and
+      // coalesce kernels -- and reset() used to seed `f` alone, so every
+      // level read rms 0 at step 0 on cases whose L0 energy is plainly
+      // nonzero. M6.0 made reset() run the moments kernel over each seeded
+      // level, so a zero here now means what it says.
       //
-      // A count of zero live cells is a different thing and is left to the
-      // pool check, which owns inUse.
-      if (done > 0) {
+      // Configs that genuinely start from rest say so, because the
+      // alternative is a check that cannot fail on the cases it matters
+      // most for. A count of zero LIVE CELLS is a different thing and
+      // belongs to the pool check, which owns inUse.
+      if (!c.startsAtRest || done > 0) {
         const still = ps2.byLevel.filter(l => l.cells > 0 && l.rms === 0).map(l => l.level);
         if (still.length) {
           res.pool.push({ at: done, n: still.length,
@@ -317,6 +319,31 @@ async function runConfig(Runtime, o, c, log) {
     log(`refined shell (L${res.fineState.level}): lo.x ${firstBbox.lo[0]} -> ${res.fineState.bbox.lo[0]}`
       + ` (${moved} blocks) ${ok ? 'ok' : 'DID NOT FOLLOW'}`);
   }
+  // M6. THE TREE SAMPLER, scored against d3-amr.mjs's finestLevelAt on real
+  // GPU data. Once per config, at the END: the sampler is a function of
+  // blockSlot, so on a dynamic config the interesting hierarchy is the one
+  // the manager has been rebuilding rather than the one uploaded at boot.
+  const ts = await evalOrThrow(Runtime, `${G}.debugCheckTreeSample()`, 300000, 'debugCheckTreeSample');
+  if (ts.skipped) res.sampleSkipped = ts.skipped;
+  else {
+    res.sample = ts;
+    if (!ts.ok) {
+      res.pool.push({ at: 'end', n: ts.differ + ts.nonFinite,
+        first: { kind: 'treeSampleDiffersFromHost', ...ts.first } });
+    }
+    // A POOL WITH NO REFINED HITS IS A FAILURE, and it is a different one
+    // from a mismatch: a sampler that fell back to level 0 everywhere agrees
+    // with a host that was handed the same empty level sets, so the counts
+    // have to be looked at directly. This is the "?refine=all cannot see an
+    // interface bug" lesson in another costume.
+    if (ts.sampleLevels > 0 && ts.refinedHits === 0) {
+      res.pool.push({ at: 'end', n: 1,
+        first: { kind: 'treeSampleNeverLeftL0', points: ts.points, sampleLevels: ts.sampleLevels } });
+    }
+    log(`tree sample: ${ts.points} points, by level ${ts.byLevel.join('/')}`
+      + `  ${ts.ok && (ts.sampleLevels === 0 || ts.refinedHits > 0) ? 'match' : 'DIFFER'}`);
+  }
+
   // Did the manager actually do the thing the config exists to observe?
   // M5.5a. The manager's criterion-and-closure chain, scored against
   // d3-amr.mjs's refineHierarchy -- two independent statements of one rule,
@@ -402,15 +429,16 @@ async function main() {
     await teardown({ port: o.port, tabId, chrome, server, keepOpen: o.keepOpen });
   }
 
-  console.log('\n' + '='.repeat(128));
+  console.log('\n' + '='.repeat(144));
   console.log(`SUMMARY  ${o.steps} steps, checked every ${o.checkEvery}`);
-  console.log('='.repeat(128));
+  console.log('='.repeat(144));
   console.log(pad('config', 14) + pad('2:1 balance', 21) + pad('ring parents', 18)
-    + pad('geometry coverage', 30) + pad('want vs host', 18) + pad('pool', 20) + padL('verdict', 9));
-  console.log('-'.repeat(128));
+    + pad('geometry coverage', 30) + pad('want vs host', 18) + pad('pool', 24)
+    + pad('tree sample', 16) + padL('verdict', 9));
+  console.log('-'.repeat(144));
   let exitCode = 0;
   for (const r of report) {
-    if (r.error) { console.log(pad(r.name, 14) + pad('-', 21) + pad('-', 18) + pad('-', 30) + pad('-', 18) + pad('-', 20) + padL('ERROR', 9)); exitCode = 1; continue; }
+    if (r.error) { console.log(pad(r.name, 14) + pad('-', 21) + pad('-', 18) + pad('-', 30) + pad('-', 18) + pad('-', 24) + pad('-', 16) + padL('ERROR', 9)); exitCode = 1; continue; }
     const x = r.res;
     const balTxt = x.bal.length ? `${x.bal.length} checkpoints BAD` : (x.vacuous ? 'ok (VACUOUS N=2)' : 'ok');
     const covTxt = x.cov.length ? `${x.cov.length} checkpoints BAD`
@@ -425,10 +453,17 @@ async function main() {
     const ringTxt = x.ring.length ? `${x.ring.length} checkpoints BAD` : (x.ringVacuous ? 'ok (VACUOUS N=2)' : 'ok');
     const wantTxt = x.wantSkipped ? 'skipped'
       : (x.want ? (x.want.ok ? `ok ${x.want.levels.map(d => d.gpu).join('/')}` : 'DIFFERS') : '-');
+    // M6. In the table rather than only in the per-config log, because this
+    // file's own maxim is that "the checker ran" and "the invariant holds"
+    // are different claims -- and a summary that cannot say which is which
+    // has already given up on the distinction. The by-level histogram is
+    // what shows the sampler reached the pool at all.
+    const sampTxt = x.sampleSkipped ? 'skipped'
+      : (x.sample ? (x.sample.ok ? `ok ${x.sample.byLevel.join('/')}` : 'DIFFERS') : '-');
     const ok = !x.bal.length && !x.ring.length && !x.cov.length && !x.pool.length && x.finite;
     if (!ok) exitCode = 1;
     console.log(pad(r.name, 14) + pad(balTxt, 21) + pad(ringTxt, 18) + pad(covTxt, 30)
-      + pad(wantTxt, 18) + pad(poolTxt, 20) + padL(ok ? 'PASS' : 'FAIL', 9));
+      + pad(wantTxt, 18) + pad(poolTxt, 24) + pad(sampTxt, 16) + padL(ok ? 'PASS' : 'FAIL', 9));
   }
   if (report.some(r => r.res && r.res.blewUp && r.res.finite)) {
     console.log('\n* the field blew up, EXPECTEDLY: that config allocates tiles nothing initializes');

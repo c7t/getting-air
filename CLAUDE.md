@@ -208,7 +208,9 @@ comment above `N_LEVELS`, not this file, for what's current.
 
 ## The 3D fork (`plans/3D.md`)
 
-**M0-M5 are done; M6 (volume rendering) is next.** Depth is real:
+**M0-M5 are done; M6 is in progress (M6.0 done -- the tree sampler and the
+slice view on it; M6.1-M6.3 are the resample volume, Q-criterion and the
+raymarcher).** Depth is real:
 `?levels=N` runs at any depth, static or `?dynamic=1`, the body lives
 entirely on the finest level, and the 2:1 balance and ring-parent checks are
 gates there rather than VACUOUS lines. The
@@ -534,16 +536,34 @@ What exists today:
   brute-force nearest-point search, and asserts the tennis-racket theorem
   (a body spun about its intermediate axis must flip, one about a stable
   axis must not).
-- **The slice view shows the FINEST solution at L0 RESOLUTION**, and that
-  is not a bug to hunt. The coalesce chain republishes each level's
-  macroscopic field into its PARENT's `mac` under the refined region, so L2
-  reaches L1 reaches L0 and the dense array the renderer binds already
-  carries the deepest answer -- measured, not inferred: with `?refine=all` at
-  `?levels=3` that array is written entirely by two coalesce hops and still
-  scores 5.59e-3 against the analytic Beltrami solution. What is missing is
-  PIXELS, not values: a refined region is displayed coarse. Resolving a
-  sample point down the tree belongs to M6's sampler, not to a second
-  throwaway copy of it.
+- **THE TREE SAMPLER (`shaders/common_d3_tree_sample.wgsl`) IS THE ONLY
+  THING HERE THAT SPANS LEVELS**, and it is what the slice view now samples
+  (M6.0b). Every solver kernel is written for one level and reaches its
+  parent through `common_d3_parent_{dense,pool}.wgsl`; a viewer cannot, since
+  "the best answer available here" is a question about the whole tree.
+  Its frame is forced, not chosen: `fineToCoarseUnit` puts cell centres at
+  INTEGERS, so `g(p, m) = floor((p + 1/2) * 2^m)` and ownership is one
+  division by `2*RB` -- which is why a viewer can never land in a tile's
+  RING. `d3-amr.mjs`'s `cellAtLevel`/`finestLevelAt` are the host statement
+  of the same rule; `make test` mutation-checks them and
+  `debugCheckTreeSample` scores the real shader against them on GPU data.
+  **Any finite difference taken from it must use the sampler's own `h`** --
+  a fixed L0 step discards the resolution, a fixed finest step paints the
+  whole coarse field flat zero.
+
+- **A POOL LEVEL'S `mac` IS SEEDED AT RESET** (M6.0a,
+  `common_d3_moments.wgsl`). It is otherwise a derived buffer -- written by
+  the step and by the child's coalesce -- so before that it read as zero at
+  step 0 on every level, which a viewer renders as a hole and a check has to
+  special-case.
+
+- **`main-3d.js` NEEDS 12 STORAGE BUFFERS PER SHADER STAGE**, past the spec
+  minimum of 8, because the tree sampler binds the dense `mac` plus a
+  (`mac`, `blockSlot`) pair per level and its probe adds two more. Requested
+  with a loud failure, the treatment `main-amr.js` already settled on. A
+  bind-group-layout failure is NOT an exception: it poisons every pipeline
+  built on it and the only symptom is `Invalid PipelineLayout is invalid due
+  to a previous error`.
 
 - `tools/validate-3d.js` + `benchmarks/d3.json` — the M1, M2 and M3 gates.
   Analytic PASS/FAIL for duct, Beltrami, spin and the bounce-back sphere;
