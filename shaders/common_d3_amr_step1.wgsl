@@ -1,0 +1,364 @@
+// Fine-level (L1) LBM step over the octree pool. plans/3D.md M3.
+// Fragment only; the entry files list every include.
+//
+// Same fused pull-stream + BGK + Guo + body coupling as
+// common_d3_step.wgsl, but addressed through the pool and with
+// NEIGHBOUR-ADDRESSED STREAMING: a source cell that leaves this tile's
+// interior is resolved against the OWNING same-level tile directly, via
+// blockSlot, rather than read out of a materialized ghost cell. Only where
+// no such tile exists -- a coarse/fine interface -- does the gather fall
+// back to the ring, which the interp pass filled from the parent.
+//
+// plans/3D.md sec 1.1 calls DIRECT_GHOST "the single most valuable thing
+// the 2D work bought the 3D fork", and it is worth more here: it removes
+// the between-substep fine-fine ghost copy entirely, and the copy pass was
+// 10-13% of frame in 2D where the ring is a smaller fraction of a tile.
+//
+// D3Q19 NEVER NEEDS A CORNER TILE. Its 18 non-rest directions are 6 face +
+// 12 edge, with no (+-1,+-1,+-1) among them, so a source displaces at most
+// two axes and the corner neighbour is unreachable. D3Q27 does need it.
+// That is a real simplification D3Q19 buys and D3Q27 gives back
+// (plans/3D.md sec 2.3), and it is visible here as nbrXYZ being resolved
+// but never selected at Q=19 -- the lattice's own shell ranges make it
+// dead code the compiler folds out.
+
+@group(0) @binding(0) var<storage, read>       f_in        : array<f32>;
+@group(0) @binding(1) var<storage, read_write> f_out       : array<f32>;
+@group(0) @binding(2) var<storage, read_write> mac_pool    : array<f32>;
+@group(0) @binding(3) var<storage, read>       body        : BodyState3D;
+@group(0) @binding(4) var<storage, read>       slotToBlock : array<i32>;
+@group(0) @binding(5) var<storage, read>       blockSlot   : array<i32>;
+// The level BELOW this one, when there is one (plans/3D.md M5.2b-iii). Bound
+// always so the layout does not fork -- sec 6's 238e48c rule -- and read only
+// when HAS_CHILD is 1, which folds the lookup out at pipeline-creation time
+// at the deepest level. At ?levels=2 that is every level, so this is
+// bit-identical to the code before it existed.
+@group(0) @binding(6) var<storage, read>       childBlockSlot : array<i32>;
+
+// The FINE level's own relaxation rate, 1/tau_fine with
+// tau_fine = 2*tau_coarse - 0.5. Passed in rather than derived so there is
+// one place (main-3d.js) that owns the level->tau mapping.
+override OMEGA_FINE : f32 = 1.0f;
+
+override FORCE_X : f32 = 0.0f;
+override FORCE_Y : f32 = 0.0f;
+override FORCE_Z : f32 = 0.0f;
+override HAS_BODY : u32 = 0u;
+override USE_BOUNCEBACK : u32 = 0u;
+
+// See common_d3_step.wgsl's SOLID_EQ. Same default, same meaning; the two
+// kernels must agree, and main-3d.js passes one value to both.
+override SOLID_EQ : u32 = 1u;
+// Chi band in FINE cells. The band is a physical width, and a fine cell is
+// half a coarse cell, so the same physical band is 2x as many fine cells --
+// which is exactly the correction the 2D solver's K_EPS * dx_L1 makes, and
+// exactly the thing plans/3D.md's M3 note warns will bite where a refined
+// shell wraps a body. Expressed in COARSE units by the caller and halved
+// here, so one number means one physical width at every level.
+override CHI_EPS : f32 = 1.5f;
+
+// --- THE PARENT-UNIT TO L0 CONVERSION (plans/3D.md M5.4b) -----------------
+//
+// fineToCoarseUnit3 returns a position in the PARENT LEVEL's cell units, and
+// the body lives in L0 units. At level 1 those coincide and these are the
+// identity; below level 1 they do not, and the map is AFFINE rather than a
+// pure scale because refinement is CELL-CENTRED: one rung is
+// L0 = 0.5*u - 0.25, so over (m-1) rungs
+//
+//     L0_SCALE  = 2^-(m-1)
+//     L0_OFFSET = -0.5 * (1 - 2^-(m-1))
+//
+// Its absence is why the first depth-3 sphere measured Cd EXACTLY 0.0000:
+// this kernel evaluated the SDF at coordinates twice too large per level, so
+// no cell at level 2 was ever inside the body, no bounce-back link ever
+// crossed a surface, and the force kernel downstream had nothing to find.
+// The force kernel needed the same fix, but it was NOT the cause -- the body
+// was simply not being imposed at that level at all. A zero that comes from
+// two places at once is worth saying out loud: fixing only the visible one
+// leaves the number at zero and looks like no progress.
+override L0_SCALE : f32 = 1.0f;
+override L0_OFFSET : f32 = 0.0f;
+
+// The chi band is a fixed number of CELLS at the level that resolves it, so
+// it scales with this level's cell size: 0.5 at level 1, 2^-m in general.
+override CHI_SCALE : f32 = 0.5f;
+
+// M4.1b: collide the tile INTERIOR only. Chen et al. (2006)'s coalesce
+// averages the advected-but-UNCOLLIDED interface states, and the paper is
+// explicit that averaging collided ones instead "would invalidate the
+// correctness of non-equilibrium distributions on the coarse grid" -- the
+// a = (n-1)/2n offset that stands in for the Dupuis-Chopard rescale is
+// exactly the bookkeeping of NOT colliding here. So a ring cell advects and
+// stores, nothing more.
+//
+// The whole tile is still STEPPED, for the reason this file's header gives:
+// a substep that writes only interiors leaves the other ping-pong buffer's
+// ring uninitialized, and the next substep's interface gather reads it.
+// What changes is only whether the gathered value is collided before it is
+// stored. 0 restores the pre-M4.1b behaviour of colliding everything, which
+// is what `?interface=interp` needs to stay a faithful A/B.
+override COLLIDE_RING : u32 = 0u;
+
+// 1 when a finer level exists below this one.
+override HAS_CHILD : u32 = 0u;
+
+// AN INTERIOR CELL THIS LEVEL NO LONGER SOLVES, because a finer level does.
+// `coveredByFiner` from common_d3_step.wgsl -- which the DENSE level has
+// always had -- applied one rung down. Its absence was a real momentum leak
+// the moment a third level existed, and the leak was in `mac_pool`:
+//
+//   coalesce(child -> this level) writes this level's mac_pool at covered
+//   cells, from the child's own moments, correctly. Then THIS KERNEL ran
+//   afterwards and overwrote it -- with moments taken from a population
+//   vector that is part delivery-outbox and part self-stepped, because
+//   coalesce only writes the directions whose target is unrefined. The
+//   parent's own coalesce then reads those moments and hands them upward.
+//
+// A COVERED CELL'S POPULATIONS ARE NOT A DISTRIBUTION, deliberately: they
+// are an OUTBOX, staging the fine outflux in the slot the coarse neighbour
+// will pull from. Taking moments of an outbox is the mistake, and skipping
+// the cell removes it -- nothing else reads those populations, because a
+// neighbour only ever pulls direction i from a cell whose target IS that
+// neighbour, and coalesce writes exactly those.
+//
+// INTERIOR ONLY, AND THAT IS THE WHOLE CORRECTION. The first attempt at
+// this skipped RING cells too, on the reasoning that a covered ring cell is
+// never read -- and mass drift went from 2e-1 to -8e+3. A ring cell is this
+// level's ghost for ITS OWN parent, and the parent's coalesce harvests the
+// outflux out of exactly those cells: it has to keep advecting whether or
+// not a child happens to cover it. The two roles are independent and the
+// cell serves both.
+//
+// `g` is this level's own global cell coordinate. A child block covers RB of
+// this level's cells, and there are fineDim()/RB of them per axis.
+fn coveredByChild(g: vec3<i32>) -> bool {
+  if (HAS_CHILD == 0u) { return false; }
+  let w = vec3<u32>(wrapFine3(g));
+  let cb = w / RB;
+  let n = vec3<u32>(fineDim()) / RB;
+  return childBlockSlot[(cb.z * n.y + cb.y) * n.x + cb.x] >= 0;
+}
+
+override SPONGE_W : f32 = 0.0f;
+override SPONGE_UX : f32 = 0.0f;
+override SPONGE_UY : f32 = 0.0f;
+override SPONGE_UZ : f32 = 0.0f;
+
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let FB = poolFB();
+  let fz = gid.z % FB;
+  let slot = gid.z / FB;
+  if (gid.x >= FB || gid.y >= FB) { return; }
+  let fi = vec3<u32>(gid.x, gid.y, fz);
+
+  let blockID = slotToBlock[slot];
+  if (blockID < 0) { return; }
+
+  // THE WHOLE TILE IS STEPPED, RING INCLUDED. This looks like waste -- at
+  // RB=4 the ring is 70% of a tile (1216 of 1728 cells) and only the
+  // interior is the tile's own solution -- but it is the mechanism GHOST=2
+  // exists for, and stepping the interior alone is silently wrong.
+  //
+  // Why: the pool ping-pongs across the two fine substeps, A -> B -> A. If a
+  // substep writes only interiors, the buffer it wrote has an UNINITIALIZED
+  // ring, and the next substep's interface gather -- the one case the ring
+  // still serves after DIRECT_GHOST -- reads it. That is not a small error;
+  // it is NaN on the first macro-step. It also hides completely under
+  // ?refine=all, where every neighbour tile exists and no ring cell is ever
+  // read, which is exactly how it was found: `all` was clean to 1.6e-3
+  // against the analytic solution while a partially-refined box was NaN.
+  //
+  // So the ring SELF-ADVANCES: substep A's gather on a depth-1 ring cell
+  // reaches into depth 2, leaving depth 1 valid for substep B. A depth-2
+  // cell's own sources fall outside the tile and clamp, so depth 2 is
+  // degraded after substep A -- which is fine, because nothing reads it
+  // again before interp refreshes the whole ring next macro-step.
+  // plans/3D.md sec 2.1 records the same reasoning for the 2D solver, and
+  // its "don't STEP the ghost cells" lead is precisely about recovering
+  // this cost without giving up the mechanism.
+
+  let b = blockXYZ(u32(blockID));
+  let origin = b * RB;
+  let RB2 = 2u * RB;
+
+  // Covered by a finer level? Then this level does not solve here and must
+  // not write -- neither the populations nor mac_pool. See coveredByChild,
+  // including why this tests the INTERIOR only.
+  if (isInterior3(fi)
+      && coveredByChild(vec3<i32>(b) * i32(RB2) + vec3<i32>(fi) - i32(GHOST))) { return; }
+
+  // Neighbour-slot resolution, hoisted out of the QN-direction gather.
+  // A source is at most one cell away and an interior is RB2 >= 2 wide, so
+  // at most ONE non-zero block offset is reachable per axis -- the whole
+  // gather needs at most SEVEN neighbour tiles (3 face, 3 edge, 1 corner),
+  // resolved once here instead of re-resolved with a fresh blockSlot load on
+  // every direction. A fully-interior thread loads nothing at all.
+  var off = vec3<i32>(0, 0, 0);
+  off.x = select(select(0, 1, fi.x + 1u >= GHOST + RB2), -1, fi.x <= GHOST);
+  off.y = select(select(0, 1, fi.y + 1u >= GHOST + RB2), -1, fi.y <= GHOST);
+  off.z = select(select(0, 1, fi.z + 1u >= GHOST + RB2), -1, fi.z <= GHOST);
+  // The block grid is periodic, matching the dense level's own periodicity.
+  let nb = vec3<u32>(nbx(), nby(), nbz());
+  let bn = vec3<u32>(
+    wrapu(i32(b.x) + off.x, nb.x),
+    wrapu(i32(b.y) + off.y, nb.y),
+    wrapu(i32(b.z) + off.z, nb.z));
+
+  var nbrX = -1; var nbrY = -1; var nbrZ = -1;
+  var nbrXY = -1; var nbrXZ = -1; var nbrYZ = -1; var nbrXYZ = -1;
+  if (off.x != 0) { nbrX = blockSlot[blockIdOf(vec3<u32>(bn.x, b.y, b.z))]; }
+  if (off.y != 0) { nbrY = blockSlot[blockIdOf(vec3<u32>(b.x, bn.y, b.z))]; }
+  if (off.z != 0) { nbrZ = blockSlot[blockIdOf(vec3<u32>(b.x, b.y, bn.z))]; }
+  if (off.x != 0 && off.y != 0) { nbrXY = blockSlot[blockIdOf(vec3<u32>(bn.x, bn.y, b.z))]; }
+  if (off.x != 0 && off.z != 0) { nbrXZ = blockSlot[blockIdOf(vec3<u32>(bn.x, b.y, bn.z))]; }
+  if (off.y != 0 && off.z != 0) { nbrYZ = blockSlot[blockIdOf(vec3<u32>(b.x, bn.y, bn.z))]; }
+  if (off.x != 0 && off.y != 0 && off.z != 0) { nbrXYZ = blockSlot[blockIdOf(bn)]; }
+
+  let poolPlane = arrayLength(&f_in) / QN;
+  let cell = poolCell(slot, fi);
+
+  // Body position, in COARSE units -- the SDF and every body quantity live
+  // in the dense level's coordinates, so the fine level converts rather than
+  // keeping a second frame.
+  let p = vec3<f32>(
+    fineToCoarseUnit3(i32(fi.x), origin.x),
+    fineToCoarseUnit3(i32(fi.y), origin.y),
+    fineToCoarseUnit3(i32(fi.z), origin.z)) * L0_SCALE + L0_OFFSET;
+  let phi = select(1e30f, get_phi3(p, body), HAS_BODY != 0u);
+  let us = select(vec3<f32>(0f), bodyVelocity3(p, body), HAS_BODY != 0u);
+
+  var f: array<f32, QN>;
+  for (var i = 0u; i < QN; i++) {
+    let ei = vec3<i32>(ex[i], ey[i], ez[i]);
+    var s = vec3<i32>(fi) - ei;
+
+    if (HAS_BODY != 0u && USE_BOUNCEBACK != 0u) {
+      // The sharp inside test uses the UNCLAMPED, geometrically-correct
+      // source position, while the reflected VALUE comes from this cell's
+      // own (always valid) data -- the same distinction the 2D fine step
+      // draws, and for the same reason: a tile edge is a buffer-addressing
+      // artifact, not a physical statement.
+      let sp = vec3<f32>(
+        fineToCoarseUnit3(s.x, origin.x),
+        fineToCoarseUnit3(s.y, origin.y),
+        fineToCoarseUnit3(s.z, origin.z)) * L0_SCALE + L0_OFFSET;
+      if (get_phi3(sp, body) < 0f) {
+        let corr = 2f * wt[i] * dot(vec3<f32>(f32(ei.x), f32(ei.y), f32(ei.z)), us) / CS2;
+        f[i] = f_in[opp[i] * poolPlane + cell] + corr;
+        continue;
+      }
+    }
+
+    // Does the source leave the interior, and on which axes? If so the
+    // offset can only be off.{x,y,z} (see the hoist above), so this is pure
+    // register work -- no second blockSlot load.
+    let ox = select(0, off.x, s.x < i32(GHOST) || s.x >= i32(GHOST + RB2));
+    let oy = select(0, off.y, s.y < i32(GHOST) || s.y >= i32(GHOST + RB2));
+    let oz = select(0, off.z, s.z < i32(GHOST) || s.z >= i32(GHOST + RB2));
+    var ns = -1;
+    if (ox != 0 && oy != 0 && oz != 0) { ns = nbrXYZ; }
+    else if (ox != 0 && oy != 0) { ns = nbrXY; }
+    else if (ox != 0 && oz != 0) { ns = nbrXZ; }
+    else if (oy != 0 && oz != 0) { ns = nbrYZ; }
+    else if (ox != 0) { ns = nbrX; }
+    else if (oy != 0) { ns = nbrY; }
+    else if (oz != 0) { ns = nbrZ; }
+
+    var srcSlot = slot;
+    if (ns >= 0) {
+      // Re-express the source in the neighbour's own local frame. It always
+      // lands in ITS INTERIOR: s in [-1, GHOST-1] maps to [RB2-1, RB2+1],
+      // and s in [GHOST+RB2, FB] maps to [GHOST, GHOST+2]. So this reads
+      // real same-level data, never the neighbour's own ring -- which is
+      // the property that makes the fine-fine ghost copy unnecessary, and
+      // which tools/test-d3-amr.js asserts directly.
+      srcSlot = u32(ns);
+      s -= vec3<i32>(ox, oy, oz) * i32(RB2);
+    }
+    // With no owning tile this is a coarse/fine interface and the ring is
+    // the fallback -- the ring's one remaining job after DIRECT_GHOST. The
+    // clamp is a no-op on the neighbour path (see above) and only bites
+    // here, where the source may sit one past the ring at a corner.
+    let sc = vec3<u32>(
+      u32(clamp(s.x, 0, i32(FB) - 1)),
+      u32(clamp(s.y, 0, i32(FB) - 1)),
+      u32(clamp(s.z, 0, i32(FB) - 1)));
+    f[i] = f_in[i * poolPlane + poolCell(srcSlot, sc)];
+  }
+
+  var rho = 0f;
+  var m = vec3<f32>(0f);
+  for (var i = 0u; i < QN; i++) {
+    rho += f[i];
+    m += f[i] * vec3<f32>(f32(ex[i]), f32(ey[i]), f32(ez[i]));
+  }
+  let rhoDen = max(rho, 1e-6f);
+  let ustar = m / rhoDen;
+
+  // CHI_EPS arrives in COARSE units and is halved: a fine cell is half a
+  // coarse cell, so the same physical band width is twice as many fine
+  // cells. Getting this wrong makes the solid boundary sharper or blurrier
+  // on the refined level than on the level around it -- a discontinuity in
+  // the body itself at the interface.
+  let chi = select(0f, chiFromPhiEps3(phi, CHI_EPS * CHI_SCALE),
+                   HAS_BODY != 0u && USE_BOUNCEBACK == 0u);
+  let F = rho * chi * (us - ustar) + vec3<f32>(FORCE_X, FORCE_Y, FORCE_Z);
+  let u = ustar + F / (2.0f * rhoDen);
+  let u_sq = dot(u, u);
+
+  let macPlane = arrayLength(&mac_pool) / 4u;
+  mac_pool[0u * macPlane + cell] = rho;
+  mac_pool[1u * macPlane + cell] = u.x;
+  mac_pool[2u * macPlane + cell] = u.y;
+  mac_pool[3u * macPlane + cell] = u.z;
+
+  // Sponge distances are measured in COARSE units against the L0 domain, so
+  // a refined tile near a domain face absorbs exactly as its parent does --
+  // and in WINDOW coordinates, so that under a moving window the absorbing
+  // band travels with the body here exactly as it does on L0 (M8.3).
+  // winCoord is the identity without a window.
+  let wp = winCoord(p, winOffset(vec3<f32>(body.cx, body.cy, body.cz)));
+  let spongeW = spongeWeight3(
+    min(wp.x, f32(NX - 1u) - wp.x),
+    min(wp.y, f32(NY - 1u) - wp.y),
+    min(wp.z, f32(NZ - 1u) - wp.z), SPONGE_W);
+
+  // A ring cell advects and stores; see COLLIDE_RING.
+  if (COLLIDE_RING == 0u && !isInterior3(fi)) {
+    for (var i = 0u; i < QN; i++) { f_out[i * poolPlane + cell] = f[i]; }
+    return;
+  }
+
+  var fo: array<f32, QN>;
+  for (var i = 0u; i < QN; i++) {
+    let ei = vec3<f32>(f32(ex[i]), f32(ey[i]), f32(ez[i]));
+    let eu = dot(ei, u);
+    let feq = wt[i] * rho * (1f + 3f*eu + 4.5f*eu*eu - 1.5f*u_sq);
+    let t1 = (ei - u) * 3.0f;
+    let Si = (1.0f - 0.5f * OMEGA_FINE) * wt[i] * dot(t1 + (eu * 9.0f) * ei, F);
+    let fCollide = f[i] - OMEGA_FINE * (f[i] - feq) + Si;
+    let euFar = ei.x*SPONGE_UX + ei.y*SPONGE_UY + ei.z*SPONGE_UZ;
+    let uFarSq = SPONGE_UX*SPONGE_UX + SPONGE_UY*SPONGE_UY + SPONGE_UZ*SPONGE_UZ;
+    let fTarget = wt[i] * (1.0f + 3.0f*euFar + 4.5f*euFar*euFar - 1.5f*uFarSq);
+    fo[i] = mix(fCollide, fTarget, spongeW);
+  }
+  // The solid interior, held at the body's own equilibrium -- the pool's
+  // copy of common_d3_step.wgsl's step 5, whose header carries the
+  // measurement and the reasoning. It has to be here too because the body
+  // lives ENTIRELY on the finest level (plans/3D.md M5.4), so on an AMR run
+  // these are the only kernels that step the cells inside it at all.
+  if (SOLID_EQ != 0u && HAS_BODY != 0u && USE_BOUNCEBACK != 0u && phi < 0f) {
+    let usq = dot(us, us);
+    for (var i = 0u; i < QN; i++) {
+      let eu = f32(ex[i])*us.x + f32(ey[i])*us.y + f32(ez[i])*us.z;
+      fo[i] = wt[i] * (1f + 3f*eu + 4.5f*eu*eu - 1.5f*usq);
+    }
+    let macPlane2 = arrayLength(&mac_pool) / 4u;
+    mac_pool[0u * macPlane2 + cell] = 1f;
+    mac_pool[1u * macPlane2 + cell] = us.x;
+    mac_pool[2u * macPlane2 + cell] = us.y;
+    mac_pool[3u * macPlane2 + cell] = us.z;
+  }
+  for (var i = 0u; i < QN; i++) { f_out[i * poolPlane + cell] = fo[i]; }
+}

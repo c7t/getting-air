@@ -2,9 +2,6 @@
 *.pdf
 AGAL/
 notes.txt
-plans/*
-!plans/perf-characterization.md
-!plans/AMR-vs-dense-validation.md
 transcripts/
 snapshots/
 https.py
@@ -13,3 +10,8 @@ https.py
 *.mp4
 *.log
 telemetry.log
+
+# Emacs lock files (.#name, dangling symlinks) and autosaves (#name#).
+# Both are swept in by `git add -A`, and both just were.
+.#*
+\#*\#

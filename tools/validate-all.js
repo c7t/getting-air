@@ -38,7 +38,14 @@ const { evalExpr: evalExprChan, runCase: runChanCase } = require('./lib/channel-
 const { evalExpr: evalExprTgv, runCase: runTgvCase } = require('./lib/tgv-metrics');
 const { runInvariantSweep } = require('./lib/amr-invariants');
 const {
+  caseUrl: d3CaseUrl, runDuctCase, runBeltramiCase, runTgvReport,
+} = require('./lib/d3-metrics');
+const {
+  caseUrl: d3BodyCaseUrl, runSphereCase, runSpinCase,
+} = require('./lib/d3-body-metrics');
+const {
   ensureServer, ensureChrome, openTab, firstTab, navigateTo, waitForGlobal, teardown,
+  attachPageWatch, assertPageHealthy,
 } = require('./lib/browser-lifecycle');
 
 const REPO_ROOT = path.join(__dirname, '..');
@@ -118,6 +125,48 @@ function defaultConfigs(baseUrl) {
     {
       name: 'reentry-amr-boot',
       url: `${baseUrl}/index-reentry-amr.html`,
+      checkBoots: true,
+    },
+    // The M0 3D spike page (plans/3D.md sec 5). It is a BENCH page with no
+    // physics check of its own, but it is the only consumer of
+    // shaders/d3_*.wgsl and of the generated lattice fragments, and
+    // plans/3D.md sec 6 item 4 says to add every 3D page here ON THE DAY IT
+    // IS CREATED rather than after it breaks -- which is the lesson 238e48c
+    // taught at the cost of a broken production page. `?n=32` keeps it
+    // cheap: the boot smoke asks whether the pipelines compile and the loop
+    // advances, not how fast it goes.
+    // index-3d.html under a cheap boot smoke as well as the physics gates
+    // below: the gates drive it paused via debugStepSync, so nothing else
+    // here would notice if the LIVE render loop broke.
+    {
+      name: 'd3-boot',
+      url: `${baseUrl}/index-3d.html?n=24`,
+      checkBoots: true,
+    },
+    // The AMR page under a boot smoke as well as the physics gate: the gate
+    // drives it paused via debugStepSync, so nothing else here would notice
+    // if the live render loop broke with a pool bound.
+    {
+      name: 'd3-amr-boot',
+      url: `${baseUrl}/index-3d.html?n=24&levels=2&refine=all`,
+      checkBoots: true,
+    },
+    {
+      name: 'd3-spike-boot',
+      url: `${baseUrl}/index-3d-spike.html?n=32&steps=2&reps=1`,
+      checkBoots: true,
+    },
+    // THE MOVING WINDOW under a boot smoke (plans/3D.md M8.3). It is a page
+    // nothing else here visits: the 3D physics gates are all unwindowed, and
+    // tools/probe-d3-window.js is a standalone report. It also adds a shader
+    // fragment to a dozen entry files, a pipeline override to eight
+    // pipelines and a binding to the render bind group -- which is the
+    // 238e48c failure surface exactly, and the reason runBootSmoke exists.
+    // `?n=8` keeps it cheap; the question is whether the pipelines compile
+    // and the loop advances.
+    {
+      name: 'd3-window-boot',
+      url: `${baseUrl}/index-3d.html?scenario=fall&n=8&tow=0.04&bounceback=1&window=x`,
       checkBoots: true,
     },
     // index-amr.html under the structural-invariant sweep. This is the page
@@ -236,6 +285,68 @@ function defaultConfigs(baseUrl) {
       url: `${baseUrl}/index-tgv-amr.html?levels=3`,
       checkTgvPhysics: true,
       tgvFilter: c => c.levels === 3,
+    },
+    // Dense 3D (plans/3D.md M1). Two ANALYTIC gates -- square-duct
+    // Poiseuille flow and a decaying Beltrami (ABC) flow -- plus the 3D
+    // Taylor-Green vortex as a report. All three drive the SAME page
+    // (index-3d.html with a ?scenario=), which is deliberate: main-3d.js is
+    // not forked per scenario the way the 2D harnesses are, so these gates
+    // exercise the exact code path the interactive page uses. See
+    // benchmarks/d3.json and d3-scenarios.mjs.
+    //
+    // Kept to one case each here -- the full sweep is `node
+    // tools/validate-3d.js`, the same relationship validate-cylinder.js has
+    // to this file. What belongs in the default sweep is "did 3D break",
+    // not a resolution study.
+    {
+      name: 'd3-duct',
+      url: `${baseUrl}/index-3d.html?scenario=duct`,
+      checkD3Physics: 'duct',
+      d3Filter: c => c.name === 'duct-N48-magic',
+    },
+    {
+      name: 'd3-beltrami',
+      url: `${baseUrl}/index-3d.html?scenario=beltrami`,
+      checkD3Physics: 'beltrami',
+      d3Filter: c => c.name === 'bel-N48',
+    },
+    // M2, the body. `spin` is seconds long and isolates the 6-DOF
+    // integrator against its host reference on real GPU code -- the highest
+    // value per second in this whole file, since that is the hardest new
+    // code and its errors are the least visible (a wrong gyroscopic
+    // coupling conserves |L| perfectly and simply tumbles wrongly).
+    // M3: the octree pool at N=2, scored on the analytic Beltrami flow with
+    // every block refined (no coarse/fine interface). See
+    // benchmarks/d3.json's amr_interface_note for what is NOT gated.
+    {
+      name: 'd3-amr',
+      url: `${baseUrl}/index-3d.html?scenario=beltrami&levels=2`,
+      checkD3Physics: 'amr',
+      d3Filter: c => c.name === 'amr-all-RB4',
+    },
+    // The same pool with a REAL coarse/fine interface. `d3-amr` above cannot
+    // see an interface bug at all -- with every block refined the rescaled
+    // coarse f is discarded and the rings are never read -- which is how the
+    // pre/post-collision Dupuis-Chopard bug survived M3 with all three amr
+    // gates green and bit-identical. Scored against recorded values, not
+    // physics: benchmarks/d3.json's amr_box_note.
+    {
+      name: 'd3-amr-box',
+      url: `${baseUrl}/index-3d.html?scenario=beltrami&levels=2&refine=box`,
+      checkD3Physics: 'amr-box',
+      d3Filter: c => c.name === 'amr-box-RB4',
+    },
+    {
+      name: 'd3-spin',
+      url: `${baseUrl}/index-3d.html?scenario=spin`,
+      checkD3Physics: 'spin',
+      d3Filter: c => c.name === 'spin-N32',
+    },
+    {
+      name: 'd3-sphere',
+      url: `${baseUrl}/index-3d.html?scenario=sphere`,
+      checkD3Physics: 'sphere',
+      d3Filter: c => c.name === 'sphere-Re100-D16',
     },
   ];
 }
@@ -387,6 +498,49 @@ async function runTgvPhysics(Page, Runtime, opts, config) {
   return { ok, results };
 }
 
+// Dense 3D physics. Owns its own navigation per case (every parameter is
+// page-load-time, exactly as for TGV), and runs the same tools/lib/
+// d3-metrics.js entry points tools/validate-3d.js does.
+async function runD3Physics(Page, Runtime, opts, config, watch) {
+  const bench = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, 'benchmarks', 'd3.json'), 'utf8'));
+  const kind = config.checkD3Physics;
+  const key = { duct: 'duct_cases', beltrami: 'beltrami_cases', tgv: 'tgv_cases',
+                sphere: 'sphere_cases', spin: 'spin_cases', amr: 'amr_cases',
+                'amr-box': 'amr_box_cases' }[kind];
+  const run = { duct: runDuctCase, beltrami: runBeltramiCase, tgv: runTgvReport,
+                sphere: runSphereCase, spin: runSpinCase, amr: runBeltramiCase,
+                'amr-box': runBeltramiCase }[kind];
+  // The M2 body cases build their URLs from a different set of knobs (Re,
+  // bounceback) than the M1 fluid ones, so the URL builder follows the case
+  // kind rather than being one function that knows about everything.
+  // The case KIND is not always the scenario name: the M3 `amr` cases are
+  // beltrami runs with pool parameters, so the scenario they drive is
+  // beltrami. Keeping the two separate is what lets a scenario be scored by
+  // more than one kind of check.
+  const scenarioOf = { amr: 'beltrami', 'amr-box': 'beltrami' };
+  const urlFor = (c) => (kind === 'sphere' || kind === 'spin')
+    ? d3BodyCaseUrl(opts.baseUrl, kind, c, opts.extra)
+    : d3CaseUrl(opts.baseUrl, scenarioOf[kind] || kind, c, opts.extra);
+  const cases = bench[key].filter(config.d3Filter || (() => true));
+
+  const results = [];
+  for (const c of cases) {
+    await navigateTo(Page, urlFor(c));
+    await waitForGlobal(Runtime, 'window.__D3', 60000);
+    await assertPageHealthy(Runtime, watch, c.name);
+    const res = await run(Runtime, { timeout: opts.physicsTimeout }, c, s => console.log('    ' + s));
+    await assertPageHealthy(Runtime, watch, c.name);
+    results.push({ name: c.name, ...res });
+  }
+  const checksOf = (r) => (kind === 'duct' ? [r.fieldCheck, r.peakCheck, r.xCheck]
+    : (kind === 'beltrami' || kind === 'amr' || kind === 'amr-box') ? [r.fieldCheck, r.rateCheck]
+    : kind === 'sphere' ? [r.cdCheck, r.settledCheck, r.lateralCheck]
+    : kind === 'spin' ? [r.angCheck, r.lCheck, r.qCheck, r.movedCheck]
+    : [r.finiteCheck]);
+  const ok = results.every(r => checksOf(r).every(k => k.pass));
+  return { ok, results };
+}
+
 async function runInvariants(Runtime, opts, global) {
   return runInvariantSweep(Runtime, {
       // Corner (diagonal) 2:1 balance is a hard requirement of ?ghostfree=1 --
@@ -451,7 +605,15 @@ async function main() {
   // stack one listener per prior config by the end of the run, logging each
   // later exception that many times over.
   let currentConfigName = null;
-  Runtime.exceptionThrown(e => console.error(`  [${currentConfigName}] browser exception:`, e.exceptionDetails.text));
+  // attachPageWatch supersedes the bare exceptionThrown listener that used
+  // to be here: every page wraps startup as init().catch(handleErr), so a
+  // bad parameter or a shader/bind-group mismatch never throws uncaught --
+  // it is a console.error plus an `error:` line in #status. The boot smoke
+  // already polled #status for exactly that reason; this makes the same
+  // signal available to the PHYSICS configs too, which were blind to it.
+  const watch = await attachPageWatch(client, {
+    onError: (e) => console.error(`  [${currentConfigName}] ${e.kind}: ${e.text.split('\n')[0]}`),
+  });
 
   try {
     for (const config of configs) {
@@ -466,6 +628,9 @@ async function main() {
         // every other config below uses.
         console.log('  -- physics (u(y) vs. analytic) --');
         physics = await runChannelPhysics(Page, Runtime, opts, config);
+      } else if (config.checkD3Physics) {
+        console.log(`  -- physics (dense 3D, ${config.checkD3Physics} vs. analytic) --`);
+        physics = await runD3Physics(Page, Runtime, opts, config, watch);
       } else if (config.checkTgvPhysics) {
         console.log('  -- physics (field vs. analytic TGV solution) --');
         physics = await runTgvPhysics(Page, Runtime, opts, config);

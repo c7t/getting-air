@@ -1,0 +1,614 @@
+{
+  "geometry": "Dense 3D LBM (index-3d.html), N^3 lattice. Two analytic gates and one reporting scenario -- see d3-scenarios.mjs's header for why these two and not the 3D Taylor-Green vortex at Re=1600 that plans/3D.md M1 originally named.",
+  "gates": {
+    "duct": "Square-duct Poiseuille flow: periodic in x, stationary no-slip walls on y and z, uniform Guo body force sized to a target peak velocity. Started from REST, so the initial condition is independent of the reference solution -- this gate cannot be passed by a shared mistake between the seed and the check. Scored on the steady u_x cross-section (averaged along x) against the classical series solution. `x_spread_tol` bounds the variation of u_x ALONG the periodic axis relative to the peak: a settled duct flow is x-invariant by construction, so a nonzero spread means either an unconverged run or something wrong with the periodic direction, and it is checked separately from the profile error rather than being allowed to hide inside it.",
+    "beltrami": "Decaying ABC (Beltrami) flow, triply periodic. curl(u) = k*u, so the nonlinear term is a pure gradient and u(t) = u0 * exp(-nu k^2 t) EXACTLY, with the spatial shape preserved. Genuinely three-dimensional and time-dependent -- an asymmetry between the axes (a transposed index, a dropped uz term in feq, a wrong ez entry) breaks shape preservation, which is what field_l2_tol measures, while decay_rate_tol measures the viscosity the solver actually realizes.",
+    "tgv": "3D Taylor-Green vortex. NOT a gate: the nonlinear term does not vanish, so there is no closed form, and the standard Re=1600 comparison is against digitized DNS dissipation curves at 256^3-512^3 that this project does not have. Present as the initial condition that comparison will need, and reported (kinetic energy, enstrophy, dissipation rate) so a regression in it is at least VISIBLE. Reported cases have no tolerances and never fail the suite.",
+    "sphere": "Flow past a PINNED sphere in uniform crossflow, ALBC sponge on every face, Cd = Fx / (1/2 rho U^2 pi R^2) against the Schiller-Naumann correlation Cd = 24/Re (1 + 0.15 Re^0.687). Below Re ~ 210 the wake is steady and axisymmetric, so unlike the 2D cylinder there is nothing to time-average -- Cd simply settles, which `settle_tol` verifies rather than assumes (two samples, 70% and 100% of the run). `lateral_tol` bounds the cross-flow force |(Cl, Cs)| / Cd: it must vanish by symmetry, and it is an INDEPENDENT check -- a transposed axis or a wrong torque in the six-scalar force reduction shows up there and not in Cd at all. Cases come in resolution pairs at the same Re so the suite can assert that refining moves Cd TOWARD the reference; a single tolerance can be met by a body of the wrong size with a compensating error, a convergence trend cannot.",
+    "spin": "The 6-DOF integrator with the fluid force switched off (NO_FLUID_FORCE), compared step for step against d3-body.mjs's stepFreeBody(). Not a fluid case: shaders/d3_physics.wgsl is the hardest new code in M2 and its errors are the least visible -- a wrong gyroscopic coupling still conserves |L| exactly and simply tumbles wrongly -- so it is checked against the host reference on real GPU code. The spin starts near the INTERMEDIATE principal axis so the compared trajectory is the tumbling one; `movedCheck` asserts the body actually turned, since agreement on a body that barely moved would prove nothing.",
+    "amr": "AMR at N=2 (plans/3D.md M3), scored on the SAME analytic Beltrami flow as the dense gate. `refine=all` refines every block, so there is no coarse/fine interface anywhere: it validates the octree pool, the fine solver with DIRECT_GHOST, the ring, the coarse->fine interpolation, the fine->coarse restriction and the S_Advance schedule end to end, against an exact solution. It should be BETTER than the dense run of the same case, not merely equal -- the fine level resolves the mode at twice the resolution -- and it is: decay-rate error -1.22e-4 against dense's +9.38e-4. The RB=4 and RB=8 cases are bit-identical to each other, which is the evidence that the tile decomposition does not affect the answer. M4.1e NOTE 2026-09-10: these cases now run the new default ?interface=explode. Q19 is bit-identical across that flip (2.293e-3, rate -1.222e-4, unchanged); Q27's decay-rate REL moved -1.301e-4 -> -1.302e-4 while every printed field L2rel stayed identical at all three checkpoints and the rate itself still prints 1.7132e-3. That is a last-ulp difference, not a physics change, and the cause is known: with refine=all there is no interface at all, so the ONLY thing that differs between the couplings is that `average` and `coalesce` sum the eight children in different orders when they restrict rho and u -- the same formula, and float addition is not associative. Do not chase it, and do not tighten these tolerances to the point where an ulp matters. NOT GATED HERE: a partially-refined domain. See amr_interface_note."
+  },
+  "measurement": {
+    "duct_steps": "settle_multiple x the (1,1) duct mode's time constant 2a^2/(nu pi^2), rounded per case at run time, so the same physical settling is used regardless of N or nu",
+    "beltrami_checkpoints": "multiples of td = 1/(nu k^2), k = 2 pi / N",
+    "decay_rate": "fit via -ln(rms(t_b)/rms(t_a))/(t_b - t_a) between the last two checkpoints, rms taken over the strided full-volume sample",
+    "sphere_steps": "settle_convective x the convective time D/U, rounded per case. Cd was observed settled to three digits by ~20 D/U at every Re tested; the default 30 leaves margin.",
+    "sphere_cd": "Cd = Fx / (1/2 rho U^2 A), A = pi R^2, rho = 1 in lattice units. Fx is read back through the body state, which d3_physics.wgsl fills every step INCLUDING for a pinned body.",
+    "amr_checkpoints": "multiples of the Beltrami decay time td, as for the dense case, so the AMR and dense numbers are directly comparable"
+  },
+  "tolerances_note": "Set from measurement, 2026-09-09, RTX 4080. Observed duct L2rel spans 6.3e-5 (Q27, tau=0.933) to 1.7e-3 (tau=0.6); observed beltrami worst-checkpoint L2rel spans 9.4e-5 to 8.3e-3 and decay-rate relative error 1.2e-5 to 2.1e-3, converging at second order in N (2.08e-3 -> 9.38e-4 -> 5.60e-4 for N = 32, 48, 64), which is the expected O(k^2) lattice-viscosity correction. Tolerances sit a few times above the worst observed value: loose enough not to be a resolution-dependent tripwire, far tighter than any real defect. tau=0.9330127 is (1/2) + sqrt(3)/4, the BGK value at which the TRT magic parameter Lambda = (tau-1/2)^2 equals 3/16 and halfway bounce-back places the wall EXACTLY halfway between the last fluid cell and the first solid one -- which is the convention d3-scenarios.mjs's ductCoord() and shaders/common_d3_step.wgsl both assume. The tau=0.8 and tau=0.6 duct cases are deliberately off that value and are there to keep the wall-position error visible rather than tuned away.",
+  "duct_cases": [
+    {
+      "name": "duct-N24",
+      "n": 24,
+      "tau": 0.8,
+      "u0": 0.05,
+      "q": 19,
+      "settle_multiple": 12,
+      "field_l2_tol": 0.005,
+      "peak_tol": 0.005,
+      "x_spread_tol": 1e-05
+    },
+    {
+      "name": "duct-N48",
+      "n": 48,
+      "tau": 0.8,
+      "u0": 0.05,
+      "q": 19,
+      "settle_multiple": 12,
+      "field_l2_tol": 0.005,
+      "peak_tol": 0.005,
+      "x_spread_tol": 1e-05
+    },
+    {
+      "name": "duct-N48-magic",
+      "n": 48,
+      "tau": 0.9330127,
+      "u0": 0.05,
+      "q": 19,
+      "settle_multiple": 12,
+      "field_l2_tol": 0.002,
+      "peak_tol": 0.002,
+      "x_spread_tol": 1e-05
+    },
+    {
+      "name": "duct-N48-tau06",
+      "n": 48,
+      "tau": 0.6,
+      "u0": 0.05,
+      "q": 19,
+      "settle_multiple": 12,
+      "field_l2_tol": 0.005,
+      "peak_tol": 0.005,
+      "x_spread_tol": 1e-05
+    },
+    {
+      "name": "duct-N48-Q27",
+      "n": 48,
+      "tau": 0.9330127,
+      "u0": 0.05,
+      "q": 27,
+      "settle_multiple": 12,
+      "field_l2_tol": 0.002,
+      "peak_tol": 0.002,
+      "x_spread_tol": 1e-05
+    }
+  ],
+  "beltrami_cases": [
+    {
+      "name": "bel-N32",
+      "n": 32,
+      "tau": 0.8,
+      "u0": 0.04,
+      "q": 19,
+      "checkpoints": [
+        0.5,
+        1.5,
+        3.0
+      ],
+      "field_l2_tol": 0.02,
+      "decay_rate_tol": 0.005
+    },
+    {
+      "name": "bel-N48",
+      "n": 48,
+      "tau": 0.8,
+      "u0": 0.04,
+      "q": 19,
+      "checkpoints": [
+        0.5,
+        1.5,
+        3.0
+      ],
+      "field_l2_tol": 0.01,
+      "decay_rate_tol": 0.005
+    },
+    {
+      "name": "bel-N64",
+      "n": 64,
+      "tau": 0.8,
+      "u0": 0.04,
+      "q": 19,
+      "checkpoints": [
+        0.5,
+        1.5,
+        3.0
+      ],
+      "field_l2_tol": 0.01,
+      "decay_rate_tol": 0.005
+    },
+    {
+      "name": "bel-N48-tau06",
+      "n": 48,
+      "tau": 0.6,
+      "u0": 0.04,
+      "q": 19,
+      "checkpoints": [
+        0.5,
+        1.5,
+        3.0
+      ],
+      "field_l2_tol": 0.02,
+      "decay_rate_tol": 0.005
+    },
+    {
+      "name": "bel-N48-tau10",
+      "n": 48,
+      "tau": 1.0,
+      "u0": 0.04,
+      "q": 19,
+      "checkpoints": [
+        0.5,
+        1.5,
+        3.0
+      ],
+      "field_l2_tol": 0.01,
+      "decay_rate_tol": 0.005
+    },
+    {
+      "name": "bel-N48-u0hi",
+      "n": 48,
+      "tau": 0.8,
+      "u0": 0.08,
+      "q": 19,
+      "checkpoints": [
+        0.5,
+        1.5,
+        3.0
+      ],
+      "field_l2_tol": 0.02,
+      "decay_rate_tol": 0.005
+    },
+    {
+      "name": "bel-N48-Q27",
+      "n": 48,
+      "tau": 0.8,
+      "u0": 0.04,
+      "q": 27,
+      "checkpoints": [
+        0.5,
+        1.5,
+        3.0
+      ],
+      "field_l2_tol": 0.01,
+      "decay_rate_tol": 0.005
+    }
+  ],
+  "tgv_cases": [
+    {
+      "name": "tgv-N64-Re244",
+      "n": 64,
+      "tau": 0.51,
+      "u0": 0.08,
+      "q": 19,
+      "checkpoints": [
+        200,
+        600,
+        1200
+      ]
+    }
+  ],
+  "sphere_tolerances_note": "Measured 2026-09-09, RTX 4080. BOUNCE-BACK is the gating coupling and lands +6.9% to +12.8% above Schiller-Naumann across Re = 20..200 at D = 16, falling with resolution (Re=20: 2.944 at D=16, 2.907 at D=24, against 2.610). That offset is expected and well documented for a staircased bounce-back sphere at these resolutions -- the discrete surface has more area than the smooth one and the effective diameter exceeds the nominal -- plus ~1.2% blockage. cd_tol_rel of 0.15 covers it with margin while remaining far tighter than any real defect. THE DIFFUSE (chi) CASES ARE REGRESSION CHECKS, NOT PHYSICS CHECKS, and are scored against RECORDED values rather than against literature: measured Cd 4.649 (Re=20, D=16), 3.878 (Re=20, D=24), 2.523 (Re=100, D=16) against references 2.610 / 2.610 / 1.092. That is the SAME open diffuse-interface-width issue CLAUDE.md already records for the 2D dense-reference cylinder (Cd 1.950 against 1.35+-0.15), and for the same reason: the chi band is a fixed number of cells wide regardless of resolution, so the effective body radius exceeds the nominal one and Cd converges FROM ABOVE (4.649 -> 3.878 as D goes 16 -> 24). It is worse in 3D than in 2D because the frontal area error goes as (1 + d/R)^2 rather than (1 + d/R). Do NOT re-baseline these against Schiller-Naumann; treat a change in them as a regression to explain.",
+  "sphere_cases": [
+    {
+      "name": "sphere-Re20-D16",
+      "n": 16,
+      "re": 20,
+      "u0": 0.05,
+      "q": 19,
+      "bounceback": true,
+      "settle_convective": 30,
+      "cd_tol_rel": 0.15,
+      "lateral_tol": 0.02
+    },
+    {
+      "name": "sphere-Re20-D24",
+      "n": 24,
+      "re": 20,
+      "u0": 0.05,
+      "q": 19,
+      "bounceback": true,
+      "settle_convective": 30,
+      "cd_tol_rel": 0.15,
+      "lateral_tol": 0.02,
+      "converges_from": "sphere-Re20-D16"
+    },
+    {
+      "name": "sphere-Re50-D16",
+      "n": 16,
+      "re": 50,
+      "u0": 0.05,
+      "q": 19,
+      "bounceback": true,
+      "settle_convective": 30,
+      "cd_tol_rel": 0.15,
+      "lateral_tol": 0.02
+    },
+    {
+      "name": "sphere-Re100-D16",
+      "n": 16,
+      "re": 100,
+      "u0": 0.05,
+      "q": 19,
+      "bounceback": true,
+      "settle_convective": 30,
+      "cd_tol_rel": 0.15,
+      "lateral_tol": 0.02
+    },
+    {
+      "name": "sphere-Re200-D16",
+      "n": 16,
+      "re": 200,
+      "u0": 0.05,
+      "q": 19,
+      "bounceback": true,
+      "settle_convective": 30,
+      "cd_tol_rel": 0.15,
+      "lateral_tol": 0.02
+    },
+    {
+      "name": "sphere-Re100-D16-Q27",
+      "n": 16,
+      "re": 100,
+      "u0": 0.05,
+      "q": 27,
+      "bounceback": true,
+      "settle_convective": 30,
+      "cd_tol_rel": 0.15,
+      "lateral_tol": 0.02
+    }
+  ],
+  "sphere_shed_note": "UNSTEADY SPHERE (plans/3D.md M8.1), and the first case in this suite with a shed vortex in it. Every other sphere case is Re <= 200, which Johnson & Patel (JFM 378, 1999, pp. 19-70) place in the STEADY AXISYMMETRIC regime -- so they assert a SETTLED Cd and a cross-flow force under 2% of it, and both are violated by construction the moment the wake sheds. That is why this needs its own runner rather than a tolerance change: the existing gate cannot express the claim. Johnson & Patel identify three regimes by DNS -- steady axisymmetric (Re <= 210), steady planar-symmetric (210 < Re <= 270), unsteady periodic (Re > 270) -- and report St = 0.136 with mean Cd = 0.671 at Re = 300, which is the benchmark this case is scored against. THE STROUHAL NUMBER IS THE GATE AND Cd IS REPORTED. A frequency is a property of the wake; a surface integral over a staircased bounce-back sphere at D = 16 is substantially a property of the staircase, and this suite already measures Cd +12.8% against Schiller-Naumann at Re = 20 while the flow itself is right. Gating on the quantity the discretization does not dominate is what makes this a physics check rather than a resolution check -- and cd_tol_rel is deliberately absent here for that reason. TWO STRUCTURAL CHECKS SIT ALONGSIDE St, because a Strouhal number computed from a signal that is not periodic is a number fitted to noise: `amp_min` requires the projected lateral force to actually oscillate (a steady run reports zero crossings and would otherwise look like a missing measurement rather than a failure), and `anisotropy_min` requires the wake to be PLANAR enough for a shedding plane to exist -- a sphere picks its azimuthal orientation spontaneously, so the plane is fitted from the lateral-force covariance, and fitting a line to isotropic noise would otherwise succeed silently. MEASURED 2026-09-10, RTX 4080, three runs. St = 0.1301 (-4.4%) with no perturbation; 0.1225 (-9.9%) at perturb=0.02 seed=12345; 0.1305 (-4.0%) at seed=777. Cd is 0.7487-0.7496 in all three. So TWO SEPARATE FACTS. First, Cd is reproducible to 0.1% while St scatters about 6% seed-to-seed over a 12-period window -- the frequency estimate is the noisy quantity here, and a build-vs-build claim on St therefore needs a SAME-SEED repeat, exactly as CLAUDE.md already requires for AMR Cd. Do not read 0.1225 against 0.1305 as a regression; re-run with the same seed before believing a fourth-digit move. st_tol_rel = 0.2 sits comfortably outside that scatter while still being 3x tighter than the Cd offset it deliberately does not gate. The window could be lengthened to shrink the scatter as 1/sqrt(periods), at proportionate cost; 12 periods was judged enough against a 20% bound. Second, and this is why `perturb` exists at all: the UNPERTURBED run selected its shedding plane at exactly 45 degrees with an anisotropy of 1.6e5, i.e. perfectly planar and locked to a D3Q19 diagonal. A uniform freestream past a centred body is exactly symmetric, so the only thing available to choose a plane is the lattice. With a seed the plane lands at 8 and 58 degrees for the two seeds and the anisotropy falls to 5.3 and 19.8 -- planar-symmetric but wandering, which is what a real sphere wake does. main-cylinder.js's PERTURB comment records the 2D form of the same trap, where onset growing from round-off made Cd and shedding strength appear to SHRINK with resolution. perturb defaults to 0 everywhere so every steady case stays bit-identical; only the shedding cases opt in.",
+  "sphere_shed_cases": [
+    {
+      "name": "sphere-shed-Re300-D16",
+      "n": 16,
+      "re": 300,
+      "u0": 0.05,
+      "q": 19,
+      "bounceback": true,
+      "st": 0.136,
+      "cd": 0.671,
+      "st_tol_rel": 0.2,
+      "transient_convective": 60,
+      "periods": 12,
+      "amp_min": 0.02,
+      "anisotropy_min": 3,
+      "perturb": 0.02,
+      "seed": 12345,
+      "reference": "Johnson & Patel, JFM 378 (1999) 19-70, Re=300: St=0.136, Cd=0.671"
+    }
+  ],
+  "sphere_diffuse_cases": [
+    {
+      "name": "sphere-diff-Re20-D16",
+      "n": 16,
+      "re": 20,
+      "u0": 0.05,
+      "q": 19,
+      "settle_convective": 30,
+      "cd_recorded": 4.649,
+      "cd_tol_rel_recorded": 0.03,
+      "lateral_tol": 0.02
+    },
+    {
+      "name": "sphere-diff-Re20-D24",
+      "n": 24,
+      "re": 20,
+      "u0": 0.05,
+      "q": 19,
+      "settle_convective": 30,
+      "cd_recorded": 3.878,
+      "cd_tol_rel_recorded": 0.03,
+      "lateral_tol": 0.02,
+      "converges_from": "sphere-diff-Re20-D16"
+    },
+    {
+      "name": "sphere-diff-Re100-D16",
+      "n": 16,
+      "re": 100,
+      "u0": 0.05,
+      "q": 19,
+      "settle_convective": 30,
+      "cd_recorded": 2.523,
+      "cd_tol_rel_recorded": 0.03,
+      "lateral_tol": 0.02
+    }
+  ],
+  "sphere_amr_note": "SPHERE WITH AMR (plans/3D.md M4.1d) -- the case this suite never had, and the point of the whole M4 exercise. It is scored against the DENSE case's own measured Cd, not against Schiller-Naumann: what it tests is CROSS-LEVEL INVARIANCE, i.e. that the same physical body gives the same drag whether the region around it is refined or not. A literature comparison cannot see that -- the staircased bounce-back sphere sits +12.8% above S-N either way, and a level-weighting bug would hide inside that offset. It is also the only gate on shaders/common_d3_force_pool.wgsl's dx^(D-1) = dx^2 weighting: dropping the 1/dt factor (dx^3) would halve the fine contribution, and with a body-fitted shell the fine level owns ALL of it, so the error is a factor of two in Cd, not a subtlety. Measured 2026-09-10, RTX 4080: AMR Cd 2.9417 against the dense 2.9436, 0.06%. The tolerance is 0.5%, which is 8x the measured difference and 100x below the dx^3 bug. CONFIRMED TO FIRE, not merely to pass: rebuilt with DX_WEIGHT = 0.125 the case gives Cd 1.4708, exactly -50.0% -- the predicted factor of two, 100x over the bound. A gate that has never been shown to fail is a recorded number, not a gate. DEPTH 3 (sphere-amr-L3-Re20-D16, plans/3D.md M5.4b) makes the same cross-level-invariance claim one rung deeper, and it is the ONLY gate on DX_WEIGHT being an override rather than L1's baked 0.25: the weight is dx^(D-1) = 4^-m, so a value left at 0.25 would report FOUR TIMES the drag at depth 3, the same shape of error as the dx^3 mistake recorded above but in the other direction. It also gates M5.4's hard requirement end to end -- with exactly one force pass at the finest level, a body that was NOT entirely inside that level would simply be missing part of its surface, and Cd would fall short rather than blow up. THE DEPTH-3 CASE HAS A 3% BOUND WHERE DEPTH 2 HAS 0.5%, AND THAT IS NOT A WIDENED TOLERANCE -- it is a different physical claim, and the evidence is a convergence ladder. Refining the shell genuinely changes the near-wall solution: measured, the velocity field one cell off the surface differs by 48% between levels=2 and levels=3, decaying to 6e-4 far away and to 6e-7 inside the body. Cd follows it. Run at D=8 where depth 4 fits, fx goes 0.189120 / 0.191727 / 0.186495 / 0.184122 for levels 1-4, i.e. increments of +1.38%, -2.73%, -1.27% -- HALVING after the coarsest step, which is first-order convergence and exactly what a staircased bounce-back sphere does. The levels 1->2 step is simply not on the asymptotic trend, at either diameter, which is why depth 2 reproduces the dense Cd to 0.07% and depth 3 does not. The bound still does the job the case exists for: a wrong cross-level WEIGHT is a factor of 2 or 4 (cd_with_dx3_weight above is exactly half), so 3% catches it with 17x to spare while admitting the 1.4% the physics actually moves.",
+  "sphere_amr_cases": [
+    {
+      "name": "sphere-amr-Re20-D16",
+      "n": 16,
+      "re": 20,
+      "u0": 0.05,
+      "q": 19,
+      "bounceback": true,
+      "levels": 2,
+      "rb": 4,
+      "refine": "body",
+      "interface": "explode",
+      "settle_convective": 30,
+      "cd_matches": "sphere-Re20-D16",
+      "cd_matches_tol": 0.005,
+      "cd_measured": 2.9416,
+      "cd_dense_reference": 2.9436,
+      "cd_with_dx3_weight": 1.4708
+    },
+    {
+      "name": "sphere-amr-L3-Re20-D16",
+      "n": 16,
+      "re": 20,
+      "u0": 0.05,
+      "q": 19,
+      "bounceback": true,
+      "levels": 3,
+      "rb": 4,
+      "refine": "body",
+      "interface": "explode",
+      "settle_convective": 30,
+      "cd_matches": "sphere-Re20-D16",
+      "cd_matches_tol": 0.03,
+      "cd_dense_reference": 2.9436,
+      "cd_with_dx3_weight": 1.4708,
+      "cd_measured": 2.9015
+    },
+    {
+      "name": "sphere-amr-dynamic-Re20-D16",
+      "n": 16,
+      "re": 20,
+      "u0": 0.05,
+      "q": 19,
+      "bounceback": true,
+      "levels": 2,
+      "rb": 4,
+      "refine": "body",
+      "interface": "explode",
+      "settle_convective": 30,
+      "cd_matches": "sphere-amr-Re20-D16",
+      "cd_dense_reference": 2.9436,
+      "cd_with_dx3_weight": 1.4708,
+      "dynamic": 1,
+      "cd_matches_exact": true
+    },
+    {
+      "name": "sphere-amr-dynamic-L3-Re20-D16",
+      "n": 16,
+      "re": 20,
+      "u0": 0.05,
+      "q": 19,
+      "bounceback": true,
+      "levels": 3,
+      "rb": 4,
+      "refine": "body",
+      "interface": "explode",
+      "settle_convective": 30,
+      "cd_matches": "sphere-amr-L3-Re20-D16",
+      "cd_dense_reference": 2.9436,
+      "dynamic": 1,
+      "cd_matches_exact": true
+    }
+  ],
+  "spin_cases": [
+    {
+      "name": "spin-N32",
+      "n": 32,
+      "u0": 0.02,
+      "q": 19,
+      "checkpoints": [
+        500,
+        2500,
+        12500
+      ],
+      "orientation_tol": 0.02,
+      "l_tol": 1e-06
+    }
+  ],
+  "amr_interface_note": "The coarse/fine interface had TWO defects. One is FIXED (2026-09-09): the grid transfers applied the PRE-collision Dupuis-Chopard fneq factor (tau_f/tau_c)*dx_f/dx_c to POST-collision populations. This solver's step kernels are fused pull-stream+collide, so every buffer holds f AFTER collision, and the factor that applies is (tau_f-1)/(tau_c-1)/2 -- at tau=0.8 that is -0.25 against the +0.6875 the code used, wrong magnitude and opposite SIGN. It was found by measuring mass and momentum separately (tools/analyze-d3-interface.js): mass sat at the f32 readback floor while momentum leaked seven orders above its own floor, linearly in t. That asymmetry IS the diagnosis -- fneq has no zeroth or first moment so it cannot touch a mass flux, but the second moment is the viscous stress, i.e. the momentum flux. The amr-all cases could not see it (they are bit-identical across the fix: with every block refined the rescaled coarse f is discarded and the rings are never read), which is why amr-box-RB4 is now in this file. STILL OPEN: the interface is not CONSERVATIVE. With the rescale correct a partially-refined run still converges at FIRST order -- whole-domain L2rel at t=0.5*td is 1.36e-2 / 9.02e-3 / 7.04e-3 at N=32/48/64 (ratios 1.51, 1.28 against first order's 1.5, 1.33), while the no-interface controls sit at 4.6e-3 / 2.3e-3 / 2.0e-3. That is the classic composite-grid signature: the two sides compute the seam flux independently and disagree. The fix is refluxing and it is the first item of M4 (plans/3D.md M3 sketches the shape). Until it lands a partially-refined 3D run is not trustworthy for a quantitative number, and the sphere-with-AMR comparison against M2's dense Cd is deliberately NOT part of this suite -- it would report the seam, not the solver. M4 UPDATE 2026-09-09: the flux correction (?reflux=1) is built and makes conservation EXACT -- the momentum leak stops dead -- and on a corner-free seam (?refine=slab) halves the field error. It is OPT-IN and not the default because on a seam with a convex corner it is far worse than leaving it off: the fine lattice's diagonal channels carry half what the coarse one does across a corner (D3Q19 has no (1,1,+-1)), so a cell-by-cell flux balance is ill-posed there. amr-box-RB4's numbers below are with reflux OFF. M4.1e UPDATE 2026-09-10: ?interface=explode is now the DEFAULT and amr-box-RB4 is PINNED to ?interface=interp, which changes its role rather than its numbers -- it is now the LEGACY CONTROL, the case that says the M3 coupling still does exactly what it always did (field L2rel 9.012e-3, rate 1.024e-2, unchanged through all of M4). The DEFAULT path is gated by amr-box-explode-field, amr_conserve_cases and sphere_amr_cases. Do NOT re-baseline amr-box-RB4 onto explode: a control that tracks whatever the default happens to be is not a control. M4.1b UPDATE 2026-09-09: refluxing is SUPERSEDED by Chen et al. 2006's explode/coalesce (?interface=explode), which as of the coalesce orphan pass is exactly conservative in mass AND momentum on every rung of the geometry ladder (all/slab/bar/box) -- box mass drift -2.69e+1 -> -5.85e-3 at t=8, momentum frozen rather than growing. THAT PATH IS NOT THE DEFAULT AND HAS NO CASE IN THIS FILE: every number here, amr-box-RB4 included, is still the ?interface=interp path and is unchanged by it (verified bit-identical). M4.1c UPDATE 2026-09-10: with the IN-orphan and the linear explosion in, the explode path's FIELD error now tracks the no-interface control to within 8-10% (box whole-domain L2rel at 0.5 t_d: 4.54e-3 / 2.48e-3 / 2.11e-3 at N = 32/48/64 against refine=all's 4.58e-3 / 2.29e-3 / 1.98e-3), i.e. 3.6x better than the interp path amr-box-RB4 measures. amr-box-RB4 is still interp and is deliberately left alone -- it is the control that says this work did not disturb the published default. See plans/3D.md M4.1b-c.",
+  "amr_cases": [
+    {
+      "name": "amr-all-RB4",
+      "n": 48,
+      "tau": 0.8,
+      "u0": 0.04,
+      "q": 19,
+      "levels": 2,
+      "refine": "all",
+      "rb": 4,
+      "checkpoints": [
+        0.5,
+        1.5,
+        3.0
+      ],
+      "field_l2_tol": 0.01,
+      "decay_rate_tol": 0.005
+    },
+    {
+      "name": "amr-all-RB8",
+      "n": 48,
+      "tau": 0.8,
+      "u0": 0.04,
+      "q": 19,
+      "levels": 2,
+      "refine": "all",
+      "rb": 8,
+      "checkpoints": [
+        0.5,
+        1.5,
+        3.0
+      ],
+      "field_l2_tol": 0.01,
+      "decay_rate_tol": 0.005,
+      "matches": "amr-all-RB4"
+    },
+    {
+      "name": "amr-all-Q27",
+      "n": 48,
+      "tau": 0.8,
+      "u0": 0.04,
+      "q": 27,
+      "levels": 2,
+      "refine": "all",
+      "rb": 4,
+      "checkpoints": [
+        0.5,
+        1.5,
+        3.0
+      ],
+      "field_l2_tol": 0.01,
+      "decay_rate_tol": 0.005
+    }
+  ],
+  "amr_box_note": "REGRESSION BOUNDS, NOT PHYSICS TOLERANCES -- the same distinction sphere_diffuse_cases carries. THIS CASE IS NOW THE LEGACY CONTROL: since M4.1e the default is ?interface=explode, and this case is pinned to ?interface=interp so that it keeps measuring the M3 coupling. Its error is dominated by that coupling's known first-order interface (see amr_interface_note), so there is nothing to score it against except its own measured value -- and the point is that the value must NOT move. Everything below describes the interp path and stays true of it. The tolerances are ~30% above what was measured on an RTX 4080 on 2026-09-09, which is tight enough to catch a factor-of-two regression and loose enough not to fire on driver noise. The point of the case is that BEFORE it existed nothing in this suite ever loaded a partially-refined 3D run, which is exactly how the pre/post-collision rescale bug survived M3. The original note said these numbers should FALL and be re-baselined when the interface was fixed. That is what amr-box-explode-field records (2.484e-3 against this case's 9.012e-3, a 3.6x improvement); THIS case was deliberately NOT re-baselined, because pinning it to interp is what makes it evidence that M4 left the old path alone. Checkpoints are deliberately short (0.25 and 0.5 decay times): the seam error spreads over the whole domain by 3 t_d, and a saturated field measures the pollution rather than the injection. Measured 2026-09-09, RTX 4080: field L2rel 9.012e-3 and decay-rate rel err 1.024e-2. The SAME case run with ?dcpre=1 -- the pre-collision factor, i.e. the bug -- gives 4.618e-2, so this case would have failed its own bound by 3.8x before the fix. That is what makes it a real guard rather than a recorded curiosity.",
+  "amr_box_cases": [
+    {
+      "name": "amr-box-RB4",
+      "n": 48,
+      "tau": 0.8,
+      "u0": 0.04,
+      "q": 19,
+      "levels": 2,
+      "refine": "box",
+      "boxfrac": 0.5,
+      "rb": 4,
+      "interface": "interp",
+      "checkpoints": [
+        0.25,
+        0.5
+      ],
+      "field_l2_tol": 0.012,
+      "decay_rate_tol": 0.014,
+      "field_l2_measured": 0.009012,
+      "decay_rate_measured": 0.01024,
+      "field_l2_with_dcpre": 0.04618
+    }
+  ],
+  "amr_conserve_note": "CONSERVATION GATES for the ?interface=explode path (plans/3D.md M4.1b), and the ONLY cases in this file that load it -- every other AMR case here is ?interface=interp and is unaffected by anything on the explode path. They exist because M4.1b's convex-edge mass leak shipped green: the field gates could not see it (amr-box-RB4 is the interp path, and refine=all has no interface at all), so a defect that lost mass at 1500x the arithmetic floor rate passed everything. MASS is scored as absolute drift from t=0 against a bound well above an arithmetic floor -- the floor is f32 readback accumulation, grows linearly in t, and is LARGEST on refine=all which has no interface, so it is not physics. Measured 2026-09-09, RTX 4080, N=48 over 256 steps: box 0.531, bar 0.569, slab 0.644, all 0.765; the leak was -3.4 PER STEP. MOMENTUM is scored as drift from a WARMUP sample, not from t=0: there is a real one-time transient in the first steps as the coarse initial condition and the pool reconcile (box settles on 6.94e-1 and does not move for 1000 steps), and it is the startup offset, not a leak. That makes it the sharp half of the gate -- the leak moved momentum 0.86 in 15 steps against under 1e-3 in 1000 now. `bar` is the cheapest geometry with convex edges and no corner and is the case that actually failed; `box` adds corners. BOTH CASES WERE CONFIRMED TO FIRE on the pre-orphan-pass shader rather than merely to pass on the fixed one, which is the difference between a gate and a recorded number: mass -576.2 (bar) and -858.7 (box) against the 5.0 bound, momentum 1.921 and 11.17 against 0.05 -- 115x to 223x over, while the fixed interface sits 9x under on mass and 170x under on momentum. The `*_with_leak` fields below are those measurements. DO NOT WIDEN these to accommodate a change: a conservation bound that has to grow is reporting a leak. DEPTH-3 CASES (plans/3D.md M5.2b-ii, ?levels=3 + ?handdepth=1) score the L1/L2 seam, where the parent is a POOL rather than the dense grid. They use N=32 rather than 48 because the level-2 pool at N=48 is several hundred MiB and this gate does not need the resolution -- it is a conservation statement, not a convergence one. Their tolerances are inherited from the depth-2 rows deliberately: the claim being made is that adding a level does not make the interface leak, so a looser bound at depth would be assuming the answer.",
+  "amr_conserve_cases": [
+    {
+      "name": "amr-bar-explode",
+      "n": 48,
+      "tau": 0.8,
+      "u0": 0.04,
+      "q": 19,
+      "levels": 2,
+      "refine": "bar",
+      "boxfrac": 0.5,
+      "rb": 4,
+      "interface": "explode",
+      "warmup": 8,
+      "steps": 256,
+      "mass_tol": 5.0,
+      "mom_tol": 0.05,
+      "mass_measured": 0.5685,
+      "mom_measured": 0.0002937,
+      "mass_with_leak": -576.2,
+      "mom_with_leak": 1.921
+    },
+    {
+      "name": "amr-box-explode",
+      "n": 48,
+      "tau": 0.8,
+      "u0": 0.04,
+      "q": 19,
+      "levels": 2,
+      "refine": "box",
+      "boxfrac": 0.5,
+      "rb": 4,
+      "interface": "explode",
+      "warmup": 8,
+      "steps": 256,
+      "mass_tol": 5.0,
+      "mom_tol": 0.05,
+      "mass_measured": 0.5305,
+      "mom_measured": 0.0001625,
+      "mass_with_leak": -858.7,
+      "mom_with_leak": 11.17
+    },
+    {
+      "name": "amr-bar-explode-L3",
+      "n": 32,
+      "tau": 0.8,
+      "u0": 0.04,
+      "q": 19,
+      "levels": 3,
+      "refine": "bar",
+      "boxfrac": 0.5,
+      "rb": 4,
+      "interface": "explode",
+      "warmup": 8,
+      "steps": 256,
+      "mass_tol": 5.0,
+      "mom_tol": 0.05,
+      "mass_with_leak": -576.2,
+      "mom_with_leak": 1.921
+    },
+    {
+      "name": "amr-box-explode-L3",
+      "n": 32,
+      "tau": 0.8,
+      "u0": 0.04,
+      "q": 19,
+      "levels": 3,
+      "refine": "box",
+      "boxfrac": 0.5,
+      "rb": 4,
+      "interface": "explode",
+      "warmup": 8,
+      "steps": 256,
+      "mass_tol": 5.0,
+      "mom_tol": 0.05,
+      "mass_with_leak": -576.2,
+      "mom_with_leak": 1.921
+    }
+  ],
+  "amr_box_explode_note": "FIELD accuracy on the ?interface=explode path (plans/3D.md M4.1c), the companion to amr_conserve_cases' conservation bounds. The pair is deliberate: M4.1b was exactly conservative and still carried an O(1) seam defect, so a conservation gate alone demonstrably does not guard this interface. Scored against RECORDED values, like amr-box-RB4 -- but unlike amr-box-RB4 the number is no longer dominated by a known defect: it tracks the no-interface control (refine=all) to within 8-10% at N = 32/48/64, so what these bounds actually guard is 'the seam is still invisible'. Measured 2026-09-10, RTX 4080. If a change makes these RISE, the seam signature is back; do not widen them. DEPTH 3 (amr-box-explode-field-L3, plans/3D.md M5.6). The same claim one rung deeper, and at depth the box case has TWO seams rather than one: the criterion is evaluated at the FINEST level (M5.1b) and every coarser level is whatever cascade21 requires around it, so L1's refined region is strictly larger than L2's footprint and there is an L1/L2 interface as well as an L0/L1 one. Measured 2026-09-10, RTX 4080, N=32: worst-checkpoint field L2rel 6.137e-3 against its own no-interface control (refine=all, levels=3) at 5.590e-3 -- +9.8%, inside the same 8-10% band the depth-2 case holds to with one seam. The depth-2 run of the SAME case and resolution is 4.544e-3, so the depth-3 number is not a regression against depth 2 either; it is a different discretization with a genuinely finer inner region and one more seam. The decay-rate error is where the seam actually shows: 4.832e-3 against the refine=all control's -9.501e-4, which flips sign, and 3.359e-3 for the one-seam depth-2 case. REPEAT-CHECKED: two runs of the same build are BIT-IDENTICAL at every checkpoint, so these bounds are tight on purpose and a fourth-digit move is a real change, not noise.",
+  "amr_box_explode_cases": [
+    {
+      "name": "amr-box-explode-field",
+      "n": 48,
+      "tau": 0.8,
+      "u0": 0.04,
+      "q": 19,
+      "levels": 2,
+      "refine": "box",
+      "boxfrac": 0.5,
+      "rb": 4,
+      "interface": "explode",
+      "checkpoints": [
+        0.25,
+        0.5
+      ],
+      "field_l2_tol": 0.0035,
+      "decay_rate_tol": 0.004,
+      "field_l2_measured": 0.002484,
+      "decay_rate_measured": 0.001826,
+      "field_l2_control_all": 0.002293,
+      "field_l2_interp_same_case": 0.009012
+    },
+    {
+      "name": "amr-box-explode-field-L3",
+      "n": 32,
+      "tau": 0.8,
+      "u0": 0.04,
+      "q": 19,
+      "levels": 3,
+      "refine": "box",
+      "boxfrac": 0.5,
+      "rb": 4,
+      "interface": "explode",
+      "checkpoints": [
+        0.25,
+        0.5
+      ],
+      "field_l2_tol": 0.008,
+      "decay_rate_tol": 0.007,
+      "field_l2_measured": 0.006137,
+      "decay_rate_measured": 0.004832,
+      "field_l2_control_all_L3": 0.00559,
+      "field_l2_same_case_L2": 0.004544,
+      "decay_rate_control_all_L3": -0.0009501
+    }
+  ],
+  "sphere_amr_dynamic_note": "M4.2b-i's gate, and it is an EXACT equality rather than a tolerance. ?dynamic=1 makes the pool's block->slot map writable by a kernel -- a free-list stack, a coarsen pass and a refine pass -- instead of uploaded once. The body in this case is PINNED, so the geometry criterion wants exactly the same 160 blocks at every re-evaluation, and a manager that decides 'no change' must therefore change NOTHING. Any drift at all means the machinery perturbs the run when it is not supposed to act, which is the one thing that has to be true before M4.2b-ii lets it act. Same reasoning as M4.1a's bit-identical gate: introduce the machinery against an unchanged answer, THEN make it load-bearing. The criterion in shaders/common_d3_manage.wgsl is deliberately character-for-character the one d3-amr.mjs's refineNearBody applies on the host -- same eight corners, same centre, same margin -- because a criterion that disagreed by one block would break this gate with no way to tell it from a real allocator defect. DEPTH 3 (sphere-amr-dynamic-L3-Re20-D16, plans/3D.md M5.6) makes the same equality claim against a manager that now runs at EVERY level: a decide-and-close chain over the tree, then drain/coarsen finest-first and refine/fill coarsest-first (M5.5b). There is far more machinery to perturb the answer than at depth 2 and none of it may. Measured 2026-09-10, RTX 4080: Cd 2.9015, bit-identical to the static depth-3 run. It is the PHYSICS partner to validate-d3-invariants.js's body3-dynamic, which makes the structural version of the same claim, and to drift3, which is the case where the manager must actually act -- neither of those scores a field, and this one cannot see a manager that moves tiles correctly but transfers them wrongly."
+}
