@@ -171,7 +171,9 @@ async function init() {
     // M8.2b: the fall scenario's two reference frames.
     'tow', 'stream',
     // M8.3: the moving window, per axis. ?window=x, ?window=0 to force it off.
-    'window']);
+    'window',
+    // M8.4a: the hand-placed wake box's extent, in body diameters.
+    'wake', 'wakeR']);
   for (const k of urlParams.keys()) {
     if (PAGE_PARAMS.has(k) || k in SCENARIOS[scenarioName].defaults) continue;
     throw new Error(`?${k}=: not a parameter of scenario "${scenarioName}" `
@@ -310,6 +312,9 @@ async function init() {
   // margin that forced it, so debugCheckGeometryCoverage can restate the
   // requirement independently.
   let refineMode = null, geomForced = null;
+  // The hand-placed wake box, when ?refine=wake put one there (M8.4a). Only
+  // for reporting -- the set it produced is already in `hier`.
+  let wakeBox = null;
   if (AMR) {
     if ([NX, NY, NZ].some(n => n % RB !== 0)) {
       statusEl.textContent = `error: ?rb=${RB} does not divide the ${NX}x${NY}x${NZ} domain`;
@@ -378,8 +383,8 @@ async function init() {
       const lo = [NX, NY].map(n => n * (1 - frac) / 2);
       const hi = [NX, NY].map(n => n * (1 + frac) / 2);
       want = ({ mid }) => [0, 1].every(i => mid[i] >= lo[i] && mid[i] < hi[i]);
-    } else if (mode === 'body') {
-      if (!params.body) throw new Error('?refine=body: this scenario has no body');
+    } else if (mode === 'body' || mode === 'wake') {
+      if (!params.body) throw new Error(`?refine=${mode}: this scenario has no body`);
       const sh = params.body.shape, bx = params.body.x;
       const margin = numParam('margin', 2);
       // Sphere-only for now, which is what M3's validation needs; a general
@@ -403,9 +408,48 @@ async function init() {
       // untouched.
       geomForced = { radius: sh.a, margin,
         sdfAt: (c) => (q) => Math.hypot(...wrapDelta3([q[0] - c[0], q[1] - c[1], q[2] - c[2]], WIN_N)) - sh.a };
-      want = nearBodyWant(geomForced.sdfAt(bx), margin);
+      const bodyWant = nearBodyWant(geomForced.sdfAt(bx), margin);
+      want = bodyWant;
+      if (mode === 'wake') {
+        // --- THE HAND-PLACED WAKE BOX (plans/3D.md M8.4a) ------------------
+        //
+        // NOT A CRITERION. It is the CONTROL that tells a criterion what it
+        // has to achieve, and it exists before any criterion for the reason
+        // M5.0 exists: M8.4's gate is "the shed wake stays resolved", and
+        // writing a Q-criterion first would be tuning a threshold against an
+        // imagined case. This refines the wake BY HAND, so the question
+        // "what does resolving the wake buy" has an answer -- measured in St
+        // against M8.1's yardstick -- before anything decides for itself.
+        //
+        // It is also the control M8.4c is scored against: a criterion-built
+        // set that does not reproduce this set's St is not doing the job,
+        // whatever its threshold sweep says.
+        //
+        // THE UNION WITH THE BODY SET IS BY CONSTRUCTION, not by hoping the
+        // box contains the body. M5.4's hard requirement (the body lives
+        // entirely on the finest level) is enforced by refusals that key off
+        // `geomForced`, and debugCheckGeometryCoverage restates it at cell
+        // granularity -- both keep working unchanged on a SUPERSET, and
+        // neither would survive this being a box that merely ought to
+        // overlap the body.
+        //
+        // Downstream is +x on every scenario that has a wake here, which is
+        // the same assumption d3-scenarios.mjs's `sphere` and `fall` already
+        // make about their own domains being long in x.
+        const D = 2 * sh.a;
+        const lenD = numParam('wake', 6);      // downstream extent, in diameters
+        const radD = numParam('wakeR', 1);     // transverse half-width, in diameters
+        const wlo = [bx[0] - margin, bx[1] - radD * D, bx[2] - radD * D];
+        const whi = [bx[0] + lenD * D, bx[1] + radD * D, bx[2] + radD * D];
+        // The block's BOX overlaps the wake box, not just its centre: a
+        // centre test drops the blocks straddling the boundary, which is a
+        // ragged edge on the one region whose job is to be a clean control.
+        const inWake = ({ lo, hi }) => [0, 1, 2].every(i => hi[i] > wlo[i] && lo[i] < whi[i]);
+        want = (b) => bodyWant(b) || inWake(b);
+        wakeBox = { lo: wlo, hi: whi, lenD, radD };
+      }
     } else {
-      throw new Error(`?refine=${mode}: expected all, box, bar, slab or body`);
+      throw new Error(`?refine=${mode}: expected all, box, bar, slab, body or wake`);
     }
     hier = refineHierarchy(pool, { levels: LEVELS, want });
   }
@@ -469,6 +513,18 @@ async function init() {
   // allocation churn to test nothing.
   if (DYNAMIC && !geomForced) {
     throw new Error(`?dynamic=1 needs ?refine=body (a geometry-forced criterion); ?refine=${refineMode} is a fixed region`);
+  }
+  // AND ?refine=wake IS NOT DYNAMIC EITHER, even though it sets geomForced.
+  // The manager's criterion is common_d3_manage.wgsl's blockWanted, which
+  // knows the BODY and nothing else -- so on the first management event it
+  // would coarsen the entire wake box away and report a perfectly consistent
+  // pool while doing it. The run would look healthy and be measuring the
+  // thing the box was added to avoid. Refused until M8.4b gives the kernel a
+  // field criterion; this is the same refusal shape as the one above, for
+  // the same reason.
+  if (DYNAMIC && refineMode === 'wake') {
+    throw new Error('?dynamic=1 does not yet work with ?refine=wake: the manager\'s criterion is'
+      + ' geometry-only, so it would coarsen the wake box away on the first event (plans/3D.md M8.4a)');
   }
 
   // The slot budget. Static refinement knows its own answer up front and
@@ -3136,6 +3192,10 @@ async function init() {
       // switched out of, which is exactly the lie that makes a control
       // useless (M8.3).
       windowAxes: WIN_AXES.slice(), windowAnchor: WIN_ANCHOR.slice(), windowDims: WIN_N.slice(),
+      // The refinement mode and, where there is one, the hand-placed wake box
+      // (M8.4a) -- so a harness reports the region it actually ran rather
+      // than the one its URL asked for.
+      refineMode, wakeBox,
       levels: LEVELS, amr: AMR,
       // How deep the VIEWER can see, which is LEVELS - 1 unless the run is
       // deeper than the sampler has bindings for. Reported so a tool scores
