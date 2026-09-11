@@ -90,16 +90,31 @@ export function omegaOfGrad(J) {
 // not a quantity.
 export function qRef(u, d) { return (u / d) ** 2; }
 
-// THE DEFAULT THRESHOLD, in units of qRef.
+// THE DEFAULT THRESHOLD, in units of qRef. MEASURED, 2026-09-11, not chosen.
 //
-// STATED AS A CHOICE WITH A REASON, not tuned: Q > 0 is the textbook vortex
-// definition and would flag every rotation-dominated cell including the
-// numerical noise floor, so a bare Q > 0 is not a refinement criterion, it is
-// a way to refine most of the domain. The value here is the smallest ROUND
-// number that is clear of that floor at the resolutions this solver runs --
-// and it is a knob (`?qthresh=`) precisely because the right value is a
-// property of the flow, not of this file.
-export const Q_THRESHOLD = 0.05;
+// Q > 0 is the textbook vortex definition and would flag every
+// rotation-dominated cell including the noise floor, so a bare Q > 0 is not a
+// refinement criterion -- it is a way to refine most of the domain. The
+// question is where the floor actually sits, and `debugCriterion()` answers
+// it on a real shed wake (dense sphere, Re=300, D=16, perturb=0.02):
+//
+//   t = 0 D/U    max Q/qRef = 0.093   -- freestream plus the 2% symmetry-
+//                breaking seed, and NOTHING ELSE. At 0.05 that flags 49.93%
+//                of the domain and at 0.02, 99.98%.
+//   t = 20..60   max Q/qRef = 12.8..13.1 in the developed wake, i.e. 140x
+//                the seeded floor.
+//
+// So the separation is enormous and the only mistake available is setting the
+// threshold INSIDE the floor. 0.05 -- the value first written here, by eye --
+// was exactly that mistake: it flags half the domain at step 0, which on a
+// dynamic run is slot exhaustion before the flow has developed at all, for
+// reasons that have nothing to do with vortices.
+//
+// 0.1 is the smallest round value that flags ZERO blocks on the seeded
+// initial field while flagging 379-628 blocks in the developed wake. It stays
+// a knob (`?qthresh=`) because the right value is a property of the flow, not
+// of this file -- but it is now a measured default rather than a guess.
+export const Q_THRESHOLD = 0.1;
 
 // HOW FAR AHEAD TO REFINE, in L0 cells, for a structure that CONVECTS.
 //

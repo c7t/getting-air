@@ -177,9 +177,13 @@ const close = (a, b, tol, what) =>
     assert.ok(/om2 \+= O \* O/.test(src) && /s2 \+= S \* S/.test(src),
       'the shader must accumulate both Frobenius norms separately');
     assert.ok(/0\.5f \* \(om2 - s2\)/.test(src), 'and combine them as 1/2(|Omega|^2 - |S|^2)');
-    // The OR is load-bearing: geometry has already written this array.
-    assert.ok(/blockWant\[[^\]]*\] = 1u;/.test(src) && !/blockWant\[[^\]]*\] = select/.test(src),
-      'the shader must OR into blockWant, never assign it');
+    // It reports per-block MAX Q rather than a boolean, so a threshold sweep
+    // is host arithmetic on one readback instead of a GPU pass per threshold
+    // -- which is what makes the slot-budget sizing measurable at all.
+    assert.ok(/blockQ\s*:\s*array<f32>/.test(src),
+      'the criterion must report per-block max Q as f32, not a boolean want');
+    assert.ok(!/Q_ABS/.test(src),
+      'and must NOT carry the threshold: folding it in makes every sweep a GPU pass');
   });
 
   console.log(`\nd3-criterion: ${pass} test(s) passed`);

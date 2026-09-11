@@ -173,7 +173,9 @@ async function init() {
     // M8.3: the moving window, per axis. ?window=x, ?window=0 to force it off.
     'window',
     // M8.4a: the hand-placed wake box's extent, in body diameters.
-    'wake', 'wakeR']);
+    'wake', 'wakeR',
+    // M8.4: the Q-criterion's convection lead, in L0 cells.
+    'qlead']);
   for (const k of urlParams.keys()) {
     if (PAGE_PARAMS.has(k) || k in SCENARIOS[scenarioName].defaults) continue;
     throw new Error(`?${k}=: not a parameter of scenario "${scenarioName}" `
@@ -909,6 +911,53 @@ async function init() {
     layout: device.createPipelineLayout({ bindGroupLayouts: [zeroBGL] }),
     compute: { module: zeroModule, entryPoint: 'main' },
   }) : null;
+
+  // --- the Q-criterion, as a DIAGNOSTIC (plans/3D.md M8.4) -------------------
+  //
+  // WIRED READ-ONLY FIRST, AND ON PURPOSE. It reports per-block max Q and
+  // drives nothing. What has to be answered before it may drive anything is
+  // the SLOT BUDGET: maxSlotsAt() derives the pool size from the INITIAL
+  // refined set, which for a geometry criterion is the whole answer and for a
+  // field criterion is a domain with no wake in it yet. Running out of slots
+  // is a HARD failure here (M5.4a) and should stay one -- slots come off an
+  // atomicSub free list, so "drop what did not fit" would make the resolution
+  // of the wake depend on allocation order, which is nondeterministic and
+  // exactly the kind of run that looks healthy while being quietly worse. So
+  // the budget has to be sized from a measurement, and this is the
+  // measurement.
+  //
+  // It is evaluated on the FINEST level's candidate block grid, which is the
+  // grid the criterion would flag into.
+  const CRIT_LEVEL = Math.max(1, LEVELS - 1);
+  const CRIT_NB = [NX, NY, NZ].map(n => Math.max(1, Math.round(n / RB * 2 ** (CRIT_LEVEL - 1))));
+  const CRIT_BLK_L0 = RB * 2 ** -(CRIT_LEVEL - 1);
+  // The localization limit the shader's header names: below one L0 cell per
+  // candidate block the criterion cannot tell siblings apart, so it would
+  // flag all of them. Said out loud rather than silently over-refining.
+  const critNote = CRIT_BLK_L0 < 1
+    ? `   [criterion at L${CRIT_LEVEL} spans ${CRIT_BLK_L0} L0 cells: below cell granularity]` : '';
+  const critBuf = device.createBuffer({
+    size: CRIT_NB[0] * CRIT_NB[1] * CRIT_NB[2] * 4,
+    usage: U.STORAGE | U.COPY_SRC });
+  const critBGL = device.createBindGroupLayout({ entries: [
+    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+  ]});
+  const critBG = device.createBindGroup({ layout: critBGL, entries: [
+    { binding: 0, resource: { buffer: mac } }, { binding: 1, resource: { buffer: critBuf } }]});
+  // The convection lead, in L0 cells: how far the flow carries a vortex
+  // between management events. Derived from the scenario's own velocity scale
+  // the same way d3-criterion.mjs states it, and overridable for a sweep.
+  const CRIT_U = params.u0 || params.u_t || params.uRel || 0;
+  const CRIT_LEAD = numParam('qlead', MANAGE_EVERY * CRIT_U);
+  const critModule = device.createShaderModule({
+    code: await loadShader(`shaders/d3_criterion_q${Q}.wgsl`), label: `d3_criterion_q${Q}` });
+  const critPipe = await device.createComputePipelineAsync({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [critBGL] }),
+    compute: { module: critModule, entryPoint: 'reduceQ', constants: {
+      ...dims, BLK_L0: CRIT_BLK_L0,
+      NBX: CRIT_NB[0], NBY: CRIT_NB[1], NBZ: CRIT_NB[2], LEAD: CRIT_LEAD } },
+  });
 
   // --- AMR pipelines --------------------------------------------------------
   // tau_fine = 2*tau_coarse - 0.5 (the acoustic-scaling relation this
@@ -2388,6 +2437,61 @@ async function init() {
   // character here -- both concentrate in the wake -- and if the answer is
   // marginal on |omega| it is worth re-running on Q before building
   // anything.
+  // THE SIZING MEASUREMENT (plans/3D.md M8.4). One dispatch, one readback,
+  // every threshold answered on the host -- which is why the kernel reports
+  // per-block max Q rather than a boolean.
+  //
+  // It reports three things per threshold, and the second two are the ones a
+  // budget and a renderer actually need:
+  //   count/frac  how many blocks the criterion wants, i.e. THE SLOT BUDGET.
+  //   bbox        the flagged set's bounding box.
+  //   boxRatio    bbox volume / flagged count -- M6.4c's trigger. M6.4's
+  //               bounding boxes work because a geometry-forced set is ONE
+  //               COMPACT REGION; a wake-following set is not, and above ~4x
+  //               the boxes have stopped paying (plans/3D.md M8.4, M8.5).
+  //               Measuring it here is what turns "it also invalidates M6.4's
+  //               boxes" from an expectation into a number.
+  const critStaging = device.createBuffer({
+    size: critBuf.size, usage: U.MAP_READ | U.COPY_DST });
+  async function debugCriterion(thresholds) {
+    const enc = device.createCommandEncoder();
+    const p = enc.beginComputePass();
+    p.setPipeline(critPipe); p.setBindGroup(0, critBG);
+    p.dispatchWorkgroups(CRIT_NB[0], CRIT_NB[1], CRIT_NB[2]);
+    p.end();
+    enc.copyBufferToBuffer(critBuf, 0, critStaging, 0, critBuf.size);
+    device.queue.submit([enc.finish()]);
+    await critStaging.mapAsync(GPUMapMode.READ);
+    const q = new Float32Array(critStaging.getMappedRange()).slice();
+    critStaging.unmap();
+    const [nx, ny, nz] = CRIT_NB;
+    const total = nx * ny * nz;
+    // Normalized by the body's own shear scale, so the threshold is
+    // dimensionless and the same number means the same thing at another Re or
+    // resolution -- d3-criterion.mjs's qRef.
+    const D = params.D || params.n;
+    const qr = D && CRIT_U ? (CRIT_U / D) ** 2 : 1;
+    let qMax = -Infinity;
+    for (let i = 0; i < total; i++) if (q[i] > qMax) qMax = q[i];
+    const ths = thresholds || [0.5, 0.2, 0.1, 0.05, 0.02, 0.01];
+    const rows = ths.map((t) => {
+      const cut = t * qr;
+      let n = 0;
+      const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+      for (let i = 0; i < total; i++) {
+        if (!(q[i] > cut)) continue;
+        n++;
+        const b = [i % nx, Math.floor(i / nx) % ny, Math.floor(i / (nx * ny))];
+        for (let k = 0; k < 3; k++) { lo[k] = Math.min(lo[k], b[k]); hi[k] = Math.max(hi[k], b[k]); }
+      }
+      const boxVol = n ? (hi[0] - lo[0] + 1) * (hi[1] - lo[1] + 1) * (hi[2] - lo[2] + 1) : 0;
+      return { thresh: t, count: n, frac: n / total,
+               bbox: n ? { lo, hi } : null, boxVol, boxRatio: n ? boxVol / n : null };
+    });
+    return { step, level: CRIT_LEVEL, nb: CRIT_NB.slice(), blkL0: CRIT_BLK_L0,
+             lead: CRIT_LEAD, total, qMax, qRef: qr, qMaxNorm: qMax / qr, rows };
+  }
+
   async function debugOccupancy(brick) {
     const B = Math.max(1, Math.round(brick || 8));
     const m = await readMacro();
@@ -3216,7 +3320,7 @@ async function init() {
         tauCoarse: TAU_COARSE, tauFine: TAU_FINE, reflux: REFLUX,
       } : {}),
     }),
-    readSubsampled, readDuctProfile, readStats, readBody, readPoolStats,
+    readSubsampled, readDuctProfile, readStats, readBody, readPoolStats, debugCriterion,
     debugCheck21Balance, debugCheckGeometryCoverage, debugCheckRingParents, debugPoolState,
     debugRunBalance, debugSampleTree, debugCheckTreeSample, debugReadVolume,
     debugHotspot, debugRunAndCollect, debugOccupancy,
@@ -3271,7 +3375,7 @@ async function init() {
           + ` off ${winOff.map(v => v.toFixed(0)).join(',')} travelled ${winTravel.toFixed(1)}`
         : '';
       statusEl.textContent = `${scenarioName}  D3Q${Q}  ${NX}x${NY}x${NZ}  step ${step}${t}${amrTxt}\n`
-        + `${AXIS_NAMES[axis]}-slice ${slice}   ${live ? 'running' : 'paused'}${viewDepthNote}${winTxt}`;
+        + `${AXIS_NAMES[axis]}-slice ${slice}   ${live ? 'running' : 'paused'}${viewDepthNote}${winTxt}${critNote}`;
     }
     requestAnimationFrame(() => frame().catch(e => reportFatal(statusEl, e)));
   }

@@ -39,11 +39,25 @@
 // and the vec4 type is what says so -- see common_d3_parentmac_dense.wgsl
 // for what confusing this with a pool's planar layout cost once already.
 @group(0) @binding(0) var<storage, read>       macL0     : array<vec4<f32>>;
-// The FINEST level's want array. ORed into, never assigned: the geometry
-// criterion has already written its answer here and this adds to it. A
-// detached vortex and a body are two independent reasons to refine, and the
-// set that gets built is the union.
-@group(0) @binding(1) var<storage, read_write> blockWant : array<u32>;
+// PER-BLOCK MAX Q, not a boolean want, and the difference is deliberate --
+// it is also the shape 2D's amr_criterion_pool.wgsl settled on
+// (`childCriterion : array<f32>`).
+//
+// Folding the threshold in here would make every question about the
+// threshold cost a GPU pass: "how many blocks does qthresh=0.05 flag" and
+// "how many does 0.02 flag" are then two runs of the reduction rather than
+// two lines of host arithmetic on one readback. That matters because THE
+// THRESHOLD IS THE UNMEASURED PARAMETER -- it sets the size of the refined
+// set, which sets the slot budget, and the budget is currently derived from
+// the INITIAL set (main-3d.js's maxSlotsAt), i.e. from a domain with no wake
+// in it yet. Sizing that honestly needs a sweep, and this makes the sweep
+// free.
+//
+// It also keeps this kernel from having to know that geometry has already
+// written a want somewhere: the union of "near the body" and "inside a
+// vortex" is taken by whoever consumes both, not by whichever happens to run
+// second.
+@group(0) @binding(1) var<storage, read_write> blockQ : array<f32>;
 
 override NX : u32;
 override NY : u32;
@@ -56,12 +70,6 @@ override BLK_L0 : f32 = 4.0f;
 override NBX : u32 = 1u;
 override NBY : u32 = 1u;
 override NBZ : u32 = 1u;
-
-// THE THRESHOLD, ALREADY IN ABSOLUTE UNITS. The host multiplies the
-// dimensionless `?qthresh=` by the scenario's own (U/D)^2 -- see
-// d3-criterion.mjs's qRef -- so nothing here has to know the velocity scale,
-// and the same threshold means the same thing at another Re or resolution.
-override Q_ABS : f32 = 1e30f;
 
 // HOW FAR AHEAD TO FLAG, in L0 cells. A detached vortex convects; a set that
 // only covers where it IS is stale before the next management event, exactly
@@ -81,9 +89,9 @@ fn l0Cell(x: i32, y: i32, z: i32) -> u32 {
 fn uAt(x: i32, y: i32, z: i32) -> vec3<f32> { return macL0[l0Cell(x, y, z)].yzw; }
 
 // Q = 1/2(|Omega|^2 - |S|^2) at an L0 cell, by centred differences over the
-// six face neighbours. The step is ONE L0 CELL, so Q comes out in L0 units
-// and Q_ABS is in the same -- the criterion is a statement about the flow,
-// and the flow does not know what level is asking.
+// six face neighbours. The step is ONE L0 CELL, so Q comes out in L0 units,
+// and so does any threshold compared against it -- the criterion is a
+// statement about the flow, and the flow does not know what level is asking.
 //
 // Written as the difference of the two Frobenius norms rather than the
 // equivalent -1/2 J_ij J_ji: the compact form is one transposition away from
@@ -112,7 +120,7 @@ fn qAt(x: i32, y: i32, z: i32) -> f32 {
 }
 
 @compute @workgroup_size(64)
-fn flagQ(@builtin(workgroup_id) wg: vec3<u32>,
+fn reduceQ(@builtin(workgroup_id) wg: vec3<u32>,
          @builtin(local_invocation_index) lid: u32) {
   if (wg.x >= NBX || wg.y >= NBY || wg.z >= NBZ) { return; }
 
@@ -142,7 +150,9 @@ fn flagQ(@builtin(workgroup_id) wg: vec3<u32>,
     workgroupBarrier();
   }
   if (lid != 0u) { return; }
-  if (wg_q[0] <= Q_ABS) { return; }
-  // OR, never assign: the geometry criterion's answer is already here.
-  blockWant[(wg.z * NBY + wg.y) * NBX + wg.x] = 1u;
+  // ASSIGNED, not accumulated: this array is this kernel's own answer about
+  // the flow, and it is recomputed from scratch every time the criterion
+  // runs. The union with the geometry-forced set happens downstream, where
+  // both answers are in hand.
+  blockQ[(wg.z * NBY + wg.y) * NBX + wg.x] = wg_q[0];
 }
