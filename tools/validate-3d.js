@@ -33,7 +33,7 @@ const {
 } = require('./lib/browser-lifecycle');
 const { caseUrl, runDuctCase, runBeltramiCase, runTgvReport, runConserveCase } = require('./lib/d3-metrics');
 const {
-  caseUrl: bodyCaseUrl, runSphereCase, runSpinCase,
+  caseUrl: bodyCaseUrl, runSphereCase, runSphereShedCase, runSpinCase,
 } = require('./lib/d3-body-metrics');
 
 const REPO_ROOT = path.join(__dirname, '..');
@@ -64,6 +64,7 @@ function checksOf(r) {
   if (r.scenario === 'amr-conserve') return [x.massCheck, x.momCheck];
   if (r.scenario === 'tgv') return [x.finiteCheck];
   if (r.scenario === 'spin') return [x.angCheck, x.lCheck, x.qCheck, x.movedCheck];
+  if (r.scenario === 'sphere-shed') return [x.stCheck, x.shedCheck, x.planarCheck, ...(x.cdCheck ? [x.cdCheck] : [])];
   if (r.scenario.startsWith('sphere')) return [x.cdCheck, x.settledCheck, x.lateralCheck, ...(x.convergeCheck ? [x.convergeCheck] : [])];
   return [];
 }
@@ -110,6 +111,11 @@ async function main() {
     { scenario: 'spin', run: runSpinCase, cases: bench.spin_cases, gate: true, body: true },
     { scenario: 'sphere', run: runSphereCase, cases: bench.sphere_cases, gate: true, body: true },
     { scenario: 'sphere', key: 'sphere-diffuse', run: runSphereCase, cases: bench.sphere_diffuse_cases, gate: true, body: true, diffuse: true },
+    // M8.1. The first case in this suite with a shed vortex in it, and the
+    // only one whose claim is a FREQUENCY. Ordered after the steady spheres
+    // because it is far longer (a dozen shedding periods) and because a
+    // steady-wake failure is the cheaper thing to see first.
+    { scenario: 'sphere', key: 'sphere-shed', run: runSphereShedCase, cases: bench.sphere_shed_cases, gate: true, body: true },
     // M4.1d. Sphere inside a refined shell, scored against the DENSE case's
     // own Cd rather than literature -- see benchmarks/d3.json's
     // sphere_amr_note. Ordered after the dense spheres because it reads one
@@ -249,6 +255,10 @@ async function main() {
     } else if (r.scenario === 'spin') {
       c2 = `|L| drift ${e3(x.lCheck.measured)}`; c3 = `turned ${x.totalTurn.toFixed(2)} rad`;
       checks = [x.angCheck, x.lCheck, x.qCheck, x.movedCheck];
+    } else if (r.scenario === 'sphere-shed') {
+      c2 = `St ${x.st == null ? 'NONE' : x.st.toFixed(4)} (${x.st == null ? '-' : (x.stErr * 100).toFixed(1) + '%'})`;
+      c3 = `Cd ${x.cd.toFixed(3)} amp ${e3(x.amp)}`;
+      checks = [x.stCheck, x.shedCheck, x.planarCheck, ...(x.cdCheck ? [x.cdCheck] : [])];
     } else if (r.scenario.startsWith('sphere')) {
       c2 = `Cd ${x.cd.toFixed(4)} (${(x.relErr * 100).toFixed(1)}%)`;
       c3 = `lat ${e3(x.lateral)}`;
@@ -265,6 +275,7 @@ async function main() {
              : r.scenario === 'amr-conserve' ? `d mass ${e3(x.massDrift)}`
              : (r.scenario === 'beltrami' || r.scenario === 'amr' || r.scenario === 'amr-box') ? e3(x.maxL2rel)
              : r.scenario === 'spin' ? `${e3(x.angCheck.measured)} rad`
+             : r.scenario === 'sphere-shed' ? `StErr ${x.st == null ? '-' : (x.stErr * 100).toFixed(1) + '%'}`
              : r.scenario.startsWith('sphere') ? `ref ${x.cdRef.toFixed(3)}` : '-', 14)
       + padL(c2, 20) + padL(c3, 20) + padL(ok ? 'PASS' : 'FAIL', 10));
   }

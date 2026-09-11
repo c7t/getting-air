@@ -200,6 +200,48 @@ export function tgvVelocityAt(x, y, z, N, u0) {
 
 // Non-cubic form. M2's sphere scenario needs a long, narrow box; the M1
 // scenarios are all cubes and go through seedMacro() below.
+// Deterministic PRNG, so a perturbed run is still reproducible for
+// regression use. Same generator (mulberry32) and same default seed as
+// main-cylinder.js, which is not an accident: the two projects' shedding
+// onsets should be seeded the same way if their numbers are ever compared.
+function mulberry32(seed) {
+  let s = seed | 0;
+  return function () {
+    s = (s + 0x6D2B79F5) | 0;
+    let t = Math.imul(s ^ (s >>> 15), 1 | s);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// A SMALL TRANSVERSE PERTURBATION ON THE INITIAL CONDITION, and it exists
+// because the 2D project already paid for its absence (main-cylinder.js's
+// PERTURB, whose comment is worth reading in full).
+//
+// A uniform freestream past a centred body is EXACTLY symmetric, so shedding
+// onset has to grow from whatever asymmetry round-off provides -- and that
+// seed is SMALLER AND SLOWER-GROWING AT HIGHER RESOLUTION, because a finer
+// grid has less discretization error to seed from. In 2D that made Cd and
+// shedding strength look like they SHRANK with resolution, when really the
+// finer runs had not saturated inside the same step budget. The trap is
+// worse in 3D, not better: a sphere's wake must also select an azimuthal
+// PLANE, and there is nothing in a symmetric initial condition to select it
+// with.
+//
+// Defaults to 0 everywhere, so every existing case is bit-identical and the
+// steady-regime gates are untouched. Opt in per case.
+export function seedMacro3Perturbed(dims, velAt, amp, seed, axes) {
+  const out = seedMacro3(dims, velAt);
+  if (!amp) return out;
+  const [NX, NY, NZ] = dims;
+  const rng = mulberry32(seed | 0);
+  const a = axes || [1, 2];            // transverse components by default
+  for (let c = 0; c < NX * NY * NZ; c++) {
+    for (const k of a) out[4 * c + 1 + k] += amp * (rng() * 2 - 1);
+  }
+  return out;
+}
+
 function seedMacro3(dims, velAt) {
   const [NX, NY, NZ] = dims;
   const out = new Float32Array(4 * NX * NY * NZ);
@@ -309,7 +351,11 @@ SCENARIOS.sphere = {
   name: 'sphere',
   // `n` is the sphere DIAMETER in cells here, not the domain edge -- the
   // resolution that matters for a body is how many cells span it.
-  defaults: { n: 16, tau: null, u0: 0.05, re: 100 },
+  // `perturb` is a fraction of u0 and defaults to 0, so every steady case is
+  // bit-identical to before it existed. It is opt-in for the SHEDDING cases
+  // -- see seedMacro3Perturbed for why a symmetric initial condition is a
+  // trap rather than a neutral choice.
+  defaults: { n: 16, tau: null, u0: 0.05, re: 100, perturb: 0, seed: 12345 },
   walls: [],
   dims: ({ n }) => [
     Math.round(SPHERE_DOMAIN.length * n),
@@ -341,7 +387,7 @@ SCENARIOS.sphere = {
   // body -- the penalization drives the interior to the body's velocity
   // within a few hundred steps and starting from rest instead only adds an
   // acoustic transient to wait out.
-  macro: (dims, p) => seedMacro3(dims, () => [p.u0, 0, 0]),
+  macro: (dims, p) => seedMacro3Perturbed(dims, () => [p.u0, 0, 0], p.perturb * p.u0, p.seed),
 };
 
 // --- drift: a body that TRANSLATES, for the dynamic-refinement gate --------

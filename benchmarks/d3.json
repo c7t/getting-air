@@ -258,6 +258,27 @@
       "lateral_tol": 0.02
     }
   ],
+  "sphere_shed_note": "UNSTEADY SPHERE (plans/3D.md M8.1), and the first case in this suite with a shed vortex in it. Every other sphere case is Re <= 200, which Johnson & Patel (JFM 378, 1999, pp. 19-70) place in the STEADY AXISYMMETRIC regime -- so they assert a SETTLED Cd and a cross-flow force under 2% of it, and both are violated by construction the moment the wake sheds. That is why this needs its own runner rather than a tolerance change: the existing gate cannot express the claim. Johnson & Patel identify three regimes by DNS -- steady axisymmetric (Re <= 210), steady planar-symmetric (210 < Re <= 270), unsteady periodic (Re > 270) -- and report St = 0.136 with mean Cd = 0.671 at Re = 300, which is the benchmark this case is scored against. THE STROUHAL NUMBER IS THE GATE AND Cd IS REPORTED. A frequency is a property of the wake; a surface integral over a staircased bounce-back sphere at D = 16 is substantially a property of the staircase, and this suite already measures Cd +12.8% against Schiller-Naumann at Re = 20 while the flow itself is right. Gating on the quantity the discretization does not dominate is what makes this a physics check rather than a resolution check -- and cd_tol_rel is deliberately absent here for that reason. TWO STRUCTURAL CHECKS SIT ALONGSIDE St, because a Strouhal number computed from a signal that is not periodic is a number fitted to noise: `amp_min` requires the projected lateral force to actually oscillate (a steady run reports zero crossings and would otherwise look like a missing measurement rather than a failure), and `anisotropy_min` requires the wake to be PLANAR enough for a shedding plane to exist -- a sphere picks its azimuthal orientation spontaneously, so the plane is fitted from the lateral-force covariance, and fitting a line to isotropic noise would otherwise succeed silently. MEASURED 2026-09-10, RTX 4080, three runs. St = 0.1301 (-4.4%) with no perturbation; 0.1225 (-9.9%) at perturb=0.02 seed=12345; 0.1305 (-4.0%) at seed=777. Cd is 0.7487-0.7496 in all three. So TWO SEPARATE FACTS. First, Cd is reproducible to 0.1% while St scatters about 6% seed-to-seed over a 12-period window -- the frequency estimate is the noisy quantity here, and a build-vs-build claim on St therefore needs a SAME-SEED repeat, exactly as CLAUDE.md already requires for AMR Cd. Do not read 0.1225 against 0.1305 as a regression; re-run with the same seed before believing a fourth-digit move. st_tol_rel = 0.2 sits comfortably outside that scatter while still being 3x tighter than the Cd offset it deliberately does not gate. The window could be lengthened to shrink the scatter as 1/sqrt(periods), at proportionate cost; 12 periods was judged enough against a 20% bound. Second, and this is why `perturb` exists at all: the UNPERTURBED run selected its shedding plane at exactly 45 degrees with an anisotropy of 1.6e5, i.e. perfectly planar and locked to a D3Q19 diagonal. A uniform freestream past a centred body is exactly symmetric, so the only thing available to choose a plane is the lattice. With a seed the plane lands at 8 and 58 degrees for the two seeds and the anisotropy falls to 5.3 and 19.8 -- planar-symmetric but wandering, which is what a real sphere wake does. main-cylinder.js's PERTURB comment records the 2D form of the same trap, where onset growing from round-off made Cd and shedding strength appear to SHRINK with resolution. perturb defaults to 0 everywhere so every steady case stays bit-identical; only the shedding cases opt in.",
+  "sphere_shed_cases": [
+    {
+      "name": "sphere-shed-Re300-D16",
+      "n": 16,
+      "re": 300,
+      "u0": 0.05,
+      "q": 19,
+      "bounceback": true,
+      "st": 0.136,
+      "cd": 0.671,
+      "st_tol_rel": 0.2,
+      "transient_convective": 60,
+      "periods": 12,
+      "amp_min": 0.02,
+      "anisotropy_min": 3,
+      "perturb": 0.02,
+      "seed": 12345,
+      "reference": "Johnson & Patel, JFM 378 (1999) 19-70, Re=300: St=0.136, Cd=0.671"
+    }
+  ],
   "sphere_diffuse_cases": [
     {
       "name": "sphere-diff-Re20-D16",

@@ -62,6 +62,10 @@ function caseUrl(baseUrl, scenario, c, extra) {
   if (c.refine) p.set('refine', c.refine);
   if (c.interface) p.set('interface', c.interface);
   if (c.dynamic) p.set('dynamic', c.dynamic);
+  // M8.1. Symmetry breaking for the shedding cases; absent (and therefore 0)
+  // everywhere else, so the steady cases stay bit-identical.
+  if (c.perturb) p.set('perturb', c.perturb);
+  if (c.seed) p.set('seed', c.seed);
   return `${baseUrl}/index-3d.html?${p}${extra ? `&${extra}` : ''}`;
 }
 
@@ -103,6 +107,124 @@ async function runSphereCase(Runtime, opts, c, log) {
     cdCheck: checkTol('CdRelErr', relErr, 0, c.cd_tol_rel),
     settledCheck: checkTol('settleDrift', drift, 0, c.settle_tol ?? 0.01),
     lateralCheck: checkTol('lateral/Cd', lateral, 0, c.lateral_tol ?? 0.02),
+  };
+}
+
+// --- sphere, SHEDDING (plans/3D.md M8.1) ------------------------------------
+//
+// WHY THIS IS A SEPARATE RUNNER. runSphereCase asserts that Cd has STOPPED
+// MOVING and that the cross-flow force is under 2% of it. Both are correct
+// for Re <= 210 -- Johnson & Patel (JFM 378, 1999) place the steady
+// axisymmetric regime there -- and both are violated BY CONSTRUCTION once
+// the wake sheds. So no existing gate can express "the wake is unsteady and
+// its frequency is right", which is the one claim standing between this
+// solver and the falling-card target.
+//
+// THE STROUHAL NUMBER IS THE GATE; Cd IS REPORTED. A frequency is a property
+// of the WAKE, and a staircased bounce-back surface at D = 16 perturbs it
+// far less than it perturbs the surface integral -- the existing cases
+// already measure Cd +12.8% against Schiller-Naumann at Re=20 while the flow
+// itself is right. Gating on the quantity the discretization does not
+// dominate is the difference between a physics check and a resolution check.
+//
+// THE WAKE PLANE IS NOT KNOWN IN ADVANCE, and that is the one genuinely 3D
+// part. A 2D cylinder sheds in the only plane it has; a sphere's wake picks
+// an azimuthal orientation spontaneously (and can drift), so neither Cl nor
+// Cs alone is the signal, and their MAGNITUDE is worse than either -- it is
+// a rectified sine with twice the frequency and no zero crossings at all.
+// The projection below finds the plane from the data (the principal axis of
+// the lateral-force covariance) and hands the resulting SCALAR series to
+// cylinder-metrics' own estimator, which is tested and wants no second copy.
+function projectLateral(history, transientSteps) {
+  const win = history.filter(r => r[0] > transientSteps);
+  if (win.length < 4) return { rows: [], theta: NaN, anisotropy: NaN };
+  const cl = win.map(r => r[4]), cs = win.map(r => r[5]);
+  const mL = cl.reduce((a, b) => a + b, 0) / cl.length;
+  const mS = cs.reduce((a, b) => a + b, 0) / cs.length;
+  let sll = 0, sss = 0, sls = 0;
+  for (let i = 0; i < win.length; i++) {
+    const a = cl[i] - mL, b = cs[i] - mS;
+    sll += a * a; sss += b * b; sls += a * b;
+  }
+  sll /= win.length; sss /= win.length; sls /= win.length;
+  // Principal axis of a symmetric 2x2 covariance, closed form.
+  const theta = 0.5 * Math.atan2(2 * sls, sll - sss);
+  const ct = Math.cos(theta), st = Math.sin(theta);
+  // Eigenvalues, for the anisotropy report below.
+  const tr = sll + sss, det = sll * sss - sls * sls;
+  const disc = Math.sqrt(Math.max(0, tr * tr / 4 - det));
+  const e1 = tr / 2 + disc, e2 = tr / 2 - disc;
+  // Rebuild rows with the PROJECTED lateral in column 4, so
+  // cylinder-metrics' analyze() reads it unchanged.
+  const rows = win.map((r, i) => [r[0], r[1], r[2], r[3], (cl[i] - mL) * ct + (cs[i] - mS) * st]);
+  // ANISOTROPY IS A CHECK, not decoration: a genuinely planar wake has one
+  // dominant axis, so e1/e2 >> 1. A value near 1 means the lateral force is
+  // isotropic noise and the "shedding plane" is an artefact of fitting a
+  // line to a circle -- in which case the Strouhal number below is fitting
+  // noise too, and the tool says so rather than reporting a number.
+  return { rows, theta, anisotropy: e2 > 0 ? e1 / e2 : Infinity, e1, e2 };
+}
+
+async function runSphereShedCase(Runtime, opts, c, log) {
+  const { analyze } = require('./cylinder-metrics');
+  const p = await evalOrThrow(Runtime, 'window.__D3.getParams()', 20000, 'getParams');
+  const conv = p.convective;                       // D/U in steps
+  const transient = Math.round((c.transient_convective || 60) * conv);
+  // Long enough for the requested number of shedding periods at the
+  // EXPECTED Strouhal, so a case at a different Re gets a proportionate
+  // window rather than a fixed step count.
+  const period = conv / c.st;                      // steps per shedding cycle
+  const measure = Math.round((c.periods || 12) * period);
+  // ~24 samples per period: enough that the zero crossing is interpolated
+  // between close neighbours, cheap enough that the readback is noise.
+  const every = Math.max(1, Math.round(period / 24));
+  if (log) {
+    log(`D=${p.D} Re=${p.re} ${p.bounceback ? 'bounceback' : 'diffuse'} Q${p.Q}: tau=${p.tau.toFixed(4)} nu=${p.nu.toFixed(5)}`);
+    log(`  D/U=${conv.toFixed(0)} steps, expected period ${period.toFixed(0)} steps`);
+    log(`  transient ${transient} then ${measure} steps (${c.periods || 12} periods), sampling every ${every}`);
+  }
+
+  await evalOrThrow(Runtime, `window.__D3.debugStepSync(${transient})`, ((opts.timeout || 600) + 120) * 1000, 'debugStepSync');
+  const r = await evalOrThrow(Runtime,
+    `window.__D3.debugRunAndCollect(${measure}, ${every})`, ((opts.timeout || 600) + 600) * 1000, 'debugRunAndCollect');
+
+  const proj = projectLateral(r.history, 0);       // the transient is already behind us
+  const a = analyze(proj.rows, 0, p.D, p.u0);
+  const st = a.st;
+  const stErr = st == null ? NaN : (st - c.st) / c.st;
+  const cdErr = (a.cdMean - c.cd) / c.cd;
+  // Peak-to-peak of the projected lateral, as a fraction of Cd: the
+  // amplitude of the thing whose frequency is being measured. A steady wake
+  // gives ~0 here, which is how a case that did NOT shed is told from one
+  // that sheds at the wrong frequency.
+  const amp = proj.rows.length
+    ? (Math.max(...proj.rows.map(x => x[4])) - Math.min(...proj.rows.map(x => x[4]))) / Math.abs(a.cdMean)
+    : 0;
+  if (log) {
+    log(`  St=${st == null ? 'NONE' : st.toFixed(4)} vs ${c.st} (${st == null ? '-' : (stErr * 100).toFixed(1) + '%'})`
+      + `  Cd=${a.cdMean.toFixed(4)} vs ${c.cd} (${(cdErr * 100).toFixed(1)}%)`);
+    log(`  ${a.crossings} crossings, ${a.samples} samples, lateral pk-pk/Cd=${amp.toExponential(2)}`
+      + `, wake plane ${(proj.theta * 180 / Math.PI).toFixed(0)} deg, anisotropy ${proj.anisotropy.toFixed(1)}`);
+  }
+
+  return {
+    D: p.D, re: p.re, tau: p.tau, Q: p.Q, bounceback: !!p.bounceback,
+    steps: transient + measure, st, cd: a.cdMean, stErr, cdErr, amp,
+    crossings: a.crossings, samples: a.samples, theta: proj.theta, anisotropy: proj.anisotropy,
+    // THE GATE. St against the DNS benchmark; Cd only reported unless the
+    // case asks for it, because at these resolutions Cd is a statement about
+    // the staircased surface and St is a statement about the flow.
+    stCheck: checkTol('StRelErr', stErr, 0, c.st_tol_rel),
+    // IT MUST ACTUALLY SHED. A steady run has no crossings and no amplitude,
+    // and would otherwise report St = null and pass nothing -- which reads
+    // the same as a missing measurement. This makes "it did not shed" a
+    // FAILURE with its own name.
+    shedCheck: { pass: amp >= (c.amp_min ?? 0.02) && a.crossings >= 5,
+      label: 'shedAmplitude', measured: amp, target: c.amp_min ?? 0.02, tol: null },
+    // And the wake must be planar enough for a plane to mean something.
+    planarCheck: { pass: proj.anisotropy >= (c.anisotropy_min ?? 3),
+      label: 'wakeAnisotropy', measured: proj.anisotropy, target: c.anisotropy_min ?? 3, tol: null },
+    ...(c.cd_tol_rel ? { cdCheck: checkTol('CdRelErr', cdErr, 0, c.cd_tol_rel) } : {}),
   };
 }
 
@@ -162,4 +284,4 @@ async function runSpinCase(Runtime, opts, c, log) {
   };
 }
 
-module.exports = { evalExpr, checkTol, caseUrl, runSphereCase, runSpinCase, quatAngle };
+module.exports = { evalExpr, checkTol, caseUrl, runSphereCase, runSphereShedCase, runSpinCase, quatAngle, projectLateral };

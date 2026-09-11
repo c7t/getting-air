@@ -2067,6 +2067,45 @@ async function init() {
     return poolExhausted;
   }
 
+  // M8.1. STEP AND RECORD THE BODY FORCE, for the unsteady gate.
+  //
+  // The sphere cases up to now measure Cd ONCE, at the end, and assert it
+  // has stopped moving. That is the right instrument for Re <= 210, where
+  // Johnson & Patel (JFM 378, 1999) put the steady axisymmetric regime and
+  // where there is genuinely nothing to time-average. Above Re ~ 270 the
+  // wake sheds periodically, and a single late sample of a periodic signal
+  // is not a mean -- it is a phase.
+  //
+  // So this returns the HISTORY, in the row shape tools/lib/cylinder-metrics
+  // already analyses in 2D: [step, fx, fy, Cd, Cl, Cs, fz]. The first five
+  // columns are exactly what its `analyze` reads, which is the point -- the
+  // zero-crossing Strouhal estimator is tested code and does not want a
+  // second copy.
+  //
+  // ONE readBody PER SAMPLE, not per step: the body state is 136 bytes and
+  // the sample interval is chosen by the caller to give tens of samples per
+  // shedding period, so the readback is noise against the steps between it.
+  async function debugRunAndCollect(nSteps, every) {
+    live = false;
+    playBtn.textContent = 'play';
+    const k = Math.max(1, Math.round(every) || 1);
+    const history = [];
+    let done = 0;
+    if (await checkPoolExhausted()) return { step, history, exhausted: poolExhausted };
+    while (done < nSteps) {
+      const n = Math.min(k, nSteps - done);
+      const enc = device.createCommandEncoder();
+      encodeSteps(enc, n);          // advances `step` itself
+      device.queue.submit([enc.finish()]);
+      await device.queue.onSubmittedWorkDone();
+      done += n;
+      const b = await readBody();
+      history.push([step, b.fx, b.fy, b.cd ?? NaN, b.cl ?? NaN, b.cs ?? NaN, b.fz]);
+      if (await checkPoolExhausted()) break;
+    }
+    return { step, history, exhausted: poolExhausted };
+  }
+
   async function debugStepSync(n) {
     live = false;
     playBtn.textContent = 'play';
@@ -2178,6 +2217,61 @@ async function init() {
       step, ke: ke / n3, enstrophy: ens / n3, dissipation: 2 * params.nu * (ens / n3),
       maxSpeed: Math.sqrt(maxSpeed), rhoMin, rhoMax, finite,
     };
+  }
+
+  // HOW MUCH OF THE DOMAIN IS WORTH SAMPLING? plans/3D.md M8.5.
+  //
+  // Empty-space skipping pays in proportion to how much space is empty, and
+  // M8.5's whole design rests on that fraction being small. It is cheaper to
+  // measure it than to argue about it -- M8.0 is the standing reminder --
+  // and this is the measurement: |omega| per cell, reduced to a MAX PER
+  // BRICK, then the fraction of bricks whose max clears a threshold.
+  //
+  // BRICKS, NOT CELLS, and the difference is the entire point. A ray skips a
+  // whole brick or none of it, so the cell-level occupancy flatters the
+  // scheme: a vortex sheet one cell thick through the middle of every brick
+  // is 1% of cells and 100% of bricks, and buys nothing at all. The pair is
+  // reported together so that shape is visible rather than averaged away.
+  //
+  // |omega| rather than Q because readStats already computes the curl and
+  // this is a sizing measurement, not a render. The two have the same
+  // character here -- both concentrate in the wake -- and if the answer is
+  // marginal on |omega| it is worth re-running on Q before building
+  // anything.
+  async function debugOccupancy(brick) {
+    const B = Math.max(1, Math.round(brick || 8));
+    const m = await readMacro();
+    const at = (x, y, z, c) => m[4 * ((((z + NZ) % NZ) * NY + ((y + NY) % NY)) * NX + ((x + NX) % NX)) + 1 + c];
+    const nb = [Math.ceil(NX / B), Math.ceil(NY / B), Math.ceil(NZ / B)];
+    const brickMax = new Float64Array(nb[0] * nb[1] * nb[2]);
+    const cells = [];
+    let wMax = 0;
+    for (let z = 0; z < NZ; z++) {
+      for (let y = 0; y < NY; y++) {
+        for (let x = 0; x < NX; x++) {
+          const wx = (at(x, y + 1, z, 2) - at(x, y - 1, z, 2)) * 0.5 - (at(x, y, z + 1, 1) - at(x, y, z - 1, 1)) * 0.5;
+          const wy = (at(x, y, z + 1, 0) - at(x, y, z - 1, 0)) * 0.5 - (at(x + 1, y, z, 2) - at(x - 1, y, z, 2)) * 0.5;
+          const wz = (at(x + 1, y, z, 1) - at(x - 1, y, z, 1)) * 0.5 - (at(x, y + 1, z, 0) - at(x, y - 1, z, 0)) * 0.5;
+          const w = Math.hypot(wx, wy, wz);
+          if (!Number.isFinite(w)) continue;
+          cells.push(w);
+          if (w > wMax) wMax = w;
+          const bi = ((z / B | 0) * nb[1] + (y / B | 0)) * nb[0] + (x / B | 0);
+          if (w > brickMax[bi]) brickMax[bi] = w;
+        }
+      }
+    }
+    // Thresholds as fractions of the field's own maximum, because the
+    // absolute scale is a scenario property and the question is about shape.
+    const fracs = [0.5, 0.2, 0.1, 0.05, 0.02, 0.01];
+    const nBricks = brickMax.length;
+    const rows = fracs.map(f => {
+      const t = f * wMax;
+      let nc = 0; for (const w of cells) if (w > t) nc++;
+      let nbk = 0; for (const w of brickMax) if (w > t) nbk++;
+      return { frac: f, threshold: t, cellFrac: nc / cells.length, brickFrac: nbk / nBricks };
+    });
+    return { step, brick: B, nBricks, nCells: cells.length, omegaMax: wMax, rows };
   }
 
   // WHERE, not just whether. plans/3D.md M8's tau probe.
@@ -2921,7 +3015,7 @@ async function init() {
     readSubsampled, readDuctProfile, readStats, readBody, readPoolStats,
     debugCheck21Balance, debugCheckGeometryCoverage, debugCheckRingParents, debugPoolState,
     debugRunBalance, debugSampleTree, debugCheckTreeSample, debugReadVolume,
-    debugHotspot,
+    debugHotspot, debugRunAndCollect, debugOccupancy,
     readInterfaceDiag, readFluxAcc,
     debugStepSync,
   };
