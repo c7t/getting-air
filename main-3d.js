@@ -1890,27 +1890,46 @@ async function init() {
   // are filled, not solved, and including them would blur exactly the
   // distinction this is for). Reported next to the coarse level's own RMS so
   // "is the fine level advancing at all" is answerable rather than inferred.
-  const poolStaging = AMR ? device.createBuffer({
-    size: Math.max(1, poolAlloc.activeSlots) * pool.tileCells * 4 * 4,
-    usage: U.MAP_READ | U.COPY_DST,
-  }) : null;
-  async function readPoolStats() {
-    if (!AMR) return null;
-    const bytes = Math.max(1, poolAlloc.activeSlots) * pool.tileCells * 4 * 4;
+  //
+  // EVERY LEVEL, and over the SLOT BUDGET rather than the initial active
+  // count (M5.6). It used to read level 1 alone and walk slots
+  // [0, activeSlots), which is wrong twice over once the tree is deeper than
+  // two or the manager can move a tile: a blowup born on level 2 was
+  // invisible here, and under ?dynamic=1 a slot below activeSlots may be
+  // FREE (holding a dead tile's leftovers) while one above it is in use, so
+  // the statistics were taken over the wrong set of cells entirely. The
+  // authority on which slots are live is slotToBlock, so that is what it
+  // reads. Same trap the codebase names elsewhere: a checker fed one level
+  // of a three-level tree cannot fail.
+  //
+  // The staging buffer is allocated ON FIRST USE and grown to fit, because
+  // sizing it up front to the deepest level's budget costs tens of MB of
+  // MAP_READ memory on a run that may never call this.
+  let poolStaging = null, poolStagingBytes = 0;
+  async function readPoolStatsAt(m) {
+    const lv = L[m];
+    const bytes = Math.max(1, lv.slots) * pool.tileCells * 4 * 4;
+    if (poolStagingBytes < bytes) {
+      if (poolStaging) poolStaging.destroy();
+      poolStaging = device.createBuffer({ size: bytes, usage: U.MAP_READ | U.COPY_DST });
+      poolStagingBytes = bytes;
+    }
+    const s2b = await readI32(lv.slotToBlock, lv.slots * 4);
     const enc = device.createCommandEncoder();
-    enc.copyBufferToBuffer(macPool, 0, poolStaging, 0, bytes);
+    enc.copyBufferToBuffer(lv.mac, 0, poolStaging, 0, bytes);
     device.queue.submit([enc.finish()]);
-    await poolStaging.mapAsync(GPUMapMode.READ);
-    const m = new Float32Array(poolStaging.getMappedRange()).slice();
+    await poolStaging.mapAsync(GPUMapMode.READ, 0, bytes);
+    const mm = new Float32Array(poolStaging.getMappedRange(0, bytes)).slice();
     poolStaging.unmap();
-    const FB = pool.FB, plane = Math.max(1, poolAlloc.activeSlots) * pool.tileCells;
+    const FB = pool.FB, plane = Math.max(1, lv.slots) * pool.tileCells;
     let sq = 0, n = 0, finite = true, rhoMin = Infinity, rhoMax = -Infinity;
-    for (let s = 0; s < poolAlloc.activeSlots; s++) {
+    for (let s = 0; s < lv.slots; s++) {
+      if (s2b[s] < 0) continue;          // free slot: whatever the last owner left
       for (let z = GHOST; z < GHOST + 2 * RB; z++) {
         for (let y = GHOST; y < GHOST + 2 * RB; y++) {
           for (let x = GHOST; x < GHOST + 2 * RB; x++) {
             const c = s * pool.tileCells + (z * FB + y) * FB + x;
-            const rho = m[0 * plane + c], ux = m[1 * plane + c], uy = m[2 * plane + c], uz = m[3 * plane + c];
+            const rho = mm[0 * plane + c], ux = mm[1 * plane + c], uy = mm[2 * plane + c], uz = mm[3 * plane + c];
             if (!Number.isFinite(rho + ux + uy + uz)) { finite = false; continue; }
             sq += ux * ux + uy * uy + uz * uz; n++;
             if (rho < rhoMin) rhoMin = rho;
@@ -1919,7 +1938,19 @@ async function init() {
         }
       }
     }
-    return { step, rms: Math.sqrt(sq / Math.max(n, 1)), cells: n, finite, rhoMin, rhoMax };
+    return { level: m, rms: Math.sqrt(sq / Math.max(n, 1)), cells: n, finite, rhoMin, rhoMax };
+  }
+  // The top-level fields stay LEVEL 1's, so every existing caller reads what
+  // it always read; `byLevel` is the per-level surface. `finite` is the one
+  // exception and it is deliberate: it is an ALL-levels answer, because a
+  // NaN anywhere in the hierarchy is a blown-up run and reporting level 1 as
+  // finite while level 2 is not would be the exact failure this is for.
+  async function readPoolStats() {
+    if (!AMR) return null;
+    const byLevel = [];
+    for (let m = 1; m < LEVELS; m++) byLevel.push(await readPoolStatsAt(m));
+    const { level, ...lv1 } = byLevel[0];
+    return { step, ...lv1, finite: byLevel.every(r => r.finite), byLevel };
   }
 
   // --- AMR structural invariants (plans/3D.md M4.2, risk #2) ---------------
@@ -1975,10 +2006,17 @@ async function init() {
     poolStateStaging.unmap();
     return v;
   }
-  // Per level, and the top-level fields still report LEVEL 1 so every
-  // existing caller reads what it always read (tools/validate-d3-invariants.js
-  // asserts on `inUse`, `free` and `bbox` directly). `byLevel` is the new
-  // surface; M5.6 is where the tools move onto it.
+  // Per level, and the top-level fields still report LEVEL 1 so a caller
+  // that predates the hierarchy reads what it always read. `byLevel` is the
+  // surface the tools use: as of M5.6 tools/validate-d3-invariants.js takes
+  // its `inUse` and `bbox` expectations from the FINEST level, because that
+  // is the level the criterion is evaluated at and therefore the only one
+  // where "the manager acted" is a statement about the criterion rather
+  // than about the closure propagating something that happened below.
+  //
+  // `problems` and `slotsExhausted` are ALL-levels answers and always were:
+  // a defect anywhere in the tree is a defect, and a checker fed one level
+  // of a three-level tree cannot fail.
   async function debugPoolState() {
     if (!AMR) return { skipped: 'no pool (?levels=1)' };
     const byLevel = [null];

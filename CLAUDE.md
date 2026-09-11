@@ -208,9 +208,9 @@ comment above `N_LEVELS`, not this file, for what's current.
 
 ## The 3D fork (`plans/3D.md`)
 
-**M0-M4 are done, and M5 is done through M5.5b; M5.6 (validation and
-tooling at depth) is what remains of it.** Depth is real: `?levels=3` runs,
-with or without `?dynamic=1`, and the 2:1 balance and ring-parent checks are
+**M0-M5 are done; M6 (volume rendering) is next.** Depth is real:
+`?levels=N` runs at any depth, static or `?dynamic=1`, the body lives
+entirely on the finest level, and the 2:1 balance and ring-parent checks are
 gates there rather than VACUOUS lines. The
 coarse/fine interface on the `?interface=explode` path -- the DEFAULT since
 M4.1e -- is exactly conservative in mass AND momentum, and its field error
@@ -534,6 +534,17 @@ What exists today:
   brute-force nearest-point search, and asserts the tennis-racket theorem
   (a body spun about its intermediate axis must flip, one about a stable
   axis must not).
+- **The slice view shows the FINEST solution at L0 RESOLUTION**, and that
+  is not a bug to hunt. The coalesce chain republishes each level's
+  macroscopic field into its PARENT's `mac` under the refined region, so L2
+  reaches L1 reaches L0 and the dense array the renderer binds already
+  carries the deepest answer -- measured, not inferred: with `?refine=all` at
+  `?levels=3` that array is written entirely by two coalesce hops and still
+  scores 5.59e-3 against the analytic Beltrami solution. What is missing is
+  PIXELS, not values: a refined region is displayed coarse. Resolving a
+  sample point down the tree belongs to M6's sampler, not to a second
+  throwaway copy of it.
+
 - `tools/validate-3d.js` + `benchmarks/d3.json` — the M1, M2 and M3 gates.
   Analytic PASS/FAIL for duct, Beltrami, spin and the bounce-back sphere;
   the 3D TGV only reports; the diffuse sphere cases and `amr-box-RB4` are

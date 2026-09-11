@@ -217,6 +217,15 @@ async function runConfig(Runtime, o, c, log) {
     const cov = await evalOrThrow(Runtime, `${G}.debugCheckGeometryCoverage()`, 300000, 'debugCheckGeometryCoverage');
     const ps = await evalOrThrow(Runtime, `${G}.debugPoolState()`, 300000, 'debugPoolState');
     const st = await evalOrThrow(Runtime, `${G}.readStats()`, 300000, 'readStats');
+    // EVERY POOL LEVEL'S OWN FIELD, not just L0's (M5.6). readStats reads the
+    // dense macroscopic array, which a fine level only reaches through
+    // coalesce and only at the cells it covers -- so "L0 is finite" is a
+    // weaker statement than it looks, and at depth it is two transfers
+    // removed from where a newly-filled or newly-drained tile actually
+    // lives. This reads each level's own mac pool, over the SLOT BUDGET and
+    // honouring slotToBlock, so a tile the manager has just handed out is in
+    // the sample the moment it exists.
+    const ps2 = await evalOrThrow(Runtime, `${G}.readPoolStats()`, 300000, 'readPoolStats');
     if (ps.ok === false) res.pool.push({ at: done, n: ps.problems.length, first: ps.problems[0] });
     // M5.4a. Running out of slots is a HARD failure: refinement is
     // geometry-forced, so a refused tile means a coarse/fine seam through
@@ -237,7 +246,7 @@ async function runConfig(Runtime, o, c, log) {
       // 1 and nothing changes. byLevel is 0-based from level 1.
       const fine = ps.byLevel ? ps.byLevel[ps.byLevel.length - 1] : ps;
       res.fineState = fine;
-      if (firstInUse === null) { firstInUse = ps.inUse; firstBbox = fine.bbox; }
+      if (firstInUse === null) { firstInUse = fine.inUse; firstBbox = fine.bbox; }
     }
     if (bal.skipped) throw new Error(`2:1 balance unavailable: ${bal.skipped}`);
     res.vacuous = bal.vacuous;
@@ -248,6 +257,34 @@ async function runConfig(Runtime, o, c, log) {
     if (ring.ok === false) res.ring.push({ at: done, n: ring.nViolations, first: ring.violations[0] });
     if (cov.ok === false && !c.skipCoverage) res.cov.push({ at: done, n: cov.nViolations, first: cov.violations[0] });
     if (cov.required != null) res.required = cov.required;
+    if (ps2 && ps2.byLevel) {
+      res.poolLevels = ps2.byLevel;
+      const bad = ps2.byLevel.filter(l => !l.finite);
+      if (bad.length && !c.fieldWrongByDesign) {
+        res.pool.push({ at: done, n: bad.length,
+          first: { kind: 'poolLevelNotFinite', level: bad[0].level, cells: bad[0].cells } });
+      }
+      // A level whose interiors are all-zero after the run has started is
+      // not advancing -- the shape an unseeded pool has, and what
+      // M5.2b-ii's bug looked like before the blowup reached L0.
+      //
+      // NOT AT done === 0, and the reason is worth knowing rather than
+      // working around: a pool's `mac` is a DERIVED buffer, written by the
+      // step and coalesce kernels, and reset() seeds `f` only. So every
+      // level reads rms 0 at step 0 even on a case whose L0 kinetic energy
+      // is nonzero, and it is correct by the first substep. `drift` also
+      // genuinely starts from rest.
+      //
+      // A count of zero live cells is a different thing and is left to the
+      // pool check, which owns inUse.
+      if (done > 0) {
+        const still = ps2.byLevel.filter(l => l.cells > 0 && l.rms === 0).map(l => l.level);
+        if (still.length) {
+          res.pool.push({ at: done, n: still.length,
+            first: { kind: 'poolLevelNotAdvancing', levels: still } });
+        }
+      }
+    }
     if (st.finite === false || !Number.isFinite(st.ke)) {
       res.blewUp = true;
       res.finite = !!c.fieldWrongByDesign;   // expected here, a failure anywhere else
@@ -259,7 +296,10 @@ async function runConfig(Runtime, o, c, log) {
       + `  ring ${ring.ok ? (ring.vacuous ? 'vacuous' : `ok (${ring.required})`) : `${ring.nViolations} VIOLATIONS`}`
       + `  coverage ${cov.skipped ? 'skipped' : (cov.ok ? `ok (${cov.required} cells required)` : `${cov.nViolations} VIOLATIONS`)}`
       + `  pool ${ps.ok ? `ok (${ps.inUse} in use, ${ps.free} free${ps.dynamic ? ', dynamic' : ''})` : `${ps.problems.length} PROBLEMS`}`
-      + `  ke=${Number(st.ke).toExponential(3)}`);
+      + `  ke=${Number(st.ke).toExponential(3)}`
+      + (ps2 && ps2.byLevel
+        ? '  rms ' + ps2.byLevel.map(l => `L${l.level} ${Number(l.rms).toExponential(2)}${l.finite ? '' : ' NaN'}`).join(' ')
+        : ''));
     if (done === steps) break;
     const k = Math.min(o.checkEvery, steps - done);
     await evalOrThrow(Runtime, `${G}.debugStepSync(${k})`, (o.timeout + 30) * 1000, 'debugStepSync');
@@ -299,15 +339,21 @@ async function runConfig(Runtime, o, c, log) {
     res.pool.push({ at: 'end', n: 1, first: { kind: 'expectedExhaustionDidNotFire' } });
     log('expected the pool to be exhausted and it was not -- the hard failure did not fire');
   }
-  if (c.expectInUse && res.poolState) {
-    const moved = res.poolState.inUse - firstInUse;
+  // THE FINEST LEVEL, for the same reason expectBboxMove reads it: that is
+  // where the criterion is evaluated, so it is where "the manager acted" is
+  // a statement about the criterion firing rather than about the closure
+  // propagating something that happened below. Identical at ?levels=2.
+  if (c.expectInUse && res.fineState) {
+    const now = res.fineState.inUse;
+    const moved = now - firstInUse;
     const want = c.expectInUse === 'increase' ? moved > 0 : moved < 0;
-    res.expectation = { want: c.expectInUse, from: firstInUse, to: res.poolState.inUse, ok: want };
+    res.expectation = { want: c.expectInUse, from: firstInUse, to: now, ok: want };
     if (!want) {
       res.pool.push({ at: 'end', n: 1,
-        first: { kind: 'managerDidNotAct', expected: c.expectInUse, inUse: `${firstInUse} -> ${res.poolState.inUse}` } });
+        first: { kind: 'managerDidNotAct', level: res.fineState.level, expected: c.expectInUse,
+                 inUse: `${firstInUse} -> ${now}` } });
     }
-    log(`manager ${c.expectInUse}: inUse ${firstInUse} -> ${res.poolState.inUse} ${want ? 'ok' : 'DID NOT ACT'}`);
+    log(`manager ${c.expectInUse} (L${res.fineState.level}): inUse ${firstInUse} -> ${now} ${want ? 'ok' : 'DID NOT ACT'}`);
   }
   return res;
 }
@@ -395,7 +441,9 @@ async function main() {
     console.log('is the DENSE L0 grid, so no parent tile can be missing. Dynamic refinement does');
     console.log('not change either -- it moves tiles WITHIN one level. Do not read those rows as');
     console.log('evidence about the invariants, only that the machinery runs.');
-    console.log('The ?levels=3 rows (box3, bar3) are where both are REAL, as of M5.3.');
+    console.log('The ?levels=3 rows are where both are REAL: box3/bar3/body3 on a tree the HOST');
+    console.log('built (M5.3), and body3-dynamic/drift3 on one the MANAGER rebuilds every few');
+    console.log('steps (M5.5b). drift3 is the only row where the manager must actually ACT.');
     console.log('');
     console.log('RING PARENTS is vacuous for a DIFFERENT reason worth keeping straight: level 1\'s');
     console.log('parent is the DENSE L0 grid, which exists everywhere, so no parent tile can be');

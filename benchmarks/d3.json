@@ -349,6 +349,23 @@
       "cd_with_dx3_weight": 1.4708,
       "dynamic": 1,
       "cd_matches_exact": true
+    },
+    {
+      "name": "sphere-amr-dynamic-L3-Re20-D16",
+      "n": 16,
+      "re": 20,
+      "u0": 0.05,
+      "q": 19,
+      "bounceback": true,
+      "levels": 3,
+      "rb": 4,
+      "refine": "body",
+      "interface": "explode",
+      "settle_convective": 30,
+      "cd_matches": "sphere-amr-L3-Re20-D16",
+      "cd_dense_reference": 2.9436,
+      "dynamic": 1,
+      "cd_matches_exact": true
     }
   ],
   "spin_cases": [
@@ -524,7 +541,7 @@
       "mom_with_leak": 1.921
     }
   ],
-  "amr_box_explode_note": "FIELD accuracy on the ?interface=explode path (plans/3D.md M4.1c), the companion to amr_conserve_cases' conservation bounds. The pair is deliberate: M4.1b was exactly conservative and still carried an O(1) seam defect, so a conservation gate alone demonstrably does not guard this interface. Scored against RECORDED values, like amr-box-RB4 -- but unlike amr-box-RB4 the number is no longer dominated by a known defect: it tracks the no-interface control (refine=all) to within 8-10% at N = 32/48/64, so what these bounds actually guard is 'the seam is still invisible'. Measured 2026-09-10, RTX 4080. If a change makes these RISE, the seam signature is back; do not widen them.",
+  "amr_box_explode_note": "FIELD accuracy on the ?interface=explode path (plans/3D.md M4.1c), the companion to amr_conserve_cases' conservation bounds. The pair is deliberate: M4.1b was exactly conservative and still carried an O(1) seam defect, so a conservation gate alone demonstrably does not guard this interface. Scored against RECORDED values, like amr-box-RB4 -- but unlike amr-box-RB4 the number is no longer dominated by a known defect: it tracks the no-interface control (refine=all) to within 8-10% at N = 32/48/64, so what these bounds actually guard is 'the seam is still invisible'. Measured 2026-09-10, RTX 4080. If a change makes these RISE, the seam signature is back; do not widen them. DEPTH 3 (amr-box-explode-field-L3, plans/3D.md M5.6). The same claim one rung deeper, and at depth the box case has TWO seams rather than one: the criterion is evaluated at the FINEST level (M5.1b) and every coarser level is whatever cascade21 requires around it, so L1's refined region is strictly larger than L2's footprint and there is an L1/L2 interface as well as an L0/L1 one. Measured 2026-09-10, RTX 4080, N=32: worst-checkpoint field L2rel 6.137e-3 against its own no-interface control (refine=all, levels=3) at 5.590e-3 -- +9.8%, inside the same 8-10% band the depth-2 case holds to with one seam. The depth-2 run of the SAME case and resolution is 4.544e-3, so the depth-3 number is not a regression against depth 2 either; it is a different discretization with a genuinely finer inner region and one more seam. The decay-rate error is where the seam actually shows: 4.832e-3 against the refine=all control's -9.501e-4, which flips sign, and 3.359e-3 for the one-seam depth-2 case. REPEAT-CHECKED: two runs of the same build are BIT-IDENTICAL at every checkpoint, so these bounds are tight on purpose and a fourth-digit move is a real change, not noise.",
   "amr_box_explode_cases": [
     {
       "name": "amr-box-explode-field",
@@ -547,7 +564,30 @@
       "decay_rate_measured": 0.001826,
       "field_l2_control_all": 0.002293,
       "field_l2_interp_same_case": 0.009012
+    },
+    {
+      "name": "amr-box-explode-field-L3",
+      "n": 32,
+      "tau": 0.8,
+      "u0": 0.04,
+      "q": 19,
+      "levels": 3,
+      "refine": "box",
+      "boxfrac": 0.5,
+      "rb": 4,
+      "interface": "explode",
+      "checkpoints": [
+        0.25,
+        0.5
+      ],
+      "field_l2_tol": 0.008,
+      "decay_rate_tol": 0.007,
+      "field_l2_measured": 0.006137,
+      "decay_rate_measured": 0.004832,
+      "field_l2_control_all_L3": 0.00559,
+      "field_l2_same_case_L2": 0.004544,
+      "decay_rate_control_all_L3": -0.0009501
     }
   ],
-  "sphere_amr_dynamic_note": "M4.2b-i's gate, and it is an EXACT equality rather than a tolerance. ?dynamic=1 makes the pool's block->slot map writable by a kernel -- a free-list stack, a coarsen pass and a refine pass -- instead of uploaded once. The body in this case is PINNED, so the geometry criterion wants exactly the same 160 blocks at every re-evaluation, and a manager that decides 'no change' must therefore change NOTHING. Any drift at all means the machinery perturbs the run when it is not supposed to act, which is the one thing that has to be true before M4.2b-ii lets it act. Same reasoning as M4.1a's bit-identical gate: introduce the machinery against an unchanged answer, THEN make it load-bearing. The criterion in shaders/common_d3_manage.wgsl is deliberately character-for-character the one d3-amr.mjs's refineNearBody applies on the host -- same eight corners, same centre, same margin -- because a criterion that disagreed by one block would break this gate with no way to tell it from a real allocator defect."
+  "sphere_amr_dynamic_note": "M4.2b-i's gate, and it is an EXACT equality rather than a tolerance. ?dynamic=1 makes the pool's block->slot map writable by a kernel -- a free-list stack, a coarsen pass and a refine pass -- instead of uploaded once. The body in this case is PINNED, so the geometry criterion wants exactly the same 160 blocks at every re-evaluation, and a manager that decides 'no change' must therefore change NOTHING. Any drift at all means the machinery perturbs the run when it is not supposed to act, which is the one thing that has to be true before M4.2b-ii lets it act. Same reasoning as M4.1a's bit-identical gate: introduce the machinery against an unchanged answer, THEN make it load-bearing. The criterion in shaders/common_d3_manage.wgsl is deliberately character-for-character the one d3-amr.mjs's refineNearBody applies on the host -- same eight corners, same centre, same margin -- because a criterion that disagreed by one block would break this gate with no way to tell it from a real allocator defect. DEPTH 3 (sphere-amr-dynamic-L3-Re20-D16, plans/3D.md M5.6) makes the same equality claim against a manager that now runs at EVERY level: a decide-and-close chain over the tree, then drain/coarsen finest-first and refine/fill coarsest-first (M5.5b). There is far more machinery to perturb the answer than at depth 2 and none of it may. Measured 2026-09-10, RTX 4080: Cd 2.9015, bit-identical to the static depth-3 run. It is the PHYSICS partner to validate-d3-invariants.js's body3-dynamic, which makes the structural version of the same claim, and to drift3, which is the case where the manager must actually act -- neither of those scores a field, and this one cannot see a manager that moves tiles correctly but transfers them wrongly."
 }
