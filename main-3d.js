@@ -1630,6 +1630,9 @@ async function init() {
   const STEPS_PER_FRAME = Math.max(1, Math.round(numParam('spf', Math.max(1, Math.round(262144 / NCELLS * 8)))));
   const uRefDefault = params.scenario === 'duct' ? params.uPeak
     : params.scenario === 'sphere' ? params.u0 * 1.6      // the flow accelerates around the body
+    // `fall` has no freestream at all -- the fluid starts at rest and the
+    // only velocity scale is the body's own terminal one.
+    : params.scenario === 'fall' ? params.u_t * 1.6
     : 2 * params.u0;
   // Render normalizations, derived per scenario rather than inherited from
   // the 2D pages' constants. common_vortcolor.wgsl's tone curve is
@@ -1646,6 +1649,7 @@ async function init() {
   const V_SCALE = numParam('vscale',
     scenarioName === 'duct' ? 2 * params.uPeak / params.a
       : scenarioName === 'sphere' ? 2 * params.u0 / params.R
+      : scenarioName === 'fall' ? 2 * params.u_t / params.R
         : (params.k || 2 * Math.PI / N) * U_SCALE);
 
   function writeRenderParams() {

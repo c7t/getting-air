@@ -390,6 +390,79 @@ SCENARIOS.sphere = {
   macro: (dims, p) => seedMacro3Perturbed(dims, () => [p.u0, 0, 0], p.perturb * p.u0, p.seed),
 };
 
+// --- fall: a body the FLUID actually moves (plans/3D.md M8.2) --------------
+//
+// THE FIRST 3D SCENARIO IN WHICH THE FLUID FORCE MOVES A BODY. Everything
+// before it is pinned (`sphere`) or free with the coupling switched off
+// (`drift`, `spin`, both `noFluidForce: true`), so the six-scalar force
+// reduction, the 6-DOF integrator and the moving-body boundary condition
+// have all been validated SEPARATELY and never against each other. That gap
+// is the whole reason this exists -- see plans/3D.md M8.
+//
+// A SPHERE FIRST, DELIBERATELY, even though the target is a plate: its drag
+// law is known, this suite already measures it (sphere_cases, and their
+// ~+12% staircase offset against Schiller-Naumann), so the terminal velocity
+// is PREDICTABLE and the gate can be a number rather than a look.
+//
+// THE PARAMETERS ARE THE TERMINAL STATE, not the forcing. You say what
+// terminal velocity and Reynolds number you want and the gravity follows,
+// exactly as card-params.mjs derives G_LU from U_T rather than the other way
+// round -- because the regime is the physical input and the acceleration is
+// an implementation detail of reaching it. At terminal the fluid force
+// balances the effective weight:
+//
+//     rho_b V g_eff = 1/2 rho U_T^2 Cd A      =>  g_eff = U_T^2 Cd A / (2 rho_b V)
+//
+// G IS AN ACCELERATION AND IT IS ALREADY BUOYANCY-CORRECTED, matching
+// d3_physics.wgsl's GX/GY/GZ and the 2D page's G_EFF. The momentum-exchange
+// force this solver measures does NOT include buoyancy -- gravity is never
+// applied to the FLUID, so there is no hydrostatic gradient to produce it --
+// so the correction has to live here rather than being double counted.
+SCENARIOS.fall = {
+  name: 'fall',
+  // `n` is the sphere DIAMETER in cells, as in `sphere`.
+  defaults: { n: 12, re: 100, u_t: 0.04, rho_b: 4, perturb: 0, seed: 12345 },
+  walls: [],
+  // Long in the fall direction and no longer than it needs to be across:
+  // the body has to reach terminal velocity AND then travel far enough to
+  // measure it, which is the domain's whole job here.
+  dims: ({ n }) => [Math.round(16 * n), Math.round(6 * n), Math.round(6 * n)],
+  derive: (p) => {
+    const { n, re, u_t, rho_b } = p;
+    const nu = u_t * n / re;
+    const tau = tauFromNu(nu);
+    const d = SCENARIOS.fall.dims(p);
+    const R = n / 2;
+    const V = (4 / 3) * Math.PI * R ** 3;
+    const area = Math.PI * R * R;
+    const cd = schillerNaumann(re);
+    // The balance above, solved for the acceleration.
+    const gEff = u_t * u_t * cd * area / (2 * rho_b * V);
+    const shape = { kind: SHAPE.SPHERE, a: R };
+    const body = makeBodyState({ shape, x: [2 * n, d[1] / 2, d[2] / 2], density: rho_b });
+    return {
+      nu, tau, re, R, D: n, dims: d, body, pinned: false,
+      area, cd, rho_b, u_t,
+      // FALLS ALONG +x, the long axis. Nothing about the solver prefers an
+      // axis; the domain does.
+      gravity: [gEff, 0, 0],
+      gEff,
+      // Quiescent fluid, and a sponge that holds it there rather than at a
+      // freestream -- this is a body falling through still fluid, not a body
+      // held in a flow.
+      sponge: { width: Math.max(6, Math.round(n / 2)), u: [0, 0, 0] },
+      force: [0, 0, 0],
+      blockage: area / (d[1] * d[2]),
+      // Time to terminal is ~U_T/g_eff; the natural unit for how long a run
+      // needs, and the tools size their windows from it.
+      tSettle: u_t / gEff,
+      convective: n / u_t,
+      cdReference: cd,
+    };
+  },
+  macro: (dims, p) => seedMacro3Perturbed(dims, () => [0, 0, 0], p.perturb * p.u_t, p.seed),
+};
+
 // --- drift: a body that TRANSLATES, for the dynamic-refinement gate --------
 //
 // plans/3D.md M4.2b-iii. A free sphere given an initial linear velocity with
