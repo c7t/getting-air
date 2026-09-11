@@ -810,7 +810,8 @@ async function init() {
       { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
       { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
       { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-        ]});
+              { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    ]});
     const avgBGL = device.createBindGroupLayout({ entries: [
       { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
       { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
@@ -829,6 +830,10 @@ async function init() {
     interpFullPipe = await mk(interpBGL, interpModule, { ...poolConst, TAU_COARSE, DC_PRE, GHOST_ONLY: 0, TIME_BLEND: 0.0 });
     step1Pipe = await mk(step1BGL, step1Module, {
       ...poolConst,
+      // A finer level below this one means this level stops solving where it
+      // is covered -- what the dense step has always done. 0 at ?levels=2,
+      // so the lookup folds out and the build is bit-identical.
+      HAS_CHILD: L[2] ? 1 : 0,
       // Chen's coalesce averages advected-but-UNCOLLIDED interface states,
       // so under explode/coalesce the ring advects and stores only.
       COLLIDE_RING: EXPLODE ? 0 : 1,
@@ -920,10 +925,14 @@ async function init() {
       [mkInterp(fA, fB, fPoolA), mkInterp(fA, fB, fPoolB)],   // coarse t in fA
       [mkInterp(fB, fA, fPoolA), mkInterp(fB, fA, fPoolB)],   // coarse t in fB
     ];
+    // Binding 6 is the CHILD level's blockSlot where there is one and this
+    // level's own where there is not -- a harmless self-reference that keeps
+    // ONE layout, since HAS_CHILD = 0 folds every read of it away.
     const mkStep = (a, b) => device.createBindGroup({ layout: step1BGL, entries: [
       { binding: 0, resource: { buffer: a } }, { binding: 1, resource: { buffer: b } },
       { binding: 2, resource: { buffer: macPool } }, { binding: 3, resource: { buffer: bodyBuf } },
-      { binding: 4, resource: { buffer: slotToBlockBuf } }, { binding: 5, resource: { buffer: blockSlotBuf } }]});
+      { binding: 4, resource: { buffer: slotToBlockBuf } }, { binding: 5, resource: { buffer: blockSlotBuf } },
+      { binding: 6, resource: { buffer: (L[2] || L[1]).blockSlot } }]});
     step1BG_AB = mkStep(fPoolA, fPoolB);
     step1BG_BA = mkStep(fPoolB, fPoolA);
     // average writes the coarse buffer the COARSE step just wrote, so it
@@ -996,6 +1005,7 @@ async function init() {
         lv.step1Pipe = await mk(step1BGL, step1Module, {
           ...pc,
           COLLIDE_RING: EXPLODE ? 0 : 1,
+          HAS_CHILD: L[m + 1] ? 1 : 0,
           OMEGA_FINE: 1 / tauAtLevel(m),
           FORCE_X: params.force[0], FORCE_Y: params.force[1], FORCE_Z: params.force[2],
           HAS_BODY, USE_BOUNCEBACK, CHI_EPS,
@@ -1025,7 +1035,8 @@ async function init() {
         const mkStepL = (a, b) => device.createBindGroup({ layout: step1BGL, entries: [
           { binding: 0, resource: { buffer: a } }, { binding: 1, resource: { buffer: b } },
           { binding: 2, resource: { buffer: lv.mac } }, { binding: 3, resource: { buffer: bodyBuf } },
-          { binding: 4, resource: { buffer: lv.slotToBlock } }, { binding: 5, resource: { buffer: lv.blockSlot } }]});
+          { binding: 4, resource: { buffer: lv.slotToBlock } }, { binding: 5, resource: { buffer: lv.blockSlot } },
+          { binding: 6, resource: { buffer: (L[m + 1] || lv).blockSlot } }]});
         lv.step1BG_AB = mkStepL(lv.fA, lv.fB);
         lv.step1BG_BA = mkStepL(lv.fB, lv.fA);
 

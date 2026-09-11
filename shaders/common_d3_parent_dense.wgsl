@@ -24,3 +24,11 @@
 
 fn parentIndex(v: vec3<u32>) -> i32 { return i32(coarseCell(v)); }
 fn parentPresent(v: vec3<u32>) -> bool { return true; }
+
+// THE PARENT'S MACROSCOPIC ARRAY HAS A DIFFERENT LAYOUT AT DEPTH, and that
+// is not a style difference -- it is a silent bug if assumed away. The dense
+// L0 `mac` is INTERLEAVED, [rho,ux,uy,uz] per cell, because the renderer and
+// every host readback walk it that way. A pool `mac_pool` is PLANAR,
+// component-major, because pool kernels stride by slot. Coalesce writes one
+// of them and reads the other, so it has to ask.
+fn parentMacIndex(cell: u32, comp: u32, plane: u32) -> u32 { return 4u * cell + comp; }

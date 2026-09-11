@@ -252,10 +252,14 @@ fn coalesceAt(c: vec3<u32>) {
       mac_pool[2u * macPlane + fc],
       mac_pool[3u * macPlane + fc]);
   }
-  mac[4u * cell + 0u] = rhoSum * 0.125f;
-  mac[4u * cell + 1u] = momSum.x / max(rhoSum, 1e-6f);
-  mac[4u * cell + 2u] = momSum.y / max(rhoSum, 1e-6f);
-  mac[4u * cell + 3u] = momSum.z / max(rhoSum, 1e-6f);
+  // parentMacIndex, not 4*cell+c: the dense L0 mac is interleaved and a pool
+  // mac_pool is planar. See either parent fragment's note -- assuming the
+  // dense layout at depth measured -8.0e+3 of mass drift.
+  let macOutPlane = arrayLength(&mac) / 4u;
+  mac[parentMacIndex(cell, 0u, macOutPlane)] = rhoSum * 0.125f;
+  mac[parentMacIndex(cell, 1u, macOutPlane)] = momSum.x / max(rhoSum, 1e-6f);
+  mac[parentMacIndex(cell, 2u, macOutPlane)] = momSum.y / max(rhoSum, 1e-6f);
+  mac[parentMacIndex(cell, 3u, macOutPlane)] = momSum.z / max(rhoSum, 1e-6f);
 
   // --- coalesce ------------------------------------------------------------
   for (var i = 0u; i < QN; i++) {

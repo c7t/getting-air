@@ -57,3 +57,10 @@ fn parentIndex(v: vec3<u32>) -> i32 {
 }
 
 fn parentPresent(v: vec3<u32>) -> bool { return parentSlotOf(v) >= 0; }
+
+// PLANAR, unlike the dense sibling's interleaved layout -- see its note. A
+// pool's macroscopic array is component-major, the same way its f array is,
+// and writing it in the dense layout was measured as a mass drift of -8.0e+3
+// against a bound of 5: every moment landed in a different cell. It survived
+// a first look because both arrays are f32 of exactly the right length.
+fn parentMacIndex(cell: u32, comp: u32, plane: u32) -> u32 { return comp * plane + cell; }

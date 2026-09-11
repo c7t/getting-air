@@ -28,6 +28,12 @@
 @group(0) @binding(3) var<storage, read>       body        : BodyState3D;
 @group(0) @binding(4) var<storage, read>       slotToBlock : array<i32>;
 @group(0) @binding(5) var<storage, read>       blockSlot   : array<i32>;
+// The level BELOW this one, when there is one (plans/3D.md M5.2b-iii). Bound
+// always so the layout does not fork -- sec 6's 238e48c rule -- and read only
+// when HAS_CHILD is 1, which folds the lookup out at pipeline-creation time
+// at the deepest level. At ?levels=2 that is every level, so this is
+// bit-identical to the code before it existed.
+@group(0) @binding(6) var<storage, read>       childBlockSlot : array<i32>;
 
 // The FINE level's own relaxation rate, 1/tau_fine with
 // tau_fine = 2*tau_coarse - 0.5. Passed in rather than derived so there is
@@ -62,6 +68,46 @@ override CHI_EPS : f32 = 1.5f;
 // stored. 0 restores the pre-M4.1b behaviour of colliding everything, which
 // is what `?interface=interp` needs to stay a faithful A/B.
 override COLLIDE_RING : u32 = 0u;
+
+// 1 when a finer level exists below this one.
+override HAS_CHILD : u32 = 0u;
+
+// AN INTERIOR CELL THIS LEVEL NO LONGER SOLVES, because a finer level does.
+// `coveredByFiner` from common_d3_step.wgsl -- which the DENSE level has
+// always had -- applied one rung down. Its absence was a real momentum leak
+// the moment a third level existed, and the leak was in `mac_pool`:
+//
+//   coalesce(child -> this level) writes this level's mac_pool at covered
+//   cells, from the child's own moments, correctly. Then THIS KERNEL ran
+//   afterwards and overwrote it -- with moments taken from a population
+//   vector that is part delivery-outbox and part self-stepped, because
+//   coalesce only writes the directions whose target is unrefined. The
+//   parent's own coalesce then reads those moments and hands them upward.
+//
+// A COVERED CELL'S POPULATIONS ARE NOT A DISTRIBUTION, deliberately: they
+// are an OUTBOX, staging the fine outflux in the slot the coarse neighbour
+// will pull from. Taking moments of an outbox is the mistake, and skipping
+// the cell removes it -- nothing else reads those populations, because a
+// neighbour only ever pulls direction i from a cell whose target IS that
+// neighbour, and coalesce writes exactly those.
+//
+// INTERIOR ONLY, AND THAT IS THE WHOLE CORRECTION. The first attempt at
+// this skipped RING cells too, on the reasoning that a covered ring cell is
+// never read -- and mass drift went from 2e-1 to -8e+3. A ring cell is this
+// level's ghost for ITS OWN parent, and the parent's coalesce harvests the
+// outflux out of exactly those cells: it has to keep advecting whether or
+// not a child happens to cover it. The two roles are independent and the
+// cell serves both.
+//
+// `g` is this level's own global cell coordinate. A child block covers RB of
+// this level's cells, and there are fineDim()/RB of them per axis.
+fn coveredByChild(g: vec3<i32>) -> bool {
+  if (HAS_CHILD == 0u) { return false; }
+  let w = vec3<u32>(wrapFine3(g));
+  let cb = w / RB;
+  let n = vec3<u32>(fineDim()) / RB;
+  return childBlockSlot[(cb.z * n.y + cb.y) * n.x + cb.x] >= 0;
+}
 
 override SPONGE_W : f32 = 0.0f;
 override SPONGE_UX : f32 = 0.0f;
@@ -105,6 +151,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let b = blockXYZ(u32(blockID));
   let origin = b * RB;
   let RB2 = 2u * RB;
+
+  // Covered by a finer level? Then this level does not solve here and must
+  // not write -- neither the populations nor mac_pool. See coveredByChild,
+  // including why this tests the INTERIOR only.
+  if (isInterior3(fi)
+      && coveredByChild(vec3<i32>(b) * i32(RB2) + vec3<i32>(fi) - i32(GHOST))) { return; }
 
   // Neighbour-slot resolution, hoisted out of the QN-direction gather.
   // A source is at most one cell away and an interior is RB2 >= 2 wide, so
