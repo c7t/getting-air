@@ -161,7 +161,9 @@ async function init() {
     'uscale', 'vscale', 'vortGamma', 'bounceback', 'chiEps', 'vmax', 'omax',
     'levels', 'rb', 'refine', 'margin', 'boxfrac', 'dcpre', 'reflux', 'interface',
     'explin', 'orphans', 'dynamic', 'manageEvery', 'slotHeadroom', 'amrskip',
-    'manageMargin', 'manageStart']);
+    'manageMargin', 'manageStart',
+    // M6: the resample volume.
+    'vol', 'volbox', 'volBudget']);
   for (const k of urlParams.keys()) {
     if (PAGE_PARAMS.has(k) || k in SCENARIOS[scenarioName].defaults) continue;
     throw new Error(`?${k}=: not a parameter of scenario "${scenarioName}" `
@@ -1459,6 +1461,152 @@ async function init() {
     }));
   }
 
+  // --- M6.1: the resample volume -------------------------------------------
+  //
+  // The hierarchy onto a dense box, for the raymarcher M6.3 will point at
+  // it. Every default here comes from the ballpark in plans/3D.md M6, not
+  // from taste:
+  //
+  //   ?vol=N       voxels per L0 cell. 0 (the default) builds nothing --
+  //                the slice view samples the tree directly and owes this
+  //                pass nothing, so until M6.3 has something to look at,
+  //                filling a volume every frame would be pure cost. The
+  //                gate config turns it on.
+  //   ?volbox=     `domain` (default) or `refined` -- the finest level's
+  //                bounding box. That is the 10 MB case against the full
+  //                domain's 2.25 GB for the SAME data at the SAME
+  //                resolution, which is the ratio AMR exists to exploit.
+  //   ?volBudget=  MiB, default 256. Exceeding it REFUSES rather than
+  //                silently shrinking, for M5.0's reason: a view that
+  //                quietly renders a coarser volume than asked for is a
+  //                plausible picture of a grid nobody chose.
+  const VOL_MULT = Math.max(0, numParam('vol', 0));
+  const VOL_BUDGET_MB = Math.max(1, numParam('volBudget', 256));
+  const volBoxMode = urlParams.get('volbox') || 'domain';
+  if (!['domain', 'refined'].includes(volBoxMode)) {
+    statusEl.textContent = `error: ?volbox=${volBoxMode} is not one of domain|refined`;
+    return;
+  }
+  // A level's refined set in L0 CELL UNITS. A level-m block spans
+  // RB * 2^-(m-1) L0 cells -- level 1's blocks are RB cells wide because its
+  // parent IS L0, and each rung halves that. Checked against the measured
+  // flagship case: level 2's box is 12 blocks per axis at 2 L0 cells = 24.
+  const refinedBoxL0 = (m) => {
+    const a = hier.byLevel[m], w = RB / 2 ** (m - 1);
+    let lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+    for (let id = 0; id < a.pool.nBlocks; id++) {
+      if (a.blockSlot[id] < 0) continue;
+      const b = a.pool.blockOf(id);
+      for (let k = 0; k < 3; k++) { lo[k] = Math.min(lo[k], b[k] * w); hi[k] = Math.max(hi[k], (b[k] + 1) * w); }
+    }
+    return Number.isFinite(lo[0]) ? { lo, hi } : null;
+  };
+  let volTex = null, volPipe = null, volBG = null, volDisp = null, volInfo = null;
+  if (VOL_MULT > 0) {
+    const box = volBoxMode === 'refined' && AMR ? refinedBoxL0(LEVELS - 1) : null;
+    const lo = box ? box.lo : [0, 0, 0];
+    const ext = box ? box.hi.map((h, k) => h - box.lo[k]) : [NX, NY, NZ];
+    const res = ext.map(e => Math.max(1, Math.round(e * VOL_MULT)));
+    const bytes = res[0] * res[1] * res[2] * 8;            // rgba16float
+    if (bytes > VOL_BUDGET_MB * 1048576) {
+      statusEl.textContent = `error: ?vol=${VOL_MULT} over ${volBoxMode} needs a`
+        + ` ${res.join('x')} volume = ${(bytes / 1048576).toFixed(0)} MiB, past ?volBudget=${VOL_BUDGET_MB}.`
+        + ' Lower ?vol=, use ?volbox=refined, or raise the budget deliberately';
+      return;
+    }
+    const lim = device.limits.maxTextureDimension3D;
+    if (Math.max(...res) > lim) {
+      statusEl.textContent = `error: ?vol=${VOL_MULT} needs a ${res.join('x')} volume,`
+        + ` past this GPU's maxTextureDimension3D of ${lim}`;
+      return;
+    }
+    volTex = device.createTexture({
+      size: res, dimension: '3d', format: 'rgba16float',
+      // COPY_SRC so debugReadVolume can score it against the sampler it was
+      // filled from; TEXTURE_BINDING for M6.2 and the raymarcher.
+      usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC,
+      label: 'd3_volume' });
+    const volBGL = device.createBindGroupLayout({ entries: [
+      ...renderBGL_entries.map(e => ({ ...e, visibility: GPUShaderStage.COMPUTE })),
+      { binding: 10, visibility: GPUShaderStage.COMPUTE,
+        storageTexture: { access: 'write-only', format: 'rgba16float', viewDimension: '3d' } },
+    ]});
+    volPipe = await device.createComputePipelineAsync({
+      layout: device.createPipelineLayout({ bindGroupLayouts: [volBGL] }),
+      compute: {
+        module: device.createShaderModule({
+          code: await loadShader(`shaders/d3_resample_q${Q}.wgsl`), label: `d3_resample_q${Q}` }),
+        entryPoint: 'main',
+        constants: { ...dims, RB, SAMPLE_LEVELS,
+          VOL_NX: res[0], VOL_NY: res[1], VOL_NZ: res[2],
+          VOL_OX: lo[0], VOL_OY: lo[1], VOL_OZ: lo[2],
+          VOL_HX: ext[0] / res[0], VOL_HY: ext[1] / res[1], VOL_HZ: ext[2] / res[2] },
+      },
+    });
+    volBG = device.createBindGroup({ layout: volBGL, entries: [
+      ...treeSampleEntries(), { binding: 10, resource: volTex.createView() }]});
+    volDisp = res.map(r => Math.ceil(r / 4));
+    volInfo = { res, lo, ext, h: ext.map((e, k) => e / res[k]), bytes, box: volBoxMode,
+                mult: VOL_MULT, voxels: res[0] * res[1] * res[2] };
+  }
+  const encodeResample = (enc) => {
+    if (!volPipe) return;
+    const vp = enc.beginComputePass();
+    vp.setPipeline(volPipe); vp.setBindGroup(0, volBG);
+    vp.dispatchWorkgroups(volDisp[0], volDisp[1], volDisp[2]); vp.end();
+  };
+
+  // THE GATE (M6.1). Reads the volume back and hands it to the caller
+  // alongside the voxel centres, so a tool can score it against
+  // debugSampleTree at the SAME physical points -- the volume must agree
+  // with the sampler it was filled from, which is the one claim that does
+  // not depend on anything rendering.
+  //
+  // A z-SLAB rather than the whole volume: at the default resolution the
+  // flagship case is 36 MB, which is a fine thing to hold on the GPU and a
+  // silly thing to map into JS every time a check runs.
+  async function debugReadVolume(z) {
+    if (!volTex) return { skipped: 'no volume (?vol=0)' };
+    const [nx, ny] = volInfo.res;
+    const zz = Math.min(volInfo.res[2] - 1, Math.max(0, z | 0));
+    // 256-byte row alignment is a copyTextureToBuffer requirement, not a
+    // suggestion: an unpadded bytesPerRow is a validation error, and a
+    // validation error here is silent.
+    const rowBytes = Math.ceil(nx * 8 / 256) * 256;
+    const buf = device.createBuffer({ size: rowBytes * ny, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    const enc = device.createCommandEncoder();
+    encodeResample(enc);
+    enc.copyTextureToBuffer({ texture: volTex, origin: { x: 0, y: 0, z: zz } },
+      { buffer: buf, bytesPerRow: rowBytes, rowsPerImage: ny }, { width: nx, height: ny, depthOrArrayLayers: 1 });
+    device.queue.submit([enc.finish()]);
+    await buf.mapAsync(GPUMapMode.READ);
+    const raw = new Uint16Array(buf.getMappedRange().slice(0));
+    buf.unmap(); buf.destroy();
+    const out = [];
+    for (let y = 0; y < ny; y++) {
+      for (let x = 0; x < nx; x++) {
+        const o = (y * rowBytes) / 2 + x * 4;
+        out.push({
+          p: [volInfo.lo[0] + (x + 0.5) * volInfo.h[0] - 0.5,
+              volInfo.lo[1] + (y + 0.5) * volInfo.h[1] - 0.5,
+              volInfo.lo[2] + (zz + 0.5) * volInfo.h[2] - 0.5],
+          u: [half(raw[o]), half(raw[o + 1]), half(raw[o + 2])],
+          rho: half(raw[o + 3]),
+        });
+      }
+    }
+    return { info: volInfo, z: zz, texels: out };
+  }
+  // IEEE 754 binary16 -> Number. Exact, including subnormals and the zero
+  // the volume is full of before anything has run -- rounding this would
+  // turn the gate's tolerance into a property of the decoder.
+  function half(h) {
+    const s = (h & 0x8000) ? -1 : 1, e = (h >> 10) & 0x1f, f = h & 0x3ff;
+    if (e === 0) return s * f * 2 ** -24;
+    if (e === 31) return f ? NaN : s * Infinity;
+    return s * (1 + f / 1024) * 2 ** (e - 15);
+  }
+
   // --- state ---------------------------------------------------------------
   let step = 0;
   let useB = false;               // true => the CURRENT field is in fB
@@ -2689,6 +2837,8 @@ async function init() {
       // deeper than the sampler has bindings for. Reported so a tool scores
       // the sampler against the depth it actually has rather than assume.
       sampleLevels: SAMPLE_LEVELS,
+      // null when ?vol=0, which is the default -- see the resample block.
+      volume: volInfo,
       ...(AMR ? {
         rb: RB, fb: pool.FB, ghost: GHOST,
         blocks: pool.nBlocks, activeSlots: poolAlloc.activeSlots,
@@ -2704,7 +2854,7 @@ async function init() {
     }),
     readSubsampled, readDuctProfile, readStats, readBody, readPoolStats,
     debugCheck21Balance, debugCheckGeometryCoverage, debugCheckRingParents, debugPoolState,
-    debugRunBalance, debugSampleTree, debugCheckTreeSample,
+    debugRunBalance, debugSampleTree, debugCheckTreeSample, debugReadVolume,
     readInterfaceDiag, readFluxAcc,
     debugStepSync,
   };
@@ -2713,6 +2863,10 @@ async function init() {
   async function frame() {
     const enc = device.createCommandEncoder();
     if (live) encodeSteps(enc, STEPS_PER_FRAME);
+    // AFTER the steps and before the render, so the volume is the state the
+    // frame is about to show rather than the previous one. A no-op at
+    // ?vol=0, which is the default until M6.3 has something to look at.
+    encodeResample(enc);
     const rp = enc.beginRenderPass({ colorAttachments: [{
       view: ctx.getCurrentTexture().createView(),
       clearValue: { r: 0.07, g: 0.07, b: 0.1, a: 1 }, loadOp: 'clear', storeOp: 'store',

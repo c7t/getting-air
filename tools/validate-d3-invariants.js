@@ -154,6 +154,21 @@ const CONFIGS = [
   // ?dynamic=1 at depth is still refused until M5.5b wires the allocator.
   { name: 'body3', steps: 200,
     url: 'scenario=sphere&n=8&re=20&u0=0.05&q=19&bounceback=1&live=0&levels=3&rb=4&refine=body&interface=explode' },
+  // M6.1. The resample volume, at both box modes, on the depth-3 tree where
+  // the sampler has three levels to choose between.
+  //
+  // `domain` at 1x is the alignment case and is checkable by eye as well as
+  // by the gate: VOL_H = 1 with the origin at 0 puts every voxel centre
+  // exactly on an L0 cell centre, so the resample is a COPY and any box
+  // arithmetic error shows as a shift.
+  //
+  // `refined` at 4x is the case the ballpark exists for -- the finest
+  // level's bounding box at full depth, which is 10 MB on the flagship
+  // against 2.25 GB for the same resolution over the whole domain.
+  { name: 'body3-vol', steps: 8, vol: true, volZ: 16,
+    url: 'scenario=sphere&n=8&re=20&u0=0.05&q=19&bounceback=1&live=0&levels=3&rb=4&refine=body&interface=explode&vol=1' },
+  { name: 'body3-vol-refined', steps: 8, vol: true, volZ: 16,
+    url: 'scenario=sphere&n=8&re=20&u0=0.05&q=19&bounceback=1&live=0&levels=3&rb=4&refine=body&interface=explode&vol=4&volbox=refined' },
   // The same depth-3 tree with the MANAGER rebuilding it, on a PINNED body.
   // `drift3` below is what proves the allocator moves tiles; this one is its
   // control -- the criterion agrees with the initial set, so the manager
@@ -344,6 +359,48 @@ async function runConfig(Runtime, o, c, log) {
       + `  ${ts.ok && (ts.sampleLevels === 0 || ts.refinedHits > 0) ? 'match' : 'DIFFER'}`);
   }
 
+  // M6.1. THE RESAMPLE VOLUME, scored against the sampler it was filled
+  // from. Same physical points, two routes: the GPU wrote them through
+  // common_d3_resample.wgsl into an rgba16float texture, and the probe reads
+  // them through common_d3_tree_sample.wgsl into f32. They must agree to
+  // HALF-PRECISION, and that is the whole tolerance -- there is no
+  // interpolation in either path, so a disagreement is a wrong box
+  // transform, not a resampling error.
+  //
+  // Only where the config asks for a volume (?vol=): it is off by default,
+  // because until the raymarcher exists filling one every frame is cost
+  // with no reader.
+  if (c.vol) {
+    const vol = await evalOrThrow(Runtime, `${G}.debugReadVolume(${c.volZ ?? 0})`, 300000, 'debugReadVolume');
+    if (vol.skipped) res.volSkipped = vol.skipped;
+    else {
+      // Every 7th texel, which is enough to catch a transform error (those
+      // are wrong everywhere or nowhere) without shipping a megabyte of
+      // points back through Runtime.evaluate.
+      const pick = vol.texels.filter((_, i) => i % 7 === 0);
+      const probe = await evalOrThrow(Runtime,
+        `${G}.debugSampleTree(${JSON.stringify(pick.map(t => t.p))})`, 300000, 'debugSampleTree');
+      let worst = 0, bad = 0, first = null;
+      for (let i = 0; i < pick.length; i++) {
+        const a = pick[i].u, b = probe[i].u;
+        // Relative to the field's own scale, not to each component: a
+        // velocity component that is legitimately ~0 would otherwise
+        // dominate a relative error it has no business dominating.
+        const mag = Math.max(1e-6, Math.hypot(b[0], b[1], b[2]));
+        const e = Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]) / mag;
+        if (e > worst) worst = e;
+        // 2^-10 is half-precision's mantissa step; 4x it leaves room for the
+        // rounding of each component without admitting a real disagreement.
+        if (e > 4 / 1024) { bad++; if (!first) first = { p: pick[i].p, vol: a, tree: b, rel: e }; }
+      }
+      res.vol = { info: vol.info, checked: pick.length, worst, bad, first, ok: bad === 0 };
+      if (bad) res.pool.push({ at: 'end', n: bad, first: { kind: 'volumeDiffersFromSampler', ...first } });
+      log(`volume ${vol.info.res.join('x')} @${vol.info.mult}/L0 over ${vol.info.box}`
+        + ` (${(vol.info.bytes / 1048576).toFixed(1)} MiB): ${pick.length} texels,`
+        + ` worst rel ${worst.toExponential(2)} ${bad ? 'DIFFER' : 'match'}`);
+    }
+  }
+
   // Did the manager actually do the thing the config exists to observe?
   // M5.5a. The manager's criterion-and-closure chain, scored against
   // d3-amr.mjs's refineHierarchy -- two independent statements of one rule,
@@ -429,20 +486,20 @@ async function main() {
     await teardown({ port: o.port, tabId, chrome, server, keepOpen: o.keepOpen });
   }
 
-  console.log('\n' + '='.repeat(144));
+  console.log('\n' + '='.repeat(166));
   console.log(`SUMMARY  ${o.steps} steps, checked every ${o.checkEvery}`);
-  console.log('='.repeat(144));
-  console.log(pad('config', 14) + pad('2:1 balance', 21) + pad('ring parents', 18)
-    + pad('geometry coverage', 30) + pad('want vs host', 18) + pad('pool', 24)
-    + pad('tree sample', 16) + padL('verdict', 9));
-  console.log('-'.repeat(144));
+  console.log('='.repeat(166));
+  console.log(pad('config', 18) + pad('2:1 balance', 21) + pad('ring parents', 18)
+    + pad('geometry coverage', 26) + pad('want vs host', 18) + pad('pool', 24)
+    + pad('tree sample', 16) + pad('volume', 16) + padL('verdict', 9));
+  console.log('-'.repeat(166));
   let exitCode = 0;
   for (const r of report) {
-    if (r.error) { console.log(pad(r.name, 14) + pad('-', 21) + pad('-', 18) + pad('-', 30) + pad('-', 18) + pad('-', 24) + pad('-', 16) + padL('ERROR', 9)); exitCode = 1; continue; }
+    if (r.error) { console.log(pad(r.name, 18) + pad('-', 21) + pad('-', 18) + pad('-', 26) + pad('-', 18) + pad('-', 24) + pad('-', 16) + pad('-', 16) + padL('ERROR', 9)); exitCode = 1; continue; }
     const x = r.res;
     const balTxt = x.bal.length ? `${x.bal.length} checkpoints BAD` : (x.vacuous ? 'ok (VACUOUS N=2)' : 'ok');
     const covTxt = x.cov.length ? `${x.cov.length} checkpoints BAD`
-      : (x.covSkipped ? 'skipped (not geometry-forced)' : `ok (${x.required} cells required)`);
+      : (x.covSkipped ? 'skipped (not geom-forced)' : `ok (${x.required} cells)`);
     // Every level, not just level 1: at depth the interesting number is how
     // the tree is distributed, and a single count hides it entirely.
     const perLevel = x.poolState && x.poolState.byLevel
@@ -460,10 +517,16 @@ async function main() {
     // what shows the sampler reached the pool at all.
     const sampTxt = x.sampleSkipped ? 'skipped'
       : (x.sample ? (x.sample.ok ? `ok ${x.sample.byLevel.join('/')}` : 'DIFFERS') : '-');
+    // M6.1. Off in most configs -- the volume is ?vol=0 by default until the
+    // raymarcher reads one -- so most rows say so rather than leaving a gap
+    // that could be read as a pass.
+    const volTxt = x.vol ? (x.vol.ok ? `ok ${x.vol.info.res.join('x')}` : 'DIFFERS')
+      : (x.volSkipped ? 'skipped' : 'off');
     const ok = !x.bal.length && !x.ring.length && !x.cov.length && !x.pool.length && x.finite;
     if (!ok) exitCode = 1;
-    console.log(pad(r.name, 14) + pad(balTxt, 21) + pad(ringTxt, 18) + pad(covTxt, 30)
-      + pad(wantTxt, 18) + pad(poolTxt, 24) + pad(sampTxt, 16) + padL(ok ? 'PASS' : 'FAIL', 9));
+    console.log(pad(r.name, 18) + pad(balTxt, 21) + pad(ringTxt, 18) + pad(covTxt, 26)
+      + pad(wantTxt, 18) + pad(poolTxt, 24) + pad(sampTxt, 16) + pad(volTxt, 16)
+      + padL(ok ? 'PASS' : 'FAIL', 9));
   }
   if (report.some(r => r.res && r.res.blewUp && r.res.finite)) {
     console.log('\n* the field blew up, EXPECTEDLY: that config allocates tiles nothing initializes');
