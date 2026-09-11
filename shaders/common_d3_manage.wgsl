@@ -3,7 +3,7 @@
 // 2D shaders/amr_manage.wgsl. Fragment only; the entry files list every
 // include.
 //
-// TWO ENTRY POINTS, DISPATCHED AS TWO SEPARATE COMPUTE PASSES, coarsen fully
+// COARSEN AND REFINE ARE TWO SEPARATE COMPUTE PASSES, coarsen fully
 // completing before refine starts. That is not tidiness, it is a correctness
 // requirement, and the 2D file records finding it the hard way in a live
 // run: atomics guarantee that the free COUNTER is serialized across threads,
@@ -32,37 +32,33 @@
 // which blocks are wanted from step to step, which is exactly what the
 // bit-identical gate needs to not happen yet.
 //
-// THERE IS NO `balance` ENTRY POINT, AND ITS ABSENCE IS THE DELIVERABLE OF
-// M4.2b-iv rather than an omission. 2:1 balance forces refinement through
-// one closure -- a present block requires its face neighbours' PARENTS to
-// be present -- and that closure is the identity when there is only one
-// refined level, because a level-1 block's parent level is the dense L0
-// grid and L0 is present everywhere. So at ?levels=2 a balance kernel
-// could only ever be a dispatch that writes nothing back.
+// 2:1 BALANCE IS A CLOSURE ON THE WANT SET, and it therefore belongs between
+// `decide` and the drain rather than as a test inside coarsen and refine:
+// "refine forced by a neighbour that wants a deeper child" and "coarsen
+// blocked by a neighbour that has one" are one rule read in two directions,
+// and by the time those two passes run the answer is already balanced. The
+// rule is d3-amr.mjs's `cascade21`, gated by tools/test-d3-amr.js against
+// check21Balance -- a checker written FIRST, in M4.2a, deliberately before
+// there was a manager to be tempted to agree with. `completeOctets` and
+// `balance` below are its GPU mirror (M5.5a), scored against it on real GPU
+// data by tools/validate-d3-invariants.js.
 //
-// The rule itself is written and tested: d3-amr.mjs's `cascade21`, with
-// tools/test-d3-amr.js scoring it against check21Balance -- a checker
-// written first, in M4.2a, deliberately before there was a manager to be
-// tempted to agree with. It runs on the WANT set, which is why it belongs
-// between `decide` and the drain and NOT as a test inside coarsen and
-// refine: "refine forced by a neighbour that wants a deeper child" and
-// "coarsen blocked by a neighbour that has one" are the same closure read
-// in two directions, and by the time those two passes run the answer is
-// already balanced. When M5 adds the pool-parent path, the pass goes
-// there, mirroring cascade21, and the gate is that
-// tools/validate-d3-invariants.js stops printing VACUOUS.
+// At ?levels=2 that closure is the IDENTITY -- a level-1 block's parent
+// level is the dense L0 grid, which is present everywhere -- so neither pass
+// is created there and neither could write anything back if it were.
 //
-// One thing that WILL be needed and is easy to get wrong from the 2D file:
-// refinement is OCTET-COMPLETE from level 2 down. A parent spawns all eight
-// children or none, exactly as amr_manage_pool.wgsl spawns a whole quad,
-// and cascade21 records what happens to a closure that forgets it.
+// REFINEMENT IS OCTET-COMPLETE FROM LEVEL 2 DOWN. A parent spawns all eight
+// children or none, exactly as amr_manage_pool.wgsl spawns a whole quad.
+// Nothing in `refine` enforces that, and nothing needs to: `completeOctets`
+// has already made the WANT set octet-complete, so acting on it per block
+// allocates and frees whole octets. cascade21's header records what a
+// closure that forgets this does to check21Balance.
 //
-// WHAT THIS STAGE DOES NOT DO: a slot handed out here is NOT initialized,
-// and a slot released here is NOT restricted back to the coarse grid first.
-// Both are M4.2b-ii. So a criterion that actually FIRES produces an
-// uninitialized tile today -- which is why ?dynamic=1 is opt-in, why it is
-// refused unless ?refine=body, and why the only case that exercises it has a
-// PINNED body whose wanted-set never changes.
+// WHAT THIS FILE DOES NOT DO: a slot handed out here is not initialized, and
+// a slot released here is not restricted into its parent. Those are the FILL
+// and DRAIN passes -- interp with NEW_ONLY and average with DYING_ONLY --
+// and the order the host encodes them in is the design. See main-3d.js's
+// manager stanza, and plans/3D.md M4.2b-ii / M5.5b.
 
 @group(0) @binding(0) var<storage, read_write> blockSlot   : array<i32>;
 @group(0) @binding(1) var<storage, read_write> slotToBlock : array<i32>;
@@ -226,7 +222,28 @@ fn blockOfId(id: u32) -> vec3<u32> {
   return vec3<u32>(id % nx, (id / nx) % ny, id / (nx * ny));
 }
 
-// PASS 0. Evaluate the criterion, once, into blockWant. Everything after
+// PASS 0a. Zero this level's want, one thread per block.
+//
+// A GPU PASS RATHER THAN A writeBuffer, because the manager is encoded in
+// the middle of a command buffer that already holds hundreds of macro-steps:
+// device.queue.writeBuffer is ordered at SUBMIT, not where it is called, so
+// it would clear the want set of whichever step happened to be encoded last
+// and leave every other step's cascade accumulating into stale data.
+//
+// Needed because `balance` ORs rather than overwrites (see its own note), so
+// every level the criterion does not write must start at zero. The finest
+// level does not need it -- `decide` assigns -- but it is dispatched there
+// too rather than special-cased, since a skipped clear and an assigning
+// `decide` are indistinguishable right up until someone adds a second
+// criterion.
+@compute @workgroup_size(64)
+fn clearWant(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let id = gid.x;
+  if (id >= nbx() * nby() * nbz()) { return; }
+  blockWant[id] = 0u;
+}
+
+// PASS 0b. Evaluate the criterion, once, into blockWant. Everything after
 // this reads the answer rather than recomputing it -- see blockWant's own
 // note. It also fixes the answer for the whole topology change, so the drain
 // pass and the coarsen pass provably agree about which tiles are dying.

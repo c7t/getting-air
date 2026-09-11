@@ -21,14 +21,13 @@
 //                 REPORTED AS VACUOUS at ?levels=2, and that is not a
 //                 formality: with a single refined level a leaf's neighbour
 //                 is level 1 or level 0 and both are legal, so the check
-//                 CANNOT fail today. It says so rather than presenting a
+//                 CANNOT fail there. It says so rather than presenting a
 //                 green tick, because "the checker ran" and "the invariant
-//                 holds" are different claims. Dynamic refinement does not
-//                 change that -- M4.2b moves tiles within ONE level -- so
-//                 the manager ships with no balance pass at all and the
-//                 forcing rule is gated on the host instead (d3-amr.mjs's
-//                 cascade21, tools/test-d3-amr.js). M5 is what makes both
-//                 this line and that pass real.
+//                 holds" are different claims. The depth-3 configs are what
+//                 make it real -- `box3`/`bar3`/`body3` on a tree the HOST
+//                 built, and `body3-dynamic`/`drift3` on one the MANAGER
+//                 rebuilds every ?manageEvery= steps (M5.5a's cascade
+//                 kernel, M5.5b's per-level allocator).
 //   geometry      no coarse cell within ?margin= of the body sits in an
 //                 unrefined block, checked at CELL granularity against the
 //                 SDF -- an independent route from the block-corner
@@ -116,6 +115,31 @@ const CONFIGS = [
   // floor with margin, not a prediction: the point is that it moved at all.
   { name: 'drift', expectBboxMove: 4, steps: 1200,
     url: 'scenario=drift&n=24&live=0&levels=2&rb=4&refine=body&margin=2&interface=explode&dynamic=1&manageEvery=4' },
+  // THE M5.5b GATE: a moving body at DEPTH, where the allocator has to run
+  // at every level and in the order the tree requires. It is the row where
+  // three things are real at once and none of them is real without the
+  // others:
+  //
+  //   coverage   at the FINEST level, against a body that has moved -- so
+  //              the manager must have refined ahead at level 2, which it
+  //              can only do if level 1 was refined around it first
+  //              (cascade21's closure, allocated coarsest-first).
+  //   2:1        a genuine three-level tree, rebuilt from scratch every
+  //              ?manageEvery= steps rather than uploaded once by the host.
+  //              This is the first config where the balance check is a gate
+  //              on the MANAGER and not on refineHierarchy.
+  //   finite     a tile born or absorbed at depth goes through the
+  //              pool-parent fill and drain. Get either wrong and the field
+  //              blows up, which is exactly what an uninitialized tile did
+  //              at depth 2 before M4.2b-ii.
+  //
+  // Smaller than `drift` (n=12, not 24) because a depth-3 shell around the
+  // same sphere is ~270 level-2 tiles at 131 KB each; the claim is about the
+  // allocator, and it does not get truer with more cells. The body still
+  // travels u0 * steps = 0.02 * 600 = 12 coarse cells, which is 6 blocks at
+  // the FINEST level -- where a block spans 2 L0 cells at RB=4.
+  { name: 'drift3', expectBboxMove: 4, steps: 600,
+    url: 'scenario=drift&n=12&live=0&levels=3&rb=4&refine=body&margin=2&interface=explode&dynamic=1&manageEvery=4' },
   // DEPTH 3 (plans/3D.md M5.3). These are the configs that make the 2:1 and
   // ring-parent checks REAL for the first time -- at ?levels=2 both are
   // vacuous for their own separate reasons, and no amount of dynamic
@@ -130,6 +154,15 @@ const CONFIGS = [
   // ?dynamic=1 at depth is still refused until M5.5b wires the allocator.
   { name: 'body3', steps: 200,
     url: 'scenario=sphere&n=8&re=20&u0=0.05&q=19&bounceback=1&live=0&levels=3&rb=4&refine=body&interface=explode' },
+  // The same depth-3 tree with the MANAGER rebuilding it, on a PINNED body.
+  // `drift3` below is what proves the allocator moves tiles; this one is its
+  // control -- the criterion agrees with the initial set, so the manager
+  // must decide "no change" at every level and the run must stay identical
+  // to `body3`. A manager that is subtly wrong at depth tends to fail here
+  // first, because "no change" is the one answer that can be checked against
+  // a static run.
+  { name: 'body3-dynamic', steps: 200,
+    url: 'scenario=sphere&n=8&re=20&u0=0.05&q=19&bounceback=1&live=0&levels=3&rb=4&refine=body&interface=explode&dynamic=1&manageEvery=4' },
   { name: 'bar3', steps: 200,
     url: 'scenario=beltrami&n=16&tau=0.8&u0=0.04&q=19&live=0&levels=3&rb=4&refine=bar&boxfrac=0.5&interface=explode' },
   // THE CONFIG THAT PROVES THE HARD FAILURE FIRES. It asks for far more
@@ -172,7 +205,7 @@ async function runConfig(Runtime, o, c, log) {
   const p = await evalOrThrow(Runtime, `${G}.getParams()`, 20000, 'getParams');
   log(`N=${p.N} Q${p.Q} levels=${p.levels} RB=${p.rb} ${p.activeSlots}/${p.blocks} tiles`);
 
-  const res = { bal: [], ring: [], cov: [], pool: [], finite: true, vacuous: null, covSkipped: null, blewUp: false };
+  const res = { bal: [], ring: [], cov: [], pool: [], finite: true, vacuous: null, covSkipped: null, blewUp: false, fineState: null };
   // A config may cap its own step count: the allocator cases only need a few
   // steps to change hands, and running them long is spending minutes on a
   // field that is deliberately wrong.
@@ -197,7 +230,14 @@ async function runConfig(Runtime, o, c, log) {
     }
     if (ps.inUse != null) {
       res.poolState = ps;
-      if (firstInUse === null) { firstInUse = ps.inUse; firstBbox = ps.bbox; }
+      // THE FINEST LEVEL'S box, not level 1's. The criterion is evaluated
+      // there and every coarser level is derived from it, so the finest
+      // level is where "the shell followed the body" is a statement about
+      // the manager rather than about the closure. At ?levels=2 it IS level
+      // 1 and nothing changes. byLevel is 0-based from level 1.
+      const fine = ps.byLevel ? ps.byLevel[ps.byLevel.length - 1] : ps;
+      res.fineState = fine;
+      if (firstInUse === null) { firstInUse = ps.inUse; firstBbox = fine.bbox; }
     }
     if (bal.skipped) throw new Error(`2:1 balance unavailable: ${bal.skipped}`);
     res.vacuous = bal.vacuous;
@@ -225,16 +265,17 @@ async function runConfig(Runtime, o, c, log) {
     await evalOrThrow(Runtime, `${G}.debugStepSync(${k})`, (o.timeout + 30) * 1000, 'debugStepSync');
     done += k;
   }
-  if (c.expectBboxMove && res.poolState && res.poolState.bbox && firstBbox) {
-    const moved = Math.abs(res.poolState.bbox.lo[0] - firstBbox.lo[0]);
+  if (c.expectBboxMove && res.fineState && res.fineState.bbox && firstBbox) {
+    const moved = Math.abs(res.fineState.bbox.lo[0] - firstBbox.lo[0]);
     const ok = moved >= c.expectBboxMove;
-    res.expectation = { want: `bbox moves >= ${c.expectBboxMove} blocks`, moved, ok };
+    res.expectation = { want: `finest-level bbox moves >= ${c.expectBboxMove} blocks`, moved, ok };
     if (!ok) {
       res.pool.push({ at: 'end', n: 1,
-        first: { kind: 'shellDidNotFollow', movedBlocks: moved, required: c.expectBboxMove,
-                 from: firstBbox.lo, to: res.poolState.bbox.lo } });
+        first: { kind: 'shellDidNotFollow', level: res.fineState.level, movedBlocks: moved,
+                 required: c.expectBboxMove, from: firstBbox.lo, to: res.fineState.bbox.lo } });
     }
-    log(`refined shell: lo.x ${firstBbox.lo[0]} -> ${res.poolState.bbox.lo[0]} (${moved} blocks) ${ok ? 'ok' : 'DID NOT FOLLOW'}`);
+    log(`refined shell (L${res.fineState.level}): lo.x ${firstBbox.lo[0]} -> ${res.fineState.bbox.lo[0]}`
+      + ` (${moved} blocks) ${ok ? 'ok' : 'DID NOT FOLLOW'}`);
   }
   // Did the manager actually do the thing the config exists to observe?
   // M5.5a. The manager's criterion-and-closure chain, scored against

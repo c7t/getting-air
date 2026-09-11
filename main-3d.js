@@ -220,6 +220,12 @@ async function init() {
   // Both are refusals rather than warnings for M5.0's reason: a run that is
   // quietly wrong is worse than one that will not start.
   //
+  // BOTH ARE NOW LIFTED -- M5.4b gave the body one force pass at the finest
+  // level, and M5.5b gave the manager the cascade and a per-level allocator.
+  // What is still refused at any depth is narrower and is not about depth at
+  // all: a body with AMR needs ?refine=body, and ?margin= must cover the
+  // force stencil's reach.
+  //
   // BISECTION HOOK. Each name drops one pass of the pool-parent nest at every
   // level >= 2, which makes the physics wrong on purpose -- the point is to
   // find which pass a blowup lives in by removing passes one at a time, the
@@ -494,20 +500,8 @@ async function init() {
     // checking the two against each other is how the 2D free-list race was
     // confirmed -- they disagreed for exactly the colliding slot.
     lv.slotToBlock = device.createBuffer({ size: slots * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
-    const s2b = new Int32Array(slots).fill(-1);
-    s2b.set(alloc.slotToBlock.slice(0, Math.min(slots, alloc.activeSlots)));
-    device.queue.writeBuffer(lv.blockSlot, 0, alloc.blockSlot);
-    device.queue.writeBuffer(lv.slotToBlock, 0, s2b);
-    // The free list, a classic GPU stack: freeCount is how many slots are
-    // free, and the top of the stack lives at freeList[freeCount-1]. Slots
-    // [0, activeSlots) start in use; everything above is free.
-    const nFree = slots - alloc.activeSlots;
-    const freeInit = new Int32Array(Math.max(1, slots));
-    for (let i = 0; i < nFree; i++) freeInit[i] = alloc.activeSlots + i;
     lv.freeList = device.createBuffer({ size: Math.max(1, slots) * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
     lv.freeCount = device.createBuffer({ size: 16, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
-    device.queue.writeBuffer(lv.freeList, 0, freeInit);
-    device.queue.writeBuffer(lv.freeCount, 0, new Int32Array([nFree, 0, 0, 0]));
     // Always allocated, even when static: `blockWant` and `slotNew` are bound
     // into the interp and average layouts, and a layout that exists in two
     // versions is exactly the 238e48c failure surface. One dummy element is
@@ -523,10 +517,36 @@ async function init() {
     // The initial set is not "new": it was uploaded with real data by the
     // host, and marking it new would have the fill pass overwrite every tile
     // with a coarse interpolation on the first step.
-    device.queue.writeBuffer(lv.slotNew, 0, new Uint32Array(DYNAMIC ? slots : 1));
-    device.queue.writeBuffer(lv.blockWant, 0, new Uint32Array(nBlocks));
+    uploadLevelTopology(lv);
     return lv;
   };
+  // THE WHOLE OF A LEVEL'S BOOKKEEPING, uploaded from the host's initial
+  // refinement. Split out of makeLevelBuffers because reset() has to restore
+  // it too (M5.5b): the manager rewrites blockSlot, slotToBlock and the free
+  // list as tiles change hands, so re-zeroing only freeCount -- which is what
+  // reset used to do -- would leave a free list whose entries are slots that
+  // are still in use. Static runs never noticed, because nothing there ever
+  // changed. The field is re-seeded right after, so the topology and the
+  // data are restored together or not at all.
+  function uploadLevelTopology(lv) {
+    const { alloc, slots, nBlocks } = lv;
+    const s2b = new Int32Array(slots).fill(-1);
+    s2b.set(alloc.slotToBlock.slice(0, Math.min(slots, alloc.activeSlots)));
+    device.queue.writeBuffer(lv.blockSlot, 0, alloc.blockSlot);
+    device.queue.writeBuffer(lv.slotToBlock, 0, s2b);
+    // The free list, a classic GPU stack: freeCount is how many slots are
+    // free, and the top of the stack lives at freeList[freeCount-1]. Slots
+    // [0, activeSlots) start in use; everything above is free. freeCount[1]
+    // is the refusal counter, and clearing it here is what makes the hard
+    // failure per-RUN rather than permanent.
+    const nFree = slots - alloc.activeSlots;
+    const freeInit = new Int32Array(Math.max(1, slots));
+    for (let i = 0; i < nFree; i++) freeInit[i] = alloc.activeSlots + i;
+    device.queue.writeBuffer(lv.freeList, 0, freeInit);
+    device.queue.writeBuffer(lv.freeCount, 0, new Int32Array([nFree, 0, 0, 0]));
+    device.queue.writeBuffer(lv.slotNew, 0, new Uint32Array(DYNAMIC ? slots : 1));
+    device.queue.writeBuffer(lv.blockWant, 0, new Uint32Array(nBlocks));
+  }
   if (AMR) {
     for (let m = 1; m < LEVELS; m++) L[m] = makeLevelBuffers(m);
     // Per coarse cell: the mass and momentum the FINE solver moved across
@@ -726,8 +746,11 @@ async function init() {
   let explodePipe = null, coalescePipe = null;
   let explodeBG = null, coalesceBG = null;
   let forcePoolPipe = null, forcePoolBG = null, forcePoolDisp = null;
-  let manageCoarsenPipe = null, manageRefinePipe = null, manageBG = null;
-  let manageDecidePipe = null, manageClearPipe = null;
+  // The manager's per-level pipelines live on L[m] (M5.5b); only the
+  // criterion is a single pipeline, because only the finest level evaluates
+  // it. manageBG is level 1's bind group, still named by the depth-2 aliases
+  // below.
+  let manageBG = null, manageDecidePipe = null;
   let fillPipe = null, drainPipe = null;
 
   // M4's interface flux correction. OPT-IN (?reflux=1), and NOT the default
@@ -808,15 +831,12 @@ async function init() {
       return;
     }
   }
-  // UNREACHABLE TODAY and kept deliberately: ?dynamic=1 is itself refused
-  // without ?refine=body, so the body refusal above always fires first. It
-  // stops being unreachable the moment M5.4 lifts that one, which is exactly
-  // when it has to already be here.
-  if (LEVELS >= 3 && DYNAMIC) {
-    statusEl.textContent = `error: ?levels=${LEVELS} with ?dynamic=1 needs the 2:1 balance`
-      + ' pass in the manager (plans/3D.md M5.5); not built yet';
-    return;
-  }
+  // M5.5b LIFTED THE LAST DEPTH REFUSAL. ?levels>=3 with ?dynamic=1 used to
+  // stop here, because the manager had no 2:1 balance pass and could
+  // therefore build a tree the invariant forbids. It now has one (M5.5a's
+  // `completeOctets`/`balance`, scored against d3-amr.mjs's cascade21 on
+  // real GPU data) and an allocator that runs at every level in the order
+  // the tree requires. The gate is validate-d3-invariants.js's `drift3`.
   // M4.1d lifted the "explode cannot carry a body" restriction: the body
   // force is now integrated on the level that OWNS each region -- the coarse
   // kernel masks out cells a refined block covers and
@@ -858,12 +878,19 @@ async function init() {
       { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
               { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     ]});
+    // 0 f_pool (ro), 1 the PARENT's f (rw), 2 slotToBlock (ro), 3 blockWant
+    // (ro), 4 the PARENT's mac (rw). M5.5b swapped 3 and 4 so that binding 4
+    // is the parent's macroscopic array in every kernel that writes one --
+    // average as well as coalesce -- because that is the binding
+    // common_d3_parentmac_{dense,pool}.wgsl declares, and that fragment pair
+    // is the only thing standing between the two layouts and a silent
+    // transposition. See its header for what one cost.
     const avgBGL = device.createBindGroupLayout({ entries: [
       { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
       { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
       { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-      { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-      { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+      { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+      { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
     ]});
 
     const mk = (bgl, module, constants) => device.createComputePipelineAsync({
@@ -899,6 +926,8 @@ async function init() {
       fillPipe = await mk(interpBGL, interpModule,
         { ...poolConst, TAU_COARSE, DC_PRE, GHOST_ONLY: 0, TIME_BLEND: 0.0, NEW_ONLY: 1 });
       drainPipe = await mk(avgBGL, avgModule, { ...poolConst, TAU_COARSE, DC_PRE, DYING_ONLY: 1 });
+      L[1].fillPipe = fillPipe;
+      L[1].drainPipe = drainPipe;
     }
 
     // M4.2b-i: the dynamic-refinement manager. TWO pipelines over ONE module
@@ -928,10 +957,6 @@ async function init() {
         // reproduces the host's initial set exactly and M4.2b-i's
         // bit-identical gate is untouched.
         MANAGE_EVERY };
-      const mkManage = (entry) => device.createComputePipelineAsync({
-        layout: device.createPipelineLayout({ bindGroupLayouts: [manageBGL] }),
-        compute: { module: manageModule, entryPoint: entry, constants: manageConst },
-      });
       // THE CRITERION RUNS AT THE FINEST LEVEL ONLY (M5.1b), so `decide` is
       // one pipeline, built in that level's frame. Every coarser level's
       // want is derived by the closure below, never re-decided.
@@ -949,10 +974,22 @@ async function init() {
       // neither has a race to reason about -- see the shader.
       for (let m = 2; m < LEVELS; m++) L[m].octetsPipe = await mkManageAt('completeOctets', m);
       for (let m = 1; m < LEVELS - 1; m++) L[m].balancePipe = await mkManageAt('balance', m);
+      // `balance` ORs into its level's want, so every level the criterion
+      // does not write must be zeroed first -- and by a KERNEL, not a
+      // writeBuffer, which is ordered at submit rather than where it is
+      // encoded. See clearWant's own note.
+      for (let m = 1; m < LEVELS; m++) L[m].clearWantPipe = await mkManageAt('clearWant', m);
       if (DYNAMIC) {
-        manageCoarsenPipe = await mkManage('coarsen');
-        manageRefinePipe = await mkManage('refine');
-        manageClearPipe = await mkManage('clearNew');
+        // PER LEVEL (M5.5b). These used to be three pipelines built from
+        // level 1's constants, which is the same silence M5.0 refused
+        // ?levels=3 for: nbx() comes from NX, so a level-2 dispatch through
+        // a level-1 pipeline would walk an eighth of the blocks and call the
+        // rest unrefined.
+        for (let m = 1; m < LEVELS; m++) {
+          L[m].coarsenPipe = await mkManageAt('coarsen', m);
+          L[m].refinePipe = await mkManageAt('refine', m);
+          L[m].clearNewPipe = await mkManageAt('clearNew', m);
+        }
       }
       const wantDummy = { blockWant: device.createBuffer({ size: 4, usage: U.STORAGE }) };
       manageBG = device.createBindGroup({ layout: manageBGL, entries: [
@@ -1051,10 +1088,17 @@ async function init() {
     // also needs one per parity.
     const mkAvg = (dst) => device.createBindGroup({ layout: avgBGL, entries: [
       { binding: 0, resource: { buffer: fPoolA } }, { binding: 1, resource: { buffer: dst } },
-      { binding: 2, resource: { buffer: slotToBlockBuf } }, { binding: 3, resource: { buffer: mac } },
-      { binding: 4, resource: { buffer: blockWantBuf } }]});
+      { binding: 2, resource: { buffer: slotToBlockBuf } }, { binding: 3, resource: { buffer: blockWantBuf } },
+      { binding: 4, resource: { buffer: mac } }]});
     avgBGA = mkAvg(fA);
     avgBGB = mkAvg(fB);
+    // M5.5b: level 1's DRAIN and FILL, indexed by COARSE PARITY. Both act on
+    // the parent's time-t buffer, which at level 1 is the one L0 ping-pongs
+    // -- and only at level 1: every deeper level begins and ends a macro-step
+    // in its own fA (advanceLevel takes parity 0 then 1), so the pool-parent
+    // pair below is parity-free and the index is ignored there.
+    L[1].drainBG = [avgBGA, avgBGB];
+    L[1].fillBG = [interpBG[0][0], interpBG[1][0]];
 
     // --- M4.1b explode / coalesce ----------------------------------------
     if (EXPLODE) {
@@ -1180,6 +1224,47 @@ async function init() {
           { binding: 0, resource: { buffer: par.fA } }, { binding: 1, resource: { buffer: lv.fA } },
           { binding: 2, resource: { buffer: lv.slotToBlock } }, { binding: 3, resource: { buffer: par.fA } },
           { binding: 4, resource: { buffer: lv.slotNew } }, { binding: 8, resource: { buffer: par.blockSlot } }]});
+
+        // --- M5.5b: the allocator's two transfers, at depth ---------------
+        //
+        // FILL is the seed pipeline with NEW_ONLY: same module, same bind
+        // group, one override apart. A tile the manager has just allocated
+        // wants exactly the coarse->fine transfer the seed performs; the
+        // only difference is that the seed fills every tile and the fill
+        // fills the ones `refine` flagged.
+        //
+        // The bind group is SHARED rather than rebuilt because it is
+        // literally the same resources: the parent's time-t buffer is its
+        // fA at every level >= 2 (see L[1].fillBG's note), and the
+        // destination is this level's fA, which is the buffer its next
+        // substep reads.
+        lv.fillPipe = DYNAMIC ? await mk(interpPoolBGL, interpPoolModule,
+          { ...pc, TAU_COARSE: tauAtLevel(m - 1), DC_PRE, GHOST_ONLY: 0, TIME_BLEND: 0.0, NEW_ONLY: 1 }) : null;
+        lv.fillBG = [lv.interpSeedBG, lv.interpSeedBG];
+
+        // DRAIN is the pool-parent sibling of level 1's `average` -- the
+        // restriction that puts a dying tile's solution back into its parent
+        // before `coarsen` frees the slot. It is the one piece M5.5b had to
+        // build rather than re-parameterize, and it is built the same way
+        // every other pool-parent kernel here is: the shared body with
+        // common_d3_parent_pool.wgsl and common_d3_parentmac_pool.wgsl
+        // spliced in, so there is no second copy of the transfer.
+        if (DYNAMIC) {
+          const avgPoolModule = device.createShaderModule({
+            code: await loadShader(`shaders/d3_amr_average_pool_q${Q}.wgsl`), label: `d3_amr_average_pool_q${Q}` });
+          const avgPoolBGL = device.createBindGroupLayout({ entries: [ro(0), rw(1), ro(2), ro(3), rw(4), ro(8)] });
+          lv.drainPipe = await mk(avgPoolBGL, avgPoolModule,
+            { ...pc, TAU_COARSE: tauAtLevel(m - 1), DC_PRE, DYING_ONLY: 1 });
+          const drainBG = device.createBindGroup({ layout: avgPoolBGL, entries: [
+            { binding: 0, resource: { buffer: lv.fA } }, { binding: 1, resource: { buffer: par.fA } },
+            { binding: 2, resource: { buffer: lv.slotToBlock } }, { binding: 3, resource: { buffer: lv.blockWant } },
+            // The PARENT's mac pool, planar -- the same array coalesce
+            // republishes into, and for the same reason: a cell that stops
+            // being covered must not keep the moments it had while it was.
+            { binding: 4, resource: { buffer: par.mac } },
+            { binding: 8, resource: { buffer: par.blockSlot } }]});
+          lv.drainBG = [drainBG, drainBG];
+        }
       }
     }
 
@@ -1292,6 +1377,14 @@ async function init() {
   // ping-pong parity does not matter after a reset.
   function reset() {
     device.queue.writeBuffer(mac, 0, sc.macro(params.dims, params));
+    // TOPOLOGY FIRST, AND BEFORE THE SEED (M5.5b). The seed interpolates the
+    // fresh coarse field into whichever blocks slotToBlock currently names,
+    // so restoring the initial refinement after it would fill the tiles the
+    // manager happened to leave behind and then relabel them. Only matters
+    // once the manager can move a tile; it is unconditional anyway, because
+    // "restore the topology" and "restore the field" are one operation and
+    // splitting them by a flag is how they come apart.
+    if (AMR) for (let m = 1; m < LEVELS; m++) uploadLevelTopology(L[m]);
     if (HAS_BODY) {
       device.queue.writeBuffer(bodyBuf, 0, packBodyState(params.body, {
         pinned: !!params.pinned,
@@ -1338,10 +1431,10 @@ async function init() {
     // initEq READ mac and did not write it, so mac still holds the seed --
     // which is exactly the field the renderer should show at step 0.
     step = 0; useB = false;
-    // The latch is per-RUN, not permanent: reset re-seeds the pool from the
-    // initial refinement, which is by construction within budget.
+    // The latch is per-RUN, not permanent: the upload above put every level
+    // back on its initial refinement, which is by construction within budget,
+    // and cleared freeCount[1] with it.
     poolExhausted = 0;
-    if (DYNAMIC) device.queue.writeBuffer(freeCountBuf, 0, new Int32Array([MAX_SLOTS - poolAlloc.activeSlots, 0, 0, 0]));
   }
 
   // Pool dispatch shapes. The slot is folded into z because 3D has no
@@ -1361,10 +1454,37 @@ async function init() {
     L[m].tileDisp = poolDispFor(SLOTS[m]);
     L[m].coalesceDisp = m === 1 ? disp : poolDispFor(SLOTS[m - 1]);
   }
-  const avgDisp = AMR ? (() => {
+  // The restriction walks a level's OWN slots: one workgroup per (block, z
+  // sub-slab), the slot folded into z. ceil(RB/4)^3 workgroups cover a
+  // block's RB^3 parent cells, which is 1 at RB = 4.
+  const avgDispFor = (slots) => {
     const per = Math.ceil(RB / 4);
-    return [per, per, per * Math.max(1, MAX_SLOTS)];
-  })() : null;
+    return [per, per, per * Math.max(1, slots)];
+  };
+  const avgDisp = AMR ? avgDispFor(MAX_SLOTS) : null;
+  if (AMR) for (let m = 1; m < LEVELS; m++) L[m].avgDisp = avgDispFor(SLOTS[m]);
+
+  // M5.5a/M5.5b: THE DECIDE-AND-CLOSE CHAIN, encoded in one place.
+  //
+  // The criterion runs at the FINEST level only (M5.1b) and every coarser
+  // level's want is derived from it by the 2:1 closure, deepest first: a
+  // level's octets are completed before its parent gathers from it, which is
+  // cascade21's own sweep order. `balance` ORs, so each derived level is
+  // zeroed first.
+  //
+  // Shared by the manager and by debugRunBalance rather than written twice.
+  // debugRunBalance is the gate that scores this chain against
+  // d3-amr.mjs's refineHierarchy on real GPU data; if it ran a different
+  // order from the one the solver runs, it would be scoring a chain nothing
+  // uses.
+  const encodeDecideChain = (enc, managePass) => {
+    for (let m = 1; m < LEVELS; m++) managePass(L[m].clearWantPipe, m);
+    managePass(manageDecidePipe, LEVELS - 1);
+    for (let m = LEVELS - 1; m >= 2; m--) {
+      managePass(L[m].octetsPipe, m);
+      managePass(L[m - 1].balancePipe, m - 1);
+    }
+  };
 
   // ORDER PER MACRO-STEP: zero -> force (+ fine force) -> physics -> step.
   //
@@ -1504,44 +1624,79 @@ async function init() {
       // way, so the bit-identical gate below CANNOT catch it. Found by
       // reading, not by testing, and worth saying out loud: an
       // "it changed nothing" gate is blind to how often the nothing ran.
-      if (manageCoarsenPipe && (step + s) >= MANAGE_START && ((step + s - MANAGE_START) % MANAGE_EVERY) === 0) {
-        const nbTot = pool.nb[0] * pool.nb[1] * pool.nb[2];
-        const wgB = Math.ceil(nbTot / 64);
-        const wgS = Math.ceil(MAX_SLOTS / 64);
-        const blockPass = (pipe, n) => {
-          const mp = enc.beginComputePass();
-          mp.setPipeline(pipe); mp.setBindGroup(0, manageBG);
-          mp.dispatchWorkgroups(n); mp.end();
-        };
-        // FIVE PASSES, AND THE ORDER IS THE WHOLE DESIGN (M4.2b-ii).
+      if (DYNAMIC && manageDecidePipe && (step + s) >= MANAGE_START && ((step + s - MANAGE_START) % MANAGE_EVERY) === 0) {
+        // THE ORDER IS THE WHOLE DESIGN (M4.2b-ii), and M5.5b makes every
+        // line of it a sweep over levels rather than a single dispatch.
         //
-        //   decide   evaluate the criterion ONCE into blockWant, so every
-        //            pass below answers the same question. Two passes each
-        //            recomputing it is two chances to disagree.
-        //   (balance) the 2:1 closure would go HERE, on blockWant, before
-        //            anything acts on it -- M4.2b-iv. It is absent because
-        //            at ?levels=2 it is provably the identity: see
-        //            common_d3_manage.wgsl's header and d3-amr.mjs's
-        //            cascade21, which is the rule, written and tested.
-        //   drain    restrict a dying tile onto its coarse cells. MUST come
-        //            before coarsen: coarsen frees the slot and refine can
-        //            hand that same slot straight out in the next pass, by
-        //            which point the fine solution is gone.
-        //   coarsen  free the slots. Only writes to freeList.
-        //   refine   allocate. Only reads freeList -- see the manager's own
-        //            header for the race that forces this split.
-        //   fill     initialize the just-allocated tiles from the coarse
-        //            field. MUST come after refine: there is no slot to fill
-        //            until refine has handed one out.
-        //   clear    drop the just-filled flags, in its own pass because
-        //            clearing them inside fill is a race on the very test
-        //            fill uses to select its work.
-        blockPass(manageDecidePipe, wgB);
-        gridPass(drainPipe, cp === 0 ? avgBGA : avgBGB);
-        blockPass(manageCoarsenPipe, wgB);
-        blockPass(manageRefinePipe, wgB);
-        tilePass(fillPipe, interpBG[cp][0]);
-        blockPass(manageClearPipe, wgS);
+        //   decide+close  evaluate the criterion at the FINEST level and
+        //                 derive every coarser level's want from it by the
+        //                 2:1 closure, ONCE, so that every pass below
+        //                 answers the same question at every level. Two
+        //                 passes each recomputing it is two chances to
+        //                 disagree; at depth it would be 2*(LEVELS-1).
+        //   drain         restrict a dying tile into its parent. MUST come
+        //                 before coarsen: coarsen frees the slot and refine
+        //                 can hand that same slot straight out in the next
+        //                 pass, by which point the fine solution is gone.
+        //   coarsen       free the slots. Only writes to freeList.
+        //   refine        allocate. Only reads freeList -- see the manager's
+        //                 own header for the race that forces this split.
+        //   fill          initialize the just-allocated tiles from the
+        //                 parent. MUST come after refine: there is no slot
+        //                 to fill until refine has handed one out.
+        //   clear         drop the just-filled flags, in its own pass
+        //                 because clearing them inside fill is a race on
+        //                 the very test fill uses to select its work.
+        //
+        // AND THE LEVEL ORDER IS THE OTHER HALF OF IT (M5.5b):
+        //
+        //   drain/coarsen run FINEST FIRST, because a dying tile restricts
+        //   into its PARENT and the parent must still be holding its slot
+        //   when it does. A whole subtree can die in one topology change,
+        //   and finest-first collapses it one rung at a time: L3 restricts
+        //   into L2, then L2 -- now carrying what L3 handed it -- restricts
+        //   into L1. Coarsest-first would free the parent under the child
+        //   and then average into a slot that has been handed to someone
+        //   else.
+        //
+        //   refine/fill run COARSEST FIRST, the mirror image: a new tile is
+        //   interpolated FROM its parent, so the parent must exist and must
+        //   already hold real data. A newly-refined L2 tile can be the
+        //   parent of a newly-refined L3 tile in the same event, and
+        //   coarsest-first is what makes the second read the first's output
+        //   instead of the previous owner's leftovers.
+        //
+        // The two sweeps are separate for the same reason coarsen and
+        // refine are separate passes at one level: the free list cannot be
+        // pushed and popped in one dispatch.
+        const managePass = (pipe, m, wg) => {
+          const mp = enc.beginComputePass();
+          mp.setPipeline(pipe); mp.setBindGroup(0, L[m].manageBG);
+          mp.dispatchWorkgroups(wg ?? Math.ceil(L[m].nBlocks / 64)); mp.end();
+        };
+        encodeDecideChain(enc, managePass);
+        for (let m = LEVELS - 1; m >= 1; m--) {
+          // avgDisp, NOT the L0 grid dispatch. The drain walks THIS LEVEL'S
+          // SLOTS -- (per, per, per * slots), the shape its own shader
+          // documents -- and it used to be encoded through gridPass, which
+          // dispatches the coarse grid. At RB = 4 that made `per` 1 and the
+          // slot index `wgid.z`, so the pass covered the first NZ/4 slots
+          // and silently skipped every one above: 4 of 160 on the
+          // `body-coarsen` config, 6 on `drift`. A tile coarsened out of a
+          // skipped slot was freed without its solution ever reaching L0.
+          // Invisible to every gate in place -- those configs are
+          // structural, and the pool stays perfectly consistent while the
+          // FIELD loses a tile's worth of fluid.
+          dispatchPass(L[m].drainPipe, L[m].drainBG[cp], L[m].avgDisp);
+          managePass(L[m].coarsenPipe, m);
+        }
+        for (let m = 1; m < LEVELS; m++) {
+          managePass(L[m].refinePipe, m);
+          dispatchPass(L[m].fillPipe, L[m].fillBG[cp], L[m].tileDisp);
+        }
+        // One thread per SLOT, so the dispatch is the slot budget rather
+        // than the block count.
+        for (let m = 1; m < LEVELS; m++) managePass(L[m].clearNewPipe, m, Math.ceil(L[m].slots / 64));
       }
 
 
@@ -1598,14 +1753,22 @@ async function init() {
   // manager running; static refinement can never be refused a slot.
   async function checkPoolExhausted() {
     if (!DYNAMIC || poolExhausted) return poolExhausted;
-    const n = (await readI32(freeCountBuf, 16))[1];
-    if (n > 0) {
+    // EVERY LEVEL, not just level 1 (M5.5b). Each level owns its own free
+    // list and its own refusal counter, and the level that runs out is the
+    // FINEST one -- it holds the most tiles and it is the one the geometry
+    // criterion drives directly -- so checking only level 1 would miss
+    // exactly the case this exists to catch.
+    for (let m = 1; m < LEVELS; m++) {
+      const n = (await readI32(L[m].freeCount, 16))[1];
+      if (n <= 0) continue;
       poolExhausted = n;
       live = false;
       playBtn.textContent = 'play';
-      statusEl.textContent = `error: out of pool slots -- the manager was refused a tile ${n} time(s)`
-        + ` at step ${step}. Refinement is geometry-forced, so this puts a coarse/fine seam`
-        + ` through the body; raise ?slotHeadroom= (now ${SLOT_HEADROOM}) or refine less.`;
+      statusEl.textContent = `error: out of pool slots at level ${m} -- the manager was refused`
+        + ` a tile ${n} time(s) at step ${step}. Refinement is geometry-forced, so this puts a`
+        + ` coarse/fine seam through the body; raise ?slotHeadroom= (now ${SLOT_HEADROOM})`
+        + ' or refine less.';
+      break;
     }
     return poolExhausted;
   }
@@ -1922,24 +2085,15 @@ async function init() {
   // on the manager.
   async function debugRunBalance() {
     if (!AMR || !manageDecidePipe) return { skipped: 'no geometry-forced criterion' };
-    const deepest = LEVELS - 1;
-    // Every level but the finest accumulates with |=, so it starts at zero.
-    for (let m = 1; m < deepest; m++) {
-      device.queue.writeBuffer(L[m].blockWant, 0, new Uint32Array(L[m].nBlocks));
-    }
     const enc = device.createCommandEncoder();
-    const pass = (pipe, m) => {
+    // THE SAME CHAIN THE MANAGER ENCODES, not a second statement of it --
+    // including the clear, which is a kernel rather than a writeBuffer for
+    // the reason clearWant's own note gives.
+    encodeDecideChain(enc, (pipe, m) => {
       const p = enc.beginComputePass();
       p.setPipeline(pipe); p.setBindGroup(0, L[m].manageBG);
       p.dispatchWorkgroups(Math.ceil(L[m].nBlocks / 64)); p.end();
-    };
-    pass(manageDecidePipe, deepest);
-    // Deepest first: each level's octets are completed before the parent
-    // gathers from it, which is cascade21's own sweep order.
-    for (let m = deepest; m >= 2; m--) {
-      pass(L[m].octetsPipe, m);
-      pass(L[m - 1].balancePipe, m - 1);
-    }
+    });
     device.queue.submit([enc.finish()]);
     await device.queue.onSubmittedWorkDone();
 

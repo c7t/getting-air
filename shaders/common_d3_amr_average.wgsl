@@ -1,5 +1,12 @@
-// Fine (L1 pool) -> coarse (L0 dense) restriction. plans/3D.md M3.
-// Fragment only; the entry files list every include.
+// Fine -> coarse restriction: a level-m tile onto its PARENT's cells.
+// plans/3D.md M3, made parent-generic by M5.5b. Fragment only; the entry
+// files list every include.
+//
+// LEVEL-GENERIC, the same way interp and coalesce are: the parent is the
+// dense L0 grid at level 1 and a pool of tiles below it, and the only thing
+// that differs is how a parent cell is addressed. That is
+// common_d3_parent_{dense,pool}.wgsl's whole job, so this file is assembled
+// against one or the other and says nothing about which.
 //
 // Each thread owns one coarse cell and averages its EIGHT fine children
 // (against 2D's four). Dispatched so one workgroup covers one block's
@@ -21,19 +28,25 @@
 // but would NOT let fneq carry its own rescale).
 
 @group(0) @binding(0) var<storage, read>       f_pool      : array<f32>;
-@group(0) @binding(1) var<storage, read_write> f_coarse    : array<f32>;
+@group(0) @binding(1) var<storage, read_write> f_parent    : array<f32>;
 @group(0) @binding(2) var<storage, read>       slotToBlock : array<i32>;
-// The coarse macroscopic field, written here as well as the coarse `f`.
-// Without this, `mac` under a refined region would keep whatever the COARSE
-// step computed from its own (now superseded) populations, so the renderer
-// and every readback would show the coarse solution in exactly the region
-// that was refined to improve it. The averaged moments are already in hand,
-// so this costs four stores.
-@group(0) @binding(3) var<storage, read_write> mac_coarse  : array<f32>;
-// The criterion's answer, per block. Always bound -- one dummy element when
-// there is no dynamic refinement -- so this layout does not fork. DYING_ONLY
-// folds it out.
-@group(0) @binding(4) var<storage, read>       blockWant   : array<u32>;
+// The criterion's answer, per block. Always bound -- so this layout does not
+// fork -- and read only when DYING_ONLY folds the test in.
+@group(0) @binding(3) var<storage, read>       blockWant   : array<u32>;
+// binding 4 is the PARENT's macroscopic array, declared by whichever of
+// common_d3_parentmac_{dense,pool}.wgsl this module was assembled with, and
+// binding 8 (pool parent only) is the parent's blockSlot. This body cannot
+// name either array and addresses the parent through parentIndex /
+// parentMacStore, for the reason those files' headers give: the two
+// macroscopic layouts are different AND their types are different, so a
+// transposition is a compile error rather than a silent one.
+//
+// Writing `mac` at all is not optional. Without it the parent's macroscopic
+// field under a refined region would keep whatever the parent's own step
+// computed from its (now superseded) populations, so the renderer and every
+// readback would show the coarse solution in exactly the region that was
+// refined to improve it. The averaged moments are already in hand, so it
+// costs four stores.
 
 override TAU_COARSE : f32 = 0.8f;
 
@@ -119,12 +132,23 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     fo[i] = feqD3Q(rhoAvg, uAvg.x, uAvg.y, uAvg.z, i) + rescale * (s * 0.125f);
   }
 
+  // The PARENT cell this thread's eight children live in. parentIndex, not
+  // coarseCell: a dense index at level 1, a tile lookup through the parent's
+  // own blockSlot at level >= 2 (M5.2b), and the stride comes from the
+  // binding for the same reason -- a pool parent is slots x tileCells, not a
+  // grid.
+  //
+  // THE -1 BRANCH IS UNREACHABLE for the two callers that exist, and is a
+  // return rather than a clamp anyway. A child tile exists because its
+  // parent spawned it, so the parent of any tile this dispatch walks is
+  // allocated; on the drain path M5.5b's ordering is what keeps it that way
+  // while a subtree collapses (coarsen finest-first, so the parent is still
+  // holding its slot when the child restricts into it).
   let cc = b * RB + lc;
-  let ncells = NX * NY * NZ;
-  let dst = coarseCell(cc);
-  for (var i = 0u; i < QN; i++) { f_coarse[i * ncells + dst] = fo[i]; }
-  mac_coarse[4u * dst + 0u] = rhoAvg;
-  mac_coarse[4u * dst + 1u] = uAvg.x;
-  mac_coarse[4u * dst + 2u] = uAvg.y;
-  mac_coarse[4u * dst + 3u] = uAvg.z;
+  let pidx = parentIndex(cc);
+  if (pidx < 0) { return; }
+  let dst = u32(pidx);
+  let ncells = arrayLength(&f_parent) / QN;
+  for (var i = 0u; i < QN; i++) { f_parent[i * ncells + dst] = fo[i]; }
+  parentMacStore(dst, vec4<f32>(rhoAvg, uAvg.x, uAvg.y, uAvg.z));
 }

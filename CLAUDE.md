@@ -208,7 +208,10 @@ comment above `N_LEVELS`, not this file, for what's current.
 
 ## The 3D fork (`plans/3D.md`)
 
-**M0-M4 are done; M5 (a third level, the pool-parent path) is next.** The
+**M0-M4 are done, and M5 is done through M5.5b; M5.6 (validation and
+tooling at depth) is what remains of it.** Depth is real: `?levels=3` runs,
+with or without `?dynamic=1`, and the 2:1 balance and ring-parent checks are
+gates there rather than VACUOUS lines. The
 coarse/fine interface on the `?interface=explode` path -- the DEFAULT since
 M4.1e -- is exactly conservative in mass AND momentum, and its field error
 has fallen to the no-interface control's level: a refined box tracks
@@ -217,15 +220,36 @@ path's 3.6x. The fine level integrates the body force
 (`common_d3_force_pool.wgsl`, weight dx^(D-1) = dx^2, NOT dx^3) and a sphere
 in a refined shell reproduces the dense run's Cd to 0.07%.
 
-- **Dynamic refinement works behind `?dynamic=1` (M4.2b), refused unless
-  `?refine=body`.** A topology change is FIVE ORDERED PASSES -- decide,
-  drain, coarsen, refine, fill, clear -- and the order is the design, not
-  style. `drain` must precede `coarsen` (freeing first loses the fine
-  solution, since `refine` can re-hand the slot in the next pass); `fill`
-  must follow `refine`; `coarsen` and `refine` must stay separate passes (a
-  live 2D free-list race put two blocks on one slot); and `clear` is its own
-  pass because clearing the new-flag inside `fill` races the very test
-  `fill` uses to pick its work.
+- **Dynamic refinement works behind `?dynamic=1` (M4.2b), at any depth
+  (M5.5b), refused unless `?refine=body`.** A topology change is SIX ORDERED
+  PASSES -- decide(+close), drain, coarsen, refine, fill, clear -- and the
+  order is the design, not style. `drain` must precede `coarsen` (freeing
+  first loses the fine solution, since `refine` can re-hand the slot in the
+  next pass); `fill` must follow `refine`; `coarsen` and `refine` must stay
+  separate passes (a live 2D free-list race put two blocks on one slot); and
+  `clear` is its own pass because clearing the new-flag inside `fill` races
+  the very test `fill` uses to pick its work.
+
+- **AND THE LEVEL ORDER IS OPPOSITE FOR THE TWO HALVES** (M5.5b).
+  Drain+coarsen sweep FINEST-FIRST, because a dying tile restricts into its
+  PARENT and the parent must still hold its slot when it does; refine+fill
+  sweep COARSEST-FIRST, because a new tile is interpolated FROM its parent.
+  A whole subtree can be born or die in one event, so neither order is a
+  preference. The manager's want-clear is a KERNEL (`clearWant`) and not a
+  `writeBuffer`: the manager is encoded mid-command-buffer and
+  `device.queue.writeBuffer` is ordered at SUBMIT, so a host-side clear
+  would zero one step's want and leave every other step accumulating into
+  stale data.
+
+- **A dispatch that is the right SHAPE for one buffer is not thereby right
+  for another.** The depth-2 drain was encoded through the coarse-grid
+  dispatch instead of `average`'s own `(per, per, per * slots)`, so at RB=4
+  it covered the first `NZ/4` slots and skipped every one above -- 4 of 160
+  on one config. A tile coarsened out of a skipped slot was freed without
+  its solution ever reaching L0, and NOTHING in the suite could see it: the
+  structural configs check the pool, which stays perfectly consistent, and
+  the one field gate has a PINNED body that never drains. Found in M5.5b by
+  reading, not by a red cell.
 
 - **A tile being born or absorbed IS an ordinary grid transfer, so it KEEPS
   the Dupuis-Chopard rescale.** Chen's no-rescale applies to the interface,
@@ -252,12 +276,14 @@ in a refined shell reproduces the dense run's Cd to 0.07%.
   while every tile changes hands, which is why `debugPoolState` reports the
   refined set's bounding box.
 
-- **The AMR invariant checker exists and is GREEN, but its 2:1 half is
-  VACUOUS until refinement is multi-level** (`tools/validate-d3-invariants.js`,
-  `d3-amr.mjs`'s `check21Balance` / `checkGeometryCoverage`). At `?levels=2` a
-  leaf's neighbour is level 1 or level 0 and both are legal, so the check
-  cannot fail; the tool says so rather than showing a green tick. Geometry
-  coverage IS real today. The pure functions are unit-tested on inputs that
+- **The AMR invariant checker is GREEN, and its 2:1 half is VACUOUS at
+  `?levels=2` only** (`tools/validate-d3-invariants.js`, `d3-amr.mjs`'s
+  `check21Balance` / `checkGeometryCoverage`). At `?levels=2` a leaf's
+  neighbour is level 1 or level 0 and both are legal, so the check cannot
+  fail; the tool says so rather than showing a green tick. The depth-3 rows
+  are where it is a gate -- `box3`/`bar3`/`body3` on a HOST-built tree, and
+  `body3-dynamic`/`drift3` on one the MANAGER rebuilds every few steps.
+  Geometry coverage IS real at every depth. The pure functions are unit-tested on inputs that
   VIOLATE the invariant (`make test`) -- a checker only ever run on valid
   input is indistinguishable from one that returns nothing.
 
