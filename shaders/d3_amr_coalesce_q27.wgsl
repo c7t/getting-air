@@ -3,4 +3,5 @@
 
 // @include "common_d3q27_lattice.wgsl"
 // @include "common_d3_pool.wgsl"
+// @include "common_d3_parent_dense.wgsl"
 // @include "common_d3_amr_coalesce.wgsl"

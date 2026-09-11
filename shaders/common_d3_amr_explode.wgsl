@@ -119,26 +119,46 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let v = coarseOfFine(g);
   if (blockSlot[blockIdOf(blockOfCoarse(v))] >= 0) { return; }
 
-  let ncells = NX * NY * NZ;
+  // The stride between one direction's plane and the next in the PARENT
+  // array, derived from the binding rather than from NX*NY*NZ: identical for
+  // a dense parent and correct for a pool one, where the parent is slots x
+  // tileCells rather than a grid (M5.2b).
+  let pstride = arrayLength(&f_coarse) / QN;
   let poolPlane = arrayLength(&f_pool) / QN;
   let cell = poolCell(slot, fi);
-  let vc = coarseCell(v);
+  let vc = u32(parentIndex(v));
 
   // The two coarse neighbours on each axis, and whether BOTH are unrefined
   // -- i.e. whether a central difference on that axis reads real coarse
   // solutions. Hoisted out of the direction loop: it depends on v only.
-  let vmx = coarseCell(vec3<u32>(wrapu(i32(v.x) - 1, NX), v.y, v.z));
-  let vpx = coarseCell(vec3<u32>(wrapu(i32(v.x) + 1, NX), v.y, v.z));
-  let vmy = coarseCell(vec3<u32>(v.x, wrapu(i32(v.y) - 1, NY), v.z));
-  let vpy = coarseCell(vec3<u32>(v.x, wrapu(i32(v.y) + 1, NY), v.z));
-  let vmz = coarseCell(vec3<u32>(v.x, v.y, wrapu(i32(v.z) - 1, NZ)));
-  let vpz = coarseCell(vec3<u32>(v.x, v.y, wrapu(i32(v.z) + 1, NZ)));
-  let okx = !coveredCoarseX(vec3<u32>(wrapu(i32(v.x) - 1, NX), v.y, v.z))
-         && !coveredCoarseX(vec3<u32>(wrapu(i32(v.x) + 1, NX), v.y, v.z));
-  let oky = !coveredCoarseX(vec3<u32>(v.x, wrapu(i32(v.y) - 1, NY), v.z))
-         && !coveredCoarseX(vec3<u32>(v.x, wrapu(i32(v.y) + 1, NY), v.z));
-  let okz = !coveredCoarseX(vec3<u32>(v.x, v.y, wrapu(i32(v.z) - 1, NZ)))
-         && !coveredCoarseX(vec3<u32>(v.x, v.y, wrapu(i32(v.z) + 1, NZ)));
+  //
+  // AND whether they EXIST. A dense parent cell always does (parentPresent
+  // is constant-true and this folds away), but a POOL parent cell two cells
+  // out from the block may have no tile: M5.2a's ring-parent invariant
+  // covers the cells explode WRITES, dilated by one parent cell, and the
+  // central difference reaches one further. Rather than widen that
+  // invariant -- which would cost tiles on every seam to buy a second-order
+  // term at a few of them -- the admissibility test absorbs it and the
+  // explosion degrades to UNIFORM there, exactly as it already does at a
+  // concave corner. Uniform is first-order and EXACTLY conservative, so
+  // this cannot move a conservation gate.
+  let nmx = vec3<u32>(wrapu(i32(v.x) - 1, NX), v.y, v.z);
+  let npx = vec3<u32>(wrapu(i32(v.x) + 1, NX), v.y, v.z);
+  let nmy = vec3<u32>(v.x, wrapu(i32(v.y) - 1, NY), v.z);
+  let npy = vec3<u32>(v.x, wrapu(i32(v.y) + 1, NY), v.z);
+  let nmz = vec3<u32>(v.x, v.y, wrapu(i32(v.z) - 1, NZ));
+  let npz = vec3<u32>(v.x, v.y, wrapu(i32(v.z) + 1, NZ));
+  let okx = !coveredCoarseX(nmx) && !coveredCoarseX(npx) && parentPresent(nmx) && parentPresent(npx);
+  let oky = !coveredCoarseX(nmy) && !coveredCoarseX(npy) && parentPresent(nmy) && parentPresent(npy);
+  let okz = !coveredCoarseX(nmz) && !coveredCoarseX(npz) && parentPresent(nmz) && parentPresent(npz);
+  // Clamped to 0 where absent so the index is always in range; `ok*` is what
+  // decides whether the value is used at all.
+  let vmx = u32(max(parentIndex(nmx), 0));
+  let vpx = u32(max(parentIndex(npx), 0));
+  let vmy = u32(max(parentIndex(nmy), 0));
+  let vpy = u32(max(parentIndex(npy), 0));
+  let vmz = u32(max(parentIndex(nmz), 0));
+  let vpz = u32(max(parentIndex(npz), 0));
 
   // This child's offset from the parent centre, in COARSE units: the fine
   // cells covering v are 2v and 2v+1 on each axis, so the offset is -1/4 or
@@ -171,15 +191,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       let dst = wrapFine3(g + ei3);
       let intoTile = blockSlot[blockIdOf(blockOfCoarse(coarseOfFine(dst)))] >= 0
                   && all(blockOfFine(dst) == b);
-      f_pool[i * poolPlane + cell] = select(0f, f_coarse[i * ncells + vc], intoTile);
+      f_pool[i * poolPlane + cell] = select(0f, f_coarse[i * pstride + vc], intoTile);
       continue;
     }
-    let fc = f_coarse[i * ncells + vc];
+    let fc = f_coarse[i * pstride + vc];
     if (EXPLODE_LINEAR == 0u) {
       f_pool[i * poolPlane + cell] = fc;
       continue;
     }
-    let base = i * ncells;
+    let base = i * pstride;
     var G = vec3<f32>(
       select(0f, 0.5f * (f_coarse[base + vpx] - f_coarse[base + vmx]), okx),
       select(0f, 0.5f * (f_coarse[base + vpy] - f_coarse[base + vmy]), oky),

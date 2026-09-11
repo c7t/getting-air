@@ -157,8 +157,10 @@ fn coalesceOrphans(c: vec3<u32>) {
   }
   if (!near) { return; }
 
-  let ncells = NX * NY * NZ;
-  let cell = coarseCell(c);
+  // Stride from the binding, not NX*NY*NZ -- identical for a dense parent
+  // and correct for a pool one (M5.2b).
+  let ncells = arrayLength(&f_coarse) / QN;
+  let cell = u32(parentIndex(c));
   let poolPlane = arrayLength(&f_pool) / QN;
 
   // i = 0 is the rest vector: p - e_i = p, which is in c and unrefined, so
@@ -217,8 +219,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (slotI < 0) { coalesceOrphans(c); return; }
   let slot = u32(slotI);
 
-  let ncells = NX * NY * NZ;
-  let cell = coarseCell(c);
+  // Stride from the binding, not NX*NY*NZ -- identical for a dense parent
+  // and correct for a pool one (M5.2b).
+  let ncells = arrayLength(&f_coarse) / QN;
+  let cell = u32(parentIndex(c));
   let poolPlane = arrayLength(&f_pool) / QN;
   let macPlane = arrayLength(&mac_pool) / 4u;
 
