@@ -381,6 +381,24 @@ re-argued. Two things are settled and load-bearing:
   no conservation check catches. `d3-body.mjs` is the reference
   `shaders/d3_physics.wgsl` mirrors; the `spin` scenario compares them on
   real GPU code.
+- **THE SOLID INTERIOR IS HELD AT `feq(1, u_body)` EVERY STEP UNDER
+  BOUNCE-BACK** (`SOLID_EQ`, both step kernels; `?solideq=0` to A/B). Under
+  bounce-back `chi` is 0, so interior cells are stepped with reflected
+  gathers and NOTHING DAMPS THEM -- measured, max|u| reached 6x the body's
+  own speed INSIDE the body at tau=0.6, and a moving body blew up in 200
+  steps at tau=0.514. A PINNED body never notices, because nothing reads a
+  solid cell (the step's bounce-back branch reads `f_in[opp[i]]` at the
+  FLUID cell; the force kernel runs only where `phi >= 0`), which is why
+  every gate in the suite missed it for as long as no body moved. That same
+  property makes the fix provably free: it cannot change a pinned-body
+  number, and does not. It is ALSO the fresh-node refill -- a cell entering
+  the fluid arrives at equilibrium with the body's velocity -- done every
+  step because that is cheaper than detecting when to do it. **2D does not
+  have this problem**: its falling card uses chi, and its one moving
+  bounce-back body (`index-reentry.html`, tau=0.509) is KINEMATIC and runs
+  clean. Why 2D is fine and 3D was not is NOT established -- see
+  plans/3D.md M8.2a before assuming.
+
 - **Bounce-back is the accurate solid coupling in 3D; diffuse (chi) is
   not.** Sphere Cd measures +7..13% against Schiller-Naumann with
   bounce-back, and +49..131% with diffuse — converging from above with

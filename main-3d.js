@@ -163,7 +163,9 @@ async function init() {
     'explin', 'orphans', 'dynamic', 'manageEvery', 'slotHeadroom', 'amrskip',
     'manageMargin', 'manageStart',
     // M6: the resample volume.
-    'vol', 'volbox', 'volBudget']);
+    'vol', 'volbox', 'volBudget',
+    // M8.2a: the solid-interior reset, ?solideq=0 to disable for A/B.
+    'solideq']);
   for (const k of urlParams.keys()) {
     if (PAGE_PARAMS.has(k) || k in SCENARIOS[scenarioName].defaults) continue;
     throw new Error(`?${k}=: not a parameter of scenario "${scenarioName}" `
@@ -718,6 +720,12 @@ async function init() {
   const disp = [Math.ceil(NX / WG[0]), Math.ceil(NY / WG[1]), Math.ceil(NZ / WG[2])];
   const dims = { NX, NY, NZ };
   const USE_BOUNCEBACK = urlParams.has('bounceback') ? 1 : 0;
+  // M8.2a. Hold the solid interior at feq(1, u_body) every step. Default ON;
+  // ?solideq=0 restores the undamped interior for A/B. Bounce-back only --
+  // the diffuse coupling damps its own interior through chi -- and passed to
+  // BOTH step kernels from here, because the dense and pool paths must agree
+  // about what is inside a body.
+  const SOLID_EQ = urlParams.get('solideq') === '0' ? 0 : 1;
   const CHI_EPS = numParam('chiEps', 1.5);
   const sponge = params.sponge || { width: 0, u: [0, 0, 0] };
   const stepConstants = {
@@ -727,7 +735,7 @@ async function init() {
     WALL_X: params.walls.includes('x') ? 1 : 0,
     WALL_Y: params.walls.includes('y') ? 1 : 0,
     WALL_Z: params.walls.includes('z') ? 1 : 0,
-    HAS_BODY, USE_BOUNCEBACK, CHI_EPS,
+    HAS_BODY, USE_BOUNCEBACK, CHI_EPS, SOLID_EQ,
     SPONGE_W: sponge.width, SPONGE_UX: sponge.u[0], SPONGE_UY: sponge.u[1], SPONGE_UZ: sponge.u[2],
     // M4.1a: skip cells a refined block covers. Folds out entirely when
     // there is no pool.
@@ -976,7 +984,7 @@ async function init() {
       ...bodyFrameAt(1),
       OMEGA_FINE: 1 / TAU_FINE,
       FORCE_X: params.force[0], FORCE_Y: params.force[1], FORCE_Z: params.force[2],
-      HAS_BODY, USE_BOUNCEBACK, CHI_EPS,
+      HAS_BODY, USE_BOUNCEBACK, CHI_EPS, SOLID_EQ,
       SPONGE_W: sponge.width, SPONGE_UX: sponge.u[0], SPONGE_UY: sponge.u[1], SPONGE_UZ: sponge.u[2],
     });
     avgPipe = await mk(avgBGL, avgModule, { ...poolConst, TAU_COARSE, DC_PRE });
@@ -1255,7 +1263,7 @@ async function init() {
           ...bodyFrameAt(m),
           OMEGA_FINE: 1 / tauAtLevel(m),
           FORCE_X: params.force[0], FORCE_Y: params.force[1], FORCE_Z: params.force[2],
-          HAS_BODY, USE_BOUNCEBACK, CHI_EPS,
+          HAS_BODY, USE_BOUNCEBACK, CHI_EPS, SOLID_EQ,
           SPONGE_W: sponge.width, SPONGE_UX: sponge.u[0], SPONGE_UY: sponge.u[1], SPONGE_UZ: sponge.u[2],
         });
         // Explode reads the parent buffer holding time t -- the one the

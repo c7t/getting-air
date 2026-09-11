@@ -45,6 +45,10 @@ override FORCE_Y : f32 = 0.0f;
 override FORCE_Z : f32 = 0.0f;
 override HAS_BODY : u32 = 0u;
 override USE_BOUNCEBACK : u32 = 0u;
+
+// See common_d3_step.wgsl's SOLID_EQ. Same default, same meaning; the two
+// kernels must agree, and main-3d.js passes one value to both.
+override SOLID_EQ : u32 = 1u;
 // Chi band in FINE cells. The band is a physical width, and a fine cell is
 // half a coarse cell, so the same physical band is 2x as many fine cells --
 // which is exactly the correction the 2D solver's K_EPS * dx_L1 makes, and
@@ -334,6 +338,23 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let uFarSq = SPONGE_UX*SPONGE_UX + SPONGE_UY*SPONGE_UY + SPONGE_UZ*SPONGE_UZ;
     let fTarget = wt[i] * (1.0f + 3.0f*euFar + 4.5f*euFar*euFar - 1.5f*uFarSq);
     fo[i] = mix(fCollide, fTarget, spongeW);
+  }
+  // The solid interior, held at the body's own equilibrium -- the pool's
+  // copy of common_d3_step.wgsl's step 5, whose header carries the
+  // measurement and the reasoning. It has to be here too because the body
+  // lives ENTIRELY on the finest level (plans/3D.md M5.4), so on an AMR run
+  // these are the only kernels that step the cells inside it at all.
+  if (SOLID_EQ != 0u && HAS_BODY != 0u && USE_BOUNCEBACK != 0u && phi < 0f) {
+    let usq = dot(us, us);
+    for (var i = 0u; i < QN; i++) {
+      let eu = f32(ex[i])*us.x + f32(ey[i])*us.y + f32(ez[i])*us.z;
+      fo[i] = wt[i] * (1f + 3f*eu + 4.5f*eu*eu - 1.5f*usq);
+    }
+    let macPlane2 = arrayLength(&mac_pool) / 4u;
+    mac_pool[0u * macPlane2 + cell] = 1f;
+    mac_pool[1u * macPlane2 + cell] = us.x;
+    mac_pool[2u * macPlane2 + cell] = us.y;
+    mac_pool[3u * macPlane2 + cell] = us.z;
   }
   for (var i = 0u; i < QN; i++) { f_out[i * poolPlane + cell] = fo[i]; }
 }

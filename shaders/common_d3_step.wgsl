@@ -146,6 +146,13 @@ override HAS_BODY : u32 = 0u;
 // pair together.
 override USE_BOUNCEBACK : u32 = 0u;
 
+// Hold the solid interior at feq(1, u_body) every step (plans/3D.md M8.2a).
+// Bounce-back only -- the diffuse coupling damps its own interior through
+// chi. Default ON because the alternative is a latent blowup the moment a
+// body moves; `?solideq=0` restores the old behaviour for A/B, which is how
+// the measurements in the block below were taken.
+override SOLID_EQ : u32 = 1u;
+
 // Width of the diffuse chi band, in lattice cells. 1.5 matches the 2D
 // dense kernel exactly.
 override CHI_EPS : f32 = 1.5f;
@@ -303,6 +310,54 @@ fn step(@builtin(global_invocation_id) gid: vec3<u32>) {
     let uFarSq = SPONGE_UX*SPONGE_UX + SPONGE_UY*SPONGE_UY + SPONGE_UZ*SPONGE_UZ;
     let fTarget = wt[i] * (1.0f + 3.0f*euFar + 4.5f*euFar*euFar - 1.5f*uFarSq);
     fo[i] = mix(fCollide, fTarget, spongeW);
+  }
+
+  // 5. THE SOLID INTERIOR IS HELD AT THE BODY'S OWN EQUILIBRIUM.
+  //     plans/3D.md M8.2a. Bounce-back only.
+  //
+  // Under USE_BOUNCEBACK, `chi` above is 0, so a cell inside the body is
+  // stepped with reflected gathers and NOTHING DAMPS IT. Measured on the
+  // `drift` scenario (a body translating at a prescribed velocity, its force
+  // never fed back): at tau = 0.6 the largest velocity anywhere in the
+  // domain was INSIDE the body at six times the body's own speed, and at
+  // tau = 0.5144 the run blew up in 200 steps. The diffuse coupling, whose
+  // penalty term does damp the interior, survived every case with its
+  // hotspot out in the fluid where it belongs.
+  //
+  // A PINNED BODY NEVER NOTICES, which is why this survived every gate in
+  // the suite: nothing reads a solid cell. The step's bounce-back branch
+  // reads `f_in[opp[i]]` at the FLUID cell itself, and
+  // common_d3_force.wgsl's momentum exchange runs only where phi >= 0. So
+  // whatever accumulates in there stays in there -- until the body MOVES,
+  // and a cell that was interior becomes exterior with its neighbours
+  // suddenly reading it.
+  //
+  // BECAUSE NOTHING READS IT, OVERWRITING IT IS FREE. This is not a
+  // correction to the boundary condition; it is a statement that the
+  // interior has no boundary condition at all and therefore may as well
+  // hold a sensible value. feq(1, u_body) is the obvious one: the state a
+  // co-moving fluid would have.
+  //
+  // AND IT IS ALSO THE REFILL. A cell entering the fluid arrives at
+  // equilibrium with the body's local velocity, which is the cheap
+  // fresh-node scheme (Lallemand & Luo 2003) applied every step instead of
+  // at the transition -- no extrapolation, no neighbour search and no
+  // was-solid-now-fluid bookkeeping, because doing it unconditionally is
+  // cheaper than detecting when to do it.
+  //
+  // rho = 1 rather than the cell's own: the interior is not part of the
+  // fluid's mass budget under bounce-back (no population ever crosses the
+  // surface), so carrying a drifting density there buys nothing and is one
+  // more quantity that can run away.
+  if (SOLID_EQ != 0u && HAS_BODY != 0u && USE_BOUNCEBACK != 0u && phi < 0f) {
+    let usq = dot(us, us);
+    for (var i = 0u; i < QN; i++) {
+      let eu = f32(ex[i])*us.x + f32(ey[i])*us.y + f32(ez[i])*us.z;
+      fo[i] = wt[i] * (1f + 3f*eu + 4.5f*eu*eu - 1.5f*usq);
+    }
+    // The macroscopic field too, so a readback or the renderer sees the
+    // body moving rather than whatever the reflected gathers produced.
+    mac[cell] = vec4<f32>(1f, us.x, us.y, us.z);
   }
 
   for (var i = 0u; i < QN; i++) {
