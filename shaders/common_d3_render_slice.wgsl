@@ -135,7 +135,8 @@ fn planePoint(a: f32, b: f32) -> vec3<f32> {
 // A sampled velocity rotated into (in-plane u, in-plane v, out-of-plane w),
 // so the caller never has to re-derive the axis permutation. The cyclic
 // order is what makes the out-of-plane vorticity right-handed on all three
-// views -- see planeDims.
+// views -- see planeDims. Applied to a POSITION as well as a velocity below:
+// the same permutation takes a cell centre into (a, b, normal).
 fn rotateUVW(u: vec3<f32>) -> vec3<f32> {
   if (rp.axis == 0u) { return vec3<f32>(u.y, u.z, u.x); }
   if (rp.axis == 1u) { return vec3<f32>(u.z, u.x, u.y); }
@@ -146,6 +147,30 @@ fn rotateUVW(u: vec3<f32>) -> vec3<f32> {
 // covers the point.
 fn sampleUVW(a: f32, b: f32) -> vec3<f32> {
   return rotateUVW(sampleTree(planePoint(a, b)).v.yzw);
+}
+
+// The same sample, plus WHERE IT CAME FROM in the in-plane frame. A nearest
+// sampler answers at the centre of the cell containing the query, not at the
+// query -- so a finite difference has to divide by the separation of the two
+// CENTRES, not by the step it asked for. See TreeSample.c.
+struct PlaneSample { uvw : vec3<f32>, ab : vec3<f32> }
+fn samplePlane(a: f32, b: f32) -> PlaneSample {
+  let t = sampleTree(planePoint(a, b));
+  return PlaneSample(rotateUVW(t.v.yzw), rotateUVW(t.c));
+}
+
+// One centred derivative, over the TRUE separation of the samples returned.
+//
+// THE GUARD IS FOR A TREE MID-REBUILD, not for the steady case. Under 2:1
+// balance the arms cannot land in the same cell: the coarsest neighbour of a
+// level-m cell is level m-1, whose size is exactly 2h, so a 2h separation
+// always crosses a boundary. This sampler is documented as safe to call
+// while the manager is halfway through a topology change, though, and a zero
+// separation there would be a divide by zero rather than a stale pixel.
+fn dUdX(plus: PlaneSample, minus: PlaneSample, comp: u32, axis: u32, h: f32) -> f32 {
+  let dx = plus.ab[axis] - minus.ab[axis];
+  if (abs(dx) < 1e-6f * max(h, 1e-6f)) { return 0f; }
+  return (plus.uvw[comp] - minus.uvw[comp]) / dx;
 }
 
 // Dark-blue -> cyan -> yellow ramp for unsigned magnitudes. Distinct from
@@ -174,21 +199,33 @@ fn fs_main(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> {
     // Out-of-plane vorticity: d(v)/d(a) - d(u)/d(b) with (a,b) the in-plane
     // axes, by central differences.
     //
-    // THE STEP IS THE LOCAL CELL SIZE, not a fixed one, and that is forced
+    // THE STEP ASKED FOR IS THE LOCAL CELL SIZE, and that much is forced
     // rather than chosen. A fixed step of one L0 cell would throw away
     // exactly the resolution this view was changed to show; a fixed step of
     // one FINEST cell would sample the same coarse cell twice outside the
     // refined region and paint it flat zero -- which is not a small error,
-    // it is the whole coarse field reading as irrotational. So the
-    // difference is taken over the cell size of the level that answered,
-    // which is a true local gradient estimate on either side of a seam.
+    // it is the whole coarse field reading as irrotational.
     //
-    // Across a seam one arm can land on a coarser cell, and the staircase
-    // that produces is not hidden: this is the view for looking at seams.
+    // BUT THE STEP DELIVERED IS NOT THE STEP ASKED FOR, and dividing by the
+    // latter was a real bug (fixed 2026-09-11). sampleTree is NEAREST: it
+    // answers at the centre of the cell containing the query. Across a seam
+    // the `+h` arm can land in a coarser cell whose centre is up to half that
+    // cell away, so the true separation of the two samples is anywhere from
+    // about 0.5 to 1.5 times 2h -- and dividing by 2h regardless mis-scales
+    // omega by an O(1) factor EXACTLY at tile boundaries. That is not the
+    // resolution staircase an earlier version of this comment waved at; it
+    // is a wrong value, and it showed up as artifacts along the seams in the
+    // one view that exists to look at them.
+    //
+    // The tell was that `speed` -- a point sample with no derivative in it --
+    // is smooth across the very seams where `vorticity` is not. A field that
+    // cannot express the artifact not expressing it is what separates a
+    // rendering bug from a solver one.
     let h = t.h;
-    let omega = (sampleUVW(pa + h, pb).y - sampleUVW(pa - h, pb).y)
-              - (sampleUVW(pa, pb + h).x - sampleUVW(pa, pb - h).x);
-    return vec4(vorticityColor(omega / (2f * h) / max(rp.vScale, 1e-12f)), 1.0);
+    let ap = samplePlane(pa + h, pb); let am = samplePlane(pa - h, pb);
+    let bp = samplePlane(pa, pb + h); let bm = samplePlane(pa, pb - h);
+    let omega = dUdX(ap, am, 1u, 0u, h) - dUdX(bp, bm, 0u, 1u, h);
+    return vec4(vorticityColor(omega / max(rp.vScale, 1e-12f)), 1.0);
   }
   if (rp.mode == 2u) {
     // Signed velocity along the slice normal, on the same ramp so the sign

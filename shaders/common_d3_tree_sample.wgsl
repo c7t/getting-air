@@ -76,6 +76,23 @@ struct TreeSample {
   // same cell twice inside a coarse region (a flat zero) or smear across
   // several inside a fine one.
   h     : f32,
+  // THE CENTRE OF THE CELL THIS VALUE ACTUALLY CAME FROM, in the same
+  // continuous L0 frame as the query, and UNWRAPPED -- so it is continuous
+  // with `p` and a sample taken across the periodic seam does not report a
+  // centre a whole domain away.
+  //
+  // WHY IT IS RETURNED AT ALL. This sampler is NEAREST, not interpolating:
+  // ask at p and you get the value at the centre of whichever cell contains
+  // p, which can be half a coarse cell away. A caller taking a finite
+  // difference therefore does NOT know its own step -- it knows what it
+  // asked for, not what it got, and at a coarse/fine seam those differ by an
+  // O(1) factor. Dividing by the requested step instead of the delivered one
+  // mis-scales the derivative exactly at seams, which is visible as
+  // artifacts along tile boundaries in the very view that exists to look at
+  // them. Observed and fixed 2026-09-11; the tell was that `speed` (a point
+  // sample, no derivative) is smooth across the same seams where
+  // `vorticity` is not.
+  c     : vec3<f32>,
 }
 
 fn treeWrap(v: i32, n: i32) -> u32 { return u32(((v % n) + n) % n); }
@@ -84,10 +101,12 @@ fn treeWrap(v: i32, n: i32) -> u32 { return u32(((v % n) + n) % n); }
 // `level` as the miss signal; callers test it.
 fn sampleAtLevel(p: vec3<f32>, m: u32) -> TreeSample {
   var out: TreeSample;
-  out.level = 0u; out.h = 1f; out.v = vec4<f32>(0f);
+  out.level = 0u; out.h = 1f; out.v = vec4<f32>(0f); out.c = p;
   let s = f32(1u << m);                       // 2^m
   let dims = vec3<i32>(i32(NX), i32(NY), i32(NZ)) * i32(1u << m);
   let gf = floor((p + vec3<f32>(0.5f)) * s);
+  // From the UNWRAPPED index, so it stays continuous with p across the seam.
+  out.c = (gf + vec3<f32>(0.5f)) / s - vec3<f32>(0.5f);
   let g = vec3<u32>(
     treeWrap(i32(gf.x), dims.x),
     treeWrap(i32(gf.y), dims.y),
@@ -129,6 +148,7 @@ fn sampleAtLevel(p: vec3<f32>, m: u32) -> TreeSample {
 fn sampleDense(p: vec3<f32>) -> TreeSample {
   var out: TreeSample;
   let gf = floor(p + vec3<f32>(0.5f));
+  out.c = gf;                                 // s = 1, so the centre IS gf
   let c = vec3<u32>(
     treeWrap(i32(gf.x), i32(NX)),
     treeWrap(i32(gf.y), i32(NY)),
