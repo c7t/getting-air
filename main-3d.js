@@ -77,7 +77,7 @@ import { reportFatal, reportNoWebGPU, reportNoAdapter } from './error-overlay.mj
 import { assembleShader } from './shader-loader.mjs';
 import { SUPPORTED_Q } from './lattice-3d.mjs';
 import { SCENARIOS, SCENARIO_NAMES, resolveScenario, nuFromTau, beltramiVelocityAt } from './d3-scenarios.mjs';
-import { packBodyState, unpackBodyState, BODY_FIELDS } from './d3-body.mjs';
+import { packBodyState, unpackBodyState, BODY_FIELDS, sdfBody, qRotateInv } from './d3-body.mjs';
 import { makePool, refineHierarchy, nearBodyWant, storageRatio, GHOST,
          check21Balance, checkGeometryCoverage, checkRingParentCoverage,
          cellAtLevel, finestLevelAt } from './d3-amr.mjs';
@@ -2180,6 +2180,72 @@ async function init() {
     };
   }
 
+  // WHERE, not just whether. plans/3D.md M8's tau probe.
+  //
+  // readStats answers "is the field finite" with a boolean, and a boolean
+  // cannot tell a wall instability from a body instability from a seam
+  // instability from BGK simply giving out in the bulk -- which is the whole
+  // question when the relaxation time is being walked toward 1/2. So this
+  // returns two LOCATIONS:
+  //
+  //   hot    the argmax of |u|, which exists on every step and whose
+  //          MIGRATION is the early warning. A hotspot pinned one cell off
+  //          the body surface is the bounce-back; one sitting on a
+  //          coarse/fine seam is the interface; one wandering in the wake is
+  //          the collision operator.
+  //   first  the first non-finite cell, once there is one. By then the
+  //          hotspot has usually already said where it came from, which is
+  //          the point of reporting both.
+  //
+  // Each is annotated with the finest level covering it (d3-amr.mjs's
+  // finestLevelAt on a real blockSlot readback -- the same route
+  // debugCheckTreeSample scores the shader against), its distance to the
+  // body surface in L0 cells, and its distance to the nearest wall. Those
+  // three numbers are the diagnosis; everything else is narrative.
+  async function debugHotspot() {
+    const m = await readMacro();
+    const sets = AMR ? await readLevelSets() : [null];
+    const present = (lv, b) => sets[lv].has(b.join(','));
+    const body = HAS_BODY ? await readBody() : null;
+    const wallAxes = ['x', 'y', 'z'].filter(a => params.walls.includes(a));
+    const dimsArr = [NX, NY, NZ];
+    const annotate = (c) => {
+      const x = c % NX, y = Math.floor(c / NX) % NY, z = Math.floor(c / (NX * NY));
+      const p3 = [x, y, z];
+      const o = { ijk: p3, rho: m[4 * c], u: [m[4 * c + 1], m[4 * c + 2], m[4 * c + 3]] };
+      o.level = AMR ? finestLevelAt(p3, { levels: LEVELS, dims: dimsArr, rb: RB, present }) : 0;
+      if (body) {
+        // Body-frame distance, so it is the SDF the solver uses and not a
+        // centre-distance that a non-spherical body would make meaningless.
+        const d = [p3[0] - body.cx, p3[1] - body.cy, p3[2] - body.cz];
+        // The shape from the READBACK, not from params: that is what the
+        // GPU is actually using, and on a free body it is also the only
+        // copy that has moved.
+        const shape = { kind: body.shape, a: body.a, b: body.b, c: body.c, r: body.r };
+        o.sdf = sdfBody(qRotateInv([body.qw, body.qx, body.qy, body.qz], d), shape);
+      }
+      if (wallAxes.length) {
+        o.wall = Math.min(...wallAxes.map(a => {
+          const i = { x: 0, y: 1, z: 2 }[a];
+          return Math.min(p3[i], dimsArr[i] - 1 - p3[i]);
+        }));
+      }
+      return o;
+    };
+    let best = -1, bestC = 0, first = -1, nBad = 0;
+    for (let c = 0; c < NCELLS; c++) {
+      const rho = m[4 * c], ux = m[4 * c + 1], uy = m[4 * c + 2], uz = m[4 * c + 3];
+      if (!Number.isFinite(rho + ux + uy + uz)) { nBad++; if (first < 0) first = c; continue; }
+      const sp2 = ux * ux + uy * uy + uz * uz;
+      if (sp2 > best) { best = sp2; bestC = c; }
+    }
+    return {
+      step, finite: nBad === 0, nNonFinite: nBad,
+      hot: best >= 0 ? { ...annotate(bestC), speed: Math.sqrt(best) } : null,
+      first: first >= 0 ? annotate(first) : null,
+    };
+  }
+
   // Fine-level diagnostic: RMS speed over tile INTERIORS only (ring cells
   // are filled, not solved, and including them would blur exactly the
   // distinction this is for). Reported next to the coarse level's own RMS so
@@ -2855,6 +2921,7 @@ async function init() {
     readSubsampled, readDuctProfile, readStats, readBody, readPoolStats,
     debugCheck21Balance, debugCheckGeometryCoverage, debugCheckRingParents, debugPoolState,
     debugRunBalance, debugSampleTree, debugCheckTreeSample, debugReadVolume,
+    debugHotspot,
     readInterfaceDiag, readFluxAcc,
     debugStepSync,
   };
