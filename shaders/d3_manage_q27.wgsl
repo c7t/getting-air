@@ -6,4 +6,5 @@
 // @include "common_d3_window.wgsl"
 // @include "common_d3_geometry.wgsl"
 // @include "common_d3_pool.wgsl"
+// @include "common_refine.wgsl"
 // @include "common_d3_manage.wgsl"

@@ -91,12 +91,51 @@
 @group(0) @binding(8) var<storage, read> blockQ : array<f32>;
 
 // THE FIELD CRITERION, off by default so every scenario that predates M8.4 is
-// bit-identical rather than merely unaffected. Q_ABS is already in absolute
-// units -- the host multiplies the dimensionless `?qthresh=` by the
-// scenario's own (U/D)^2 (d3-criterion.mjs's qRef), so nothing here has to
-// know the velocity scale.
+// bit-identical rather than merely unaffected.
+//
+// IT IS A LADDER, NOT A THRESHOLD, and that is not a refinement of the idea
+// -- it is the idea. A single yes/no per block answers "is there a vortex
+// here", refines it to the FINEST level, and so decides depth by proximity
+// to the body rather than by what the flow is doing. 2D MEASURED that exact
+// failure before replacing it (common_refine.wgsl's header): at N=3, 118 of
+// 132 level-2 blocks were inside the geometry halo and the other 14 were the
+// 2:1 cascade shell -- "level 2 never reached the wake at all, however
+// energetic the wake was".
+//
+// So this includes 2D's `common_refine.wgsl` verbatim rather than restating
+// it. That file is pure scalar arithmetic over four overrides with nothing
+// two-dimensional in it, and one statement of a ladder is worth more than a
+// second copy that agrees today.
+//
+// THE UNITS. The criterion kernel reports max Q per block, and Q ~ (du/dx)^2
+// -- so sqrt(Q) is a ROTATION RATE, directly comparable to the |omega| the
+// 2D ladder was calibrated against, and epsPhys = log2(sqrt(Q)) puts the two
+// on one scale. The `+ m` physical-units shift common_refine.wgsl documents
+// is ZERO here because the field is read at L0; it becomes 2*m (not m) the
+// day this is evaluated per level, since Q carries the gradient squared.
 override HAS_Q : u32 = 0u;
-override Q_ABS : f32 = 1e30f;
+// Which level THIS dispatch decides for. The ladder answers "how deep does
+// this region want to be", so each level asks whether that answer reaches it.
+override LEVEL_M : i32 = 1;
+// Level-1 block counts, for mapping a level-m block onto the criterion grid.
+override CNBX : u32 = 1u;
+override CNBY : u32 = 1u;
+override CNBZ : u32 = 1u;
+const Q_FLOOR = 1e-30f;
+// THE LADDER'S OWN OVERRIDES, which common_refine.wgsl requires its includer
+// to declare -- the same arrangement common_geometry.wgsl uses for W/H.
+//
+// REFINE_THRESH is DERIVED BY THE HOST from `?qthresh=`, not typed here:
+// qthresh is dimensionless against the body's own shear scale and its default
+// was measured (d3-criterion.mjs), so the ladder's base is
+// 0.5*log2(qthresh * qRef) and keeps that measurement rather than replacing
+// it with a second number calibrated by eye. N_REFINE_INC is the only new
+// free parameter: how many octaves of rotation rate each further level costs.
+override REFINE_THRESH : f32 = -1e30f;
+override COARSEN_THRESH : f32 = -1e30f;
+override N_REFINE_INC : f32 = 1.0f;
+override N_REFINE_MAX : f32 = 1.0f;
+override MAX_LEVEL : i32 = 1;
 
 override MARGIN : f32 = 2.0f;
 // How many macro-steps pass before the criterion is re-evaluated. The
@@ -272,12 +311,42 @@ fn clearWant(@builtin(global_invocation_id) gid: vec3<u32>) {
 // The geometry half stays FIRST in the expression deliberately: it is the one
 // whose failure is a seam through the body (M5.4), and `||` short-circuits,
 // so a block the body needs is never subject to the field test at all.
+//
+// RUNS AT EVERY LEVEL NOW, not only the finest, which is what makes the
+// refinement GRADED: the ladder says how deep a region wants to be, and each
+// level asks whether that answer reaches it. `balance` then ORs the 2:1
+// closure on top -- and its own note already expected this ("this level may
+// also have been wanted in its own right ... a vorticity criterion per level
+// would"), which is why it ORs rather than overwrites.
+//
+// HYSTERESIS, mirroring 2D: a block that is ALREADY refined is held against
+// the coarsen ladder, one band below the refine ladder, so it must fall a
+// full band below the level it holds before releasing it. Without it a block
+// sitting on a rung refines and coarsens on alternate evaluations, and every
+// one of those transitions re-interpolates its region from the parent --
+// which 2D records as visible wake "lumpiness" it was already bitten by.
 @compute @workgroup_size(64)
 fn decide(@builtin(global_invocation_id) gid: vec3<u32>) {
   let id = gid.x;
   if (id >= nbx() * nby() * nbz()) { return; }
-  let geom = blockWanted(blockOfId(id));
-  let field = HAS_Q != 0u && blockQ[id] > Q_ABS;
+  let b = blockOfId(id);
+  let geom = blockWanted(b);
+  var field = false;
+  if (HAS_Q != 0u) {
+    // This level's block onto the criterion's LEVEL-1 grid: level m's blocks
+    // are 2^(m-1) times finer, so the map is a shift per axis. One integer
+    // divide rather than a reduction, at the cost of the criterion being
+    // localized to a level-1 block -- which is the resolution the criterion
+    // was computed at anyway.
+    let sh = u32(max(LEVEL_M - 1, 0));
+    let c = vec3<u32>(min(b.x >> sh, CNBX - 1u), min(b.y >> sh, CNBY - 1u), min(b.z >> sh, CNBZ - 1u));
+    let q = blockQ[(c.z * CNBY + c.y) * CNBX + c.x];
+    // sqrt(Q) is the rotation rate; log2 of it is what the ladder eats.
+    let epsPhys = 0.5f * log2(max(q, Q_FLOOR));
+    let held = blockSlot[id] >= 0;
+    let want = select(desiredLevel(epsPhys), desiredLevelCoarsen(epsPhys), held);
+    field = want >= LEVEL_M;
+  }
   blockWant[id] = select(0u, 1u, geom || field);
 }
 

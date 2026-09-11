@@ -132,3 +132,80 @@ export const Q_THRESHOLD = 0.1;
 // WERE. `?refine=body` on the drift scenario is the 2D-shaped precedent for
 // that failing quietly.
 export function convectionLead(manageEvery, u) { return manageEvery * Math.abs(u); }
+
+// --- COVERAGE: the gate (plans/3D.md M8.4) ---------------------------------
+//
+// THE FIELD CRITERION'S ANALOGUE OF d3-amr.mjs's checkGeometryCoverage, and
+// deliberately the same shape. That one states the geometry criterion's hard
+// requirement at CELL granularity -- every cell within `margin` of the body
+// must sit in a refined block -- by an INDEPENDENT route from the
+// block-corner sampling that built the set. This states the field
+// criterion's: **every cell whose Q exceeds the threshold must sit in a
+// refined block**, checked per cell against a per-BLOCK-max reduction, which
+// is likewise a different computation and not a re-run of the same one.
+//
+// IT MUST HOLD AT EVERY STEP, NOT AT THE ONES THE MANAGER RUNS ON. That is
+// not a new standard: common_d3_manage.wgsl's geometry criterion already
+// makes exactly this claim, and its `MANAGE_EVERY * |v|` lead term exists to
+// satisfy it -- "a shell that only just covers the body at decision time is
+// already stale on the very next step". convectionLead() above is the same
+// term for a structure that convects instead of being carried by a body.
+//
+// WHAT THIS CAN CATCH THAT NOTHING ELSE DOES. A vortex leaving the refined
+// region between management events does not blow up, does not drift the
+// conservation checks, and does not change the picture: it is simply solved
+// at L0 while the run reports a healthy pool. Structural pool checks pass
+// (the pool stays perfectly consistent), the interface checks pass (the seam
+// is fine, it is just in the wrong place), and Cd moves by an amount nobody
+// can attribute. This is the check that names it.
+//
+// ONE ASYMMETRY WITH THE GEOMETRY VERSION, and it is why the bound here is
+// measured rather than declared: a body does not teleport, but a VORTEX CAN
+// BE CREATED above threshold somewhere new between two decisions. Convection
+// lead cannot cover that, and no lead can. So violations decompose into
+// convection (which the lead should remove, and `?qlead=0` should restore)
+// and creation (which only a shorter MANAGE_EVERY reduces) -- and the two are
+// told apart by whether the violating cell is adjacent to the refined set.
+export function checkFieldCoverage({ dims, rb, blockSlot, qAt, thresh, maxReport = 32 }) {
+  const [NX, NY, NZ] = dims;
+  const nbx = Math.round(NX / rb), nby = Math.round(NY / rb);
+  const refinedAt = (x, y, z) => {
+    const id = ((Math.floor(z / rb) * nby) + Math.floor(y / rb)) * nbx + Math.floor(x / rb);
+    return blockSlot[id] >= 0;
+  };
+  const violations = [];
+  let required = 0, covered = 0, adjacent = 0, qWorst = -Infinity;
+  for (let z = 0; z < NZ; z++) {
+    for (let y = 0; y < NY; y++) {
+      for (let x = 0; x < NX; x++) {
+        const q = qAt(x, y, z);
+        if (!(q > thresh)) continue;
+        required++;
+        if (refinedAt(x, y, z)) { covered++; continue; }
+        // ADJACENT to the refined set means the structure was covered and has
+        // moved off the edge of it -- convection, i.e. the lead was too
+        // short. Isolated means it appeared where nothing was refined --
+        // creation, which only a shorter decision interval reduces. The
+        // distinction is the actionable part; a bare violation count is not.
+        let near = false;
+        for (let d = 0; d < 6 && !near; d++) {
+          const o = [[1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1]][d];
+          const p = [(x + o[0] + NX) % NX, (y + o[1] + NY) % NY, (z + o[2] + NZ) % NZ];
+          near = refinedAt(p[0], p[1], p[2]);
+        }
+        if (near) adjacent++;
+        if (q > qWorst) qWorst = q;
+        if (violations.length < maxReport) violations.push({ cell: [x, y, z], q, adjacent: near });
+      }
+    }
+  }
+  const n = required - covered;
+  return {
+    required, covered, violations: n, reported: violations,
+    // Split by cause, and as a FRACTION of what was required -- an absolute
+    // count means nothing without knowing how much there was to cover.
+    frac: required ? n / required : 0,
+    convection: adjacent, creation: n - adjacent,
+    qWorst: n ? qWorst : null,
+  };
+}

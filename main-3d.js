@@ -80,7 +80,7 @@ import { SCENARIOS, SCENARIO_NAMES, resolveScenario, nuFromTau, beltramiVelocity
 import { packBodyState, unpackBodyState, BODY_FIELDS, sdfBody, qRotateInv } from './d3-body.mjs';
 import { parseWindowAxes, wrapDims, wrapDelta3, windowOffset3, windowCoord3,
          windowConstants } from './d3-window.mjs';
-import { Q_THRESHOLD } from './d3-criterion.mjs';
+import { Q_THRESHOLD, gradU, qOfGrad, checkFieldCoverage } from './d3-criterion.mjs';
 import { makePool, refineHierarchy, nearBodyWant, storageRatio, GHOST,
          check21Balance, checkGeometryCoverage, checkRingParentCoverage,
          cellAtLevel, finestLevelAt } from './d3-amr.mjs';
@@ -89,7 +89,20 @@ const canvas   = document.getElementById('c');
 const statusEl = document.getElementById('status');
 
 const urlParams = new URLSearchParams(window.location.search);
-const numParam = (k, d) => (urlParams.has(k) ? (parseFloat(urlParams.get(k)) || d) : d);
+// `Number.isFinite`, NOT `|| d`. ZERO IS FALSY, so the old form silently
+// returned the DEFAULT for every `?x=0` -- and 0 is a meaningful value for
+// most of these (?qlead=0 removes the convection lead, ?slotWarn=0 silences
+// the budget warning, ?margin=0, ?manageStart=0). It cost a measurement: a
+// ?qlead=0 control leg came back byte-identical to the default leg, which
+// reads exactly like "the term does nothing" and was in fact "the parameter
+// never arrived". This file's own header names that failure -- a parameter
+// silently dropped is worse than one rejected -- and this was an instance of
+// it hiding in the parser.
+const numParam = (k, d) => {
+  if (!urlParams.has(k)) return d;
+  const v = parseFloat(urlParams.get(k));
+  return Number.isFinite(v) ? v : d;
+};
 const AXIS_NAMES = ['x', 'y', 'z'];
 
 // Parsers that can REJECT live in functions, not module-scope consts: a
@@ -178,7 +191,7 @@ async function init() {
     // M8.4: the Q-criterion's threshold (its PRESENCE turns the criterion on),
     // its convection lead in L0 cells, and the fraction of the slot budget at
     // which the page starts saying so.
-    'qthresh', 'qlead', 'slotWarn',
+    'qthresh', 'qlead', 'slotWarn', 'qinc', 'qhyst',
     // M8.4: an absolute per-level slot budget. A field criterion's set is not
     // predicted by the initial one, so ?slotHeadroom= cannot size it.
     'slots']);
@@ -958,9 +971,16 @@ async function init() {
   //
   // It is evaluated on the FINEST level's candidate block grid, which is the
   // grid the criterion would flag into.
-  const CRIT_LEVEL = Math.max(1, LEVELS - 1);
-  const CRIT_NB = [NX, NY, NZ].map(n => Math.max(1, Math.round(n / RB * 2 ** (CRIT_LEVEL - 1))));
-  const CRIT_BLK_L0 = RB * 2 ** -(CRIT_LEVEL - 1);
+  // ON THE LEVEL-1 BLOCK GRID, at L0 resolution -- ONE evaluation, and the
+  // LADDER is what grades it (plans/3D.md M8.4). That is the whole reason the
+  // ladder is lighter than a per-level error estimator: `desiredLevel` turns a
+  // single criterion value into "how deep does this region want to be", so
+  // every level reads the same buffer with a shift instead of needing its own
+  // field. The cost is that the grading is localized to a level-1 block,
+  // which is the resolution the criterion was computed at anyway.
+  const CRIT_LEVEL = 1;
+  const CRIT_NB = [NX, NY, NZ].map(n => Math.max(1, Math.round(n / RB)));
+  const CRIT_BLK_L0 = RB;
   // The localization limit the shader's header names: below one L0 cell per
   // candidate block the criterion cannot tell siblings apart, so it would
   // flag all of them. Said out loud rather than silently over-refining.
@@ -991,16 +1011,22 @@ async function init() {
   // or resolution (d3-criterion.mjs's qRef).
   const CRIT_D = params.D || params.n;
   const Q_ABS = Q_THRESH * ((CRIT_U && CRIT_D) ? (CRIT_U / CRIT_D) ** 2 : 1);
+  // Octaves of rotation rate per further level, and the hysteresis band.
+  // 2D ships INC = 1 and a one-octave REFINE/COARSEN gap; both are knobs here
+  // for the same reason they are there -- the right values are properties of
+  // the flow.
+  const Q_INC = numParam('qinc', 1);
+  const Q_HYST = numParam('qhyst', 1);
   if (Q_ON) {
-    // The criterion writes on the FINEST level's block grid and `decide`
-    // indexes it with that level's block id. Those are derived separately --
-    // here from NX/RB, there from d3-amr.mjs's poolAtLevel -- so they are
-    // checked against each other rather than assumed equal. A mismatch would
-    // not crash; it would flag the wrong blocks.
-    const nbFinest = AMR ? hier.byLevel[LEVELS - 1].pool.nb : CRIT_NB;
-    if (CRIT_NB.some((n, i) => n !== nbFinest[i])) {
+    // The criterion writes on LEVEL 1's block grid, and every level's `decide`
+    // indexes it by shifting its own block id down. Those two are derived
+    // separately -- here from NX/RB, there from d3-amr.mjs's poolAtLevel -- so
+    // they are checked against each other rather than assumed equal. A
+    // mismatch would not crash; it would flag the wrong blocks.
+    const nbCrit = AMR ? hier.byLevel[CRIT_LEVEL].pool.nb : CRIT_NB;
+    if (CRIT_NB.some((n, i) => n !== nbCrit[i])) {
       statusEl.textContent = `error: the Q-criterion grid ${CRIT_NB.join('x')} does not match`
-        + ` level ${CRIT_LEVEL}'s block grid ${nbFinest.join('x')}`;
+        + ` level ${CRIT_LEVEL}'s block grid ${nbCrit.join('x')}`;
       return;
     }
     if (!AMR) {
@@ -1311,7 +1337,18 @@ async function init() {
         // OFF unless ?qthresh= was given, at which point Q_ABS folds the
         // whole field test out at pipeline-creation time and every scenario
         // that predates M8.4 is bit-identical.
-        HAS_Q: Q_ON ? 1 : 0, Q_ABS: Q_ON ? Q_ABS : 1e30,
+        HAS_Q: Q_ON ? 1 : 0,
+        // The ladder's base, derived from the MEASURED `?qthresh=` rather
+        // than typed as a second calibration: sqrt(Q) is the rotation rate
+        // the ladder eats, so the base is log2 of the threshold's own
+        // rotation rate. COARSEN sits ?qhyst= octaves below it -- the
+        // anti-flicker band, without which a block on a rung refines and
+        // coarsens on alternate evaluations and re-interpolates its region
+        // every time.
+        REFINE_THRESH: 0.5 * Math.log2(Math.max(Q_ABS, 1e-30)),
+        COARSEN_THRESH: 0.5 * Math.log2(Math.max(Q_ABS, 1e-30)) - Q_HYST,
+        N_REFINE_INC: Q_INC, N_REFINE_MAX: 1e30, MAX_LEVEL: LEVELS - 1,
+        CNBX: CRIT_NB[0], CNBY: CRIT_NB[1], CNBZ: CRIT_NB[2],
         MARGIN: Number.isFinite(MANAGE_MARGIN) ? MANAGE_MARGIN : geomForced.margin,
         // The lead term is zero for a pinned body, so the criterion still
         // reproduces the host's initial set exactly and M4.2b-i's
@@ -1328,7 +1365,19 @@ async function init() {
           NX: NX * 2 ** (m - 1), NY: NY * 2 ** (m - 1), NZ: NZ * 2 ** (m - 1),
           BOX_SCALE: 2 ** -(m - 1), ...(extra || {}) } },
       });
-      manageDecidePipe = await mkManageAt('decide', deepest);
+      // PER LEVEL NOW, because the ladder grades: each level asks whether the
+      // depth the flow wants reaches it. The finest level's pipeline is the
+      // one the geometry criterion runs through (M5.1b is unchanged -- geometry
+      // is still evaluated at the finest level only, and cascade21 forces its
+      // ancestors); the coarser ones exist for the FIELD half.
+      manageDecidePipe = await mkManageAt('decide', deepest, { LEVEL_M: deepest });
+      for (let m = 1; m < LEVELS - 1; m++) {
+        // HAS_BODY off below the finest level: geometry is evaluated there and
+        // only there, and letting a coarser level re-evaluate it would refine
+        // a shell the cascade is already responsible for -- two mechanisms for
+        // one requirement, which is what M4.2b-i removed.
+        L[m].decidePipe = await mkManageAt('decide', m, { LEVEL_M: m, HAS_BODY: 0 });
+      }
       // The 2:1 cascade, per level: octet completion at m, then the parent
       // gather that writes m-1 from m. Both are one-thread-per-output, so
       // neither has a race to reason about -- see the shader.
@@ -2072,6 +2121,9 @@ async function init() {
     }
     for (let m = 1; m < LEVELS; m++) managePass(L[m].clearWantPipe, m);
     managePass(manageDecidePipe, LEVELS - 1);
+    // The coarser levels' field half, before the cascade ORs 2:1 on top.
+    // Skipped when the criterion is off, so the chain is exactly what it was.
+    if (Q_ON) for (let m = 1; m < LEVELS - 1; m++) managePass(L[m].decidePipe, m);
     for (let m = LEVELS - 1; m >= 2; m--) {
       managePass(L[m].octetsPipe, m);
       managePass(L[m - 1].balancePipe, m - 1);
@@ -2607,6 +2659,9 @@ async function init() {
     let qMax = -Infinity;
     for (let i = 0; i < total; i++) if (q[i] > qMax) qMax = q[i];
     const ths = thresholds || [0.5, 0.2, 0.1, 0.05, 0.02, 0.01];
+    // The ladder's base is the ACTIVE threshold's own rotation rate, matching
+    // what the manager is running (main-3d.js's REFINE_THRESH derivation).
+    const cutBase = Q_THRESH * qr;
     const rows = ths.map((t) => {
       const cut = t * qr;
       let n = 0;
@@ -2621,8 +2676,35 @@ async function init() {
       return { thresh: t, count: n, frac: n / total,
                bbox: n ? { lo, hi } : null, boxVol, boxRatio: n ? boxVol / n : null };
     });
+    // THE LADDER'S DEMAND, per level, WITHOUT ALLOCATING IT. Measuring demand
+    // by refining it cannot see past the slot budget -- which is exactly
+    // where the question lives, since a setting that over-refines is one that
+    // exhausts. The kernel reports per-block Q for this reason: the whole
+    // ladder is host arithmetic on one readback.
+    //
+    // An L1 block wanting level k implies its EIGHT children at each level
+    // below (refinement is octet-complete from level 2 down, M5), so the tile
+    // count at level j is 8^(j-1) times the number of L1 blocks wanting >= j.
+    // That is the number the slot budget has to cover, and it is what makes
+    // the difference between graded and ungraded concrete rather than
+    // rhetorical.
+    const ladderAt = (base, inc, maxLevel) => {
+      const want = new Array(maxLevel + 1).fill(0);
+      for (let i = 0; i < total; i++) {
+        const eps = 0.5 * Math.log2(Math.max(q[i], 1e-30));
+        let k = 0;
+        for (let j = 1; j <= maxLevel; j++) if (eps >= base + inc * (j - 1)) k = j;
+        for (let j = 1; j <= k; j++) want[j]++;
+      }
+      return want.slice(1).map((n, i) => ({ level: i + 1, blocks: n, tiles: n * 8 ** i }));
+    };
     return { step, level: CRIT_LEVEL, nb: CRIT_NB.slice(), blkL0: CRIT_BLK_L0,
-             lead: CRIT_LEAD, total, qMax, qRef: qr, qMaxNorm: qMax / qr, rows };
+             lead: CRIT_LEAD, total, qMax, qRef: qr, qMaxNorm: qMax / qr, rows,
+             ladder: (base, inc, maxLevel) => ladderAt(base, inc, maxLevel),
+             // Precomputed for the common case, since a function does not
+             // survive the structured clone a CDP readback does.
+             demand: [0.5, 1, 2, 3, 4].map(inc => ({
+               inc, levels: ladderAt(0.5 * Math.log2(Math.max(cutBase, 1e-30)), inc, LEVELS - 1) })) };
   }
 
   // THE ACCOUNTING, for a tool rather than an eye. A harness sizing the slot
@@ -2646,6 +2728,37 @@ async function init() {
         peakFrac: (DYNAMIC ? poolPeak[l.level] : l.alloc.activeSlots) / l.slots,
       })),
     };
+  }
+
+  // THE GATE (plans/3D.md M8.4). Every cell whose Q exceeds the threshold must
+  // sit in a refined block, checked HERE at cell granularity against a set
+  // built from a per-block-max reduction on the GPU -- two different
+  // computations, which is what makes agreement evidence rather than a
+  // tautology. The same discipline debugCheckGeometryCoverage is held to.
+  //
+  // Q is recomputed on the host from `mac`, deliberately: reading the
+  // criterion buffer back would check the manager against the criterion's own
+  // answer and could not see the criterion itself being wrong.
+  async function debugCheckQCoverage(thresh) {
+    if (!AMR) return { skipped: 'no pool' };
+    if (!Q_ON) return { skipped: 'the field criterion is off (?qthresh=)' };
+    const m = await readMacro();
+    const lv = L[LEVELS - 1];
+    const bs = await readBlockSlot(LEVELS - 1);
+    // The criterion's grid is the finest level's; its cells are L0 cells
+    // scaled by the same factor CRIT_BLK_L0 carries.
+    const at = (x, y, z) => {
+      const c = 4 * ((((z + NZ) % NZ) * NY + ((y + NY) % NY)) * NX + ((x + NX) % NX));
+      return [m[c + 1], m[c + 2], m[c + 3]];
+    };
+    const qAt = (x, y, z) => qOfGrad(gradU(
+      [at(x + 1, y, z), at(x, y + 1, z), at(x, y, z + 1)],
+      [at(x - 1, y, z), at(x, y - 1, z), at(x, y, z - 1)], 1));
+    const cut = (thresh ?? Q_THRESH) * ((CRIT_U && CRIT_D) ? (CRIT_U / CRIT_D) ** 2 : 1);
+    const r = checkFieldCoverage({
+      dims: [NX, NY, NZ], rb: CRIT_BLK_L0, blockSlot: bs, qAt, thresh: cut });
+    return { step, thresh: thresh ?? Q_THRESH, lead: CRIT_LEAD,
+             manageEvery: MANAGE_EVERY, inUse: poolInUse[LEVELS - 1], slots: lv.slots, ...r };
   }
 
   async function debugOccupancy(brick) {
@@ -3482,7 +3595,7 @@ async function init() {
       } : {}),
     }),
     readSubsampled, readDuctProfile, readStats, readBody, readPoolStats, debugCriterion,
-    debugPoolUsage,
+    debugPoolUsage, debugCheckQCoverage,
     debugCheck21Balance, debugCheckGeometryCoverage, debugCheckRingParents, debugPoolState,
     debugRunBalance, debugSampleTree, debugCheckTreeSample, debugReadVolume,
     debugHotspot, debugRunAndCollect, debugOccupancy,
