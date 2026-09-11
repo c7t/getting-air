@@ -85,6 +85,18 @@
 // always so the layout does not fork; read only by that entry point, which is
 // created only where there is a child level.
 @group(0) @binding(7) var<storage, read> childWant : array<u32>;
+// PER-BLOCK MAX Q from common_d3_criterion.wgsl (plans/3D.md M8.4), indexed
+// on the FINEST level's block grid -- the grid `decide` runs on. Bound always,
+// like childWant, so the layout does not fork; read only where HAS_Q is set.
+@group(0) @binding(8) var<storage, read> blockQ : array<f32>;
+
+// THE FIELD CRITERION, off by default so every scenario that predates M8.4 is
+// bit-identical rather than merely unaffected. Q_ABS is already in absolute
+// units -- the host multiplies the dimensionless `?qthresh=` by the
+// scenario's own (U/D)^2 (d3-criterion.mjs's qRef), so nothing here has to
+// know the velocity scale.
+override HAS_Q : u32 = 0u;
+override Q_ABS : f32 = 1e30f;
 
 override MARGIN : f32 = 2.0f;
 // How many macro-steps pass before the criterion is re-evaluated. The
@@ -249,11 +261,24 @@ fn clearWant(@builtin(global_invocation_id) gid: vec3<u32>) {
 // this reads the answer rather than recomputing it -- see blockWant's own
 // note. It also fixes the answer for the whole topology change, so the drain
 // pass and the coarsen pass provably agree about which tiles are dying.
+//
+// THE UNION OF THE TWO CRITERIA IS TAKEN HERE, and here only (M8.4). A body
+// and a detached vortex are two independent reasons to refine a block, and
+// `decide` is already the single producer every other pass reads -- so the
+// alternative, having the criterion kernel OR into blockWant itself, would
+// make the answer depend on which of two dispatches ran second. One producer,
+// one union, three consumers.
+//
+// The geometry half stays FIRST in the expression deliberately: it is the one
+// whose failure is a seam through the body (M5.4), and `||` short-circuits,
+// so a block the body needs is never subject to the field test at all.
 @compute @workgroup_size(64)
 fn decide(@builtin(global_invocation_id) gid: vec3<u32>) {
   let id = gid.x;
   if (id >= nbx() * nby() * nbz()) { return; }
-  blockWant[id] = select(0u, 1u, blockWanted(blockOfId(id)));
+  let geom = blockWanted(blockOfId(id));
+  let field = HAS_Q != 0u && blockQ[id] > Q_ABS;
+  blockWant[id] = select(0u, 1u, geom || field);
 }
 
 // PASS 2. Release the slot of any refined block the criterion no longer

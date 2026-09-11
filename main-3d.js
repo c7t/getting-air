@@ -80,6 +80,7 @@ import { SCENARIOS, SCENARIO_NAMES, resolveScenario, nuFromTau, beltramiVelocity
 import { packBodyState, unpackBodyState, BODY_FIELDS, sdfBody, qRotateInv } from './d3-body.mjs';
 import { parseWindowAxes, wrapDims, wrapDelta3, windowOffset3, windowCoord3,
          windowConstants } from './d3-window.mjs';
+import { Q_THRESHOLD } from './d3-criterion.mjs';
 import { makePool, refineHierarchy, nearBodyWant, storageRatio, GHOST,
          check21Balance, checkGeometryCoverage, checkRingParentCoverage,
          cellAtLevel, finestLevelAt } from './d3-amr.mjs';
@@ -174,9 +175,13 @@ async function init() {
     'window',
     // M8.4a: the hand-placed wake box's extent, in body diameters.
     'wake', 'wakeR',
-    // M8.4: the Q-criterion's convection lead, in L0 cells, and the fraction
-    // of the slot budget at which the page starts saying so.
-    'qlead', 'slotWarn']);
+    // M8.4: the Q-criterion's threshold (its PRESENCE turns the criterion on),
+    // its convection lead in L0 cells, and the fraction of the slot budget at
+    // which the page starts saying so.
+    'qthresh', 'qlead', 'slotWarn',
+    // M8.4: an absolute per-level slot budget. A field criterion's set is not
+    // predicted by the initial one, so ?slotHeadroom= cannot size it.
+    'slots']);
   for (const k of urlParams.keys()) {
     if (PAGE_PARAMS.has(k) || k in SCENARIOS[scenarioName].defaults) continue;
     throw new Error(`?${k}=: not a parameter of scenario "${scenarioName}" `
@@ -539,8 +544,27 @@ async function init() {
   // level demands a wider buffer shell around it. A budget derived from the
   // depth-2 answer would under-allocate the coarser levels of every deeper
   // run (plans/3D.md M5.1b).
+  // THE SLOT BUDGET. ?slotHeadroom= scales the INITIAL set, which is the right
+  // derivation for a geometry criterion -- the body's shell is the whole
+  // answer and it does not grow. A FIELD criterion's set is not predicted by
+  // the initial one at all: at reset the flow has not developed and the wake
+  // does not exist yet, so the initial set is the geometry shell and the
+  // steady-state set is several times it (measured: 160 blocks of geometry
+  // against 379-628 of wake, plans/3D.md M8.4).
+  //
+  // So ?slots= sets it absolutely, and that is the knob a field criterion has
+  // to use. It is sized from debugCriterion()'s sweep rather than guessed --
+  // and running out is still a HARD failure, so the budget is a claim about
+  // the flow that the run will check.
+  const SLOT_ABS = Math.round(numParam('slots', NaN));
   const maxSlotsAt = (m) => {
     const a = hier.byLevel[m];
+    if (Number.isFinite(SLOT_ABS) && SLOT_ABS > 0) {
+      // Never BELOW the initial set: that would refuse a geometry-forced tile
+      // at step 0, which is M5.4a's hard failure arriving before the run has
+      // done anything.
+      return Math.min(a.pool.nBlocks, Math.max(a.activeSlots, SLOT_ABS));
+    }
     return Math.min(a.pool.nBlocks, Math.max(1, DYNAMIC
       ? Math.ceil(a.activeSlots * SLOT_HEADROOM)
       : a.activeSlots));
@@ -956,6 +980,50 @@ async function init() {
   // the same way d3-criterion.mjs states it, and overridable for a sweep.
   const CRIT_U = params.u0 || params.u_t || params.uRel || 0;
   const CRIT_LEAD = numParam('qlead', MANAGE_EVERY * CRIT_U);
+  // THE FIELD CRITERION IS OPT-IN, and the switch is the presence of
+  // `?qthresh=` rather than a separate flag. Absent, Q_ABS folds the whole
+  // test out of `decide` at pipeline-creation time and every scenario that
+  // predates M8.4 is bit-identical rather than merely unaffected.
+  const Q_ON = urlParams.has('qthresh');
+  const Q_THRESH = numParam('qthresh', Q_THRESHOLD);
+  // Dimensionless in, absolute out: the threshold is quoted against the
+  // body's own shear scale so one number means the same thing at another Re
+  // or resolution (d3-criterion.mjs's qRef).
+  const CRIT_D = params.D || params.n;
+  const Q_ABS = Q_THRESH * ((CRIT_U && CRIT_D) ? (CRIT_U / CRIT_D) ** 2 : 1);
+  if (Q_ON) {
+    // The criterion writes on the FINEST level's block grid and `decide`
+    // indexes it with that level's block id. Those are derived separately --
+    // here from NX/RB, there from d3-amr.mjs's poolAtLevel -- so they are
+    // checked against each other rather than assumed equal. A mismatch would
+    // not crash; it would flag the wrong blocks.
+    const nbFinest = AMR ? hier.byLevel[LEVELS - 1].pool.nb : CRIT_NB;
+    if (CRIT_NB.some((n, i) => n !== nbFinest[i])) {
+      statusEl.textContent = `error: the Q-criterion grid ${CRIT_NB.join('x')} does not match`
+        + ` level ${CRIT_LEVEL}'s block grid ${nbFinest.join('x')}`;
+      return;
+    }
+    if (!AMR) {
+      statusEl.textContent = 'error: ?qthresh= is a refinement criterion and needs ?levels>=2;'
+        + ' debugCriterion() reports it read-only on a dense run';
+      return;
+    }
+    if (!DYNAMIC) {
+      // A field criterion on a STATIC set is a contradiction: the set is
+      // chosen once at reset, from a flow that has not developed, and can
+      // never follow anything. Refused rather than quietly refining a
+      // t = 0 wake forever.
+      statusEl.textContent = 'error: ?qthresh= needs ?dynamic=1 -- a field criterion on a set'
+        + ' chosen once at reset would refine a flow that has not developed yet';
+      return;
+    }
+    if (CRIT_BLK_L0 < 1) {
+      statusEl.textContent = `error: ?qthresh= at ?levels=${LEVELS} rb=${RB} gives ${CRIT_BLK_L0}`
+        + ' L0 cells per candidate block; the criterion reads the L0 field and cannot tell'
+        + ' siblings apart below one cell (plans/3D.md M8.4)';
+      return;
+    }
+  }
   const critModule = device.createShaderModule({
     code: await loadShader(`shaders/d3_criterion_q${Q}.wgsl`), label: `d3_criterion_q${Q}` });
   const critPipe = await device.createComputePipelineAsync({
@@ -1230,12 +1298,20 @@ async function init() {
         { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
         { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
         { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+        // M8.4: per-block max Q from the field criterion, on the FINEST
+        // level's grid. Bound on every level's group like childWant, so the
+        // layout does not fork; read only by `decide`, and only when HAS_Q.
+        { binding: 8, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
       ]});
       // MARGIN comes from the SAME value refineNearBody used to build the
       // static set, not from a second read of ?margin=: the bit-identical
       // gate needs the two criteria to agree exactly, and two independent
       // parses of one parameter is how they would silently stop agreeing.
       const manageConst = { ...poolConst, HAS_BODY, ...WINC,
+        // OFF unless ?qthresh= was given, at which point Q_ABS folds the
+        // whole field test out at pipeline-creation time and every scenario
+        // that predates M8.4 is bit-identical.
+        HAS_Q: Q_ON ? 1 : 0, Q_ABS: Q_ON ? Q_ABS : 1e30,
         MARGIN: Number.isFinite(MANAGE_MARGIN) ? MANAGE_MARGIN : geomForced.margin,
         // The lead term is zero for a pinned body, so the criterion still
         // reproduces the host's initial set exactly and M4.2b-i's
@@ -1284,7 +1360,8 @@ async function init() {
         { binding: 4, resource: { buffer: bodyBuf } },
         { binding: 5, resource: { buffer: blockWantBuf } },
         { binding: 6, resource: { buffer: slotNewBuf } },
-        { binding: 7, resource: { buffer: wantDummy.blockWant } }]});
+        { binding: 7, resource: { buffer: wantDummy.blockWant } },
+        { binding: 8, resource: { buffer: critBuf } }]});
       // Per level, so the closure can be dispatched down the tree. Binding 5
       // is THIS level's want and binding 7 is the CHILD's; at the deepest
       // level the child slot is bound to itself, which `balance` never reads
@@ -1305,7 +1382,12 @@ async function init() {
           // the symptom is a manager that decides nothing at all. Found
           // exactly that way. The deepest level's `balance` pipeline does
           // not exist, so what sits here is never read.
-          { binding: 7, resource: { buffer: (L[m + 1] || wantDummy).blockWant } }]});
+          { binding: 7, resource: { buffer: (L[m + 1] || wantDummy).blockWant } },
+          // The SAME criterion buffer on every level's group. It is indexed
+          // on the finest level's grid, which is the only level `decide`
+          // runs on -- the coarser levels' groups carry it so the layout
+          // stays one layout, exactly as binding 7 does.
+          { binding: 8, resource: { buffer: critBuf } }]});
       }
     }
 
@@ -1977,6 +2059,17 @@ async function init() {
   // order from the one the solver runs, it would be scoring a chain nothing
   // uses.
   const encodeDecideChain = (enc, managePass) => {
+    // THE FIELD CRITERION RUNS FIRST, because `decide` reads its answer.
+    // Its own bind group, so it is encoded here rather than through
+    // managePass -- and inside this function rather than at the call site, so
+    // that every caller of the chain (the manager, and debugRunBalance) sees
+    // the same passes in the same order. Skipped entirely when the criterion
+    // is off, which is the default.
+    if (Q_ON) {
+      const cp = enc.beginComputePass();
+      cp.setPipeline(critPipe); cp.setBindGroup(0, critBG);
+      cp.dispatchWorkgroups(CRIT_NB[0], CRIT_NB[1], CRIT_NB[2]); cp.end();
+    }
     for (let m = 1; m < LEVELS; m++) managePass(L[m].clearWantPipe, m);
     managePass(manageDecidePipe, LEVELS - 1);
     for (let m = LEVELS - 1; m >= 2; m--) {
@@ -2957,6 +3050,11 @@ async function init() {
   // on the manager.
   async function debugRunBalance() {
     if (!AMR || !manageDecidePipe) return { skipped: 'no geometry-forced criterion' };
+    // The host reference this is scored against is refineHierarchy on the
+    // GEOMETRY want alone, so with the field criterion on the two are
+    // answering different questions and a disagreement would mean nothing.
+    // Said rather than silently compared (M8.4).
+    if (Q_ON) return { skipped: 'the field criterion is on; the host reference is geometry-only' };
     const enc = device.createCommandEncoder();
     // THE SAME CHAIN THE MANAGER ENCODES, not a second statement of it --
     // including the clear, which is a kernel rather than a writeBuffer for
