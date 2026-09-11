@@ -108,8 +108,17 @@ override TIME_BLEND : f32 = 0.0f;
 // One coarse cell's macroscopic state and non-equilibrium part.
 fn sampleCoarse(c: vec3<i32>) -> CoarseSample3 {
   let w = vec3<u32>(wrapu(c.x, NX), wrapu(c.y, NY), wrapu(c.z, NZ));
-  let cell = coarseCell(w);
-  let ncells = NX * NY * NZ;
+  // parentIndex, not coarseCell: a dense index at level 1, a tile lookup at
+  // level >= 2 (M5.2b). The stride comes from the binding for the same
+  // reason -- a pool parent is slots x tileCells, not a grid.
+  //
+  // The clamp is unreachable for the cells this actually consumes: interp
+  // samples within one parent cell of the child block's footprint, which is
+  // exactly what M5.2a's ring-parent invariant covers and what
+  // tools/validate-d3-invariants.js gates. Same posture as explode's
+  // gradient clamp.
+  let cell = u32(max(parentIndex(w), 0));
+  let ncells = arrayLength(&f_coarse_t0) / QN;
   var out: CoarseSample3;
   var rho = 0f;
   var m = vec3<f32>(0f);

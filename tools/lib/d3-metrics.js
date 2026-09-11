@@ -59,6 +59,11 @@ function caseUrl(baseUrl, scenario, c, extra) {
   const p = new URLSearchParams({ scenario, n: c.n, tau: c.tau, u0: c.u0, q: c.q || 19, live: '0' });
   // AMR knobs, present only on the M3 cases.
   if (c.levels) p.set('levels', c.levels);
+  // Depth 3 has no scheduler yet (plans/3D.md M5.3); the page refuses it
+  // without this acknowledgement and runs it as a diagnostic. Set from the
+  // case's own level count rather than a per-case flag, so a case cannot ask
+  // for depth 3 and forget it.
+  if (c.levels >= 3) p.set('handdepth', '1');
   if (c.refine) p.set('refine', c.refine);
   if (c.boxfrac) p.set('boxfrac', c.boxfrac);
   if (c.rb) p.set('rb', c.rb);

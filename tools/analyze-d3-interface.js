@@ -80,6 +80,17 @@ const CONFIGS = [
   // No fine level at all: the coarse solver's own discretization error, the
   // floor everything else is measured against.
   { name: 'dense', levels: 1 },
+  // --- depth 3 (plans/3D.md M5.2b-ii) -------------------------------------
+  // The SAME geometry ladder one rung down, where the seam is L1/L2 and the
+  // parent is a POOL rather than the dense grid. `all3` is the no-interface
+  // control for these, and it is a control in a stronger sense than `all`
+  // is at depth 2: with every block refined at every level, coalesce writes
+  // no populations at all (every target is covered), so it isolates the
+  // pool-parent DISPATCH and seeding from the coupling.
+  { name: 'slab3', levels: 3, refine: 'slab' },
+  { name: 'bar3', levels: 3, refine: 'bar' },
+  { name: 'box3', levels: 3, refine: 'box' },
+  { name: 'all3', levels: 3, refine: 'all' },
 ];
 
 function parseArgs(argv) {
@@ -110,6 +121,10 @@ function parseArgs(argv) {
 function urlFor(o, c) {
   const p = new URLSearchParams({ scenario: 'beltrami', n: o.n, tau: o.tau, u0: o.u0, q: o.q, live: '0' });
   if (c.levels > 1) { p.set('levels', c.levels); p.set('rb', o.rb); p.set('refine', c.refine); }
+  // Depth 3 has no scheduler yet (plans/3D.md M5.3), so the page refuses it
+  // without this acknowledgement and runs it as a diagnostic only -- which
+  // is exactly what this tool is.
+  if (c.levels > 2) p.set('handdepth', '1');
   if (['box', 'bar', 'slab'].includes(c.refine)) p.set('boxfrac', o.boxfrac);
   return `${o.baseUrl}/index-3d.html?${p}${o.extra ? `&${o.extra}` : ''}`;
 }

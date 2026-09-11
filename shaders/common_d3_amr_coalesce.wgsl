@@ -207,11 +207,21 @@ fn coalesceOrphans(c: vec3<u32>) {
   }
 }
 
-@compute @workgroup_size(4, 4, 4)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  if (gid.x >= NX || gid.y >= NY || gid.z >= NZ) { return; }
-  let c = vec3<u32>(gid.x, gid.y, gid.z);
-
+// ONE PARENT CELL'S WORTH OF WORK. The `main` that calls this differs
+// between a dense parent and a pool one -- and ONLY in how `c` is obtained,
+// which is why the body lives here rather than being forked (M5.2b).
+//
+//   dense parent   one thread per L0 cell, dispatched over the grid.
+//   pool parent    the parent is not a grid, so the dispatch walks parent
+//                  TILES and each thread takes one INTERIOR cell of one.
+//                  Interior only, because a parent's ring is not a cell the
+//                  parent solves -- some other parent tile owns it, and that
+//                  tile's own thread is the one that speaks for it.
+//
+// The orphan pass comes along for free in both: "unrefined parent cells near
+// the seam" are exactly the parent cells no child covers, and those are
+// visited either way.
+fn coalesceAt(c: vec3<u32>) {
   // Covered cells only: this pass speaks for the coarse cells the coarse
   // solver no longer runs on.
   let b = blockOfCoarse(c);

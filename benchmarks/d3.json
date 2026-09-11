@@ -427,7 +427,7 @@
       "field_l2_with_dcpre": 0.04618
     }
   ],
-  "amr_conserve_note": "CONSERVATION GATES for the ?interface=explode path (plans/3D.md M4.1b), and the ONLY cases in this file that load it -- every other AMR case here is ?interface=interp and is unaffected by anything on the explode path. They exist because M4.1b's convex-edge mass leak shipped green: the field gates could not see it (amr-box-RB4 is the interp path, and refine=all has no interface at all), so a defect that lost mass at 1500x the arithmetic floor rate passed everything. MASS is scored as absolute drift from t=0 against a bound well above an arithmetic floor -- the floor is f32 readback accumulation, grows linearly in t, and is LARGEST on refine=all which has no interface, so it is not physics. Measured 2026-09-09, RTX 4080, N=48 over 256 steps: box 0.531, bar 0.569, slab 0.644, all 0.765; the leak was -3.4 PER STEP. MOMENTUM is scored as drift from a WARMUP sample, not from t=0: there is a real one-time transient in the first steps as the coarse initial condition and the pool reconcile (box settles on 6.94e-1 and does not move for 1000 steps), and it is the startup offset, not a leak. That makes it the sharp half of the gate -- the leak moved momentum 0.86 in 15 steps against under 1e-3 in 1000 now. `bar` is the cheapest geometry with convex edges and no corner and is the case that actually failed; `box` adds corners. BOTH CASES WERE CONFIRMED TO FIRE on the pre-orphan-pass shader rather than merely to pass on the fixed one, which is the difference between a gate and a recorded number: mass -576.2 (bar) and -858.7 (box) against the 5.0 bound, momentum 1.921 and 11.17 against 0.05 -- 115x to 223x over, while the fixed interface sits 9x under on mass and 170x under on momentum. The `*_with_leak` fields below are those measurements. DO NOT WIDEN these to accommodate a change: a conservation bound that has to grow is reporting a leak.",
+  "amr_conserve_note": "CONSERVATION GATES for the ?interface=explode path (plans/3D.md M4.1b), and the ONLY cases in this file that load it -- every other AMR case here is ?interface=interp and is unaffected by anything on the explode path. They exist because M4.1b's convex-edge mass leak shipped green: the field gates could not see it (amr-box-RB4 is the interp path, and refine=all has no interface at all), so a defect that lost mass at 1500x the arithmetic floor rate passed everything. MASS is scored as absolute drift from t=0 against a bound well above an arithmetic floor -- the floor is f32 readback accumulation, grows linearly in t, and is LARGEST on refine=all which has no interface, so it is not physics. Measured 2026-09-09, RTX 4080, N=48 over 256 steps: box 0.531, bar 0.569, slab 0.644, all 0.765; the leak was -3.4 PER STEP. MOMENTUM is scored as drift from a WARMUP sample, not from t=0: there is a real one-time transient in the first steps as the coarse initial condition and the pool reconcile (box settles on 6.94e-1 and does not move for 1000 steps), and it is the startup offset, not a leak. That makes it the sharp half of the gate -- the leak moved momentum 0.86 in 15 steps against under 1e-3 in 1000 now. `bar` is the cheapest geometry with convex edges and no corner and is the case that actually failed; `box` adds corners. BOTH CASES WERE CONFIRMED TO FIRE on the pre-orphan-pass shader rather than merely to pass on the fixed one, which is the difference between a gate and a recorded number: mass -576.2 (bar) and -858.7 (box) against the 5.0 bound, momentum 1.921 and 11.17 against 0.05 -- 115x to 223x over, while the fixed interface sits 9x under on mass and 170x under on momentum. The `*_with_leak` fields below are those measurements. DO NOT WIDEN these to accommodate a change: a conservation bound that has to grow is reporting a leak. DEPTH-3 CASES (plans/3D.md M5.2b-ii, ?levels=3 + ?handdepth=1) score the L1/L2 seam, where the parent is a POOL rather than the dense grid. They use N=32 rather than 48 because the level-2 pool at N=48 is several hundred MiB and this gate does not need the resolution -- it is a conservation statement, not a convergence one. Their tolerances are inherited from the depth-2 rows deliberately: the claim being made is that adding a level does not make the interface leak, so a looser bound at depth would be assuming the answer.",
   "amr_conserve_cases": [
     {
       "name": "amr-bar-explode",
@@ -468,6 +468,42 @@
       "mom_measured": 0.0001625,
       "mass_with_leak": -858.7,
       "mom_with_leak": 11.17
+    },
+    {
+      "name": "amr-bar-explode-L3",
+      "n": 32,
+      "tau": 0.8,
+      "u0": 0.04,
+      "q": 19,
+      "levels": 3,
+      "refine": "bar",
+      "boxfrac": 0.5,
+      "rb": 4,
+      "interface": "explode",
+      "warmup": 8,
+      "steps": 256,
+      "mass_tol": 5.0,
+      "mom_tol": 0.05,
+      "mass_with_leak": -576.2,
+      "mom_with_leak": 1.921
+    },
+    {
+      "name": "amr-box-explode-L3",
+      "n": 32,
+      "tau": 0.8,
+      "u0": 0.04,
+      "q": 19,
+      "levels": 3,
+      "refine": "box",
+      "boxfrac": 0.5,
+      "rb": 4,
+      "interface": "explode",
+      "warmup": 8,
+      "steps": 256,
+      "mass_tol": 5.0,
+      "mom_tol": 0.05,
+      "mass_with_leak": -576.2,
+      "mom_with_leak": 1.921
     }
   ],
   "amr_box_explode_note": "FIELD accuracy on the ?interface=explode path (plans/3D.md M4.1c), the companion to amr_conserve_cases' conservation bounds. The pair is deliberate: M4.1b was exactly conservative and still carried an O(1) seam defect, so a conservation gate alone demonstrably does not guard this interface. Scored against RECORDED values, like amr-box-RB4 -- but unlike amr-box-RB4 the number is no longer dominated by a known defect: it tracks the no-interface control (refine=all) to within 8-10% at N = 32/48/64, so what these bounds actually guard is 'the seam is still invisible'. Measured 2026-09-10, RTX 4080. If a change makes these RISE, the seam signature is back; do not widen them.",

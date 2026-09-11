@@ -159,7 +159,7 @@ async function init() {
   const PAGE_PARAMS = new Set(['scenario', 'q', 'axis', 'slice', 'mode', 'spf', 'live',
     'uscale', 'vscale', 'vortGamma', 'bounceback', 'chiEps', 'vmax', 'omax',
     'levels', 'rb', 'refine', 'margin', 'boxfrac', 'dcpre', 'reflux', 'interface',
-    'explin', 'orphans', 'dynamic', 'manageEvery', 'slotHeadroom',
+    'explin', 'orphans', 'dynamic', 'manageEvery', 'slotHeadroom', 'handdepth', 'handskip',
     'manageMargin', 'manageStart']);
   for (const k of urlParams.keys()) {
     if (PAGE_PARAMS.has(k) || k in SCENARIOS[scenarioName].defaults) continue;
@@ -208,9 +208,28 @@ async function init() {
   // with a different spelling: a validation config written as ?levels=3
   // would pass and mean nothing. M5.3 lifts this, when the recursive
   // schedule has something to run.
-  if (LEVELS > 2) {
-    statusEl.textContent = `error: ?levels=${LEVELS} is not implemented yet`
-      + ' (the pool-parent path is plans/3D.md M5); ?levels=1 or 2';
+  //
+  // M5.2b-ii OPENS A CRACK IN IT, and deliberately a narrow one. The
+  // pool-parent coupling exists and can be dispatched, but NO SCHEDULER
+  // drives it (that is M5.3), so ?levels=3 is allowed only with
+  // ?handdepth=1, which also disables live stepping and debugStepSync. A
+  // run under that flag is a DIAGNOSTIC, not a solve: it exists so
+  // tools/analyze-d3-interface.js can measure the L1/L2 seam, and calling
+  // it a solver before M5.3 would be exactly the silence M5.0 refused.
+  const HAND_DEPTH = urlParams.get('handdepth') === '1';
+  // BISECTION HOOK for the hand-driven depth path. Each name drops one pass
+  // of the L2 nest, which makes the physics wrong on purpose -- the point is
+  // to find which pass a blowup lives in by removing passes one at a time,
+  // the same attribution method ?benchSkip= uses for cost. Not a physics
+  // knob; ?levels=3 is a diagnostic already.
+  const HAND_SKIP = new Set((urlParams.get('handskip') || '').split(',').filter(Boolean));
+  if (LEVELS > 2 && !HAND_DEPTH) {
+    statusEl.textContent = `error: ?levels=${LEVELS} needs ?handdepth=1 until M5.3`
+      + ' (the pool-parent coupling exists; no scheduler drives it); ?levels=1 or 2';
+    return;
+  }
+  if (LEVELS > 3) {
+    statusEl.textContent = `error: ?levels=${LEVELS}: only depth 3 is wired (plans/3D.md M5.2b-ii)`;
     return;
   }
   const AMR = LEVELS >= 2;
@@ -674,6 +693,9 @@ async function init() {
   // owns the level -> tau mapping rather than each shader re-deriving it.
   const TAU_COARSE = params.tau;
   const TAU_FINE = 2 * TAU_COARSE - 0.5;
+  // Level 0 is TAU_COARSE and each level down doubles the distance from 1/2,
+  // which is the acoustic-scaling relation the depth-2 pair already encodes.
+  const tauAtLevel = (m) => { let t = TAU_COARSE; for (let k = 0; k < m; k++) t = 2 * t - 0.5; return t; };
   // 1 puts the grid transfers back on the PRE-collision Dupuis-Chopard
   // factor, which is wrong for this solver's post-collision buffers and was
   // the M3 interface bug -- kept switchable so the defect can be measured
@@ -739,6 +761,16 @@ async function init() {
   const IFACE = urlParams.get('interface') || 'explode';
   if (!['explode', 'interp'].includes(IFACE)) throw new Error(`?interface=${IFACE}: expected explode or interp`);
   const EXPLODE = AMR && IFACE === 'explode';
+  // Only the explode/coalesce coupling has a pool-parent variant (M5.2b-ii).
+  // ?interface=interp is the superseded M3 path, kept switchable at depth 2
+  // purely to A/B the conversion; giving it a second implementation at depth
+  // would be two copies of a coupling that is not the default and is known
+  // not to be conservative.
+  if (LEVELS >= 3 && !EXPLODE) {
+    statusEl.textContent = `error: ?levels=${LEVELS} needs ?interface=explode`
+      + ' (the pool-parent coupling exists only there, plans/3D.md M5.2b-ii)';
+    return;
+  }
   // M4.1d lifted the "explode cannot carry a body" restriction: the body
   // force is now integrated on the level that OWNS each region -- the coarse
   // kernel masks out cells a refined block covers and
@@ -778,7 +810,7 @@ async function init() {
       { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
       { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
       { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    ]});
+        ]});
     const avgBGL = device.createBindGroupLayout({ entries: [
       { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
       { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
@@ -935,6 +967,90 @@ async function init() {
         { binding: 2, resource: { buffer: blockSlotBuf } }, { binding: 3, resource: { buffer: macPool } },
         { binding: 4, resource: { buffer: mac } }]});
       coalesceBG = [mkCoalesce(fA), mkCoalesce(fB)];
+
+      // --- M5.2b-ii: the same coupling with a POOL parent, level >= 2 ----
+      //
+      // Same two modules' worth of physics, assembled with
+      // common_d3_parent_pool.wgsl instead of the dense fragment, and with
+      // coalesce's parent-tile dispatch. The only per-level values are
+      // poolConst's NX/NY/NZ -- read as THE PARENT GRID's dims, which is
+      // what makes every other function in common_d3_pool.wgsl level-generic
+      // (M5.2b-i) -- and the relaxation time.
+      //
+      // Bindings 8 and 9 are the parent's own pool bookkeeping and exist
+      // only on this path; the dense parent needs neither, because a dense
+      // cell is addressed arithmetically and always exists.
+      for (let m = 2; m < LEVELS; m++) {
+        const par = L[m - 1], lv = L[m];
+        const pc = { NX: NX * 2 ** (m - 1), NY: NY * 2 ** (m - 1), NZ: NZ * 2 ** (m - 1), RB };
+        const explodePoolModule = device.createShaderModule({
+          code: await loadShader(`shaders/d3_amr_explode_pool_q${Q}.wgsl`), label: `d3_amr_explode_pool_q${Q}` });
+        const coalescePoolModule = device.createShaderModule({
+          code: await loadShader(`shaders/d3_amr_coalesce_pool_q${Q}.wgsl`), label: `d3_amr_coalesce_pool_q${Q}` });
+        const ro = (binding) => ({ binding, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } });
+        const rw = (binding) => ({ binding, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } });
+        const explodePoolBGL = device.createBindGroupLayout({ entries: [ro(0), rw(1), ro(2), ro(3), ro(8)] });
+        const coalescePoolBGL = device.createBindGroupLayout({ entries: [ro(0), rw(1), ro(2), ro(3), rw(4), ro(8), ro(9)] });
+        lv.explodePipe = await mk(explodePoolBGL, explodePoolModule, { ...pc, EXPLODE_LINEAR });
+        lv.coalescePipe = await mk(coalescePoolBGL, coalescePoolModule, { ...pc, ORPHANS });
+        lv.step1Pipe = await mk(step1BGL, step1Module, {
+          ...pc,
+          COLLIDE_RING: EXPLODE ? 0 : 1,
+          OMEGA_FINE: 1 / tauAtLevel(m),
+          FORCE_X: params.force[0], FORCE_Y: params.force[1], FORCE_Z: params.force[2],
+          HAS_BODY, USE_BOUNCEBACK, CHI_EPS,
+          SPONGE_W: sponge.width, SPONGE_UX: sponge.u[0], SPONGE_UY: sponge.u[1], SPONGE_UZ: sponge.u[2],
+        });
+        // Explode reads the parent buffer holding time t -- the one the
+        // parent's own upcoming substep will READ -- and writes the ring of
+        // the buffer this level's substep A reads. Coalesce writes back into
+        // that same parent buffer, exactly as the depth-2 pair does against
+        // L0. Indexed by parent parity for the same reason.
+        const mkEx = (src) => device.createBindGroup({ layout: explodePoolBGL, entries: [
+          { binding: 0, resource: { buffer: src } }, { binding: 1, resource: { buffer: lv.fA } },
+          { binding: 2, resource: { buffer: lv.slotToBlock } }, { binding: 3, resource: { buffer: lv.blockSlot } },
+          { binding: 8, resource: { buffer: par.blockSlot } }]});
+        lv.explodeBG = [mkEx(par.fA), mkEx(par.fB)];
+        const mkCo = (dst) => device.createBindGroup({ layout: coalescePoolBGL, entries: [
+          { binding: 0, resource: { buffer: lv.fA } }, { binding: 1, resource: { buffer: dst } },
+          { binding: 2, resource: { buffer: lv.blockSlot } }, { binding: 3, resource: { buffer: lv.mac } },
+          // The PARENT's mac pool, not L0's: coalesce republishes the
+          // macroscopic field under the refined region, and at depth the
+          // cells it speaks for live in the parent's pool. `parentIndex`
+          // addresses both the same way, 4 floats per cell.
+          { binding: 4, resource: { buffer: par.mac ?? mac } },
+          { binding: 8, resource: { buffer: par.blockSlot } },
+          { binding: 9, resource: { buffer: par.slotToBlock } }]});
+        lv.coalesceBG = [mkCo(par.fA), mkCo(par.fB)];
+        const mkStepL = (a, b) => device.createBindGroup({ layout: step1BGL, entries: [
+          { binding: 0, resource: { buffer: a } }, { binding: 1, resource: { buffer: b } },
+          { binding: 2, resource: { buffer: lv.mac } }, { binding: 3, resource: { buffer: bodyBuf } },
+          { binding: 4, resource: { buffer: lv.slotToBlock } }, { binding: 5, resource: { buffer: lv.blockSlot } }]});
+        lv.step1BG_AB = mkStepL(lv.fA, lv.fB);
+        lv.step1BG_BA = mkStepL(lv.fB, lv.fA);
+
+        // AND THE SEED. A level's pool starts as whatever the GPU zeroed it
+        // to, and zero is not a fluid state: rho = 0 there, so the first
+        // coalesce hands the parent nothing and the run detonates in one
+        // step. That is exactly how this was found -- with L2 never
+        // stepped, coalesce alone still blew L1 up, which pointed at L2's
+        // CONTENTS rather than at the pass.
+        //
+        // Level 1 is seeded by interpFullPipe from the L0 initial condition
+        // (see reset()); every level below it needs the same transfer from
+        // ITS parent, which is the same module with the pool-parent
+        // fragment. Seeding must cascade in order -- L2 reads an L1 that has
+        // already been filled.
+        const interpPoolModule = device.createShaderModule({
+          code: await loadShader(`shaders/d3_amr_interp_pool_q${Q}.wgsl`), label: `d3_amr_interp_pool_q${Q}` });
+        const interpPoolBGL = device.createBindGroupLayout({ entries: [ro(0), rw(1), ro(2), ro(3), ro(4), ro(8)] });
+        lv.interpFullPipe = await mk(interpPoolBGL, interpPoolModule,
+          { ...pc, TAU_COARSE: tauAtLevel(m - 1), DC_PRE, GHOST_ONLY: 0, TIME_BLEND: 0.0 });
+        lv.interpSeedBG = device.createBindGroup({ layout: interpPoolBGL, entries: [
+          { binding: 0, resource: { buffer: par.fA } }, { binding: 1, resource: { buffer: lv.fA } },
+          { binding: 2, resource: { buffer: lv.slotToBlock } }, { binding: 3, resource: { buffer: par.fA } },
+          { binding: 4, resource: { buffer: lv.slotNew } }, { binding: 8, resource: { buffer: par.blockSlot } }]});
+      }
     }
 
     // --- M4 interface flux correction ------------------------------------
@@ -996,7 +1112,11 @@ async function init() {
   // --- state ---------------------------------------------------------------
   let step = 0;
   let useB = false;               // true => the CURRENT field is in fB
-  let live = urlParams.get('live') !== '0';
+  // HAND_DEPTH runs are diagnostics, not solves: nothing schedules the
+  // hierarchy yet (M5.3), so a live animation would present a hand-flattened
+  // stanza as if it were the solver. Driven only by debugStepSync, from the
+  // tools.
+  let live = urlParams.get('live') !== '0' && LEVELS < 3;
   let axis = parseAxis();
   const axisExtent = (a) => [NX, NY, NZ][a];
   let slice = urlParams.has('slice')
@@ -1066,6 +1186,17 @@ async function init() {
       ip.setBindGroup(0, interpBG[0][0]);     // reset always leaves state in fA
       ip.dispatchWorkgroups(tileDisp[0], tileDisp[1], tileDisp[2]);
       ip.end();
+      // ...then cascade the seed down every deeper level, IN ORDER: L2 reads
+      // an L1 that this pass has already filled (M5.2b-ii). A separate
+      // compute pass per level, because each must observe the previous
+      // one's writes.
+      for (let m = 2; m < LEVELS; m++) {
+        const lp = enc.beginComputePass();
+        lp.setPipeline(L[m].interpFullPipe);
+        lp.setBindGroup(0, L[m].interpSeedBG);
+        lp.dispatchWorkgroups(pool.FB / 4, pool.FB / 4, (pool.FB / 4) * Math.max(1, SLOTS[m]));
+        lp.end();
+      }
     }
     device.queue.submit([enc.finish()]);
     // initEq READ mac and did not write it, so mac still holds the seed --
@@ -1157,6 +1288,15 @@ async function init() {
         gp.dispatchWorkgroups(disp[0], disp[1], disp[2]);
         gp.end();
       };
+      // A pool dispatch over `slots` tiles, for a level that is not level 1.
+      // Coalesce at depth is dispatched over the PARENT's slot count, not
+      // its own -- it walks parent tiles (M5.2b-i's finding).
+      const poolPass = (pipe, bg, slots) => {
+        const pp = enc.beginComputePass();
+        pp.setPipeline(pipe); pp.setBindGroup(0, bg);
+        pp.dispatchWorkgroups(pool.FB / 4, pool.FB / 4, (pool.FB / 4) * Math.max(1, slots));
+        pp.end();
+      };
 
       // --- dynamic refinement (M4.2b) ---------------------------------------
       //
@@ -1233,8 +1373,33 @@ async function init() {
         //   L0 x1      the coarse step, now gathering coalesced values as if
         //              they were ordinary neighbours.
         tilePass(explodePipe, explodeBG[cp]);
-        tilePass(step1Pipe, step1BG_AB);
-        tilePass(step1Pipe, step1BG_BA);
+        if (LEVELS >= 3) {
+          // M5.2b-ii, HAND-FLATTENED at depth 3 -- the same stanza one rung
+          // down, which is what M5.3 replaces with the S_Advance recursion.
+          //
+          // Each of L1's two substeps wraps a whole L2 macro-step, and the
+          // nesting is the depth-2 shape verbatim: explode from the parent's
+          // TIME-t buffer, two substeps, coalesce back into that same buffer,
+          // and the parent's own substep LAST so it gathers the coalesced
+          // values as ordinary neighbours.
+          //
+          // The parent parity is the substep index, not `cp`: L1 substep A
+          // reads L1.fA and substep B reads L1.fB, so those are the buffers
+          // holding time t for the L2 nest inside each.
+          const l2 = L[2];
+          for (let sub = 0; sub < 2; sub++) {
+            if (!HAND_SKIP.has('explode2')) poolPass(l2.explodePipe, l2.explodeBG[sub], SLOTS[2]);
+            if (!HAND_SKIP.has('step2')) {
+              poolPass(l2.step1Pipe, l2.step1BG_AB, SLOTS[2]);
+              poolPass(l2.step1Pipe, l2.step1BG_BA, SLOTS[2]);
+            }
+            if (!HAND_SKIP.has('coalesce2')) poolPass(l2.coalescePipe, l2.coalesceBG[sub], SLOTS[1]);
+            tilePass(step1Pipe, sub === 0 ? step1BG_AB : step1BG_BA);
+          }
+        } else {
+          tilePass(step1Pipe, step1BG_AB);
+          tilePass(step1Pipe, step1BG_BA);
+        }
         gridPass(coalescePipe, coalesceBG[cp]);
         coarseStep();
       } else {
@@ -1900,7 +2065,11 @@ async function init() {
         : scenarioName === 'duct' ? `  t/settle=${(step / params.settle).toFixed(2)}`
         : scenarioName === 'sphere' ? `  t/(D/U)=${(step / params.convective).toFixed(2)}`
           : params.re ? `  Re=${params.re.toFixed(0)}` : '';
-      const amrTxt = AMR ? `  L1 ${poolAlloc.activeSlots}/${pool.nBlocks} blocks (RB=${RB}, FB=${pool.FB})` : '';
+      const amrTxt = AMR
+        ? `  ${L.slice(1).map(l => `L${l.level} ${l.alloc.activeSlots}/${l.nBlocks}`).join(' ')}`
+          + ` blocks (RB=${RB}, FB=${pool.FB})`
+          + (LEVELS >= 3 ? '  [handdepth: diagnostic, no scheduler]' : '')
+        : '';
       statusEl.textContent = `${scenarioName}  D3Q${Q}  ${NX}x${NY}x${NZ}  step ${step}${t}${amrTxt}\n`
         + `${AXIS_NAMES[axis]}-slice ${slice}   ${live ? 'running' : 'paused'}`;
     }
