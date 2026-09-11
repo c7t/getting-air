@@ -116,6 +116,16 @@ const CONFIGS = [
   // floor with margin, not a prediction: the point is that it moved at all.
   { name: 'drift', expectBboxMove: 4, steps: 1200,
     url: 'scenario=drift&n=24&live=0&levels=2&rb=4&refine=body&margin=2&interface=explode&dynamic=1&manageEvery=4' },
+  // DEPTH 3 (plans/3D.md M5.3). These are the configs that make the 2:1 and
+  // ring-parent checks REAL for the first time -- at ?levels=2 both are
+  // vacuous for their own separate reasons, and no amount of dynamic
+  // refinement at one level changes that. Static refinement is enough: the
+  // claim is that refineHierarchy's tree survives the trip to the GPU and
+  // back, which is a different claim from the host-side unit tests.
+  { name: 'box3', steps: 200,
+    url: 'scenario=beltrami&n=16&tau=0.8&u0=0.04&q=19&live=0&levels=3&rb=4&refine=box&boxfrac=0.5&interface=explode' },
+  { name: 'bar3', steps: 200,
+    url: 'scenario=beltrami&n=16&tau=0.8&u0=0.04&q=19&live=0&levels=3&rb=4&refine=bar&boxfrac=0.5&interface=explode' },
   { name: 'body-refine', expectInUse: 'increase', steps: 8,
     url: 'scenario=sphere&n=16&re=20&u0=0.05&q=19&bounceback=1&live=0&levels=2&rb=4&refine=body&interface=explode&dynamic=1&manageEvery=1&manageMargin=6' },
 ];
@@ -257,25 +267,30 @@ async function main() {
     await teardown({ port: o.port, tabId, chrome, server, keepOpen: o.keepOpen });
   }
 
-  console.log('\n' + '='.repeat(104));
+  console.log('\n' + '='.repeat(110));
   console.log(`SUMMARY  ${o.steps} steps, checked every ${o.checkEvery}`);
-  console.log('='.repeat(104));
+  console.log('='.repeat(110));
   console.log(pad('config', 14) + pad('2:1 balance', 21) + pad('ring parents', 18)
-    + pad('geometry coverage', 30) + pad('pool', 14) + padL('verdict', 9));
-  console.log('-'.repeat(104));
+    + pad('geometry coverage', 30) + pad('pool', 20) + padL('verdict', 9));
+  console.log('-'.repeat(110));
   let exitCode = 0;
   for (const r of report) {
-    if (r.error) { console.log(pad(r.name, 14) + pad('-', 21) + pad('-', 18) + pad('-', 30) + pad('-', 14) + padL('ERROR', 9)); exitCode = 1; continue; }
+    if (r.error) { console.log(pad(r.name, 14) + pad('-', 21) + pad('-', 18) + pad('-', 30) + pad('-', 20) + padL('ERROR', 9)); exitCode = 1; continue; }
     const x = r.res;
     const balTxt = x.bal.length ? `${x.bal.length} checkpoints BAD` : (x.vacuous ? 'ok (VACUOUS N=2)' : 'ok');
     const covTxt = x.cov.length ? `${x.cov.length} checkpoints BAD`
       : (x.covSkipped ? 'skipped (not geometry-forced)' : `ok (${x.required} cells required)`);
+    // Every level, not just level 1: at depth the interesting number is how
+    // the tree is distributed, and a single count hides it entirely.
+    const perLevel = x.poolState && x.poolState.byLevel
+      ? x.poolState.byLevel.map(l => `${l.inUse}+${l.free}`).join(' ')
+      : (x.poolState ? `${x.poolState.inUse}+${x.poolState.free}` : null);
     const poolTxt = x.pool.length ? `${x.pool.length} BAD`
-      : (x.poolState ? `ok ${x.poolState.inUse}+${x.poolState.free}${x.blewUp ? '*' : ''}` : 'skipped');
+      : (perLevel ? `ok ${perLevel}${x.blewUp ? '*' : ''}` : 'skipped');
     const ringTxt = x.ring.length ? `${x.ring.length} checkpoints BAD` : (x.ringVacuous ? 'ok (VACUOUS N=2)' : 'ok');
     const ok = !x.bal.length && !x.ring.length && !x.cov.length && !x.pool.length && x.finite;
     if (!ok) exitCode = 1;
-    console.log(pad(r.name, 14) + pad(balTxt, 21) + pad(ringTxt, 18) + pad(covTxt, 30) + pad(poolTxt, 14) + padL(ok ? 'PASS' : 'FAIL', 9));
+    console.log(pad(r.name, 14) + pad(balTxt, 21) + pad(ringTxt, 18) + pad(covTxt, 30) + pad(poolTxt, 20) + padL(ok ? 'PASS' : 'FAIL', 9));
   }
   if (report.some(r => r.res && r.res.blewUp && r.res.finite)) {
     console.log('\n* the field blew up, EXPECTEDLY: that config allocates tiles nothing initializes');
@@ -283,13 +298,12 @@ async function main() {
   }
   const anyVacuous = report.some(r => r.res && r.res.vacuous);
   if (anyVacuous) {
-    console.log('\nVACUOUS means the 2:1 check ran and could not have failed: at ?levels=2 a leaf\'s');
-    console.log('neighbour is level 1 or level 0 and both are legal. It stays vacuous through all');
-    console.log('of M4.2b -- dynamic refinement moves tiles WITHIN one level -- and becomes a real');
-    console.log('gate when M5 adds a level. Do not read it as evidence yet.');
-    console.log('The cascade that will make it non-vacuous is d3-amr.mjs\'s cascade21, and it is');
-    console.log('the identity at ?levels=2 for the same reason, so there is no balance pass in the');
-    console.log('manager to exercise here (M4.2b-iv). make test is where that rule is gated.');
+    console.log('\nVACUOUS marks the ?levels=2 rows, where both checks CANNOT fail: a level-1');
+    console.log('leaf\'s neighbour is level 1 or level 0 and both are legal, and level 1\'s parent');
+    console.log('is the DENSE L0 grid, so no parent tile can be missing. Dynamic refinement does');
+    console.log('not change either -- it moves tiles WITHIN one level. Do not read those rows as');
+    console.log('evidence about the invariants, only that the machinery runs.');
+    console.log('The ?levels=3 rows (box3, bar3) are where both are REAL, as of M5.3.');
     console.log('');
     console.log('RING PARENTS is vacuous for a DIFFERENT reason worth keeping straight: level 1\'s');
     console.log('parent is the DENSE L0 grid, which exists everywhere, so no parent tile can be');

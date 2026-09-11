@@ -159,7 +159,7 @@ async function init() {
   const PAGE_PARAMS = new Set(['scenario', 'q', 'axis', 'slice', 'mode', 'spf', 'live',
     'uscale', 'vscale', 'vortGamma', 'bounceback', 'chiEps', 'vmax', 'omax',
     'levels', 'rb', 'refine', 'margin', 'boxfrac', 'dcpre', 'reflux', 'interface',
-    'explin', 'orphans', 'dynamic', 'manageEvery', 'slotHeadroom', 'handdepth', 'handskip',
+    'explin', 'orphans', 'dynamic', 'manageEvery', 'slotHeadroom', 'amrskip',
     'manageMargin', 'manageStart']);
   for (const k of urlParams.keys()) {
     if (PAGE_PARAMS.has(k) || k in SCENARIOS[scenarioName].defaults) continue;
@@ -209,29 +209,23 @@ async function init() {
   // would pass and mean nothing. M5.3 lifts this, when the recursive
   // schedule has something to run.
   //
-  // M5.2b-ii OPENS A CRACK IN IT, and deliberately a narrow one. The
-  // pool-parent coupling exists and can be dispatched, but NO SCHEDULER
-  // drives it (that is M5.3), so ?levels=3 is allowed only with
-  // ?handdepth=1, which also disables live stepping and debugStepSync. A
-  // run under that flag is a DIAGNOSTIC, not a solve: it exists so
-  // tools/analyze-d3-interface.js can measure the L1/L2 seam, and calling
-  // it a solver before M5.3 would be exactly the silence M5.0 refused.
-  const HAND_DEPTH = urlParams.get('handdepth') === '1';
-  // BISECTION HOOK for the hand-driven depth path. Each name drops one pass
-  // of the L2 nest, which makes the physics wrong on purpose -- the point is
-  // to find which pass a blowup lives in by removing passes one at a time,
-  // the same attribution method ?benchSkip= uses for cost. Not a physics
-  // knob; ?levels=3 is a diagnostic already.
-  const HAND_SKIP = new Set((urlParams.get('handskip') || '').split(',').filter(Boolean));
-  if (LEVELS > 2 && !HAND_DEPTH) {
-    statusEl.textContent = `error: ?levels=${LEVELS} needs ?handdepth=1 until M5.3`
-      + ' (the pool-parent coupling exists; no scheduler drives it); ?levels=1 or 2';
-    return;
-  }
-  if (LEVELS > 3) {
-    statusEl.textContent = `error: ?levels=${LEVELS}: only depth 3 is wired (plans/3D.md M5.2b-ii)`;
-    return;
-  }
+  // M5.3 LIFTED THE BLANKET REFUSAL: the recursive schedule drives any depth,
+  // and the L1/L2 seam is gated (`amr-bar-explode-L3`, `amr-box-explode-L3`).
+  // What remains refused is narrower and named, so that every depth a run
+  // CAN reach is one something validates:
+  //   - a BODY needs per-level force integration with finest-wins masking,
+  //     or the same drag is summed once per level. M5.4.
+  //   - the MANAGER has no balance pass yet, so a dynamic run at depth could
+  //     build a tree 2:1 balance forbids. M5.5.
+  // Both are refusals rather than warnings for M5.0's reason: a run that is
+  // quietly wrong is worse than one that will not start.
+  //
+  // BISECTION HOOK. Each name drops one pass of the pool-parent nest at every
+  // level >= 2, which makes the physics wrong on purpose -- the point is to
+  // find which pass a blowup lives in by removing passes one at a time, the
+  // same attribution method ?benchSkip= uses for cost. It is what found the
+  // unseeded-pool bug in M5.2b-ii, in one run.
+  const AMR_SKIP = new Set((urlParams.get('amrskip') || '').split(',').filter(Boolean));
   const AMR = LEVELS >= 2;
   // `pool` is the LEVEL-1 tiling; `hier.byLevel[m]` is level m's, from
   // d3-amr.mjs's poolAtLevel. They coincide at m = 1 and diverge by a factor
@@ -771,6 +765,20 @@ async function init() {
       + ' (the pool-parent coupling exists only there, plans/3D.md M5.2b-ii)';
     return;
   }
+  if (LEVELS >= 3 && HAS_BODY) {
+    statusEl.textContent = `error: ?levels=${LEVELS} with a body needs per-level force`
+      + ' integration and finest-wins masking (plans/3D.md M5.4); not built yet';
+    return;
+  }
+  // UNREACHABLE TODAY and kept deliberately: ?dynamic=1 is itself refused
+  // without ?refine=body, so the body refusal above always fires first. It
+  // stops being unreachable the moment M5.4 lifts that one, which is exactly
+  // when it has to already be here.
+  if (LEVELS >= 3 && DYNAMIC) {
+    statusEl.textContent = `error: ?levels=${LEVELS} with ?dynamic=1 needs the 2:1 balance`
+      + ' pass in the manager (plans/3D.md M5.5); not built yet';
+    return;
+  }
   // M4.1d lifted the "explode cannot carry a body" restriction: the body
   // force is now integrated on the level that OWNS each region -- the coarse
   // kernel masks out cells a refined block covers and
@@ -935,6 +943,10 @@ async function init() {
       { binding: 6, resource: { buffer: (L[2] || L[1]).blockSlot } }]});
     step1BG_AB = mkStep(fPoolA, fPoolB);
     step1BG_BA = mkStep(fPoolB, fPoolA);
+    L[1].step1Pipe = step1Pipe;
+    // Indexed by PARITY: entry p reads this level's buffer p and writes the
+    // other, so two substeps return the state to buffer 0.
+    L[1].step1BG = [step1BG_AB, step1BG_BA];
     // average writes the coarse buffer the COARSE step just wrote, so it
     // also needs one per parity.
     const mkAvg = (dst) => device.createBindGroup({ layout: avgBGL, entries: [
@@ -976,6 +988,13 @@ async function init() {
         { binding: 2, resource: { buffer: blockSlotBuf } }, { binding: 3, resource: { buffer: macPool } },
         { binding: 4, resource: { buffer: mac } }]});
       coalesceBG = [mkCoalesce(fA), mkCoalesce(fB)];
+      // Level 1 joins the SAME per-level record every deeper level uses, so
+      // M5.3's schedule can walk levels instead of naming them. The level-1
+      // entries differ from the rest in exactly one way -- its coalesce is
+      // dispatched over the dense L0 grid rather than over parent tiles --
+      // and that is carried as a dispatch shape, not as a branch.
+      L[1].explodePipe = explodePipe; L[1].explodeBG = explodeBG;
+      L[1].coalescePipe = coalescePipe; L[1].coalesceBG = coalesceBG;
 
       // --- M5.2b-ii: the same coupling with a POOL parent, level >= 2 ----
       //
@@ -1037,8 +1056,7 @@ async function init() {
           { binding: 2, resource: { buffer: lv.mac } }, { binding: 3, resource: { buffer: bodyBuf } },
           { binding: 4, resource: { buffer: lv.slotToBlock } }, { binding: 5, resource: { buffer: lv.blockSlot } },
           { binding: 6, resource: { buffer: (L[m + 1] || lv).blockSlot } }]});
-        lv.step1BG_AB = mkStepL(lv.fA, lv.fB);
-        lv.step1BG_BA = mkStepL(lv.fB, lv.fA);
+        lv.step1BG = [mkStepL(lv.fA, lv.fB), mkStepL(lv.fB, lv.fA)];
 
         // AND THE SEED. A level's pool starts as whatever the GPU zeroed it
         // to, and zero is not a fluid state: rho = 0 there, so the first
@@ -1127,7 +1145,7 @@ async function init() {
   // hierarchy yet (M5.3), so a live animation would present a hand-flattened
   // stanza as if it were the solver. Driven only by debugStepSync, from the
   // tools.
-  let live = urlParams.get('live') !== '0' && LEVELS < 3;
+  let live = urlParams.get('live') !== '0';
   let axis = parseAxis();
   const axisExtent = (a) => [NX, NY, NZ][a];
   let slice = urlParams.has('slice')
@@ -1223,6 +1241,15 @@ async function init() {
   // correctness risk and costs only the early-out. Identical to the old
   // shape whenever MAX_SLOTS == activeSlots, i.e. always when static.
   const tileDisp = AMR ? [Math.ceil(pool.FB / 4), Math.ceil(pool.FB / 4), (pool.FB / 4) * Math.max(1, MAX_SLOTS)] : null;
+  // Per level, for M5.3's schedule. `tileDisp` walks THIS level's tiles;
+  // `coalesceDisp` walks whatever the parent is -- the dense grid at level 1,
+  // the parent's tiles below it (M5.2b-i's finding). Stored rather than
+  // branched on, so the recursion has no level-1 special case in it.
+  const poolDispFor = (slots) => [pool.FB / 4, pool.FB / 4, (pool.FB / 4) * Math.max(1, slots)];
+  if (AMR) for (let m = 1; m < LEVELS; m++) {
+    L[m].tileDisp = poolDispFor(SLOTS[m]);
+    L[m].coalesceDisp = m === 1 ? disp : poolDispFor(SLOTS[m - 1]);
+  }
   const avgDisp = AMR ? (() => {
     const per = Math.ceil(RB / 4);
     return [per, per, per * Math.max(1, MAX_SLOTS)];
@@ -1299,14 +1326,49 @@ async function init() {
         gp.dispatchWorkgroups(disp[0], disp[1], disp[2]);
         gp.end();
       };
-      // A pool dispatch over `slots` tiles, for a level that is not level 1.
-      // Coalesce at depth is dispatched over the PARENT's slot count, not
-      // its own -- it walks parent tiles (M5.2b-i's finding).
-      const poolPass = (pipe, bg, slots) => {
+      const dispatchPass = (pipe, bg, d) => {
         const pp = enc.beginComputePass();
         pp.setPipeline(pipe); pp.setBindGroup(0, bg);
-        pp.dispatchWorkgroups(pool.FB / 4, pool.FB / 4, (pool.FB / 4) * Math.max(1, slots));
+        pp.dispatchWorkgroups(d[0], d[1], d[2]);
         pp.end();
+      };
+
+      // --- M5.3: AGAL's S_Advance, as a recursion -------------------------
+      //
+      // ONE SUBSTEP OF LEVEL m. `parity` names which of level m's two
+      // buffers holds time t; it is also the substep index, because substep
+      // p reads buffer p and writes the other, so two substeps return the
+      // state to buffer 0.
+      //
+      //   explode(m+1)   fill the child's ring from THIS level's time-t
+      //                  buffer. Once per pair of child substeps: the ring
+      //                  self-advances between them (GHOST = 2 is what pays
+      //                  for that).
+      //   recurse twice  the child takes two substeps for each of ours.
+      //   coalesce(m+1)  the child's outflux back into this level's time-t
+      //                  buffer, at the covered cells.
+      //   step(m)        LAST, so it gathers those coalesced values as
+      //                  ordinary neighbours and needs no per-direction test.
+      //
+      // LEVEL 0 IS THE BASE CASE AND IT IS A REAL ONE, not a convenience:
+      // L0 is the dense grid with no ring and no tiles (plans/AMR-multilevel
+      // decision 1, inherited). Everything above it is the uniform tile
+      // abstraction, which is why every OTHER level is one line.
+      //
+      // THE RECURSION IS ON THE HOST. WebGPU has no recursion in command
+      // encoding -- and does not need one, because this emits a FLAT command
+      // stream. What the 2D plan's M7 warns about is the hand-flattened
+      // stanza this replaces: at depth 3 it was already 14 dispatches in a
+      // fixed order, and depth 4 would have been another copy of it.
+      const advanceLevel = (m, parity) => {
+        const ch = L[m + 1];
+        if (ch) {
+          if (!AMR_SKIP.has('explode')) dispatchPass(ch.explodePipe, ch.explodeBG[parity], ch.tileDisp);
+          if (!AMR_SKIP.has('step')) { advanceLevel(m + 1, 0); advanceLevel(m + 1, 1); }
+          if (!AMR_SKIP.has('coalesce')) dispatchPass(ch.coalescePipe, ch.coalesceBG[parity], ch.coalesceDisp);
+        }
+        if (m === 0) coarseStep();
+        else dispatchPass(L[m].step1Pipe, L[m].step1BG[parity], L[m].tileDisp);
       };
 
       // --- dynamic refinement (M4.2b) ---------------------------------------
@@ -1368,10 +1430,8 @@ async function init() {
 
 
       if (EXPLODE) {
-        // M4.1b, Chen et al. 2006. The COARSE STEP RUNS LAST, and that is the
-        // whole reason no per-direction test is needed in it: coalesce writes
-        // the fine outflux into the covered cells' slots of the time-t coarse
-        // buffer, so the ordinary pull picks it up.
+        // M4.1b, Chen et al. 2006, driven by M5.3's recursion. At depth 2
+        // this emits exactly the sequence it always did:
         //
         //   explode    L0 -> the ring, for the directions whose coarse target
         //              is covered. Reads the parent at t; no interpolation,
@@ -1381,38 +1441,13 @@ async function init() {
         //              uncollided states the scheme requires.
         //   coalesce   sum the ring back into the covered cells at t, and
         //              republish `mac` under the refined region.
-        //   L0 x1      the coarse step, now gathering coalesced values as if
-        //              they were ordinary neighbours.
-        tilePass(explodePipe, explodeBG[cp]);
-        if (LEVELS >= 3) {
-          // M5.2b-ii, HAND-FLATTENED at depth 3 -- the same stanza one rung
-          // down, which is what M5.3 replaces with the S_Advance recursion.
-          //
-          // Each of L1's two substeps wraps a whole L2 macro-step, and the
-          // nesting is the depth-2 shape verbatim: explode from the parent's
-          // TIME-t buffer, two substeps, coalesce back into that same buffer,
-          // and the parent's own substep LAST so it gathers the coalesced
-          // values as ordinary neighbours.
-          //
-          // The parent parity is the substep index, not `cp`: L1 substep A
-          // reads L1.fA and substep B reads L1.fB, so those are the buffers
-          // holding time t for the L2 nest inside each.
-          const l2 = L[2];
-          for (let sub = 0; sub < 2; sub++) {
-            if (!HAND_SKIP.has('explode2')) poolPass(l2.explodePipe, l2.explodeBG[sub], SLOTS[2]);
-            if (!HAND_SKIP.has('step2')) {
-              poolPass(l2.step1Pipe, l2.step1BG_AB, SLOTS[2]);
-              poolPass(l2.step1Pipe, l2.step1BG_BA, SLOTS[2]);
-            }
-            if (!HAND_SKIP.has('coalesce2')) poolPass(l2.coalescePipe, l2.coalesceBG[sub], SLOTS[1]);
-            tilePass(step1Pipe, sub === 0 ? step1BG_AB : step1BG_BA);
-          }
-        } else {
-          tilePass(step1Pipe, step1BG_AB);
-          tilePass(step1Pipe, step1BG_BA);
-        }
-        gridPass(coalescePipe, coalesceBG[cp]);
-        coarseStep();
+        //   L0 x1      the coarse step LAST, now gathering coalesced values
+        //              as if they were ordinary neighbours -- which is the
+        //              whole reason it needs no per-direction test.
+        //
+        // `cp` is L0's parity, the one thing the dense base case still needs
+        // from outside. See advanceLevel for what deeper levels do.
+        advanceLevel(0, cp);
       } else {
         // The M3 coupling, kept for A/B only (?interface=interp). NOT
         // conservative -- see plans/3D.md M4.1b.
@@ -2079,7 +2114,6 @@ async function init() {
       const amrTxt = AMR
         ? `  ${L.slice(1).map(l => `L${l.level} ${l.alloc.activeSlots}/${l.nBlocks}`).join(' ')}`
           + ` blocks (RB=${RB}, FB=${pool.FB})`
-          + (LEVELS >= 3 ? '  [handdepth: diagnostic, no scheduler]' : '')
         : '';
       statusEl.textContent = `${scenarioName}  D3Q${Q}  ${NX}x${NY}x${NZ}  step ${step}${t}${amrTxt}\n`
         + `${AXIS_NAMES[axis]}-slice ${slice}   ${live ? 'running' : 'paused'}`;

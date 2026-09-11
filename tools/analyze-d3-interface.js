@@ -121,10 +121,6 @@ function parseArgs(argv) {
 function urlFor(o, c) {
   const p = new URLSearchParams({ scenario: 'beltrami', n: o.n, tau: o.tau, u0: o.u0, q: o.q, live: '0' });
   if (c.levels > 1) { p.set('levels', c.levels); p.set('rb', o.rb); p.set('refine', c.refine); }
-  // Depth 3 has no scheduler yet (plans/3D.md M5.3), so the page refuses it
-  // without this acknowledgement and runs it as a diagnostic only -- which
-  // is exactly what this tool is.
-  if (c.levels > 2) p.set('handdepth', '1');
   if (['box', 'bar', 'slab'].includes(c.refine)) p.set('boxfrac', o.boxfrac);
   return `${o.baseUrl}/index-3d.html?${p}${o.extra ? `&${o.extra}` : ''}`;
 }
