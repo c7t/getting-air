@@ -126,7 +126,13 @@ const CONFIGS = [
     url: 'scenario=beltrami&n=16&tau=0.8&u0=0.04&q=19&live=0&levels=3&rb=4&refine=box&boxfrac=0.5&interface=explode' },
   { name: 'bar3', steps: 200,
     url: 'scenario=beltrami&n=16&tau=0.8&u0=0.04&q=19&live=0&levels=3&rb=4&refine=bar&boxfrac=0.5&interface=explode' },
-  { name: 'body-refine', expectInUse: 'increase', steps: 8,
+  // THE CONFIG THAT PROVES THE HARD FAILURE FIRES. It asks for far more
+  // tiles than ?slotHeadroom= allows, so the manager must be refused -- and
+  // M5.4a turned that from a silent degradation into a latched stop. It used
+  // to assert the opposite (that the pool stayed consistent while quietly
+  // under-refining); the pool consistency is still asserted, but the
+  // refusal is now the point.
+  { name: 'body-refine', expectInUse: 'increase', expectExhausted: true, steps: 8,
     url: 'scenario=sphere&n=16&re=20&u0=0.05&q=19&bounceback=1&live=0&levels=2&rb=4&refine=body&interface=explode&dynamic=1&manageEvery=1&manageMargin=6' },
 ];
 
@@ -173,6 +179,16 @@ async function runConfig(Runtime, o, c, log) {
     const ps = await evalOrThrow(Runtime, `${G}.debugPoolState()`, 300000, 'debugPoolState');
     const st = await evalOrThrow(Runtime, `${G}.readStats()`, 300000, 'readStats');
     if (ps.ok === false) res.pool.push({ at: done, n: ps.problems.length, first: ps.problems[0] });
+    // M5.4a. Running out of slots is a HARD failure: refinement is
+    // geometry-forced, so a refused tile means a coarse/fine seam through
+    // the body. One config exists to prove the failure FIRES; everywhere
+    // else it is a failure.
+    if (ps.slotsExhausted) {
+      res.exhausted = ps.slotsExhausted;
+      if (!c.expectExhausted) {
+        res.pool.push({ at: done, n: 1, first: { kind: 'poolExhausted', refusals: ps.slotsExhausted } });
+      }
+    }
     if (ps.inUse != null) {
       res.poolState = ps;
       if (firstInUse === null) { firstInUse = ps.inUse; firstBbox = ps.bbox; }
@@ -215,6 +231,10 @@ async function runConfig(Runtime, o, c, log) {
     log(`refined shell: lo.x ${firstBbox.lo[0]} -> ${res.poolState.bbox.lo[0]} (${moved} blocks) ${ok ? 'ok' : 'DID NOT FOLLOW'}`);
   }
   // Did the manager actually do the thing the config exists to observe?
+  if (c.expectExhausted && !res.exhausted) {
+    res.pool.push({ at: 'end', n: 1, first: { kind: 'expectedExhaustionDidNotFire' } });
+    log('expected the pool to be exhausted and it was not -- the hard failure did not fire');
+  }
   if (c.expectInUse && res.poolState) {
     const moved = res.poolState.inUse - firstInUse;
     const want = c.expectInUse === 'increase' ? moved > 0 : moved < 0;
@@ -255,7 +275,12 @@ async function main() {
         await waitForGlobal(Runtime, 'window.__D3', 60000);
         await assertPageHealthy(Runtime, watch, c.name);
         const res = await runConfig(Runtime, o, c, s => console.log('    ' + s));
-        await assertPageHealthy(Runtime, watch, c.name);
+        // A config that EXPECTS the pool to run out will have put `error:
+        // out of pool slots` in #status -- that IS its result, so the health
+        // check has to know the difference between the guard firing and the
+        // page breaking.
+        await assertPageHealthy(Runtime, watch, c.name,
+          c.expectExhausted ? /out of pool slots/ : null);
         report.push({ name: c.name, res });
       } catch (err) {
         console.error(`    FAILED: ${err.message}`);
@@ -286,7 +311,7 @@ async function main() {
       ? x.poolState.byLevel.map(l => `${l.inUse}+${l.free}`).join(' ')
       : (x.poolState ? `${x.poolState.inUse}+${x.poolState.free}` : null);
     const poolTxt = x.pool.length ? `${x.pool.length} BAD`
-      : (perLevel ? `ok ${perLevel}${x.blewUp ? '*' : ''}` : 'skipped');
+      : (perLevel ? `ok ${perLevel}${x.exhausted ? ' EXHAUSTED(ok)' : ''}${x.blewUp ? '*' : ''}` : 'skipped');
     const ringTxt = x.ring.length ? `${x.ring.length} checkpoints BAD` : (x.ringVacuous ? 'ok (VACUOUS N=2)' : 'ok');
     const ok = !x.bal.length && !x.ring.length && !x.cov.length && !x.pool.length && x.finite;
     if (!ok) exitCode = 1;

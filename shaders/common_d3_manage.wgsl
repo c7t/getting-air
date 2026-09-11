@@ -67,7 +67,11 @@
 @group(0) @binding(0) var<storage, read_write> blockSlot   : array<i32>;
 @group(0) @binding(1) var<storage, read_write> slotToBlock : array<i32>;
 @group(0) @binding(2) var<storage, read_write> freeList    : array<i32>;
-@group(0) @binding(3) var<storage, read_write> freeCount   : atomic<i32>;
+// [0] = how many slots are free. [1] = HOW MANY TIMES A REFINE WAS REFUSED
+// FOR WANT OF A SLOT, and it is sticky: the host treats any nonzero value as
+// a hard failure and stops the run. See `refine` for why that is not an
+// over-reaction.
+@group(0) @binding(3) var<storage, read_write> freeCount   : array<atomic<i32>, 4>;
 @group(0) @binding(4) var<storage, read>       body        : BodyState3D;
 // The criterion's answer, computed ONCE by `decide` and read by every pass
 // after it. M4.2b-i evaluated blockWanted() separately in coarsen and in
@@ -163,7 +167,7 @@ fn coarsen(@builtin(global_invocation_id) gid: vec3<u32>) {
   blockSlot[id] = -1;
   slotToBlock[slot] = -1;
   // atomicAdd returns the OLD count, which is exactly the index to write.
-  let at = atomicAdd(&freeCount, 1);
+  let at = atomicAdd(&freeCount[0], 1);
   freeList[at] = slot;
 }
 
@@ -191,15 +195,29 @@ fn refine(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (blockSlot[id] >= 0) { return; }
   if (blockWant[id] == 0u) { return; }
   // atomicSub returns the OLD count; the slot to take is freeList[old-1].
-  let old = atomicSub(&freeCount, 1);
+  let old = atomicSub(&freeCount[0], 1);
   if (old <= 0) {
-    // Out of slots. Put the counter back and leave the block coarse rather
-    // than corrupting the list -- running out of headroom is a capacity
-    // problem (?slotHeadroom=), and it must degrade to "less refined than
-    // asked for" rather than to a scrambled pool. The host sees it as
-    // debugCheckGeometryCoverage failing, which is the right report: the
-    // geometry-forced constraint is genuinely not being met.
-    atomicAdd(&freeCount, 1);
+    // OUT OF SLOTS, AND THIS IS A HARD FAILURE, not a degradation.
+    //
+    // The counter still goes back and the block still stays coarse -- a
+    // scrambled free list would be worse than an unrefined block -- but the
+    // event is RECORDED, and the host stops the run on it.
+    //
+    // WHY IT IS NOT "gracefully less refined". Refinement here is
+    // geometry-forced: the block that could not be refined is one the body
+    // is about to occupy. Leaving it coarse does not cost accuracy at the
+    // margin, it puts a coarse/fine seam THROUGH the body, which is the one
+    // configuration the solid coupling is not built for (plans/3D.md M5.4,
+    // the hard requirement). The 2D experience is the evidence: a pool that
+    // runs out does not drift, it diverges.
+    //
+    // It is also recorded rather than merely inferred from
+    // debugCheckGeometryCoverage failing, because that check is expensive,
+    // runs only when a tool asks, and answers a different question -- it
+    // says the constraint is violated NOW, not that the allocator is the
+    // reason. This says the reason.
+    atomicAdd(&freeCount[0], 1);
+    atomicAdd(&freeCount[1], 1);
     return;
   }
   let slot = freeList[old - 1];

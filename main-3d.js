@@ -1146,6 +1146,12 @@ async function init() {
   // stanza as if it were the solver. Driven only by debugStepSync, from the
   // tools.
   let live = urlParams.get('live') !== '0';
+  // HARD FAILURE STATE (M5.4a). Set once the manager has been refused a slot;
+  // never cleared except by reset(). Refinement here is geometry-forced, so
+  // a refusal means a coarse/fine seam is about to pass through the body --
+  // the one configuration the solid coupling is not built for. 2D experience
+  // is that such a run does not drift, it diverges.
+  let poolExhausted = 0;
   let axis = parseAxis();
   const axisExtent = (a) => [NX, NY, NZ][a];
   let slice = urlParams.has('slice')
@@ -1231,6 +1237,10 @@ async function init() {
     // initEq READ mac and did not write it, so mac still holds the seed --
     // which is exactly the field the renderer should show at step 0.
     step = 0; useB = false;
+    // The latch is per-RUN, not permanent: reset re-seeds the pool from the
+    // initial refinement, which is by construction within budget.
+    poolExhausted = 0;
+    if (DYNAMIC) device.queue.writeBuffer(freeCountBuf, 0, new Int32Array([MAX_SLOTS - poolAlloc.activeSlots, 0, 0, 0]));
   }
 
   // Pool dispatch shapes. The slot is folded into z because 3D has no
@@ -1476,9 +1486,28 @@ async function init() {
   // needs O(10^4) steps to settle), and awaited per chunk so the queue
   // cannot run arbitrarily far ahead of the page.
   const SYNC_CHUNK = 500;
+  // Reads the manager's refusal counter, latches it, and turns it into a
+  // stop. One 16-byte readback per chunk, on a path that already waits for
+  // the queue -- so it costs a copy, not a sync. Only meaningful with the
+  // manager running; static refinement can never be refused a slot.
+  async function checkPoolExhausted() {
+    if (!DYNAMIC || poolExhausted) return poolExhausted;
+    const n = (await readI32(freeCountBuf, 16))[1];
+    if (n > 0) {
+      poolExhausted = n;
+      live = false;
+      playBtn.textContent = 'play';
+      statusEl.textContent = `error: out of pool slots -- the manager was refused a tile ${n} time(s)`
+        + ` at step ${step}. Refinement is geometry-forced, so this puts a coarse/fine seam`
+        + ` through the body; raise ?slotHeadroom= (now ${SLOT_HEADROOM}) or refine less.`;
+    }
+    return poolExhausted;
+  }
+
   async function debugStepSync(n) {
     live = false;
     playBtn.textContent = 'play';
+    if (await checkPoolExhausted()) return { step, exhausted: poolExhausted };
     let done = 0;
     while (done < n) {
       const k = Math.min(SYNC_CHUNK, n - done);
@@ -1487,8 +1516,15 @@ async function init() {
       device.queue.submit([enc.finish()]);
       await device.queue.onSubmittedWorkDone();
       done += k;
+      // STOPS ADVANCING rather than throwing: a tool that reads the returned
+      // step count or debugPoolState sees it immediately, and one that does
+      // neither gets a run that visibly goes nowhere with `error:` in the
+      // status. Throwing would make the one config that EXPECTS exhaustion
+      // (validate-d3-invariants.js's body-refine) harder to express than the
+      // failure it is testing.
+      if (await checkPoolExhausted()) break;
     }
-    return { step };
+    return { step, exhausted: poolExhausted };
   }
 
   // --- readback ------------------------------------------------------------
@@ -1679,7 +1715,11 @@ async function init() {
     const byLevel = [null];
     for (let m = 1; m < LEVELS; m++) byLevel[m] = await poolStateAt(m);
     const bad = byLevel.slice(1).flatMap((r, i) => r.problems.map(p => ({ level: i + 1, ...p })));
-    return { ...byLevel[1], problems: bad, ok: bad.length === 0, byLevel: byLevel.slice(1) };
+    await checkPoolExhausted();
+    return { ...byLevel[1], problems: bad, ok: bad.length === 0, byLevel: byLevel.slice(1),
+             // M5.4a. Nonzero means the manager was refused a tile, which is
+             // a hard failure rather than a degradation -- see the shader.
+             slotsExhausted: poolExhausted };
   }
   async function poolStateAt(m) {
     const lv = L[m];
@@ -2107,6 +2147,13 @@ async function init() {
     const now = performance.now();
     if (now - lastStatus > 250) {
       lastStatus = now;
+      // Checked on the status cadence, not per frame: one 16-byte readback
+      // four times a second is free, and the manager runs far less often
+      // than that anyway. Deliberately NOT awaited into the frame path --
+      // the latch stops the next frame, which is soon enough for a condition
+      // that is already unrecoverable.
+      if (live) checkPoolExhausted();
+      if (poolExhausted) { requestAnimationFrame(frame); return; }
       const t = scenarioName === 'beltrami' ? `  t/td=${(step / params.td).toFixed(2)}`
         : scenarioName === 'duct' ? `  t/settle=${(step / params.settle).toFixed(2)}`
         : scenarioName === 'sphere' ? `  t/(D/U)=${(step / params.convective).toFixed(2)}`

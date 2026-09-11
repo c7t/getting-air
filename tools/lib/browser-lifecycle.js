@@ -295,11 +295,16 @@ async function statusError(Runtime) {
 // One call for "did this page come up cleanly": both channels, formatted.
 // Throws, because every caller wants to stop rather than continue against a
 // page that failed to start.
-async function assertPageHealthy(Runtime, watch, what) {
+// `allowStatus` is a regexp for an `error:` line the caller EXPECTS -- a
+// config whose whole point is to trip a guard, which otherwise cannot be
+// distinguished from a config that broke. It suppresses only the status
+// line; uncaught exceptions and console errors still fail, because nothing
+// legitimately expects those.
+async function assertPageHealthy(Runtime, watch, what, allowStatus) {
   const st = await statusError(Runtime);
   const seen = watch ? watch.drain() : [];
   const lines = [];
-  if (st) lines.push(`  #status: ${st}`);
+  if (st && !(allowStatus && allowStatus.test(st))) lines.push(`  #status: ${st}`);
   for (const e of seen) lines.push(`  [${e.kind}] ${e.text.split('\n')[0]}`);
   if (lines.length) throw new Error(`${what} reported errors:\n${lines.join('\n')}`);
 }
