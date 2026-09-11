@@ -11,5 +11,7 @@ https.py
 *.log
 telemetry.log
 
-# Emacs lock files (dangling symlinks; never belong in a commit)
+# Emacs lock files (.#name, dangling symlinks) and autosaves (#name#).
+# Both are swept in by `git add -A`, and both just were.
 .#*
+\#*\#

@@ -174,8 +174,9 @@ async function init() {
     'window',
     // M8.4a: the hand-placed wake box's extent, in body diameters.
     'wake', 'wakeR',
-    // M8.4: the Q-criterion's convection lead, in L0 cells.
-    'qlead']);
+    // M8.4: the Q-criterion's convection lead, in L0 cells, and the fraction
+    // of the slot budget at which the page starts saying so.
+    'qlead', 'slotWarn']);
   for (const k of urlParams.keys()) {
     if (PAGE_PARAMS.has(k) || k in SCENARIOS[scenarioName].defaults) continue;
     throw new Error(`?${k}=: not a parameter of scenario "${scenarioName}" `
@@ -698,7 +699,12 @@ async function init() {
     const freeInit = new Int32Array(Math.max(1, slots));
     for (let i = 0; i < nFree; i++) freeInit[i] = alloc.activeSlots + i;
     device.queue.writeBuffer(lv.freeList, 0, freeInit);
-    device.queue.writeBuffer(lv.freeCount, 0, new Int32Array([nFree, 0, 0, 0]));
+    // [2] is the MINIMUM free count ever reached -- the exact high-water mark
+    // of slot usage, recorded by the refine kernel. It seeds at the CURRENT
+    // free count rather than at a large sentinel, so a run whose manager
+    // never allocates still reports the truth (the initial set is the peak)
+    // instead of a value nothing ever wrote.
+    device.queue.writeBuffer(lv.freeCount, 0, new Int32Array([nFree, 0, nFree, 0]));
     device.queue.writeBuffer(lv.slotNew, 0, new Uint32Array(DYNAMIC ? slots : 1));
     device.queue.writeBuffer(lv.blockWant, 0, new Uint32Array(nBlocks));
   }
@@ -2244,6 +2250,31 @@ async function init() {
   // stop. One 16-byte readback per chunk, on a path that already waits for
   // the queue -- so it costs a copy, not a sync. Only meaningful with the
   // manager running; static refinement can never be refused a slot.
+  // LIVE SLOT ACCOUNTING (plans/3D.md M8.4). Per level: how many slots are in
+  // use right now, and the HIGH-WATER MARK over the run.
+  //
+  // WHY THE PEAK IS THE NUMBER THAT MATTERS. Exhaustion is already a hard
+  // failure (M5.4a) and that is right, but it is a CLIFF: up to the moment it
+  // fires, a run one tile from the edge and a run at half its budget look
+  // identical. The status line made that worse by reporting
+  // `alloc.activeSlots`, which is the INITIAL static allocation and therefore
+  // never moves on a dynamic run -- so the one number on screen was the one
+  // number guaranteed not to answer the question.
+  //
+  // It matters because a FIELD criterion's set grows with the flow rather
+  // than sitting still with the geometry: measured on a shed wake, the
+  // Q-criterion wants 379 blocks at 20 D/U and 628 at 60 (plans/3D.md M8.4).
+  // A run that survived is only evidence the budget was big enough FOR THAT
+  // RUN, and without a peak there is no way to say whether it survived with
+  // margin or by luck -- which is exactly what sizing the budget needs.
+  const poolPeak = new Array(LEVELS).fill(0);
+  const poolInUse = new Array(LEVELS).fill(0);
+  // When to say so out loud, as a fraction of the budget. NOT an error -- a
+  // run at 92% of its slots is producing correct physics and should finish --
+  // but it is one flow excursion from a hard stop, and that is worth knowing
+  // WHILE it is running rather than from the error message afterwards.
+  // ?slotWarn=0 silences it.
+  const SLOT_WARN = numParam('slotWarn', 0.85);
   async function checkPoolExhausted() {
     if (!DYNAMIC || poolExhausted) return poolExhausted;
     // EVERY LEVEL, not just level 1 (M5.5b). Each level owns its own free
@@ -2252,7 +2283,15 @@ async function init() {
     // criterion drives directly -- so checking only level 1 would miss
     // exactly the case this exists to catch.
     for (let m = 1; m < LEVELS; m++) {
-      const n = (await readI32(L[m].freeCount, 16))[1];
+      const fc = await readI32(L[m].freeCount, 16);
+      // [0] is the live free count and [2] the minimum it ever reached -- the
+      // SAME readback the refusal check needs, so the accounting costs nothing
+      // beyond the arithmetic. The peak comes from [2] rather than from the
+      // sampled maximum of [0]: the kernel records it at the allocation, so a
+      // spike between two polls is counted rather than missed.
+      poolInUse[m] = L[m].slots - fc[0];
+      poolPeak[m] = Math.max(poolPeak[m], L[m].slots - fc[2]);
+      const n = fc[1];
       if (n <= 0) continue;
       poolExhausted = n;
       live = false;
@@ -2260,7 +2299,8 @@ async function init() {
       statusEl.textContent = `error: out of pool slots at level ${m} -- the manager was refused`
         + ` a tile ${n} time(s) at step ${step}. Refinement is geometry-forced, so this puts a`
         + ` coarse/fine seam through the body; raise ?slotHeadroom= (now ${SLOT_HEADROOM})`
-        + ' or refine less.';
+        + ' or refine less.'
+        + ` [peak ${poolPeak[m]}/${L[m].slots} slots]`;
       break;
     }
     return poolExhausted;
@@ -2490,6 +2530,29 @@ async function init() {
     });
     return { step, level: CRIT_LEVEL, nb: CRIT_NB.slice(), blkL0: CRIT_BLK_L0,
              lead: CRIT_LEAD, total, qMax, qRef: qr, qMaxNorm: qMax / qr, rows };
+  }
+
+  // THE ACCOUNTING, for a tool rather than an eye. A harness sizing the slot
+  // budget wants the PEAK, not the instantaneous count, and wants it as a
+  // number rather than out of the status line. Refreshes from the GPU so a
+  // caller that has been driving debugStepSync (and therefore never let the
+  // status cadence run) still gets a current answer.
+  async function debugPoolUsage() {
+    if (!AMR) return { amr: false, levels: [] };
+    if (DYNAMIC) await checkPoolExhausted();
+    return {
+      amr: true, dynamic: !!DYNAMIC, step, exhausted: poolExhausted,
+      warnAt: SLOT_WARN,
+      levels: L.slice(1).map(l => ({
+        level: l.level, slots: l.slots, blocks: l.nBlocks,
+        // A static run's set is fixed at reset, so its "live" count is its
+        // initial one and its peak is the same number -- said explicitly
+        // rather than reporting a zero that looks like an empty pool.
+        inUse: DYNAMIC ? poolInUse[l.level] : l.alloc.activeSlots,
+        peak: DYNAMIC ? poolPeak[l.level] : l.alloc.activeSlots,
+        peakFrac: (DYNAMIC ? poolPeak[l.level] : l.alloc.activeSlots) / l.slots,
+      })),
+    };
   }
 
   async function debugOccupancy(brick) {
@@ -3321,6 +3384,7 @@ async function init() {
       } : {}),
     }),
     readSubsampled, readDuctProfile, readStats, readBody, readPoolStats, debugCriterion,
+    debugPoolUsage,
     debugCheck21Balance, debugCheckGeometryCoverage, debugCheckRingParents, debugPoolState,
     debugRunBalance, debugSampleTree, debugCheckTreeSample, debugReadVolume,
     debugHotspot, debugRunAndCollect, debugOccupancy,
@@ -3362,9 +3426,25 @@ async function init() {
         : scenarioName === 'duct' ? `  t/settle=${(step / params.settle).toFixed(2)}`
         : scenarioName === 'sphere' ? `  t/(D/U)=${(step / params.convective).toFixed(2)}`
           : params.re ? `  Re=${params.re.toFixed(0)}` : '';
+      // LIVE, on a dynamic run, with the peak alongside it -- see poolPeak.
+      // A static run has no live count to report: its set is fixed at reset,
+      // so alloc.activeSlots IS the answer there and stays what it was.
       const amrTxt = AMR
-        ? `  ${L.slice(1).map(l => `L${l.level} ${l.alloc.activeSlots}/${l.nBlocks}`).join(' ')}`
+        ? `  ${L.slice(1).map(l => (DYNAMIC
+            ? `L${l.level} ${poolInUse[l.level]}/${l.slots} slots (peak ${poolPeak[l.level]}`
+              + `, ${(100 * poolPeak[l.level] / l.slots).toFixed(0)}%)`
+            : `L${l.level} ${l.alloc.activeSlots}/${l.nBlocks}`)).join(' ')}`
           + ` blocks (RB=${RB}, FB=${pool.FB})`
+        : '';
+      // THE APPROACH TO THE CLIFF, said out loud. Exhaustion is a hard stop
+      // and stays one; this is the warning that the run is close to it, which
+      // is the part that was missing -- a dynamic run gave no signal at all
+      // between "fine" and "stopped".
+      const tight = DYNAMIC && SLOT_WARN > 0
+        ? L.slice(1).filter(l => poolPeak[l.level] >= SLOT_WARN * l.slots) : [];
+      const slotWarn = tight.length
+        ? `\n   WARNING: L${tight.map(l => `${l.level} at ${(100 * poolPeak[l.level] / l.slots).toFixed(0)}%`).join(', L')}`
+          + ` of the slot budget -- raise ?slotHeadroom= (now ${SLOT_HEADROOM}) before it refuses one`
         : '';
       // The window's travel, said out loud: a window is exactly the kind of
       // thing that looks identical whether it is working or switched off, and
@@ -3375,7 +3455,8 @@ async function init() {
           + ` off ${winOff.map(v => v.toFixed(0)).join(',')} travelled ${winTravel.toFixed(1)}`
         : '';
       statusEl.textContent = `${scenarioName}  D3Q${Q}  ${NX}x${NY}x${NZ}  step ${step}${t}${amrTxt}\n`
-        + `${AXIS_NAMES[axis]}-slice ${slice}   ${live ? 'running' : 'paused'}${viewDepthNote}${winTxt}${critNote}`;
+        + `${AXIS_NAMES[axis]}-slice ${slice}   ${live ? 'running' : 'paused'}${viewDepthNote}${winTxt}${critNote}`
+        + slotWarn;
     }
     requestAnimationFrame(() => frame().catch(e => reportFatal(statusEl, e)));
   }

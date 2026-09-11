@@ -66,7 +66,9 @@
 // [0] = how many slots are free. [1] = HOW MANY TIMES A REFINE WAS REFUSED
 // FOR WANT OF A SLOT, and it is sticky: the host treats any nonzero value as
 // a hard failure and stops the run. See `refine` for why that is not an
-// over-reaction.
+// over-reaction. [2] = the MINIMUM free count ever reached, i.e. the exact
+// high-water mark of slot usage -- recorded by `refine` because a host that
+// samples the count can only report the peaks it happened to look at.
 @group(0) @binding(3) var<storage, read_write> freeCount   : array<atomic<i32>, 4>;
 @group(0) @binding(4) var<storage, read>       body        : BodyState3D;
 // The criterion's answer, computed ONCE by `decide` and read by every pass
@@ -325,6 +327,18 @@ fn refine(@builtin(global_invocation_id) gid: vec3<u32>) {
     atomicAdd(&freeCount[1], 1);
     return;
   }
+  // THE EXACT HIGH-WATER MARK, recorded where the allocation happens.
+  //
+  // The host also samples the free count, but only when it polls -- so a
+  // spike between two polls is invisible, and "we never saw it above 66%" is
+  // a weaker claim than "it never went above 66%". Sizing a slot budget wants
+  // the second one. `old - 1` is this allocation's resulting free count, and
+  // the minimum of that over the run is the peak usage; atomicMin makes it
+  // exact regardless of how many threads allocate in the same dispatch.
+  //
+  // freeCount[2] rather than a new buffer: the array is
+  // array<atomic<i32>, 4> and [2]/[3] were already spare.
+  atomicMin(&freeCount[2], old - 1);
   let slot = freeList[old - 1];
   blockSlot[id] = slot;
   slotToBlock[slot] = i32(id);
