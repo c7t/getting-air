@@ -66,6 +66,14 @@
 //   ?tau=0.8     BGK relaxation time; nu = (tau - 1/2)/3
 //   ?u0=         scenario amplitude (duct: target peak velocity)
 //   ?axis=x|y|z  slice normal, default z      ?slice=   index along it
+//   ?rotate=     quarter turns of the PICTURE, in degrees clockwise
+//                (0|90|180|270). Defaults per scenario so that the
+//                scenario's own `down` runs down the window -- `fall`
+//                declares +x, so its z-slice turns a quarter and the body
+//                falls instead of tracking sideways. An image rotation and
+//                nothing more: |u|, the out-of-plane vorticity and the
+//                normal velocity are all invariant inside the slice plane,
+//                so no sign can move.
 //   ?mode=       speed | vorticity | normal (or 0 | 1 | 2). `vorticity` is
 //                the out-of-plane component; `normal` is the velocity along
 //                the slice normal, which is what shows a duct's u_x profile.
@@ -130,6 +138,17 @@ function parseAxis() {
   return i;
 }
 
+// Degrees clockwise, and only the four that are lattice-aligned: anything
+// else would need interpolation across the slice and is a different feature.
+function parseRotate() {
+  const v = urlParams.get('rotate');
+  const deg = parseFloat(v);
+  if (!Number.isFinite(deg) || deg % 90 !== 0) {
+    throw new Error(`?rotate=${v}: expected 0, 90, 180 or 270 (degrees clockwise)`);
+  }
+  return (((deg / 90) % 4) + 4) % 4;
+}
+
 const MODE_NAMES = ['speed', 'vorticity', 'normal'];
 // The default depends on the scenario, and has to: a duct's flow is
 // unidirectional, so an x-normal slice has no in-plane velocity and
@@ -174,7 +193,7 @@ async function init() {
   // A parameter that is not one of this scenario's knobs is a typo, and
   // silently ignoring it is the failure above wearing a different hat.
   const PAGE_PARAMS = new Set(['scenario', 'q', 'axis', 'slice', 'mode', 'spf', 'live',
-    'uscale', 'vscale', 'vortGamma', 'bounceback', 'chiEps', 'vmax', 'omax',
+    'uscale', 'vscale', 'vortGamma', 'bounceback', 'chiEps', 'vmax', 'omax', 'rotate',
     'levels', 'rb', 'refine', 'margin', 'boxfrac', 'dcpre', 'reflux', 'interface',
     'explin', 'orphans', 'dynamic', 'manageEvery', 'slotHeadroom', 'amrskip',
     'manageMargin', 'manageStart',
@@ -1955,6 +1974,37 @@ async function init() {
   let poolExhausted = 0;
   let axis = parseAxis();
   const axisExtent = (a) => [NX, NY, NZ][a];
+  // THE IN-PLANE AXES FOR A SLICE NORMAL, cyclically -- the single host-side
+  // statement of planeDims()/fs_main's convention in
+  // common_d3_render_slice.wgsl: the first runs across the screen and the
+  // second down it (before any rotation). planeExtent() below indexes NX/NY/NZ
+  // with exactly this.
+  const PLANE_AXES = [[1, 2], [2, 0], [0, 1]];
+  // QUARTER TURNS THAT PUT THE SCENARIO'S `down` DOWN THE WINDOW.
+  //
+  // `rot = 0` already draws the SECOND in-plane axis downward (fs_main's
+  // `1 - uv.y`), so a scenario falling along that axis needs no turn at all;
+  // one falling along the FIRST needs the picture turned a quarter clockwise.
+  // A `down` that is the slice NORMAL is not in the picture and no rotation
+  // can help, so it stays 0 rather than picking something arbitrary.
+  //
+  // Signed, because the answer for -x is not the answer for +x -- it is the
+  // opposite turn, and a scenario that ever falls the other way should not
+  // have to discover that by looking.
+  function downTurn(a) {
+    const d = params.down;
+    if (!d) return 0;
+    const [p, q] = PLANE_AXES[a];
+    if (d[p] > 0) return 1;
+    if (d[p] < 0) return 3;
+    if (d[q] > 0) return 0;
+    if (d[q] < 0) return 2;
+    return 0;                          // `down` is the slice normal
+  }
+  // `?rotate=` overrides in DEGREES CLOCKWISE, which is how a person thinks
+  // about turning a picture; the shader counts quarter turns.
+  const ROT_OVERRIDE = urlParams.has('rotate') ? parseRotate() : null;
+  const viewTurn = () => ROT_OVERRIDE !== null ? ROT_OVERRIDE : downTurn(axis);
   let slice = urlParams.has('slice')
     ? Math.min(axisExtent(parseAxis()) - 1, Math.max(0, parseInt(urlParams.get('slice'))))
     : (axisExtent(parseAxis()) >> 1);
@@ -1986,7 +2036,7 @@ async function init() {
 
   function writeRenderParams() {
     const b = new ArrayBuffer(32);
-    new Uint32Array(b, 0, 4).set([axis, slice, mode, 0]);
+    new Uint32Array(b, 0, 4).set([axis, slice, mode, viewTurn()]);
     new Float32Array(b, 16, 4).set([U_SCALE, V_SCALE, 0, 0]);
     device.queue.writeBuffer(rpBuf, 0, b);
   }
@@ -3684,12 +3734,15 @@ async function init() {
   // width and height explicitly. Symmetric in the two axes by construction,
   // so it cannot compress in either direction.
   function planeExtent(a) {
-    // The in-plane axes for slice normal `a`, cyclically -- and this MUST
-    // agree with planeDims()/fs_main in common_d3_render_slice.wgsl, which
-    // maps the first component across the screen and the second down it.
-    if (a === 0) return [NY, NZ];
-    if (a === 1) return [NZ, NX];
-    return [NX, NY];
+    // The in-plane extents for slice normal `a`, from the one statement of
+    // the convention (PLANE_AXES), THEN swapped for an odd quarter turn --
+    // a rotated picture is as tall as the plane is wide. Getting this wrong
+    // does not rotate anything, it stretches: the canvas would keep the
+    // unrotated aspect and render a sphere as an ellipse, which is the exact
+    // distortion this function's own history is about.
+    const [p, q] = PLANE_AXES[a];
+    const e = [axisExtent(p), axisExtent(q)];
+    return (viewTurn() & 1) ? [e[1], e[0]] : e;
   }
   function resize() {
     const [pw, ph] = planeExtent(axis);

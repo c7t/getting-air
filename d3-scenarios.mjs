@@ -501,6 +501,21 @@ SCENARIOS.fall = {
       // FALLS ALONG +x, the long axis. Nothing about the solver prefers an
       // axis; the domain does.
       gravity: towed ? [0, 0, 0] : [gEff, 0, 0],
+      // WHICH WAY IS DOWN, as a signed lattice axis, for the VIEW alone.
+      //
+      // The solver does not have an opinion and must not acquire one: this
+      // is read only by main-3d.js's downTurn(), which rotates the slice
+      // picture so this direction runs down the window. Without it a fall
+      // along +x on the default z-slice tracks ACROSS the screen, and which
+      // way depends on the leg -- a towed body advances while a streamed one
+      // is pinned in a flow going the other way -- so the same physics in two
+      // Galilean frames reads as two different pictures.
+      //
+      // +x on ALL THREE LEGS, deliberately. A streamed body is not falling,
+      // but it is the SAME flow as the tow seen from the other frame
+      // (plans/3D.md M8.2b), and a control that is drawn differently from
+      // the thing it controls is a control nobody can read.
+      down: [1, 0, 0],
       gEff,
       // Quiescent fluid, and a sponge that holds it there rather than at a
       // freestream -- this is a body falling through still fluid, not a body

@@ -42,7 +42,23 @@ struct RParams {
   axis  : u32,
   slice : u32,
   mode  : u32,
-  _pad0 : u32,
+  // QUARTER TURNS OF THE PICTURE, CLOCKWISE. 0 is the historical view.
+  //
+  // IT IS AN IMAGE ROTATION AND NOTHING ELSE, which is the whole reason it
+  // is safe. Every field this view draws -- |u|, the OUT-OF-PLANE vorticity,
+  // the velocity along the slice NORMAL -- is invariant under a rotation
+  // within the slice plane, so only the uv -> (a, b) mapping below changes
+  // and not one line of the sampling or the differencing. A rotation that
+  // had to re-sign omega would be a reflection, and there is no reflection
+  // here: `rot` is a rotation subgroup on purpose.
+  //
+  // WHY IT EXISTS: a body falling along +x rendered on a z-slice moves
+  // ACROSS the window, because the in-plane axes are (x, y) and x is the
+  // horizontal one. The scenario says which way is DOWN and main-3d.js picks
+  // the turn that puts it down the screen -- see downTurn(). Nothing about
+  // the solver prefers an axis, and now nothing about the view forces the
+  // reader to remember which one the scenario chose.
+  rot   : u32,
   uScale : f32,      // velocity reference for modes 0 and 2
   vScale : f32,      // vorticity reference for mode 1
   _pad1 : f32,
@@ -221,14 +237,30 @@ fn magColor(t: f32) -> vec3<f32> {
   return mix(lo, vec3(1.0, 0.92, 0.35), smoothstep(0.55f, 1f, c));
 }
 
+// uv -> in-plane L0 cell units, through `rot` quarter turns CLOCKWISE.
+//
+// Cell i spans [i - 1/2, i + 1/2), so the -0.5 is what makes floor(p + 1/2)
+// reproduce the integer index this used to compute directly, at every zoom
+// level. uv.y = 1 is the TOP of the screen, so the unrotated form already
+// draws +b DOWNWARD; rot = 1 hands that role to +a instead.
+//
+// Each case is the composition of the previous one with a quarter turn, and
+// they are written out rather than derived from a matrix because there are
+// exactly four of them and the closed forms are one line each.
+fn uvToPlane(uv: vec2<f32>, d: vec2<u32>) -> vec2<f32> {
+  let dx = f32(d.x); let dy = f32(d.y);
+  if (rp.rot == 1u) { return vec2((1f - uv.y) * dx - 0.5f,   (1f - uv.x) * dy - 0.5f); }
+  if (rp.rot == 2u) { return vec2((1f - uv.x) * dx - 0.5f,   uv.y * dy - 0.5f); }
+  if (rp.rot == 3u) { return vec2(uv.y * dx - 0.5f,          uv.x * dy - 0.5f); }
+  return vec2(uv.x * dx - 0.5f, (1f - uv.y) * dy - 0.5f);
+}
+
 @fragment
 fn fs_main(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> {
   let d = planeDims();
-  // uv -> L0 cell units. Cell i spans [i - 1/2, i + 1/2), so the -0.5 is
-  // what makes floor(p + 1/2) reproduce the integer index this used to
-  // compute directly, at every zoom level.
-  let pa = uv.x * f32(d.x) - 0.5f;
-  let pb = (1.0 - uv.y) * f32(d.y) - 0.5f;
+  let p = uvToPlane(uv, d);
+  let pa = p.x;
+  let pb = p.y;
 
   let t = sampleTree(planePoint(pa, pb));
   let s = rotateUVW(t.v.yzw);
