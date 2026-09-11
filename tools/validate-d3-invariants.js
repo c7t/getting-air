@@ -124,6 +124,12 @@ const CONFIGS = [
   // back, which is a different claim from the host-side unit tests.
   { name: 'box3', steps: 200,
     url: 'scenario=beltrami&n=16&tau=0.8&u0=0.04&q=19&live=0&levels=3&rb=4&refine=box&boxfrac=0.5&interface=explode' },
+  // The depth-3 row where BOTH new checks are real: geometry coverage at the
+  // finest level (M5.4's hard requirement -- the body must live entirely
+  // there) and the criterion-and-closure chain against the host. Static:
+  // ?dynamic=1 at depth is still refused until M5.5b wires the allocator.
+  { name: 'body3', steps: 200,
+    url: 'scenario=sphere&n=8&re=20&u0=0.05&q=19&bounceback=1&live=0&levels=3&rb=4&refine=body&interface=explode' },
   { name: 'bar3', steps: 200,
     url: 'scenario=beltrami&n=16&tau=0.8&u0=0.04&q=19&live=0&levels=3&rb=4&refine=bar&boxfrac=0.5&interface=explode' },
   // THE CONFIG THAT PROVES THE HARD FAILURE FIRES. It asks for far more
@@ -231,6 +237,23 @@ async function runConfig(Runtime, o, c, log) {
     log(`refined shell: lo.x ${firstBbox.lo[0]} -> ${res.poolState.bbox.lo[0]} (${moved} blocks) ${ok ? 'ok' : 'DID NOT FOLLOW'}`);
   }
   // Did the manager actually do the thing the config exists to observe?
+  // M5.5a. The manager's criterion-and-closure chain, scored against
+  // d3-amr.mjs's refineHierarchy -- two independent statements of one rule,
+  // run against each other on real GPU data. Once per config rather than per
+  // checkpoint: the host side is an SDF sweep over every block at every
+  // level, and one run at the END is the interesting one anyway, since a
+  // moving body has moved by then.
+  const bal2 = await evalOrThrow(Runtime, `${G}.debugRunBalance()`, 300000, 'debugRunBalance');
+  if (bal2.skipped) res.wantSkipped = bal2.skipped;
+  else {
+    res.want = bal2;
+    if (!bal2.ok) {
+      res.pool.push({ at: 'end', n: 1,
+        first: { kind: 'wantSetDiffersFromHost', levels: bal2.levels.filter(d => d.onlyGpu || d.onlyHost) } });
+    }
+    log('want vs host: ' + bal2.levels.map(d => `L${d.level} ${d.gpu}/${d.host}`).join(' ')
+      + (bal2.ok ? '  match' : '  DIFFER'));
+  }
   if (c.expectExhausted && !res.exhausted) {
     res.pool.push({ at: 'end', n: 1, first: { kind: 'expectedExhaustionDidNotFire' } });
     log('expected the pool to be exhausted and it was not -- the hard failure did not fire');
@@ -292,15 +315,15 @@ async function main() {
     await teardown({ port: o.port, tabId, chrome, server, keepOpen: o.keepOpen });
   }
 
-  console.log('\n' + '='.repeat(110));
+  console.log('\n' + '='.repeat(128));
   console.log(`SUMMARY  ${o.steps} steps, checked every ${o.checkEvery}`);
-  console.log('='.repeat(110));
+  console.log('='.repeat(128));
   console.log(pad('config', 14) + pad('2:1 balance', 21) + pad('ring parents', 18)
-    + pad('geometry coverage', 30) + pad('pool', 20) + padL('verdict', 9));
-  console.log('-'.repeat(110));
+    + pad('geometry coverage', 30) + pad('want vs host', 18) + pad('pool', 20) + padL('verdict', 9));
+  console.log('-'.repeat(128));
   let exitCode = 0;
   for (const r of report) {
-    if (r.error) { console.log(pad(r.name, 14) + pad('-', 21) + pad('-', 18) + pad('-', 30) + pad('-', 20) + padL('ERROR', 9)); exitCode = 1; continue; }
+    if (r.error) { console.log(pad(r.name, 14) + pad('-', 21) + pad('-', 18) + pad('-', 30) + pad('-', 18) + pad('-', 20) + padL('ERROR', 9)); exitCode = 1; continue; }
     const x = r.res;
     const balTxt = x.bal.length ? `${x.bal.length} checkpoints BAD` : (x.vacuous ? 'ok (VACUOUS N=2)' : 'ok');
     const covTxt = x.cov.length ? `${x.cov.length} checkpoints BAD`
@@ -313,9 +336,12 @@ async function main() {
     const poolTxt = x.pool.length ? `${x.pool.length} BAD`
       : (perLevel ? `ok ${perLevel}${x.exhausted ? ' EXHAUSTED(ok)' : ''}${x.blewUp ? '*' : ''}` : 'skipped');
     const ringTxt = x.ring.length ? `${x.ring.length} checkpoints BAD` : (x.ringVacuous ? 'ok (VACUOUS N=2)' : 'ok');
+    const wantTxt = x.wantSkipped ? 'skipped'
+      : (x.want ? (x.want.ok ? `ok ${x.want.levels.map(d => d.gpu).join('/')}` : 'DIFFERS') : '-');
     const ok = !x.bal.length && !x.ring.length && !x.cov.length && !x.pool.length && x.finite;
     if (!ok) exitCode = 1;
-    console.log(pad(r.name, 14) + pad(balTxt, 21) + pad(ringTxt, 18) + pad(covTxt, 30) + pad(poolTxt, 20) + padL(ok ? 'PASS' : 'FAIL', 9));
+    console.log(pad(r.name, 14) + pad(balTxt, 21) + pad(ringTxt, 18) + pad(covTxt, 30)
+      + pad(wantTxt, 18) + pad(poolTxt, 20) + padL(ok ? 'PASS' : 'FAIL', 9));
   }
   if (report.some(r => r.res && r.res.blewUp && r.res.finite)) {
     console.log('\n* the field blew up, EXPECTEDLY: that config allocates tiles nothing initializes');

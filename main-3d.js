@@ -514,13 +514,17 @@ async function init() {
     // enough where there is no manager -- the pipelines that read them are
     // never created, and NEW_ONLY/DYING_ONLY fold the reads out of the ones
     // that are.
-    lv.blockWant = device.createBuffer({ size: (DYNAMIC ? nBlocks : 1) * 4, usage: U.STORAGE | U.COPY_DST });
+    // FULL SIZE ALWAYS (M5.5a). It used to be one dummy element without the
+    // manager; the criterion-and-closure chain is now exercised on static
+    // runs too (debugRunBalance), and it is nBlocks * 4 bytes -- 1.5 MB at
+    // level 2 of the sphere case, against a pool measured in hundreds.
+    lv.blockWant = device.createBuffer({ size: nBlocks * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
     lv.slotNew = device.createBuffer({ size: (DYNAMIC ? slots : 1) * 4, usage: U.STORAGE | U.COPY_DST });
     // The initial set is not "new": it was uploaded with real data by the
     // host, and marking it new would have the fill pass overwrite every tile
     // with a coarse interpolation on the first step.
     device.queue.writeBuffer(lv.slotNew, 0, new Uint32Array(DYNAMIC ? slots : 1));
-    device.queue.writeBuffer(lv.blockWant, 0, new Uint32Array(DYNAMIC ? nBlocks : 1));
+    device.queue.writeBuffer(lv.blockWant, 0, new Uint32Array(nBlocks));
     return lv;
   };
   if (AMR) {
@@ -901,7 +905,7 @@ async function init() {
     // and ONE bind group -- the split is into separate PASSES, not separate
     // resources; see common_d3_manage.wgsl on why they must not share a
     // dispatch.
-    if (DYNAMIC) {
+    if (geomForced) {
       const manageModule = device.createShaderModule({
         code: await loadShader(`shaders/d3_manage_q${Q}.wgsl`), label: `d3_manage_q${Q}` });
       const manageBGL = device.createBindGroupLayout({ entries: [
@@ -912,6 +916,7 @@ async function init() {
         { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
         { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
         { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+        { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
       ]});
       // MARGIN comes from the SAME value refineNearBody used to build the
       // static set, not from a second read of ?margin=: the bit-identical
@@ -927,10 +932,29 @@ async function init() {
         layout: device.createPipelineLayout({ bindGroupLayouts: [manageBGL] }),
         compute: { module: manageModule, entryPoint: entry, constants: manageConst },
       });
-      manageDecidePipe = await mkManage('decide');
-      manageCoarsenPipe = await mkManage('coarsen');
-      manageRefinePipe = await mkManage('refine');
-      manageClearPipe = await mkManage('clearNew');
+      // THE CRITERION RUNS AT THE FINEST LEVEL ONLY (M5.1b), so `decide` is
+      // one pipeline, built in that level's frame. Every coarser level's
+      // want is derived by the closure below, never re-decided.
+      const deepest = LEVELS - 1;
+      const mkManageAt = (entry, m, extra) => device.createComputePipelineAsync({
+        layout: device.createPipelineLayout({ bindGroupLayouts: [manageBGL] }),
+        compute: { module: manageModule, entryPoint: entry, constants: {
+          ...manageConst,
+          NX: NX * 2 ** (m - 1), NY: NY * 2 ** (m - 1), NZ: NZ * 2 ** (m - 1),
+          BOX_SCALE: 2 ** -(m - 1), ...(extra || {}) } },
+      });
+      manageDecidePipe = await mkManageAt('decide', deepest);
+      // The 2:1 cascade, per level: octet completion at m, then the parent
+      // gather that writes m-1 from m. Both are one-thread-per-output, so
+      // neither has a race to reason about -- see the shader.
+      for (let m = 2; m < LEVELS; m++) L[m].octetsPipe = await mkManageAt('completeOctets', m);
+      for (let m = 1; m < LEVELS - 1; m++) L[m].balancePipe = await mkManageAt('balance', m);
+      if (DYNAMIC) {
+        manageCoarsenPipe = await mkManage('coarsen');
+        manageRefinePipe = await mkManage('refine');
+        manageClearPipe = await mkManage('clearNew');
+      }
+      const wantDummy = { blockWant: device.createBuffer({ size: 4, usage: U.STORAGE }) };
       manageBG = device.createBindGroup({ layout: manageBGL, entries: [
         { binding: 0, resource: { buffer: blockSlotBuf } },
         { binding: 1, resource: { buffer: slotToBlockBuf } },
@@ -938,7 +962,30 @@ async function init() {
         { binding: 3, resource: { buffer: freeCountBuf } },
         { binding: 4, resource: { buffer: bodyBuf } },
         { binding: 5, resource: { buffer: blockWantBuf } },
-        { binding: 6, resource: { buffer: slotNewBuf } }]});
+        { binding: 6, resource: { buffer: slotNewBuf } },
+        { binding: 7, resource: { buffer: wantDummy.blockWant } }]});
+      // Per level, so the closure can be dispatched down the tree. Binding 5
+      // is THIS level's want and binding 7 is the CHILD's; at the deepest
+      // level the child slot is bound to itself, which `balance` never reads
+      // there because no pipeline is created for it.
+      for (let m = 1; m < LEVELS; m++) {
+        const lv = L[m];
+        lv.manageBG = device.createBindGroup({ layout: manageBGL, entries: [
+          { binding: 0, resource: { buffer: lv.blockSlot } },
+          { binding: 1, resource: { buffer: lv.slotToBlock } },
+          { binding: 2, resource: { buffer: lv.freeList } },
+          { binding: 3, resource: { buffer: lv.freeCount } },
+          { binding: 4, resource: { buffer: bodyBuf } },
+          { binding: 5, resource: { buffer: lv.blockWant } },
+          { binding: 6, resource: { buffer: lv.slotNew } },
+          // NEVER `lv.blockWant` itself: binding 5 is writable and 7 is
+          // read-only, and WebGPU rejects one buffer in both roles in a
+          // single dispatch -- which it does by SKIPPING the dispatch, so
+          // the symptom is a manager that decides nothing at all. Found
+          // exactly that way. The deepest level's `balance` pipeline does
+          // not exist, so what sits here is never read.
+          { binding: 7, resource: { buffer: (L[m + 1] || wantDummy).blockWant } }]});
+      }
     }
 
     // M4.1d: the fine level's own force/torque reduction. Created from the
@@ -1864,6 +1911,72 @@ async function init() {
     };
   }
 
+  // M5.5a. Dispatch the criterion-and-closure chain and read back every
+  // level's want set, then score it against d3-amr.mjs's refineHierarchy --
+  // the host implementation `make test` already gates on violating inputs.
+  // Two independent statements of one rule, run against each other, which is
+  // the same discipline check21Balance and cascade21 are held to.
+  //
+  // It does NOT allocate: the passes here decide and close, and wiring that
+  // into the allocator at depth is M5.5b. So this is a gate on the rule, not
+  // on the manager.
+  async function debugRunBalance() {
+    if (!AMR || !manageDecidePipe) return { skipped: 'no geometry-forced criterion' };
+    const deepest = LEVELS - 1;
+    // Every level but the finest accumulates with |=, so it starts at zero.
+    for (let m = 1; m < deepest; m++) {
+      device.queue.writeBuffer(L[m].blockWant, 0, new Uint32Array(L[m].nBlocks));
+    }
+    const enc = device.createCommandEncoder();
+    const pass = (pipe, m) => {
+      const p = enc.beginComputePass();
+      p.setPipeline(pipe); p.setBindGroup(0, L[m].manageBG);
+      p.dispatchWorkgroups(Math.ceil(L[m].nBlocks / 64)); p.end();
+    };
+    pass(manageDecidePipe, deepest);
+    // Deepest first: each level's octets are completed before the parent
+    // gathers from it, which is cascade21's own sweep order.
+    for (let m = deepest; m >= 2; m--) {
+      pass(L[m].octetsPipe, m);
+      pass(L[m - 1].balancePipe, m - 1);
+    }
+    device.queue.submit([enc.finish()]);
+    await device.queue.onSubmittedWorkDone();
+
+    const gpu = [null];
+    for (let m = 1; m < LEVELS; m++) {
+      const bytes = L[m].nBlocks * 4;
+      const e2 = device.createCommandEncoder();
+      e2.copyBufferToBuffer(L[m].blockWant, 0, blockSlotStaging, 0, bytes);
+      device.queue.submit([e2.finish()]);
+      await blockSlotStaging.mapAsync(GPUMapMode.READ, 0, bytes);
+      const v = new Uint32Array(blockSlotStaging.getMappedRange(0, bytes)).slice();
+      blockSlotStaging.unmap();
+      const set = new Set();
+      for (let id = 0; id < L[m].nBlocks; id++) if (v[id]) set.add(L[m].pool.blockOf(id).join(','));
+      gpu[m] = set;
+    }
+
+    // The host's answer for the body where it is NOW -- read back from the
+    // GPU, not the startup position, because the body moves.
+    const b = await readBody();
+    const margin = Number.isFinite(MANAGE_MARGIN) ? MANAGE_MARGIN : geomForced.margin;
+    const lead = MANAGE_EVERY * Math.hypot(b.vx, b.vy, b.vz);
+    const host = refineHierarchy(pool, {
+      levels: LEVELS, want: nearBodyWant(geomForced.sdfAt([b.cx, b.cy, b.cz]), margin + lead) });
+
+    const diffs = [];
+    for (let m = 1; m < LEVELS; m++) {
+      const h = host.sets[m], g = gpu[m];
+      let onlyGpu = 0, onlyHost = 0, firstOnlyGpu = null, firstOnlyHost = null;
+      for (const k of g) if (!h.has(k)) { onlyGpu++; if (!firstOnlyGpu) firstOnlyGpu = k; }
+      for (const k of h) if (!g.has(k)) { onlyHost++; if (!firstOnlyHost) firstOnlyHost = k; }
+      diffs.push({ level: m, gpu: g.size, host: h.size, onlyGpu, onlyHost, firstOnlyGpu, firstOnlyHost });
+    }
+    return { ok: diffs.every(d => d.onlyGpu === 0 && d.onlyHost === 0), levels: diffs,
+             vacuous: LEVELS < 3 };
+  }
+
   async function debugCheck21Balance() {
     if (!AMR) return { skipped: 'no pool (?levels=1)' };
     const levelSets = await readLevelSets();
@@ -2188,6 +2301,7 @@ async function init() {
     }),
     readSubsampled, readDuctProfile, readStats, readBody, readPoolStats,
     debugCheck21Balance, debugCheckGeometryCoverage, debugCheckRingParents, debugPoolState,
+    debugRunBalance,
     readInterfaceDiag, readFluxAcc,
     debugStepSync,
   };

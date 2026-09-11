@@ -83,6 +83,10 @@
 // pass once the tile has been initialized from the coarse field. A slot with
 // this set is holding whatever the last owner left behind.
 @group(0) @binding(6) var<storage, read_write> slotNew     : array<u32>;
+// The CHILD level's want array, read by `balance` (plans/3D.md M5.5). Bound
+// always so the layout does not fork; read only by that entry point, which is
+// created only where there is a child level.
+@group(0) @binding(7) var<storage, read> childWant : array<u32>;
 
 override MARGIN : f32 = 2.0f;
 // How many macro-steps pass before the criterion is re-evaluated. The
@@ -92,6 +96,20 @@ override MANAGE_EVERY : f32 = 1.0f;
 // The body's own radius is baked into get_phi3, so the criterion needs
 // nothing else about the shape.
 override HAS_BODY : u32 = 0u;
+// A level-m manager works in level-(m-1) CELL UNITS and the body lives in L0
+// units. 2^-(m-1), identity at level 1.
+//
+// A PURE SCALE, NOT THE AFFINE MAP the step and force kernels use (M5.4b),
+// AND THAT IS DELIBERATE. Those convert a cell CENTRE and must land on it
+// exactly. This converts a BLOCK BOX used as a conservative bound, and the
+// only thing that must be exact about it is that it AGREES with
+// d3-amr.mjs's refineHierarchy, which builds the initial set with the same
+// pure scale -- M4.2b-i's gate is that the kernel's criterion and the host's
+// produce the same set, and two nearly-right conversions that differ would
+// break it. The difference is the cell-centring offset, at most ~0.4 L0
+// cells at depth 3 against a margin of 2, and the real guarantee is the
+// CELL-GRANULAR checkGeometryCoverage rather than this box either way.
+override BOX_SCALE : f32 = 1.0f;
 
 // Does this block's coarse-cell box come within MARGIN of the body? Eight
 // corners plus the centre, minimum signed distance -- character for
@@ -119,8 +137,8 @@ fn blockWanted(b: vec3<u32>) -> bool {
   // is to be checkable.
   let lead = MANAGE_EVERY * length(vec3<f32>(body.vx, body.vy, body.vz));
   let reach = MARGIN + lead;
-  let lo = vec3<f32>(b * RB);
-  let hi = lo + f32(RB);
+  let lo = vec3<f32>(b * RB) * BOX_SCALE;
+  let hi = lo + f32(RB) * BOX_SCALE;
   var best = 1e30f;
   for (var k = 0u; k < 8u; k++) {
     let p = vec3<f32>(
@@ -131,6 +149,76 @@ fn blockWanted(b: vec3<u32>) -> bool {
   }
   best = min(best, get_phi3((lo + hi) * 0.5f, body));
   return best <= reach;
+}
+
+// --- THE 2:1 CASCADE, M5.5 -------------------------------------------------
+//
+// The GPU mirror of d3-amr.mjs's `cascade21`, which is the tested statement
+// of the rule (M4.2b-iv) and what tools/test-d3-amr.js scores this against.
+// Two passes, both GATHERS -- one thread per OUTPUT block, reading inputs it
+// does not write. There is no scatter and therefore no race to reason about,
+// which is the opposite of how the 2D manager does it and deliberately so.
+//
+// ONLY THE FINEST LEVEL EVALUATES THE CRITERION (M5.1b). Every coarser level
+// is whatever these two passes require, so `decide` runs on one pipeline and
+// the rest of the tree is derived.
+
+// PASS 1a. OCTET COMPLETION, level >= 2. A block exists because its parent
+// spawned all eight children, so a want for one is a want for all eight --
+// see cascade21's header for what a closure that forgets this does to
+// check21Balance (which reads octant (0,0,0) alone and calls the rest a
+// leaf). Level 1 is exempt: its parent is the dense L0 grid and its blocks
+// are refined individually, which is exactly what refineNearBody builds.
+//
+// Safe in place despite reading siblings it may also write, because each
+// index is written by exactly ONE thread and the value only ever goes 0->1:
+// every thread computes the OR over the same eight originals.
+@compute @workgroup_size(64)
+fn completeOctets(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let id = gid.x;
+  let n = vec3<u32>(nbx(), nby(), nbz());
+  if (id >= n.x * n.y * n.z) { return; }
+  let b = blockOfId(id);
+  let base = (b / 2u) * 2u;
+  var any = 0u;
+  for (var k = 0u; k < 8u; k++) {
+    let c = base + vec3<u32>(k & 1u, (k >> 1u) & 1u, (k >> 2u) & 1u);
+    any = any | blockWant[(c.z * n.y + c.y) * n.x + c.x];
+  }
+  blockWant[id] = any;
+}
+
+// PASS 1b. THE PARENT CLOSURE. This level's want, gathered from the child's:
+// parent p is wanted if ANY of the 64 child blocks in [2p-1, 2p+2]^3 is.
+//
+// WHY 64 AND NOT 8. cascade21's rule is present(m,b) => present(m-1,
+// parent(b+d)) for all 27 offsets d, not just the six faces: d = 0 is the
+// tree property, the faces are 2:1 balance, and the twelve edges and eight
+// corners are the RING -- a corner ring cell's parent tile must exist or
+// explode has nothing to read (M5.2a). Inverting that scatter gives this
+// gather: p's own eight children, dilated by one block in every direction.
+@compute @workgroup_size(64)
+fn balance(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let id = gid.x;
+  let n = vec3<u32>(nbx(), nby(), nbz());
+  if (id >= n.x * n.y * n.z) { return; }
+  let p = blockOfId(id);
+  let cn = n * 2u;                       // the child level's block counts
+  var any = 0u;
+  for (var k = 0u; k < 64u; k++) {
+    // [2p-1, 2p+2] on each axis, periodic like every other block lookup.
+    let o = vec3<i32>(i32(k & 3u), i32((k >> 2u) & 3u), i32((k >> 4u) & 3u)) - 1;
+    let c = vec3<u32>(
+      wrapu(i32(p.x) * 2 + o.x, cn.x),
+      wrapu(i32(p.y) * 2 + o.y, cn.y),
+      wrapu(i32(p.z) * 2 + o.z, cn.z));
+    any = any | childWant[(c.z * cn.y + c.y) * cn.x + c.x];
+  }
+  // OR, never overwrite: this level may also have been wanted in its own
+  // right. Today it cannot be -- only the finest level runs the criterion --
+  // but a vorticity criterion per level would, and silently dropping it
+  // would be the kind of thing nothing here would catch.
+  blockWant[id] = blockWant[id] | any;
 }
 
 fn blockOfId(id: u32) -> vec3<u32> {
