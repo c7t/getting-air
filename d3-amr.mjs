@@ -348,21 +348,36 @@ export function checkRingParentCoverage(levelSets, nbAt, { levels }) {
 // The requirement: no coarse cell whose centre is within `margin` of the
 // body may sit in an unrefined block. Same sign convention as
 // refineNearBody, so cells INSIDE the body (phi < 0) are included.
+// COUNT EVERY VIOLATION, RECORD THE FIRST FEW. The two are separate numbers
+// and conflating them was a real defect (found 2026-09-11): `violations` was
+// capped at 32 entries and the caller reported its LENGTH as the count, so
+// every run with more than 32 bad cells reported exactly 32. The tell was a
+// plate whose count did not move when `?margin=` was raised from 3 to 5 to 7
+// -- a criterion whose failure is independent of its own parameter is not
+// measuring what it claims to, and the constant was the cap.
+//
+// A saturating count is worse than no count: it reads as a small, bounded
+// defect, and tools/validate-d3-invariants.js bounds a FRACTION computed
+// from it. `sample` stays bounded because a violation list is for looking
+// at, not for summing.
 export function checkGeometryCoverage(pool, blockSlot, sdf, margin) {
   const [NX, NY, NZ] = pool.dims;
-  const violations = [];
-  let required = 0;
+  const sample = [];
+  let required = 0, nViolations = 0;
   for (let z = 0; z < NZ; z++) {
     for (let y = 0; y < NY; y++) {
       for (let x = 0; x < NX; x++) {
         if (sdf([x, y, z]) > margin) continue;
         required++;
         const id = pool.blockId(Math.floor(x / pool.rb), Math.floor(y / pool.rb), Math.floor(z / pool.rb));
-        if (blockSlot[id] < 0 && violations.length < 32) violations.push({ cell: [x, y, z], block: id });
+        if (blockSlot[id] < 0) {
+          nViolations++;
+          if (sample.length < 32) sample.push({ cell: [x, y, z], block: id });
+        }
       }
     }
   }
-  return { violations, required };
+  return { violations: sample, nViolations, required };
 }
 
 // 2:1 CASCADE. Turns a WANTED set into the smallest superset of it that is

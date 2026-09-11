@@ -446,9 +446,32 @@ async function init() {
       // against the same reading the kernel used. The identity without a
       // window (wrapDelta3 at WIN_N = 0), so every existing case is
       // untouched.
+      //
+      // THE BODY'S OWN SDF, IN ITS OWN ORIENTATION -- not a sphere of radius
+      // `shape.a` (fixed 2026-09-11). This used to be `length(delta) - sh.a`,
+      // which is EXACT for a sphere and wrong for every other shape the body
+      // module offers. For the falling plate it was wrong in both directions
+      // at once: it required a BALL of radius a + margin, about half of which
+      // the plate does not occupy, while the plate's own CORNERS at
+      // sqrt(a^2 + b^2 + c^2) lie OUTSIDE that ball and so were not required
+      // at all. Worse, the host BUILT the initial hierarchy from the same
+      // wrong function, so debugCheckGeometryCoverage scored the host against
+      // itself and passed -- a gate that goes green because both sides share
+      // one mistake. The GPU manager has always used the true `get_phi3`, so
+      // the first manager pass made the two disagree and the gate went red
+      // pointing at the manager, which was the half that was right.
+      //
+      // Bit-identical for a sphere: sdfBody reduces to |p| - a there, and the
+      // inverse rotation of a sphere is the identity. Every shipped case is a
+      // sphere, and all of them are unchanged.
+      //
+      // The ORIENTATION has to be passed in for the same reason the CENTRE
+      // does: a body that turns changes which cells are near it even standing
+      // still, and a plate turns through 90 degrees of its own chord.
       geomForced = { radius: sh.a, margin,
-        sdfAt: (c) => (q) => Math.hypot(...wrapDelta3([q[0] - c[0], q[1] - c[1], q[2] - c[2]], WIN_N)) - sh.a };
-      const bodyWant = nearBodyWant(geomForced.sdfAt(bx), margin);
+        sdfAt: (c, bq) => (q) => sdfBody(
+          qRotateInv(bq, wrapDelta3([q[0] - c[0], q[1] - c[1], q[2] - c[2]], WIN_N)), sh) };
+      const bodyWant = nearBodyWant(geomForced.sdfAt(bx, params.body.q), margin);
       want = bodyWant;
       if (mode === 'wake') {
         // --- THE HAND-PLACED WAKE BOX (plans/3D.md M8.4a) ------------------
@@ -2014,7 +2037,7 @@ async function init() {
     : params.scenario === 'sphere' ? params.u0 * 1.6      // the flow accelerates around the body
     // `fall` has no freestream at all -- the fluid starts at rest and the
     // only velocity scale is the body's own terminal one.
-    : params.scenario === 'fall' ? params.u_t * 1.6
+    : (params.scenario === 'fall' || params.scenario === 'card') ? params.u_t * 1.6
     : 2 * params.u0;
   // Render normalizations, derived per scenario rather than inherited from
   // the 2D pages' constants. common_vortcolor.wgsl's tone curve is
@@ -2031,7 +2054,7 @@ async function init() {
   const V_SCALE = numParam('vscale',
     scenarioName === 'duct' ? 2 * params.uPeak / params.a
       : scenarioName === 'sphere' ? 2 * params.u0 / params.R
-      : scenarioName === 'fall' ? 2 * params.u_t / params.R
+      : (scenarioName === 'fall' || scenarioName === 'card') ? 2 * params.u_t / params.R
         : (params.k || 2 * Math.PI / N) * U_SCALE);
 
   function writeRenderParams() {
@@ -3406,7 +3429,8 @@ async function init() {
     const margin = Number.isFinite(MANAGE_MARGIN) ? MANAGE_MARGIN : geomForced.margin;
     const lead = MANAGE_EVERY * Math.hypot(b.vx, b.vy, b.vz);
     const host = refineHierarchy(pool, {
-      levels: LEVELS, want: nearBodyWant(geomForced.sdfAt([b.cx, b.cy, b.cz]), margin + lead) });
+      levels: LEVELS,
+      want: nearBodyWant(geomForced.sdfAt([b.cx, b.cy, b.cz], [b.qw, b.qx, b.qy, b.qz]), margin + lead) });
 
     const diffs = [];
     for (let m = 1; m < LEVELS; m++) {
@@ -3447,9 +3471,10 @@ async function init() {
     // lives. Against the initial position instead, a manager that refined a
     // shell once and never moved it would pass.
     const b = await readBody();
-    const r = checkGeometryCoverage(pool, bs, geomForced.sdfAt([b.cx, b.cy, b.cz]), geomForced.margin);
-    return { ok: r.violations.length === 0, violations: r.violations.slice(0, 16),
-             nViolations: r.violations.length, required: r.required,
+    const r = checkGeometryCoverage(pool, bs,
+      geomForced.sdfAt([b.cx, b.cy, b.cz], [b.qw, b.qx, b.qy, b.qz]), geomForced.margin);
+    return { ok: r.nViolations === 0, violations: r.violations.slice(0, 16),
+             nViolations: r.nViolations, required: r.required,
              bodyAt: [b.cx, b.cy, b.cz] };
   }
 

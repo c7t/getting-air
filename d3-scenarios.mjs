@@ -40,7 +40,7 @@
 // Same browser+Node dual-consumption pattern as lattice-3d.mjs: imported
 // natively by the page, dynamically imported by the CommonJS tools.
 
-import { SHAPE, makeBodyState, qFromAxisAngle } from './d3-body.mjs';
+import { SHAPE, makeBodyState, qFromAxisAngle, qMul } from './d3-body.mjs';
 
 export const CS2 = 1 / 3;
 
@@ -532,6 +532,150 @@ SCENARIOS.fall = {
     };
   },
   macro: (dims, p) => seedMacro3Perturbed(dims, () => [p.stream > 0 ? p.stream : 0, 0, 0],
+                                          p.perturb * p.u_t, p.seed),
+};
+
+// --- card: THE TARGET. A free plate, falling and turning ------------------
+//
+// plans/3D.md M8: the 3D analog of the 2D project's falling card
+// (`card-params.mjs`, Pesavento & Wang 2004 Fig. 2). `fall` proved the
+// machinery on a SPHERE, whose drag law is known so its terminal velocity is
+// a number a gate can check. A plate is what the machinery was built for, and
+// it is a different problem in exactly one way that matters: **its attitude
+// is a degree of freedom that feeds back into its own drag.**
+//
+// WHAT IS DERIVED AND WHAT IS CHOSEN, because the 2D module's whole point is
+// that the regime is the input and the lattice constants follow:
+//
+//   n        CHORD in cells. The resolution knob; everything else is a ratio.
+//   aspect   thickness / chord. 0.125 is the paper's e, and at n = 32 that is
+//            their a = 32, b = 4 reference card scaled by two.
+//   span     span / chord. 1.0 is a SQUARE plate, which is NOT the paper's
+//            quasi-2D card -- see the span note below. Cheap, and the thing
+//            you can actually run.
+//   re       2 * u_t * (chord/2) / nu, THE PAPER'S CONVENTION keyed to the
+//            chord, matching card-params.mjs's after its factor-of-2 fix.
+//   i_star   the dimensionless moment of inertia that selects the branch;
+//            rho_b follows from it, exactly as in 2D.
+//   tilt     initial pitch, in radians, about the span axis. A plate dropped
+//            EXACTLY broadside is a symmetric initial condition and has
+//            nothing to fall over from but round-off -- the same trap
+//            seedMacro3Perturbed's header describes for the sphere's wake
+//            plane, and worse here because the symmetry is the BODY's.
+//
+// THE SPAN IS THE HONEST GAP. Pesavento & Wang's card is quasi-2D: a strip
+// wide enough that the ends do not matter, so I* is per unit span and the
+// tumbling is a two-dimensional bifurcation. A square plate is a DIFFERENT
+// body -- its tip vortices are not a correction, they are a comparable
+// effect -- so `span` is a knob and not a constant, and a comparison against
+// the paper needs it large. It is stated here rather than discovered later.
+//
+// WHAT THIS ACTUALLY DOES TODAY, measured 2026-09-11 at n = 32, span = 1,
+// aspect = 0.125, tilt = 0.15, dense (?levels=1), and NOT yet a gate:
+//
+//   Re = 200 (tau = 0.524):  STABLE to 43000 steps. Falls broadside at
+//       v_x = 0.043 against the target u_t = 0.05, with the measured fluid
+//       force -1.35 against a weight m*g_eff = 1.408 -- a 4% closure of the
+//       free-fall balance, which is the first time anything in 3D has closed
+//       it on a non-sphere. max|u| holds at 0.069 and rho within +-1.3%.
+//       It does NOT tumble: broadside is the stable branch here.
+//   Re = 500 (tau = 0.5096): the FLUID diverges at ~20000 steps, and the
+//       body follows rather than causes it -- max|u| goes 0.074 -> 0.16 ->
+//       0.21 -> 0.45 -> NaN over about 1800 steps while the plate is still
+//       within 3 degrees of broadside, with rho opening to [0.88, 1.07].
+//       Capping the rotation (?omax=0.004) does not prevent it, which is
+//       what rules out the body dynamics.
+//
+// So the target's Re ~ 1100 is NOT reachable at this resolution, and the
+// reason is the one M8.0 already names: tau = 0.5 + 6 u_t a / Re, so the
+// stability margin is bought with RESOLUTION, not with anything else. At
+// n = 64 and Re = 1100 that is tau = 0.5087 -- the 2D card's own shipped
+// tau0 -- and the body must then sit on a refined level, where
+// tauAtLevel doubles the margin per rung. AMR is not an optimization for
+// this case; it is the stability mechanism.
+SCENARIOS.card = {
+  name: 'card',
+  defaults: { n: 32, aspect: 0.125, span: 1, re: 500, u_t: 0.05, i_star: 0.17,
+              tilt: 0.15, perturb: 0, seed: 12345 },
+  walls: [],
+  // Long in the fall direction, and WIDE ACROSS IT, which is where this
+  // differs from `fall`. A tumbling plate does not fall straight: it
+  // translates along the direction it is turning, at a speed comparable to
+  // its own descent. The moving window handles that (window: all three axes,
+  // not `fall`'s x alone), but the SPONGE band still has to sit outside the
+  // near wake on every face.
+  dims: ({ n, span }) => [Math.round(6 * n), Math.round(5 * n),
+                          Math.round(Math.max(3 * n, 2 * span * n + 2 * n))],
+  derive: (p) => {
+    const { n, aspect, span, re, u_t, i_star } = p;
+    // Body half-extents. The BODY frame is (chord, span, thickness) on
+    // (x, y, z) -- principalInertia's ROUNDBOX case is stated in exactly
+    // those axes, so naming them any other way would put the plate's large
+    // moment on the wrong axis and the tumble would be about the wrong one.
+    const a = n / 2;                       // semi-chord
+    const b = span * n / 2;                // semi-span
+    const c = aspect * n / 2;              // semi-thickness
+    // Re on the CHORD, the paper's convention: Re = 2 u_t a / nu.
+    const nu = 2 * u_t * a / re;
+    const tau = tauFromNu(nu);
+    // rho_b from I*, the SAME closed form card-params.mjs uses --
+    //   I* = t(c^2 + t^2) rho_b / (2 c^3 rho_f)   [c = semi-chord, t = semi-thickness]
+    // -- which is per unit span and therefore span-independent, which is why
+    // it transfers to a 3D plate at all. Clamped above 1 for that module's
+    // reason: a card lighter than the fluid is not this regime.
+    const rho_b = Math.max(1.05, i_star * 2 * a ** 3 / (c * (a * a + c * c)));
+    const shape = { kind: SHAPE.ROUNDBOX, a, b, c, r: 0 };
+    const V = 8 * a * b * c;
+    // BROADSIDE drag balance, as in `fall`: the plate is dropped flat, and
+    // the frontal area is then the whole face. Cd = 1.1 is the textbook flat
+    // plate normal to the flow.
+    //
+    // THIS SETS THE TRANSIENT, NOT THE ANSWER. Once the plate turns, its own
+    // drag is whatever the flow says it is; g_eff is only how hard it is
+    // pulled. Worth checking against 2D anyway, because it is the same
+    // balance written two ways: card-params.mjs ends at G_EFF = U_T^2/(pi t rho_b)
+    // and this is U_T^2 Cd/(4 t rho_b), i.e. 1.1/4 = 0.275 against 1/pi = 0.318.
+    const cd = 1.1;
+    const area = 4 * a * b;
+    const gEff = u_t * u_t * cd * area / (2 * rho_b * V);
+    const d = SCENARIOS.card.dims(p);
+    // ORIENTATION, and it is the only fiddly part.
+    //
+    // The plate must fall FLAT -- its thin axis along the fall direction --
+    // and tumble about its SPAN, and the tumble has to be VISIBLE in the
+    // default z-slice, whose plane is (x, y). So the span must be world z.
+    // That fixes the frame completely: body (chord, span, thickness) ->
+    // world (y, z, x), which is the cyclic permutation x->y->z->x, i.e. a
+    // turn of 2pi/3 about (1,1,1). Then `tilt` pitches it about world z, the
+    // span, which is the one rotation that changes the angle of attack.
+    //
+    // Composed in WORLD order: qRotate(q, .) maps body to world, so a further
+    // world-frame rotation multiplies on the LEFT.
+    const qFlat = qFromAxisAngle([1, 1, 1], 2 * Math.PI / 3);
+    const body = makeBodyState({
+      shape, density: rho_b,
+      x: [d[0] - 2 * n, d[1] / 2, d[2] / 2],
+      q: qMul(qFromAxisAngle([0, 0, 1], p.tilt), qFlat),
+    });
+    return {
+      nu, tau, re, R: a, D: n, dims: d, body, pinned: false,
+      area, cd, rho_b, u_t, aspect, span, i_star,
+      gravity: [gEff, 0, 0], gEff,
+      // ALL THREE AXES (plans/3D.md M8.3's own note: "A tumbling plate is
+      // the case that changes that answer, and it can say so itself"). A
+      // plate that tumbles translates across the domain as fast as it falls
+      // down it, so an x-only window loses it sideways.
+      window: [1, 1, 1],
+      sponge: { width: Math.max(6, Math.round(n / 2)), u: [0, 0, 0] },
+      force: [0, 0, 0],
+      blockage: area / (d[1] * d[2]),
+      tSettle: u_t / gEff,
+      convective: n / u_t,
+      cdReference: cd,
+      down: [1, 0, 0],
+    };
+  },
+  macro: (dims, p) => seedMacro3Perturbed(dims, () => [0, 0, 0],
                                           p.perturb * p.u_t, p.seed),
 };
 
