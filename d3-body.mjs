@@ -29,6 +29,8 @@
 // Same browser+Node dual-consumption pattern as d3-scenarios.mjs and
 // lattice-3d.mjs.
 
+import { wrapPosition3 } from './d3-window.mjs';
+
 // --- shapes ---------------------------------------------------------------
 // Kept numeric and in one place because the WGSL switches on the same
 // values; tools/test-d3-body.js asserts the shader's copies agree.
@@ -207,7 +209,10 @@ export function rotationalEnergy(q, ibody, L) {
 //
 // THE REFERENCE for shaders/d3_physics.wgsl. Any change here has to be
 // mirrored there, and the `spin` scenario compares the two on real GPU code.
-export function stepFreeBody(s, { force = [0, 0, 0], torque = [0, 0, 0], gravity = [0, 0, 0], dt = 1, vMax = Infinity, oMax = Infinity } = {}) {
+// `wrap` is the moving window's per-axis domain size, 0 on an axis with no
+// window -- see d3-window.mjs. Default [0,0,0], so this is the unwindowed
+// integrator it always was, bit for bit.
+export function stepFreeBody(s, { force = [0, 0, 0], torque = [0, 0, 0], gravity = [0, 0, 0], dt = 1, vMax = Infinity, oMax = Infinity, wrap = [0, 0, 0] } = {}) {
   const m = s.mass;
   let v = [
     s.v[0] + dt * (force[0] / m + gravity[0]),
@@ -221,7 +226,12 @@ export function stepFreeBody(s, { force = [0, 0, 0], torque = [0, 0, 0], gravity
   const vmag = Math.hypot(...v);
   if (vmag > vMax) v = v.map(c => c * (vMax / vmag));
   let L = [s.L[0] + dt * torque[0], s.L[1] + dt * torque[1], s.L[2] + dt * torque[2]];
-  const x = [s.x[0] + dt * v[0], s.x[1] + dt * v[1], s.x[2] + dt * v[2]];
+  // Position, wrapped into the buffer on every windowed axis (M8.3), with
+  // the running DISPLACEMENT accumulated before the wrap -- it is the one
+  // consumer that wants the unwrapped answer, and it is reporting only.
+  // Mirrors shaders/d3_physics.wgsl.
+  const x = wrapPosition3([s.x[0] + dt * v[0], s.x[1] + dt * v[1], s.x[2] + dt * v[2]], wrap);
+  const d = [(s.d?.[0] ?? 0) + dt * v[0], (s.d?.[1] ?? 0) + dt * v[1], (s.d?.[2] ?? 0) + dt * v[2]];
   // Orientation update, from the WORLD-frame omega implied by the NEW L.
   //
   // MIDPOINT ON THE ROTATION GROUP, and this is load-bearing rather than
@@ -251,7 +261,7 @@ export function stepFreeBody(s, { force = [0, 0, 0], torque = [0, 0, 0], gravity
   const qHalf = qNormalize(qMul(expMap(w, dt / 2), s.q));
   const wHalf = omegaFromL(qHalf, s.ibody, L);
   const q = qNormalize(qMul(expMap(wHalf, dt), s.q));
-  return { ...s, x, v, q, L, omega: wHalf };
+  return { ...s, x, v, q, L, d, omega: wHalf };
 }
 
 export function makeBodyState({ shape, x, q = qIdentity(), v = [0, 0, 0], omega = [0, 0, 0], density = 1 }) {
@@ -259,7 +269,8 @@ export function makeBodyState({ shape, x, q = qIdentity(), v = [0, 0, 0], omega 
   const ibody = principalInertia(shape, mass);
   const Lb = qRotateInv(q, omega);
   const L = qRotate(q, [Lb[0] * ibody[0], Lb[1] * ibody[1], Lb[2] * ibody[2]]);
-  return { shape, mass, ibody, x: x.slice(), q: q.slice(), v: v.slice(), L, omega: omega.slice() };
+  // `d` is the displacement since construction, which is zero by definition.
+  return { shape, mass, ibody, x: x.slice(), q: q.slice(), v: v.slice(), L, omega: omega.slice(), d: [0, 0, 0] };
 }
 
 // --- GPU layout -----------------------------------------------------------
@@ -278,6 +289,9 @@ export const BODY_FIELDS = [
   'mass', 'ix', 'iy', 'iz',
   'a', 'b', 'c', 'r',
   'shape', 'pinned', 'v_max', 'o_max',
+  // Total displacement since reset -- REPORTING ONLY, see the WGSL struct's
+  // own note for why its unbounded growth is harmless here and was not in 2D.
+  'dx', 'dy', 'dz',
 ];
 
 export function packBodyState(s, { pinned = false, vMax = 0.2, oMax = 0.1 } = {}) {
@@ -291,6 +305,7 @@ export function packBodyState(s, { pinned = false, vMax = 0.2, oMax = 0.1 } = {}
     mass: s.mass, ix: s.ibody[0], iy: s.ibody[1], iz: s.ibody[2],
     a: s.shape.a, b: s.shape.b ?? s.shape.a, c: s.shape.c ?? s.shape.a, r: s.shape.r ?? 0,
     shape: s.shape.kind, pinned: pinned ? 1 : 0, v_max: vMax, o_max: oMax,
+    dx: s.d?.[0] ?? 0, dy: s.d?.[1] ?? 0, dz: s.d?.[2] ?? 0,
   };
   return new Float32Array(BODY_FIELDS.map(k => o[k]));
 }

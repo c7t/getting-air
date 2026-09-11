@@ -1,7 +1,9 @@
 // 6-DOF rigid-body state and TRUE signed-distance geometry for the dense 3D
 // solver -- the solid mask every step/force/render kernel tests against.
 // plans/3D.md M2. Fragment only; included via
-// `// @include "common_d3_geometry.wgsl"`.
+// `// @include "common_d3_geometry.wgsl"`, and it needs
+// common_d3_window.wgsl listed BEFORE it -- bodyDelta3 takes the nearest
+// periodic image of p - c on any axis the moving window is enabled on.
 //
 // FIELD ORDER IS A CONTRACT with d3-body.mjs's BODY_FIELDS, which builds the
 // buffer this reads. tools/test-d3-body.js parses this struct out of this
@@ -35,6 +37,19 @@ struct BodyState3D {
   mass : f32, ix : f32, iy : f32, iz : f32,
   a : f32, b : f32, c : f32, r : f32,
   shape : f32, pinned : f32, v_max : f32, o_max : f32,
+  // TOTAL DISPLACEMENT since reset, and REPORTING ONLY (M8.3). Under the
+  // moving window cx/cy/cz are wrapped into the buffer every step, so "how
+  // far has it fallen" is no longer readable from the position -- this is,
+  // and it is the only thing that is.
+  //
+  // NOTHING IN THE SIMULATION READS IT BACK, which is what makes its
+  // unbounded f32 growth harmless here where the 2D card's identical
+  // accumulator was not: card-total.mjs exists because the 2D card's
+  // SUB-CELL POSITION is the fractional part of this quantity, so a growing
+  // ULP quantizes the body itself. Here the sub-cell position lives in cx,
+  // which is bounded by the wrap, and the worst this can cost is a fraction
+  // of a percent of a reported travel distance.
+  dx : f32, dy : f32, dz : f32,
 }
 
 const SHAPE_SPHERE   = 0u;
@@ -134,13 +149,28 @@ fn sdSpheroid(p: vec3<f32>, a: f32, c: f32) -> f32 {
   return select(d, -d, inside);
 }
 
-// World-space signed distance. NOT periodically wrapped, unlike the 2D
-// get_phi: every M2 scenario has a sponged open far field or walls, no
-// moving window, and a body near enough to a face for its own periodic
-// image to matter is a badly-sized domain -- which should be visible as a
-// blockage error, not silently absorbed by a wrap.
+// Position of p RELATIVE TO the body centre, taking the nearest periodic
+// image on any axis the moving window is enabled on (M8.3). ONE function,
+// used by the SDF, by the local solid velocity and by the force kernels'
+// torque arm, because all three ask the same question and a body that
+// straddled the buffer seam in two of them and not the third would present
+// as a torque with no force behind it.
+//
+// WITHOUT A WINDOW THIS IS EXACTLY `p - c` (winWrapDelta is the identity at
+// WIN_N* = 0, the default), which is what keeps every scenario that predates
+// M8.3 bit-identical rather than merely unaffected in practice. The
+// no-window reading was deliberate and is worth keeping: a body near enough
+// to a face for its own periodic image to matter is a badly-sized domain,
+// and that should be visible as a blockage error rather than silently
+// absorbed. A windowed axis is the one case where crossing the seam is the
+// intended behaviour and not a mistake.
+fn bodyDelta3(p: vec3<f32>, s: BodyState3D) -> vec3<f32> {
+  return winWrapDelta(p - vec3<f32>(s.cx, s.cy, s.cz));
+}
+
+// World-space signed distance.
 fn get_phi3(p: vec3<f32>, s: BodyState3D) -> f32 {
-  let d = p - vec3<f32>(s.cx, s.cy, s.cz);
+  let d = bodyDelta3(p, s);
   let lp = qRotInv(bodyQuat(s), d);
   let kind = u32(s.shape);
   if (kind == SHAPE_SPHERE) { return sdSphere(lp, s.a); }
@@ -150,7 +180,7 @@ fn get_phi3(p: vec3<f32>, s: BodyState3D) -> f32 {
 
 // Local solid velocity at world point p: v + omega x r.
 fn bodyVelocity3(p: vec3<f32>, s: BodyState3D) -> vec3<f32> {
-  let r = p - vec3<f32>(s.cx, s.cy, s.cz);
+  let r = bodyDelta3(p, s);
   let w = vec3<f32>(s.wx, s.wy, s.wz);
   return vec3<f32>(s.vx, s.vy, s.vz) + cross(w, r);
 }

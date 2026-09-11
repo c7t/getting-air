@@ -78,6 +78,8 @@ import { assembleShader } from './shader-loader.mjs';
 import { SUPPORTED_Q } from './lattice-3d.mjs';
 import { SCENARIOS, SCENARIO_NAMES, resolveScenario, nuFromTau, beltramiVelocityAt } from './d3-scenarios.mjs';
 import { packBodyState, unpackBodyState, BODY_FIELDS, sdfBody, qRotateInv } from './d3-body.mjs';
+import { parseWindowAxes, wrapDims, wrapDelta3, windowOffset3, windowCoord3,
+         windowConstants } from './d3-window.mjs';
 import { makePool, refineHierarchy, nearBodyWant, storageRatio, GHOST,
          check21Balance, checkGeometryCoverage, checkRingParentCoverage,
          cellAtLevel, finestLevelAt } from './d3-amr.mjs';
@@ -167,7 +169,9 @@ async function init() {
     // M8.2a: the solid-interior reset, ?solideq=0 to disable for A/B.
     'solideq',
     // M8.2b: the fall scenario's two reference frames.
-    'tow', 'stream']);
+    'tow', 'stream',
+    // M8.3: the moving window, per axis. ?window=x, ?window=0 to force it off.
+    'window']);
   for (const k of urlParams.keys()) {
     if (PAGE_PARAMS.has(k) || k in SCENARIOS[scenarioName].defaults) continue;
     throw new Error(`?${k}=: not a parameter of scenario "${scenarioName}" `
@@ -194,6 +198,64 @@ async function init() {
   // sphere, whose box is long and narrow.
   const N = params.n;
   const NCELLS = NX * NY * NZ;
+
+  // --- the moving window (plans/3D.md M8.3) --------------------------------
+  //
+  // Per-axis, and NOT a translation of the field: the buffer is periodic and
+  // the fluid never moves, the BODY wraps through it, and what follows the
+  // body is the SPONGE -- see d3-window.mjs for why this reading and not the
+  // 2D pages' off_x/off_y, and shaders/common_d3_window.wgsl for the shader
+  // side. Everything here is 0 by default, at which point every function in
+  // both of those files is the identity and folds out at pipeline-creation
+  // time.
+  //
+  // THE ANCHOR IS THE BODY'S INITIAL CELL, so the offset is exactly 0 at step
+  // 0 and a windowed run starts bit-identical to an unwindowed one. It also
+  // means the scenario keeps saying where its body sits in its own domain --
+  // `fall` deliberately puts a towed body near the FAR end so the wake has
+  // the long side of the box, and the window then preserves that arrangement
+  // forever instead of having it improve as the body travels.
+  const WIN_AXES = parseWindowAxes(urlParams.get('window'), params.window || [0, 0, 0]);
+  const WIN_ANCHOR = params.body ? params.body.x.map(Math.floor) : [0, 0, 0];
+  const WIN_ON = WIN_AXES.some(Boolean);
+  if (WIN_ON) {
+    // Three refusals rather than three quiet degradations, in the shape M5.4a
+    // settled on: a window that does not do what it says is worse than one
+    // that will not start.
+    //
+    // NO BODY: the window follows the body. There is nothing else it could
+    // follow, and a window centred on nothing is a sponge in a random place.
+    if (!params.body) {
+      statusEl.textContent = `error: ?window= needs a body to follow; scenario "${scenarioName}" has none`;
+      return;
+    }
+    // A WALL: the window assumes the axis is periodic, because that is what
+    // lets the body cross the seam and the wake wrap into the absorbing band.
+    // A walled axis is neither.
+    const walled = WIN_AXES.map((on, i) => on && params.walls.includes('xyz'[i]));
+    if (walled.some(Boolean)) {
+      statusEl.textContent = `error: ?window= on a walled axis (${walled.map((w, i) => w ? 'xyz'[i] : '').join('')});`
+        + ' the window needs a periodic axis for the body to cross and the wake to be absorbed on';
+      return;
+    }
+    // NO SPONGE: this is the one that would silently produce a wrong answer
+    // rather than an obviously broken one. Without an absorbing band the wake
+    // simply wraps around the periodic buffer and the body flies back into
+    // it -- a run that looks perfectly healthy and is measuring a body in its
+    // own exhaust.
+    if (!(params.sponge && params.sponge.width > 0)) {
+      statusEl.textContent = 'error: ?window= needs a sponge; without one the wake wraps around'
+        + ' the periodic buffer and the body flies back into it';
+      return;
+    }
+  }
+  // 0 on an unwindowed axis -- the encoding both the module and the shader
+  // read as "no window here".
+  const WIN_N = wrapDims([NX, NY, NZ], WIN_AXES);
+  // Handed to every pipeline whose shader includes common_d3_window.wgsl, and
+  // ONLY those: an override a module does not declare is a validation error,
+  // so this cannot simply be folded into poolConst.
+  const WINC = windowConstants(WIN_N, WIN_ANCHOR);
 
   // --- AMR pool (plans/3D.md M3) -------------------------------------------
   // One fine level, STATIC refinement. Dynamic refinement and the 2:1
@@ -332,7 +394,15 @@ async function init() {
       // requirement moves with it. Checking against the initial position
       // would pass a manager that refined a shell and then left it behind,
       // which is precisely the failure this is meant to catch.
-      geomForced = { radius: sh.a, margin, sdfAt: (c) => (q) => Math.hypot(q[0] - c[0], q[1] - c[1], q[2] - c[2]) - sh.a };
+      // The delta takes the NEAREST PERIODIC IMAGE on any windowed axis, the
+      // same arm shaders/common_d3_geometry.wgsl's bodyDelta3 takes -- so a
+      // body that has wrapped through the buffer seam refines one shell here
+      // and not two, and debugCheckGeometryCoverage restates the requirement
+      // against the same reading the kernel used. The identity without a
+      // window (wrapDelta3 at WIN_N = 0), so every existing case is
+      // untouched.
+      geomForced = { radius: sh.a, margin,
+        sdfAt: (c) => (q) => Math.hypot(...wrapDelta3([q[0] - c[0], q[1] - c[1], q[2] - c[2]], WIN_N)) - sh.a };
       want = nearBodyWant(geomForced.sdfAt(bx), margin);
     } else {
       throw new Error(`?refine=${mode}: expected all, box, bar, slab or body`);
@@ -660,8 +730,16 @@ async function init() {
     ...Array.from({ length: 2 * MAX_SAMPLE_LEVELS }, (_, i) => (
       { binding: 2 + i, buffer: { type: 'read-only-storage' } })),
   ];
+  // The sampler's shared bindings, plus ONE this view owns: the body, for
+  // the moving window's view offset (M8.3). Appended here rather than added
+  // to renderBGL_entries so the probe and the resample -- which read the same
+  // sampler and nothing else -- do not acquire a binding neither of them
+  // uses. Same shape as the resample pass appending its output texture.
   const renderBGL = device.createBindGroupLayout({
-    entries: renderBGL_entries.map(e => ({ ...e, visibility: GPUShaderStage.FRAGMENT })) });
+    entries: [
+      ...renderBGL_entries.map(e => ({ ...e, visibility: GPUShaderStage.FRAGMENT })),
+      { binding: 12, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
+    ] });
   const bgAB = device.createBindGroup({ layout: computeBGL, entries: [
     { binding: 0, resource: { buffer: fA } }, { binding: 1, resource: { buffer: fB } },
     { binding: 2, resource: { buffer: mac } }, { binding: 3, resource: { buffer: bodyBuf } },
@@ -706,7 +784,8 @@ async function init() {
         { binding: 3 + 2 * i, resource: { buffer: lv ? lv.blockSlot : sampleDummy } },
       ];
     }).flat()];
-  const renderBG = device.createBindGroup({ layout: renderBGL, entries: treeSampleEntries() });
+  const renderBG = device.createBindGroup({ layout: renderBGL, entries: [
+    ...treeSampleEntries(), { binding: 12, resource: { buffer: bodyBuf } }]});
 
   const loadShader = (p) => assembleShader(p, (f) => fetch(f).then(r => {
     if (!r.ok) throw new Error(`failed to fetch ${f}: ${r.status}`);
@@ -737,7 +816,7 @@ async function init() {
     WALL_X: params.walls.includes('x') ? 1 : 0,
     WALL_Y: params.walls.includes('y') ? 1 : 0,
     WALL_Z: params.walls.includes('z') ? 1 : 0,
-    HAS_BODY, USE_BOUNCEBACK, CHI_EPS, SOLID_EQ,
+    HAS_BODY, USE_BOUNCEBACK, CHI_EPS, SOLID_EQ, ...WINC,
     SPONGE_W: sponge.width, SPONGE_UX: sponge.u[0], SPONGE_UY: sponge.u[1], SPONGE_UZ: sponge.u[2],
     // M4.1a: skip cells a refined block covers. Folds out entirely when
     // there is no pool.
@@ -758,7 +837,7 @@ async function init() {
   const forcePipe = HAS_BODY ? await device.createComputePipelineAsync({
     layout: device.createPipelineLayout({ bindGroupLayouts: [forceBGL] }),
     compute: { module: forceModule, entryPoint: 'main', constants: {
-      ...dims, WGX: WG[0], WGY: WG[1], WGZ: WG[2], USE_BOUNCEBACK, CHI_EPS } },
+      ...dims, WGX: WG[0], WGY: WG[1], WGZ: WG[2], USE_BOUNCEBACK, CHI_EPS, ...WINC } },
   }) : null;
   const physPipe = HAS_BODY ? await device.createComputePipelineAsync({
     layout: device.createPipelineLayout({ bindGroupLayouts: [physicsBGL] }),
@@ -767,6 +846,7 @@ async function init() {
       GY: (params.gravity || [0, 0, 0])[1],
       GZ: (params.gravity || [0, 0, 0])[2],
       NO_FLUID_FORCE: params.noFluidForce ? 1 : 0,
+      ...WINC,
     } },
   }) : null;
   const zeroPipe = HAS_BODY ? await device.createComputePipelineAsync({
@@ -986,7 +1066,7 @@ async function init() {
       ...bodyFrameAt(1),
       OMEGA_FINE: 1 / TAU_FINE,
       FORCE_X: params.force[0], FORCE_Y: params.force[1], FORCE_Z: params.force[2],
-      HAS_BODY, USE_BOUNCEBACK, CHI_EPS, SOLID_EQ,
+      HAS_BODY, USE_BOUNCEBACK, CHI_EPS, SOLID_EQ, ...WINC,
       SPONGE_W: sponge.width, SPONGE_UX: sponge.u[0], SPONGE_UY: sponge.u[1], SPONGE_UZ: sponge.u[2],
     });
     avgPipe = await mk(avgBGL, avgModule, { ...poolConst, TAU_COARSE, DC_PRE });
@@ -1044,7 +1124,7 @@ async function init() {
       // static set, not from a second read of ?margin=: the bit-identical
       // gate needs the two criteria to agree exactly, and two independent
       // parses of one parameter is how they would silently stop agreeing.
-      const manageConst = { ...poolConst, HAS_BODY,
+      const manageConst = { ...poolConst, HAS_BODY, ...WINC,
         MARGIN: Number.isFinite(MANAGE_MARGIN) ? MANAGE_MARGIN : geomForced.margin,
         // The lead term is zero for a pinned body, so the criterion still
         // reproduces the host's initial set exactly and M4.2b-i's
@@ -1138,7 +1218,7 @@ async function init() {
       // below it because refinement is cell-centred. See the shader.
       const m = LEVELS - 1;
       forcePoolPipe = await mk(forcePoolBGL, forcePoolModule, {
-        ...finePC, USE_BOUNCEBACK, CHI_EPS, DX_WEIGHT: 4 ** -m, ...bodyFrameAt(m),
+        ...finePC, USE_BOUNCEBACK, CHI_EPS, DX_WEIGHT: 4 ** -m, ...bodyFrameAt(m), ...WINC,
       });
       // Reads the pool buffer substep A will read, i.e. that level's time-t
       // state, matching the coarse kernel's own pre-streaming read.
@@ -1265,7 +1345,7 @@ async function init() {
           ...bodyFrameAt(m),
           OMEGA_FINE: 1 / tauAtLevel(m),
           FORCE_X: params.force[0], FORCE_Y: params.force[1], FORCE_Z: params.force[2],
-          HAS_BODY, USE_BOUNCEBACK, CHI_EPS, SOLID_EQ,
+          HAS_BODY, USE_BOUNCEBACK, CHI_EPS, SOLID_EQ, ...WINC,
           SPONGE_W: sponge.width, SPONGE_UX: sponge.u[0], SPONGE_UY: sponge.u[1], SPONGE_UZ: sponge.u[2],
         });
         // Explode reads the parent buffer holding time t -- the one the
@@ -1383,7 +1463,7 @@ async function init() {
       fluxPipeSet = await mk(fluxBGL, fluxModule, { ...poolConst, ACCUM: 0 });
       fluxPipeAdd = await mk(fluxBGL, fluxModule, { ...poolConst, ACCUM: 1 });
       refluxPipe = await mk(refluxBGL, refluxModule, {
-        ...poolConst, HAS_BODY,
+        ...poolConst, HAS_BODY, ...WINC,
         FORCE_X: params.force[0], FORCE_Y: params.force[1], FORCE_Z: params.force[2],
       });
       const mkFlux = (src) => device.createBindGroup({ layout: fluxBGL, entries: [
@@ -1406,7 +1486,7 @@ async function init() {
     layout: device.createPipelineLayout({ bindGroupLayouts: [renderBGL] }),
     vertex: { module: renderModule, entryPoint: 'vs_main', constants: dims },
     fragment: { module: renderModule, entryPoint: 'fs_main', targets: [{ format }], constants: {
-      ...dims, RB, SAMPLE_LEVELS,
+      ...dims, RB, SAMPLE_LEVELS, ...WINC,
       // Pinned to 1 because the page pre-normalizes -- see U_SCALE/V_SCALE.
       VORT_SCALE: 1.0,
       // Below 1 lifts weak structure toward the top of the ramp instead of
@@ -2325,7 +2405,9 @@ async function init() {
       if (body) {
         // Body-frame distance, so it is the SDF the solver uses and not a
         // centre-distance that a non-spherical body would make meaningless.
-        const d = [p3[0] - body.cx, p3[1] - body.cy, p3[2] - body.cz];
+        // Nearest periodic image under a moving window, matching bodyDelta3;
+        // the plain difference without one.
+        const d = wrapDelta3([p3[0] - body.cx, p3[1] - body.cy, p3[2] - body.cz], WIN_N);
         // The shape from the READBACK, not from params: that is what the
         // GPU is actually using, and on a free body it is also the only
         // copy that has moved.
@@ -2899,8 +2981,22 @@ async function init() {
   // into the state -- including for a pinned body, which is the whole point
   // of the sphere scenario.
   const bodyStaging = device.createBuffer({ size: BODY_FIELDS.length * 4, usage: U.MAP_READ | U.COPY_DST });
-  async function readBody() {
-    if (!HAS_BODY) return null;
+  // SERIALIZED, because there is now more than one caller. The status line
+  // reads the moving window's travel from this on its own cadence (M8.3)
+  // while a tool drives its own reads between debugStepSync batches, and ONE
+  // staging buffer cannot be mapped twice: the second mapAsync rejects and
+  // the failure surfaces somewhere else entirely, as an unexplained "Uncaught
+  // (in promise)" out of whichever caller happened to be second. Chaining is
+  // cheaper than a second staging buffer and covers every future caller
+  // rather than the two that exist. A failed read does not poison the chain.
+  let bodyReadChain = Promise.resolve();
+  function readBody() {
+    if (!HAS_BODY) return Promise.resolve(null);
+    const next = bodyReadChain.then(readBodyNow);
+    bodyReadChain = next.catch(() => {});
+    return next;
+  }
+  async function readBodyNow() {
     const enc = device.createCommandEncoder();
     enc.copyBufferToBuffer(bodyBuf, 0, bodyStaging, 0, BODY_FIELDS.length * 4);
     device.queue.submit([enc.finish()]);
@@ -2909,14 +3005,43 @@ async function init() {
     bodyStaging.unmap();
     const b = unpackBodyState(v);
     // Cd = Fx / (1/2 rho U^2 A), rho = 1 in lattice units. Reported only
-    // where a reference area and a freestream exist.
-    if (params.area && params.u0) {
-      b.cd = b.fx / (0.5 * params.u0 * params.u0 * params.area);
-      b.cl = b.fy / (0.5 * params.u0 * params.u0 * params.area);
-      b.cs = b.fz / (0.5 * params.u0 * params.u0 * params.area);
+    // where a reference area and a relative speed exist -- `uRel` is the
+    // `fall` scenario's, which is the tow speed in one frame and the
+    // freestream in the other, and the whole point of M8.2b is that the two
+    // are the same number and must be normalized by the same one.
+    const uRef = params.u0 || params.uRel;
+    if (params.area && uRef) {
+      b.cd = b.fx / (0.5 * uRef * uRef * params.area);
+      b.cl = b.fy / (0.5 * uRef * uRef * params.area);
+      b.cs = b.fz / (0.5 * uRef * uRef * params.area);
     }
+    // THE WINDOW, reported rather than inferred (M8.3). `travel` is how far
+    // the body has actually gone, which the wrap makes unreadable from the
+    // position; `win` is where it sits IN THE WINDOW, which must stay at the
+    // anchor to within a cell for as long as the run lasts -- that is the
+    // invariant a moving-window harness asserts, and it is one readback.
+    b.travel = Math.hypot(b.dx, b.dy, b.dz);
+    b.winOff = windowOffset3([b.cx, b.cy, b.cz], WIN_ANCHOR, WIN_N);
+    b.win = windowCoord3([b.cx, b.cy, b.cz], b.winOff, WIN_N);
+    b.winAnchor = WIN_ANCHOR.slice();
     b.step = step;
     return b;
+  }
+
+  // Status-line window state. `winTravel` is the body's own accumulated
+  // displacement -- the one thing the wrap makes unreadable from the position
+  // -- and `winOff` is how far the window has panned. Both are REPORTING; the
+  // view's own offset is computed in the shader and the solver's in the step
+  // kernels, each from the body buffer directly.
+  let winTravel = 0, winOff = [0, 0, 0];
+  async function refreshWindowTravel() {
+    // Swallowed: this is called without being awaited, so a failure here
+    // would otherwise surface as an unhandled rejection rather than as the
+    // status line being one quarter-second stale, which is what it is.
+    const b = await readBody().catch(() => null);
+    if (!b) return;
+    winOff = b.winOff;
+    winTravel = b.travel;
   }
 
   // --- controls ------------------------------------------------------------
@@ -3006,6 +3131,11 @@ async function init() {
     getParams: () => ({
       ...params, Q, N, NX, NY, NZ, NCELLS, scenario: scenarioName,
       hasBody: !!HAS_BODY, bounceback: USE_BOUNCEBACK,
+      // THE RESOLVED window, after `?window=`, not the scenario's own wish
+      // -- `?window=0` on `fall` would otherwise report the window it was
+      // switched out of, which is exactly the lie that makes a control
+      // useless (M8.3).
+      windowAxes: WIN_AXES.slice(), windowAnchor: WIN_ANCHOR.slice(), windowDims: WIN_N.slice(),
       levels: LEVELS, amr: AMR,
       // How deep the VIEWER can see, which is LEVELS - 1 unless the run is
       // deeper than the sampler has bindings for. Reported so a tool scores
@@ -3059,6 +3189,11 @@ async function init() {
       // that is already unrecoverable.
       if (live) checkPoolExhausted();
       if (poolExhausted) { requestAnimationFrame(frame); return; }
+      // The window's travel, for the status line only -- the VIEW pans in the
+      // shader from the body buffer itself (M8.3), because a host-refreshed
+      // offset is stale between readbacks and the picture then slides forward
+      // and snaps back every time one lands. Not awaited into the frame path.
+      if (WIN_ON) refreshWindowTravel();
       const t = scenarioName === 'beltrami' ? `  t/td=${(step / params.td).toFixed(2)}`
         : scenarioName === 'duct' ? `  t/settle=${(step / params.settle).toFixed(2)}`
         : scenarioName === 'sphere' ? `  t/(D/U)=${(step / params.convective).toFixed(2)}`
@@ -3067,8 +3202,16 @@ async function init() {
         ? `  ${L.slice(1).map(l => `L${l.level} ${l.alloc.activeSlots}/${l.nBlocks}`).join(' ')}`
           + ` blocks (RB=${RB}, FB=${pool.FB})`
         : '';
+      // The window's travel, said out loud: a window is exactly the kind of
+      // thing that looks identical whether it is working or switched off, and
+      // "the body is at window x = 168 having travelled 412 cells" is the one
+      // line that distinguishes them.
+      const winTxt = WIN_ON
+        ? `   window ${'xyz'.split('').filter((_, i) => WIN_AXES[i]).join('')}`
+          + ` off ${winOff.map(v => v.toFixed(0)).join(',')} travelled ${winTravel.toFixed(1)}`
+        : '';
       statusEl.textContent = `${scenarioName}  D3Q${Q}  ${NX}x${NY}x${NZ}  step ${step}${t}${amrTxt}\n`
-        + `${AXIS_NAMES[axis]}-slice ${slice}   ${live ? 'running' : 'paused'}${viewDepthNote}`;
+        + `${AXIS_NAMES[axis]}-slice ${slice}   ${live ? 'running' : 'paused'}${viewDepthNote}${winTxt}`;
     }
     requestAnimationFrame(() => frame().catch(e => reportFatal(statusEl, e)));
   }

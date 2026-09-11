@@ -458,14 +458,27 @@ SCENARIOS.fall = {
     // The balance above, solved for the acceleration.
     const gEff = u_t * u_t * cd * area / (2 * rho_b * V);
     const shape = { kind: SHAPE.SPHERE, a: R };
+    const towed = p.tow > 0, streamed = p.stream > 0;
+    // WHERE THE BODY SITS IS THE SAME ARRANGEMENT IN BOTH FRAMES, and under
+    // the moving window it stays that way (plans/3D.md M8.3). A streamed
+    // body sits 2n from the INLET, so its own wake has the other 14n and is
+    // not the inlet condition -- which is where the sphere scenario puts
+    // one. A body that MOVES leaves its wake BEHIND it, so it sits 2n from
+    // the FAR end instead: the mirror image, 2n of undisturbed fluid ahead
+    // and 14n of room for the wake.
+    //
+    // That mirroring is what makes the Galilean pair a comparison of the
+    // COUPLING rather than of two domains. Before the window it held only at
+    // step 0 -- a towed body carried its 14n of wake room with it only until
+    // it ran out, and M8.2b measured Cd still RISING at 8 D/U (0.951 -> 1.067
+    // against the streamed 1.362) because the room behind it was still
+    // growing while the measurement was being taken.
+    const x0 = streamed ? 2 * n : d[0] - 2 * n;
     // `v` at construction, not a vx assignment afterwards: packBodyState
     // reads `s.v[0]`, so setting `body.vx` writes a field nothing packs and
     // the body silently stays put. (It did, for one measurement.)
-    const body = makeBodyState({ shape, x: [2 * n, d[1] / 2, d[2] / 2], density: rho_b,
+    const body = makeBodyState({ shape, x: [x0, d[1] / 2, d[2] / 2], density: rho_b,
                                  v: p.tow > 0 ? [p.tow, 0, 0] : [0, 0, 0] });
-    // A streamed body sits where the sphere scenario puts one: far enough
-    // upstream that its own wake is not the inlet condition.
-    const towed = p.tow > 0, streamed = p.stream > 0;
     return {
       nu, tau, re, R, D: n, dims: d, body, pinned: streamed,
       // A towed run integrates nothing: constant velocity, force recorded.
@@ -474,6 +487,17 @@ SCENARIOS.fall = {
       // The relative speed under test, whichever frame it is expressed in.
       uRel: towed ? p.tow : (streamed ? p.stream : null),
       area, cd, rho_b, u_t,
+      // THE MOVING WINDOW, on the axis the body travels along, and ONLY
+      // where the body actually moves: a pinned streamed body has nothing to
+      // follow and the window would be an inert branch in the one case that
+      // is supposed to be the control. plans/3D.md M8.3.
+      //
+      // x only. The sphere's lateral drift is ~0.1 cells over 5000 steps
+      // against 6n of domain, so a y/z window would buy nothing and would
+      // put a moving discontinuity -- the sponge band's edge -- into the
+      // narrow direction for no reason. A tumbling plate is the case that
+      // changes that answer, and it can say so itself.
+      window: streamed ? [0, 0, 0] : [1, 0, 0],
       // FALLS ALONG +x, the long axis. Nothing about the solver prefers an
       // axis; the domain does.
       gravity: towed ? [0, 0, 0] : [gEff, 0, 0],

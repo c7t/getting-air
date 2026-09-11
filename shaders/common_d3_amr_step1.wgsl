@@ -314,11 +314,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   mac_pool[3u * macPlane + cell] = u.z;
 
   // Sponge distances are measured in COARSE units against the L0 domain, so
-  // a refined tile near a domain face absorbs exactly as its parent does.
+  // a refined tile near a domain face absorbs exactly as its parent does --
+  // and in WINDOW coordinates, so that under a moving window the absorbing
+  // band travels with the body here exactly as it does on L0 (M8.3).
+  // winCoord is the identity without a window.
+  let wp = winCoord(p, winOffset(vec3<f32>(body.cx, body.cy, body.cz)));
   let spongeW = spongeWeight3(
-    min(p.x, f32(NX - 1u) - p.x),
-    min(p.y, f32(NY - 1u) - p.y),
-    min(p.z, f32(NZ - 1u) - p.z), SPONGE_W);
+    min(wp.x, f32(NX - 1u) - wp.x),
+    min(wp.y, f32(NY - 1u) - wp.y),
+    min(wp.z, f32(NZ - 1u) - wp.z), SPONGE_W);
 
   // A ring cell advects and stores; see COLLIDE_RING.
   if (COLLIDE_RING == 0u && !isInterior3(fi)) {

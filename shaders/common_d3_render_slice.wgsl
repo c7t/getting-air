@@ -49,6 +49,36 @@ struct RParams {
   _pad2 : f32,
 }
 
+// THE BODY, for the moving window's view offset (M8.3). A binding this view
+// owns, appended AFTER the sampler's shared ones exactly as the resample
+// pass appends its output texture -- the shared description stays one
+// description, and the probe and the resample do not acquire a binding
+// neither of them reads.
+//
+// READ DIRECTLY, NOT PASSED IN. A host-written offset is as stale as the
+// last body readback, and the body advances between them: the picture then
+// slides forward and snaps back once a refresh lands, which is a visible
+// pumping rather than a subtle lag.
+@group(0) @binding(12) var<storage, read> body : BodyState3D;
+
+// THE VIEW'S OFFSET IS CONTINUOUS WHERE THE SOLVER'S IS INTEGER, and the
+// difference is deliberate. winOffset() floors, because the SPONGE BAND has
+// to be aligned to the cell grid -- a band edge sliding through a cell would
+// flicker. A viewer has no such constraint, and inheriting the floor would
+// leave the body sawing back and forth across one cell as its sub-cell part
+// ramps from 0 to 1: a full cell of jitter, at the exact frequency of the
+// body's own cell crossings, on a body that is physically standing still in
+// this frame.
+fn winViewOffset() -> vec3<f32> {
+  let c = vec3<f32>(body.cx, body.cy, body.cz);
+  let a = vec3<f32>(WIN_AX, WIN_AY, WIN_AZ);
+  let d = winDims();
+  return vec3<f32>(
+    select(0f, c.x - a.x, d.x > 0f),
+    select(0f, c.y - a.y, d.y > 0f),
+    select(0f, c.z - a.z, d.z > 0f));
+}
+
 // NX/NY/NZ come from common_d3_pool.wgsl, which the tree sampler needs
 // anyway for poolCell and the tile layout. One declaration, not two.
 
@@ -86,11 +116,20 @@ fn planeDims() -> vec2<u32> {
 // cell index because that is the whole point of M6: the pixel asks where it
 // is and the tree answers at whatever resolution it has there, instead of
 // the view quantising to L0 before it ever looks.
+//
+// THE SLICE IS IN WINDOW COORDINATES and the offset converts it to the
+// buffer position the sampler reads (M8.3). Without a window the offset is
+// zero and this is what it always was. With one, the view pans with the
+// body instead of watching it wrap across the screen -- and `slice` keeps
+// meaning "this many cells into the window", so a slice through the body
+// stays through the body as it travels. sampleTree wraps periodically
+// already, so an offset point past the far face needs no clamping here.
 fn planePoint(a: f32, b: f32) -> vec3<f32> {
   let sl = f32(rp.slice);
-  if (rp.axis == 0u) { return vec3<f32>(sl, a, b); }   // (y, z) plane at x = slice
-  if (rp.axis == 1u) { return vec3<f32>(b, sl, a); }   // (z, x) plane at y = slice
-  return vec3<f32>(a, b, sl);                          // (x, y) plane at z = slice
+  let off = winViewOffset();
+  if (rp.axis == 0u) { return vec3<f32>(sl, a, b) + off; }   // (y, z) plane at x = slice
+  if (rp.axis == 1u) { return vec3<f32>(b, sl, a) + off; }   // (z, x) plane at y = slice
+  return vec3<f32>(a, b, sl) + off;                          // (x, y) plane at z = slice
 }
 
 // A sampled velocity rotated into (in-plane u, in-plane v, out-of-plane w),

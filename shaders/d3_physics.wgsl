@@ -28,6 +28,7 @@
 // force kernels can read it without each redoing rotate-divide-rotate per
 // cell.
 
+// @include "common_d3_window.wgsl"
 // @include "common_d3_geometry.wgsl"
 
 @group(0) @binding(0) var<storage, read_write> body   : BodyState3D;
@@ -124,9 +125,22 @@ fn main() {
   let wHalf = omegaFromL(qHalf, body, Ln);
   let qn = normalize(qMul(expMapQ(wHalf, 1.0f), q));
 
-  // 4. Position.
-  let x = vec3<f32>(body.cx, body.cy, body.cz) + v;
+  // 4. Position, WRAPPED INTO THE BUFFER on every axis the moving window is
+  // enabled on (M8.3, and a no-op on every axis it is not).
+  //
+  // THIS IS THE WHOLE OF THE WINDOW ON THE SOLVER SIDE. The fluid never
+  // moves; the body advances through the periodic buffer and wraps, exactly
+  // as it physically does through the fluid, and the one thing that has to
+  // stay put relative to it -- the sponge -- follows by converting a buffer
+  // position into a window coordinate (winCoord, in both step kernels). See
+  // d3-window.mjs for why this reading and not the 2D pages' off_x/off_y,
+  // which would put a window conversion in every addressing path here.
+  //
+  // The displacement is accumulated BEFORE the wrap, because it is the one
+  // consumer that wants the unwrapped answer.
+  let x = winWrapPos(vec3<f32>(body.cx, body.cy, body.cz) + v);
 
+  body.dx = body.dx + v.x; body.dy = body.dy + v.y; body.dz = body.dz + v.z;
   body.cx = x.x; body.cy = x.y; body.cz = x.z;
   body.vx = v.x; body.vy = v.y; body.vz = v.z;
   body.Lx = Ln.x; body.Ly = Ln.y; body.Lz = Ln.z;

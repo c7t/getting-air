@@ -210,7 +210,9 @@ comment above `N_LEVELS`, not this file, for what's current.
 
 **M0-M5 are done; M6 is in progress (M6.0 done -- the tree sampler and the
 slice view on it; M6.1-M6.3 are the resample volume, Q-criterion and the
-raymarcher).** Depth is real:
+raymarcher). M8.0-M8.3 are done: the target Re runs, the solver sheds at the
+right frequency, the solid interior is held at the body's equilibrium, and a
+moving window (M8.3) makes a moving-body measurement converge at all.** Depth is real:
 `?levels=N` runs at any depth, static or `?dynamic=1`, the body lives
 entirely on the finest level, and the 2:1 balance and ring-parent checks are
 gates there rather than VACUOUS lines. The
@@ -554,6 +556,56 @@ What exists today:
   brute-force nearest-point search, and asserts the tennis-racket theorem
   (a body spun about its intermediate axis must flip, one about a stable
   axis must not).
+- **THE MOVING WINDOW IS A TRANSLATION OF THE SPONGE, NOT OF THE FIELD**
+  (M8.3, `?window=x|xyz|0`). The 2D pages make every kernel's dispatch index
+  a WINDOW coordinate and convert to a buffer index at every load and store
+  (`off_x`/`off_y`); in 3D that would be a window conversion in the dense
+  step, the pool step, moments, interp, average, explode, coalesce, both
+  force kernels and the tree sampler. So it is read the other way: the buffer
+  is periodic and **THE FLUID NEVER MOVES**, the BODY wraps through it, and
+  the only thing that has to follow the body is the ABSORBING BAND -- both
+  step kernels convert a buffer position into a window coordinate before
+  measuring its distance to a window face. Every addressing path, every tile
+  and the whole interface are untouched, because none of them ever asked
+  where the body was; the resample box's origin needed nothing at all.
+  `d3-window.mjs` and `shaders/common_d3_window.wgsl` are the two statements
+  of the convention and `make test` gates them against each other. Three
+  things to know:
+  - **The anchor is the body's INITIAL cell**, so the offset is exactly 0 at
+    step 0 and a windowed run starts bit-identical to an unwindowed one --
+    which is what makes `?window=0` a control rather than a different
+    experiment. Refused rather than degraded: no body, a walled axis, or no
+    sponge (without an absorbing band the wake wraps round and the body flies
+    back into it, which looks perfectly healthy).
+  - **The VIEW's offset is continuous where the SOLVER's is integer.** The
+    solver floors so the sponge band stays cell-aligned; a viewer that
+    inherited the floor leaves the body sawing across one cell at the exact
+    frequency of its own cell crossings. The slice view reads the body buffer
+    directly for the same class of reason -- a host-written offset is stale
+    between readbacks and the picture slides forward and snaps back.
+  - **SAMPLING A MOVING BODY'S FORCE ONCE PER CELL IT CROSSES MEASURES ONE
+    PHASE OF THE STAIRCASE, NOT THE MEAN.** The force oscillates with a
+    period of exactly 1/U steps and an amplitude comparable to the drag, so
+    the obvious sampling rate IS the alias. It produced a smooth, reproducible
+    Cd "collapse" from 1.24 to 0.30 over a run whose kinetic energy,
+    enstrophy, max|u| and density range were constant to four digits.
+    `tools/probe-d3-window.js` samples every step; `--sample=25` reproduces
+    the trap. Measured there: Cd(tow) = 0.963 converged against
+    Cd(stream) = 1.362, a real -29% in the moving-body coupling that is
+    M8.2c's to explain, and reproducible to 0.2% on a same-build repeat.
+    **The FREE FALL independently agrees with the TOW** -- terminal velocity
+    v/u_t = 1.104 means Cd = 0.894 at Re = 110 against the tow's 0.919
+    carried to the same Re, 2.8% apart by two different mechanisms -- so the
+    gap is the moving-body coupling and not the tow harness. The same fall
+    runs 40000 steps and 1681 cells through a 192-cell domain without
+    leaving.
+
+      node tools/probe-d3-window.js                  # the Galilean pair + the no-window control
+      node tools/probe-d3-window.js --legs=tow --td=60
+
+  A windowed page is otherwise visited by nothing in the standing suite, so
+  `validate-all.js` boot-smokes one as `d3-window-boot`.
+
 - **THE TREE SAMPLER (`shaders/common_d3_tree_sample.wgsl`) IS THE ONLY
   THING HERE THAT SPANS LEVELS**, and it is what the slice view now samples
   (M6.0b). Every solver kernel is written for one level and reaches its

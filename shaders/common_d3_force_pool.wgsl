@@ -160,7 +160,11 @@ fn main(
       fineToCoarseUnit3(i32(fi.y), origin.y),
       fineToCoarseUnit3(i32(fi.z), origin.z)) * L0_SCALE + L0_OFFSET;
     let phi = get_phi3(p, body);
-    let r = p - vec3<f32>(body.cx, body.cy, body.cz);
+    // Nearest periodic image under a moving window, and `p - c` without
+    // one -- the SAME arm get_phi3 and bodyVelocity3 take, so the torque
+    // cannot end up referred to a different image of the body than the
+    // force that produced it.
+    let r = bodyDelta3(p, body);
     let us = bodyVelocity3(p, body);
 
     if (USE_BOUNCEBACK != 0u) {

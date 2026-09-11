@@ -156,6 +156,19 @@ function defaultConfigs(baseUrl) {
       url: `${baseUrl}/index-3d-spike.html?n=32&steps=2&reps=1`,
       checkBoots: true,
     },
+    // THE MOVING WINDOW under a boot smoke (plans/3D.md M8.3). It is a page
+    // nothing else here visits: the 3D physics gates are all unwindowed, and
+    // tools/probe-d3-window.js is a standalone report. It also adds a shader
+    // fragment to a dozen entry files, a pipeline override to eight
+    // pipelines and a binding to the render bind group -- which is the
+    // 238e48c failure surface exactly, and the reason runBootSmoke exists.
+    // `?n=8` keeps it cheap; the question is whether the pipelines compile
+    // and the loop advances.
+    {
+      name: 'd3-window-boot',
+      url: `${baseUrl}/index-3d.html?scenario=fall&n=8&tow=0.04&bounceback=1&window=x`,
+      checkBoots: true,
+    },
     // index-amr.html under the structural-invariant sweep. This is the page
     // the project SHIPS, it defaults to levels=3, and until now the sweep
     // only ever drove window.__CYL -- so the falling-card page's own 2:1

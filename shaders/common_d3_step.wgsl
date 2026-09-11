@@ -280,10 +280,19 @@ fn step(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   mac[cell] = vec4<f32>(rho, ux, uy, uz);
 
+  // SPONGE DISTANCES ARE MEASURED IN WINDOW COORDINATES (M8.3). Without a
+  // moving window winCoord is the identity and this is `min(x, NX-1-x)` as
+  // it was; with one, the absorbing band travels with the body, which is the
+  // ENTIRE mechanism -- see shaders/common_d3_window.wgsl. Fluid entering the
+  // band behind the body has its wake eaten and emerges ahead of the body at
+  // rest, so "falling through undisturbed fluid, leaving a wake that does
+  // not come back" holds for as long as the run lasts instead of until the
+  // body reaches a face.
+  let wp = winCoord(p, winOffset(vec3<f32>(body.cx, body.cy, body.cz)));
   let spongeW = spongeWeight3(
-    min(f32(x), f32(NX - 1u - x)),
-    min(f32(y), f32(NY - 1u - y)),
-    min(f32(z), f32(NZ - 1u - z)), SPONGE_W);
+    min(wp.x, f32(NX - 1u) - wp.x),
+    min(wp.y, f32(NY - 1u) - wp.y),
+    min(wp.z, f32(NZ - 1u) - wp.z), SPONGE_W);
 
   // 4. Collide. Gathered whole and stored whole, matching lbm_step.wgsl --
   // see common_fpack.wgsl for why a per-plane store is not an option once

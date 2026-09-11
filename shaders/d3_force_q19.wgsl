@@ -3,6 +3,7 @@
 // the body: shader-loader.mjs splices exactly one level.
 
 // @include "common_d3q19_lattice.wgsl"
+// @include "common_d3_window.wgsl"
 // @include "common_d3_geometry.wgsl"
 // @include "common_d3_reduce.wgsl"
 // @include "common_d3_force.wgsl"
