@@ -165,8 +165,27 @@ fn sampleDense(p: vec3<f32>) -> TreeSample {
 // yes is by definition the finest active level. That makes this loop correct
 // on a hierarchy the manager is halfway through rebuilding, which matters
 // because the renderer runs between macro-steps and has no lock.
-fn sampleTree(p: vec3<f32>) -> TreeSample {
-  for (var m = SAMPLE_LEVELS; m >= 1u; m--) {
+fn sampleTree(p: vec3<f32>) -> TreeSample { return sampleTreeAtMost(p, SAMPLE_LEVELS); }
+
+// THE SAME WALK, CAPPED. Answers with the finest level present at p that is
+// no finer than `mMax`, so a caller can ask two places for values from the
+// SAME level rather than from whatever each place happens to have.
+//
+// WHY A CAPPED SAMPLE IS NEEDED AT ALL, and it is not about resolution. This
+// sampler is NEAREST: it answers at a cell CENTRE, and the centre of a level-m
+// cell containing p differs from p on EVERY axis, by up to half that cell.
+// Two samples from DIFFERENT levels therefore sit at different positions in
+// the two axes the caller was not differencing along -- so a finite difference
+// across a coarse/fine seam picks up the transverse gradients, scaled by
+// (transverse offset) / (in-plane step). Measured on a Beltrami box at 10% of
+// max|omega|, localized to the seam row, and that was the WHOLE of the residual
+// artifact left after the divisor fix earlier the same day (2026-09-11). Two
+// samples at the same level share the offset exactly, so it cancels.
+//
+// `mMax` above SAMPLE_LEVELS is the uncapped walk; 0 is the dense grid, which
+// is present everywhere, so a cap can always be satisfied.
+fn sampleTreeAtMost(p: vec3<f32>, mMax: u32) -> TreeSample {
+  for (var m = min(mMax, SAMPLE_LEVELS); m >= 1u; m--) {
     let s = sampleAtLevel(p, m);
     if (s.level != 0u) { return s; }
   }

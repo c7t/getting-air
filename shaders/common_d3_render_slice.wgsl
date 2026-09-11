@@ -143,31 +143,69 @@ fn rotateUVW(u: vec3<f32>) -> vec3<f32> {
   return u;
 }
 
-// Velocity at in-plane continuous coordinates, from the finest level that
-// covers the point.
-fn sampleUVW(a: f32, b: f32) -> vec3<f32> {
-  return rotateUVW(sampleTree(planePoint(a, b)).v.yzw);
+// The same sample, plus WHERE IT CAME FROM and WHICH LEVEL ANSWERED, both in
+// the in-plane frame. A nearest sampler answers at the centre of the cell
+// containing the query, not at the query -- so a finite difference has to
+// divide by the separation of the two CENTRES, not by the step it asked for.
+// See TreeSample.c. `ab` is (a, b, normal): rotateUVW takes a POSITION into
+// the plane frame exactly as it takes a velocity, so `.z` is the offset along
+// the slice normal, which is the half of this that dPlane below is about.
+struct PlaneSample { uvw : vec3<f32>, ab : vec3<f32>, level : u32 }
+fn samplePlaneAt(a: f32, b: f32, mMax: u32) -> PlaneSample {
+  let t = sampleTreeAtMost(planePoint(a, b), mMax);
+  return PlaneSample(rotateUVW(t.v.yzw), rotateUVW(t.c), t.level);
 }
 
-// The same sample, plus WHERE IT CAME FROM in the in-plane frame. A nearest
-// sampler answers at the centre of the cell containing the query, not at the
-// query -- so a finite difference has to divide by the separation of the two
-// CENTRES, not by the step it asked for. See TreeSample.c.
-struct PlaneSample { uvw : vec3<f32>, ab : vec3<f32> }
-fn samplePlane(a: f32, b: f32) -> PlaneSample {
-  let t = sampleTree(planePoint(a, b));
-  return PlaneSample(rotateUVW(t.v.yzw), rotateUVW(t.c));
-}
-
-// One centred derivative, over the TRUE separation of the samples returned.
+// ONE CENTRED DERIVATIVE, FROM A LEVEL-CONSISTENT PAIR.
 //
-// THE GUARD IS FOR A TREE MID-REBUILD, not for the steady case. Under 2:1
-// balance the arms cannot land in the same cell: the coarsest neighbour of a
-// level-m cell is level m-1, whose size is exactly 2h, so a 2h separation
-// always crosses a boundary. This sampler is documented as safe to call
-// while the manager is halfway through a topology change, though, and a zero
-// separation there would be a divide by zero rather than a stale pixel.
-fn dUdX(plus: PlaneSample, minus: PlaneSample, comp: u32, axis: u32, h: f32) -> f32 {
+// THE TWO ARMS MUST COME FROM THE SAME LEVEL, and that is a correctness
+// requirement rather than a tidiness one. sampleTree is NEAREST: it answers at
+// a cell CENTRE, which differs from the query on ALL THREE axes, by up to half
+// that cell. So a pair straddling a seam is displaced not only along the axis
+// being differenced -- which the divisor below already handles -- but along the
+// other in-plane axis and along the SLICE NORMAL too, and those displacements
+// do not cancel. The difference then carries the transverse gradients,
+// amplified by (transverse offset) / (in-plane step):
+//
+//     est(du/db) = du/db + (da/db_step) du/da + (dn/db_step) du/dn
+//
+// with dn up to a quarter of a coarse cell and db_step around one, so the
+// contamination is O(1) in the seam row. MEASURED, on a Beltrami box where the
+// exact vorticity is k*u: the seam row read 9.94% of max|omega| high, against
+// 10.00% predicted from the slice-normal term alone. Away from the seam the
+// error is 0.30% rms. That was the whole of the residual artifact after the
+// divisor fix earlier the same day -- which cut the same row from 25.6% to
+// 9.94% by fixing the denominator, and could not touch this because it is in
+// the numerator.
+//
+// THE FIX IS TO RE-ASK, NOT TO CORRECT. Two samples at the SAME level share
+// the transverse offset exactly, so it cancels in the difference and nothing
+// has to be estimated. When the first pair disagrees, both arms are re-asked
+// capped at the coarser of the two levels, at that level's own step. Each pass
+// strictly lowers the cap, and level 0 is present everywhere, so the loop ends;
+// in practice it runs once for a seam pixel and not at all for any other, which
+// is why the cost is only on the ~7% of pixels that straddle a seam.
+//
+// The seam row is then a COARSE estimate rather than a wrong fine one, which
+// is the honest answer: the finest level available to BOTH sides of a
+// difference is the finest level that difference can be taken at.
+//
+// THE ZERO GUARD IS FOR A TREE MID-REBUILD, not for the steady case. Under
+// 2:1 balance a level-consistent pair is exactly 2h apart. This sampler is
+// documented as safe to call while the manager is halfway through a topology
+// change, though, and a zero separation there would be a divide by zero
+// rather than a stale pixel.
+fn dPlane(pa: f32, pb: f32, comp: u32, axis: u32, mStart: u32) -> f32 {
+  var m = mStart;
+  var h = 1f / f32(1u << m);
+  var plus  = samplePlaneAt(pa + select(0f, h, axis == 0u), pb + select(0f, h, axis == 1u), m);
+  var minus = samplePlaneAt(pa - select(0f, h, axis == 0u), pb - select(0f, h, axis == 1u), m);
+  for (var it = 0u; it < SAMPLE_LEVELS && plus.level != minus.level; it++) {
+    m = min(plus.level, minus.level);
+    h = 1f / f32(1u << m);
+    plus  = samplePlaneAt(pa + select(0f, h, axis == 0u), pb + select(0f, h, axis == 1u), m);
+    minus = samplePlaneAt(pa - select(0f, h, axis == 0u), pb - select(0f, h, axis == 1u), m);
+  }
   let dx = plus.ab[axis] - minus.ab[axis];
   if (abs(dx) < 1e-6f * max(h, 1e-6f)) { return 0f; }
   return (plus.uvw[comp] - minus.uvw[comp]) / dx;
@@ -206,25 +244,20 @@ fn fs_main(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> {
     // refined region and paint it flat zero -- which is not a small error,
     // it is the whole coarse field reading as irrotational.
     //
-    // BUT THE STEP DELIVERED IS NOT THE STEP ASKED FOR, and dividing by the
-    // latter was a real bug (fixed 2026-09-11). sampleTree is NEAREST: it
-    // answers at the centre of the cell containing the query. Across a seam
-    // the `+h` arm can land in a coarser cell whose centre is up to half that
-    // cell away, so the true separation of the two samples is anywhere from
-    // about 0.5 to 1.5 times 2h -- and dividing by 2h regardless mis-scales
-    // omega by an O(1) factor EXACTLY at tile boundaries. That is not the
-    // resolution staircase an earlier version of this comment waved at; it
-    // is a wrong value, and it showed up as artifacts along the seams in the
-    // one view that exists to look at them.
+    // BUT THE STEP DELIVERED IS NOT THE STEP ASKED FOR, and the pair is not
+    // even taken at one resolution unless it is made to be. sampleTree is
+    // NEAREST -- it answers at the centre of the cell containing the query --
+    // so across a seam the two arms differ both in SEPARATION (an O(1) error
+    // in the divisor, fixed 2026-09-11) and in POSITION ALONG THE OTHER TWO
+    // AXES, including the slice normal, which contaminates the numerator with
+    // the transverse gradients and was worth another 10% of max|omega| in the
+    // seam row. dPlane handles both: it re-asks the pair at a common level.
     //
     // The tell was that `speed` -- a point sample with no derivative in it --
     // is smooth across the very seams where `vorticity` is not. A field that
     // cannot express the artifact not expressing it is what separates a
     // rendering bug from a solver one.
-    let h = t.h;
-    let ap = samplePlane(pa + h, pb); let am = samplePlane(pa - h, pb);
-    let bp = samplePlane(pa, pb + h); let bm = samplePlane(pa, pb - h);
-    let omega = dUdX(ap, am, 1u, 0u, h) - dUdX(bp, bm, 0u, 1u, h);
+    let omega = dPlane(pa, pb, 1u, 0u, t.level) - dPlane(pa, pb, 0u, 1u, t.level);
     return vec4(vorticityColor(omega / max(rp.vScale, 1e-12f)), 1.0);
   }
   if (rp.mode == 2u) {
