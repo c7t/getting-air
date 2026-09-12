@@ -742,7 +742,26 @@ SCENARIOS.drift = {
 // on a steady spin but not on a flip would pass a gentler test.
 SCENARIOS.spin = {
   name: 'spin',
-  defaults: { n: 32, tau: 0.8, u0: 0.02 },
+  // `fluid` COUPLES THE BODY TO THE FLOW, and it is 0 by default so the
+  // M1 gate (benchmarks/d3.json's spin-N32) is bit-identical: that case
+  // compares the GPU integrator against d3-body.mjs on a body the fluid must
+  // not touch, and a fluid torque would make the comparison meaningless.
+  //
+  // 1 turns the fluid force ON, which is the ONE COMBINATION THIS SUITE HAD
+  // NO CASE FOR: `drift` TRANSLATES with the coupling off, this scenario
+  // ROTATES with it off, and every other body is pinned or does not turn. A
+  // body that rotates under fluid torque on a REFINED grid is what M8.8's
+  // rotation lead exists to protect, and nothing exercised it -- see
+  // tools/validate-d3-invariants.js's `spin-amr`.
+  // `rho_b` MATTERS ONLY ONCE `fluid` IS ON, and then it matters a great deal.
+  // The default 1 is the fluid's own density, which for the uncoupled M1 gate
+  // is an arbitrary scale that cancels. Coupled, it is the WORST case: a
+  // neutrally-buoyant plate has no inertia to speak of against the fluid it
+  // displaces, and measured here it sheds 140x of its spin in 250 steps and
+  // then sits still -- a gate that stops rotating is a gate that stops
+  // testing rotation. A denser body coasts, and the spin-down time scales
+  // with it.
+  defaults: { n: 32, tau: 0.8, u0: 0.02, fluid: 0, rho_b: 1 },
   walls: [],
   dims: ({ n }) => [n, n, n],
   derive: (p) => {
@@ -751,8 +770,13 @@ SCENARIOS.spin = {
       shape, x: [p.n / 2, p.n / 2, p.n / 2],
       q: qFromAxisAngle([0.3, 0.5, 0.81], 0.4),   // a generic orientation, not axis-aligned
       omega: [1e-4 * p.u0, p.u0, 1e-4 * p.u0],    // near the intermediate axis
+      density: p.rho_b,
     });
-    return { nu: nuFromTau(p.tau), body, pinned: false, noFluidForce: true, force: [0, 0, 0], dims: [p.n, p.n, p.n] };
+    return { nu: nuFromTau(p.tau), body, pinned: false, noFluidForce: !p.fluid,
+             force: [0, 0, 0], dims: [p.n, p.n, p.n],
+             // THE BODY TURNS IN PLACE, so there is nothing for a window to
+             // follow and no `down` for the view to orient to.
+             R: shape.a, D: 2 * shape.a };
   },
   macro: (dims) => seedMacro3(dims, () => [0, 0, 0]),
 };

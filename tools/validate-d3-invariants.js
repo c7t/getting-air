@@ -186,6 +186,48 @@ const CONFIGS = [
   // to assert the opposite (that the pool stayed consistent while quietly
   // under-refining); the pool consistency is still asserted, but the
   // refusal is now the point.
+  // THE ROTATING BODY, WITH THE FLUID TORQUE ON, ON A REFINED GRID (M8.8).
+  //
+  // The combination this suite had no case for, and the reason M8.8's
+  // rotation lead went unexercised for as long as it went unwritten: `drift`
+  // TRANSLATES with the coupling off, `spin` ROTATES with the coupling off,
+  // and every other body is pinned or does not turn. Here `?fluid=1` turns
+  // the coupling on, so the body turns under a torque the flow gives it and
+  // the refined shell has to keep up with a surface whose fastest point is
+  // moving at |omega| * R rather than at |v|.
+  //
+  // SIZED FROM TWO CONSTRAINTS, and getting either wrong makes it not a gate.
+  //
+  // GENTLY ENOUGH THAT THE START IS NOT THE EXPERIMENT. `spin` was written
+  // with the coupling OFF, so its default omega puts the plate's tip at
+  // Mach 0.23 -- impulsively started in QUIESCENT fluid, which blows the
+  // field up inside 250 steps and tests nothing but the startup transient.
+  // ?u0=0.003 puts the tip at 0.041, Mach 0.07.
+  //
+  // SLOWLY ENOUGH THAT THE ROTATION TERM IS LOAD-BEARING. R = 13.56, so at
+  // ?manageEvery=64 the rotation lead is 2.60 cells against a ?margin=2 --
+  // the plate turns 11 degrees between manager passes and its surface sweeps
+  // those 2.6 cells. It has to CLEAR the 9-point block sampling's own
+  // ~0.559 * RB = 2.24 cells of Lipschitz slack, or that slack would cover
+  // the deficit and the gate would stay green with the term deleted.
+  // MUTATION-CHECKED, and the numbers are worth recording because they are
+  // what makes this a gate rather than a green tick. Delete the
+  // `|omega| * bodyCircumradius3` term from common_d3_manage.wgsl and this
+  // config fails with 164 coverage violations at step 250, then 61, 32, 3, 6
+  // -- DECAYING in step with omega itself (2.2e-3 at step 250 down to 6.9e-4
+  // by 1750, as the fluid spins the plate down), which is the rotation
+  // signature and not some other defect. Restore the term and all nine
+  // checkpoints are clean.
+  //
+  // The body turns IN PLACE and never translates, so a coverage failure here
+  // can only be the rotation.
+  // startsAtRest: the fluid is quiescent at step 0 (`spin`'s macro seeds
+  // zeros), so every level legitimately reads rms 0 there. From step 250 on
+  // the not-advancing check is REAL and is worth having: the only thing that
+  // can stir this fluid is the turning body, so a pool level still reading
+  // zero would mean the coupling never reached the fine level at all.
+  { name: 'spin-amr', steps: 2000, startsAtRest: true,
+    url: 'scenario=spin&n=48&tau=0.8&u0=0.003&fluid=1&rho_b=50&q=19&bounceback=1&live=0&levels=2&rb=4&refine=body&margin=2&interface=explode&dynamic=1&manageEvery=128&slots=1200' },
   { name: 'body-refine', expectInUse: 'increase', expectExhausted: true, steps: 8,
     url: 'scenario=sphere&n=16&re=20&u0=0.05&q=19&bounceback=1&live=0&levels=2&rb=4&refine=body&interface=explode&dynamic=1&manageEvery=1&manageMargin=6' },
 ];
