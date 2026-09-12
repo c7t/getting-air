@@ -35,6 +35,7 @@ const assert = require('assert');
 const {
   levelVolume, volumeStack, boxLocal, innermostAt, rayBox, rayTouchesRefined,
   stackUnwrapped, orbitBasis, orbitEye, cameraBasis, cameraRay, boxRatio,
+  orthoScale,
 } = await import('../d3-volume.mjs');
 
 let checks = 0;
@@ -171,6 +172,38 @@ const close = (a, b, tol, msg) => ok(Math.abs(a - b) <= tol, `${msg}: ${a} vs ${
   const tall = cameraRay([0.5, 1], { eye, ...cam, tanHalfFov: 0.35, aspect: 2 });
   const ang = (r) => Math.acos(Math.max(-1, Math.min(1, r.d.reduce((a, d, k) => a + d * cam.fwd[k], 0))));
   close(Math.tan(ang(wide)) / Math.tan(ang(tall)), 2, 1e-9, 'the horizontal half-angle is `aspect` times the vertical');
+}
+
+// --- the orthographic camera, which is an instrument ------------------------
+{
+  const target = [95.5, 63.5, 63.5];
+  const eye = orbitEye(target, { azim: 0.6, elev: 0.3, dist: 200 });
+  const cam = cameraBasis(eye, target);
+  const opts = { eye, ...cam, tanHalfFov: 0.35, aspect: 1, ortho: true, halfHeight: 50 };
+  // EVERY RAY PARALLEL. That is the property the measurements rest on: a
+  // plane in the flow then maps to a straight line at a computable row,
+  // where perspective foreshortening makes the same plane's apparent
+  // position depend on its distance.
+  for (const uv of [[0, 0], [0.5, 0.5], [1, 1], [0.2, 0.8]]) {
+    cameraRay(uv, opts).d.forEach((d, k) => close(d, cam.fwd[k], 1e-12,
+      `every orthographic ray runs down fwd (uv ${uv})`));
+  }
+  // AND THE IMAGE PLANE IS THE LATTICE, TO SCALE. Two pixels a known number
+  // of pixels apart are a known number of CELLS apart -- one division, no
+  // camera model, which is the entire point.
+  const a = cameraRay([0.5, 0.5], opts).o, b = cameraRay([0.5, 1], opts).o;
+  close(Math.hypot(b[0] - a[0], b[1] - a[1], b[2] - a[2]), 50, 1e-9,
+    'half the image height is `halfHeight` cells');
+  close(orthoScale(50, 400), 0.25, 1e-15, 'cells per pixel is 2*halfHeight/height');
+  // The centre pixel is the eye either way, so the two projections agree
+  // there and switching is a comparison rather than a different experiment.
+  const persp = cameraRay([0.5, 0.5], { ...opts, ortho: false });
+  persp.o.forEach((o, k) => close(o, eye[k], 1e-12, 'the centre ray starts at the eye in both'));
+  // MUTATION: a perspective ray away from the centre must NOT be parallel to
+  // fwd, or the test above would pass on a broken ortho branch.
+  const off = cameraRay([1, 1], { ...opts, ortho: false });
+  ok(Math.abs(off.d[0] - cam.fwd[0]) > 1e-3 || Math.abs(off.d[1] - cam.fwd[1]) > 1e-3,
+    'mutation: a perspective ray off-centre is not parallel to fwd');
 }
 
 // --- ray/box ---------------------------------------------------------------

@@ -208,8 +208,9 @@ comment above `N_LEVELS`, not this file, for what's current.
 
 ## The 3D fork (`plans/3D.md`)
 
-**M0-M6 are done -- M6.4's octree raymarcher included, so a refined run can
-now be LOOKED at at every level's own resolution. M8.0-M8.3 are done: the target Re runs, the solver sheds at the
+**M0-M6 are done -- M6.4's octree raymarcher and M6.5's movie mode included,
+so a refined run can now be LOOKED at at every level's own resolution, and
+filmed. M8.0-M8.3 are done: the target Re runs, the solver sheds at the
 right frequency, the solid interior is held at the body's equilibrium, and a
 moving window (M8.3) makes a moving-body measurement converge at all.** Depth is real:
 `?levels=N` runs at any depth, static or `?dynamic=1`, the body lives
@@ -878,6 +879,52 @@ What exists today:
   body pumping momentum into a CLOSED BOX, so a long window does not settle,
   it diverges -- the field's max|u| and density range are printed beside the
   closure for that reason.
+
+- **A CLIP IS RENDERED, NOT SCREEN-RECORDED** (`tools/render-d3-movie.js`,
+  M6.5). It drives the page a declared number of steps per frame, renders each
+  frame OFFSCREEN through `debugRenderFrame` (either view), and pipes raw RGBA into
+  ffmpeg. A recorder would film the SOLVER'S frame rate, so an expensive
+  configuration's clip runs slow and two builds are not comparable; here
+  `--seconds`/`--fps` describe the FILM and `--steps` the FLOW.
+  - **THE RAY'S MARCH INTERVAL IS IN WINDOW COORDINATES, NOT BUFFER ONES**
+    (M6.5a, `?winbox=0` to A/B). The body wraps through the periodic buffer
+    and its wake does not, so a march bounded by [0, N) stops at the seam and
+    the picture COLLAPSES the moment the body crosses it -- 8.22% of the frame
+    lit against 38.45%, measured at buffer x = 0. Gated as an invariance
+    (`--cases=window`): the lit fraction must not jump between samples 200
+    steps apart. 1.00x fixed, 1.84x with `?winbox=0`.
+  - **`?proj=ortho` IS THE INSTRUMENT; PERSPECTIVE IS THE PICTURE** (M6.5b).
+    Under a parallel projection with a known scale the image is an AFFINE MAP
+    OF THE LATTICE: `orthoScale` turns pixels into L0 cells with one division,
+    a plane in the flow is a straight line at a computable row, and a sphere's
+    outline is a circle rather than a conic. Reach for it before reasoning
+    about what a picture shows -- it turned "8.22% of the frame against
+    38.45%" into "the cut is at buffer x = -0.3 +- 0.25 and the box face is at
+    -0.5". The two projections frame identically at the target plane, so
+    switching is a comparison and not a different experiment.
+  - **AND IT IS INVISIBLE UNLESS YOU MEASURE AT THE SEAM.** Away from it the
+    cut plane falls outside the frame and an A/B reads as 34 pixels in
+    160,000. Two measurements said "no effect" before one said 4.7x: the other
+    was an image statistic pinned at row 0, which is CENSORED by the frame
+    edge, not constant. Test where the body's buffer position is near 0 or N.
+  - **IT REPORTS THE TRAJECTORY, and `INT |omega| dt` IS NOT THE ROTATION.**
+    That integral is ARC LENGTH -- a plate rocking back and forth accumulates
+    it without ever turning over, and the first version duly called the
+    default card "0.44 revolutions". It now reports `net = |INT omega dt|`
+    beside `arc = INT |omega| dt`: tumbling is net ~ arc, fluttering is
+    arc >> net.
+  - **THE CARD FLUTTERS, IT DOES NOT TUMBLE**, and five configurations say
+    so (n = 32, 26000 steps, chi). net/arc revolutions: 0.04/0.44 at the
+    default, 0.12/0.76 at tilt 0.7, 0.10/1.03 at `?levels=2`, 0.09/0.91 at
+    span 2, and **0.07/1.80 at the TARGET Re = 1100**. `arc` quadruples while
+    `net` stays put -- more rocking, not one more degree of turning over --
+    which is the regime being wrong rather than the initial condition, and it
+    puts a number on D4's "neither coupling tumbling". Re = 1100 SURVIVING
+    26000 steps at `?levels=2` is itself new, and is M8.0's "AMR is the
+    stability mechanism" holding.
+
+      node tools/render-d3-movie.js                      # the card, 30 s
+      node tools/render-d3-movie.js --view=slice --seconds=10 --fps=24
 
 - `tools/validate-d3-raymarch.js` — the volume renderer's gate (M6.2-M6.4b).
   Standalone and opt-in; owns its own Chrome. Three claims, none of them "the

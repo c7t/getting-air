@@ -69,6 +69,9 @@ const DEFAULTS = {
 // be comparing two different states and calling it a rendering difference.
 const BASE = 'scenario=sphere&n=8&re=100&u0=0.05&q=19&bounceback=1&live=0'
   + '&levels=3&rb=4&refine=body&interface=explode&vol=1&view=volume';
+// A body that TRAVELS, for the window case. n = 16 keeps a wrap inside a few
+// thousand steps; the defaults do the rest.
+const CARD = 'scenario=card&n=16&live=0&vol=1&view=volume';
 
 function parseArgs(argv) {
   const o = { ...DEFAULTS };
@@ -171,7 +174,10 @@ async function main() {
   const rows = [];
   const want = (name) => !o.cases || o.cases.includes(name);
   const open = async (extra, label) => {
-    const url = `${o.baseUrl}/index-3d.html?${BASE}${extra}${o.extra ? `&${o.extra}` : ''}`;
+      // The window case needs a body that TRAVELS, which the pinned sphere in
+    // BASE does not; `card` is the scenario whose clip found this.
+    const base = extra.includes('window=') ? CARD : BASE;
+    const url = `${o.baseUrl}/index-3d.html?${base}${extra}${o.extra ? `&${o.extra}` : ''}`;
     console.log(`\n=== ${label} (${url})`);
     await navigateTo(Page, url);
     await waitForGlobal(Runtime, `${G}`, 60000);
@@ -229,7 +235,7 @@ async function main() {
       // background and nothing else -- a silhouette the host can predict in
       // closed form, which is the only checkable claim a camera has.
       const p = await open('&volIso=1e9', 'camera (silhouette)');
-      const img = await ev(Runtime, `${G}.debugRenderVolume(${o.size})`, 'debugRenderVolume');
+      const img = await ev(Runtime, `${G}.debugRenderFrame(${o.size})`, 'debugRenderFrame');
       const px = decode(img.rgba);
       const st = imageStats(px);
       const body = await ev(Runtime, `${G}.readBody()`, 'readBody');
@@ -293,14 +299,14 @@ async function main() {
         for (const t of scl.texels) fieldMax = Math.max(fieldMax, t.v[0]);
       }
       const set = await ev(Runtime, `${G}.debugSetVolume({})`, 'debugSetVolume');
-      const img = await ev(Runtime, `${G}.debugRenderVolume(${o.size})`, 'debugRenderVolume');
+      const img = await ev(Runtime, `${G}.debugRenderFrame(${o.size})`, 'debugRenderFrame');
       const on = imageStats(decode(img.rgba));
       // THE A/B THAT MAKES IT A CHECK: raise the iso above everything in the
       // volume and the volume must vanish, leaving the body and the
       // background. The DIFFERENCE between the two counts is the volume's own
       // contribution, which is the thing being claimed to exist.
       await ev(Runtime, `${G}.debugSetVolume({ iso: 1e9 })`, 'debugSetVolume');
-      const imgOff = await ev(Runtime, `${G}.debugRenderVolume(${o.size})`, 'debugRenderVolume');
+      const imgOff = await ev(Runtime, `${G}.debugRenderFrame(${o.size})`, 'debugRenderFrame');
       const off = imageStats(decode(imgOff.rgba));
       await ev(Runtime, `${G}.debugSetVolume({ iso: ${set.iso} })`, 'debugSetVolume');
       console.log(`    field max ${fieldMax.toFixed(3)} against iso ${set.iso} (${set.field}/ref)`);
@@ -318,12 +324,64 @@ async function main() {
                   detail: `max ${fieldMax.toFixed(2)} > iso ${set.iso}, lit ${off.lit} -> ${on.lit}` });
     }
 
+    // --- the window: the picture must not depend on the buffer's origin ----
+    //
+    // A windowed run's body WRAPS through a periodic buffer while its wake
+    // stays a fixed distance behind it, so where the body happens to sit in
+    // the buffer is a bookkeeping detail the picture must be blind to. It was
+    // not: with the march interval in buffer coordinates the ray stopped at
+    // the seam, so the moment the body crossed it the whole wake was outside
+    // the interval and the render collapsed -- 8.22% of the frame lit against
+    // 38.45%, measured on the card at buffer x = 0.
+    //
+    // GATED AS CONTINUITY, which is the form that needs no reference picture:
+    // the flow changes very little in 200 steps, so the lit fraction must not
+    // JUMP between adjacent samples. A seam cut makes it collapse in one
+    // sample and recover over the next several, which is exactly the sawtooth
+    // that gave this away in a clip.
+    if (want('window')) {
+      const p = await open('&window=xyz&dist=0.8&volIso=0.03&volGain=2.5&volOpacity=0.6',
+                           'window (buffer-origin invariance)');
+      const lit = [];
+      for (let i = 0; i < 18; i++) {
+        if (i) await ev(Runtime, `${G}.debugStepSync(200)`, 'debugStepSync');
+        const img = await ev(Runtime, `${G}.debugRenderFrame({ w: 160, h: 160, view: 'volume' })`, 'debugRenderFrame');
+        const b = await ev(Runtime, `${G}.readBody()`, 'readBody');
+        lit.push({ step: img.step, bufX: b.cx, frac: imageStats(decode(img.rgba)).litFrac });
+      }
+      let worst = 1, at = null;
+      for (let i = 1; i < lit.length; i++) {
+        // Only DROPS matter: a wake that grows is the flow, a wake that
+        // vanishes between two adjacent samples is the seam.
+        const r = lit[i - 1].frac / Math.max(lit[i].frac, 1e-6);
+        if (r > worst) { worst = r; at = lit[i]; }
+      }
+      console.log('    lit fraction across a wrap: '
+        + lit.map(l => `${(100 * l.frac).toFixed(0)}%`).join(' '));
+      console.log(`    buffer x: ${lit.map(l => l.bufX.toFixed(0)).join(' ')}`);
+      console.log(`    worst one-sample drop ${worst.toFixed(2)}x`
+        + (at ? ` at step ${at.step} (buffer x ${at.bufX.toFixed(0)})` : ''));
+      // THE THRESHOLD IS SET FROM THE SEPARATION, not from taste, and the
+      // first value chosen by taste was wrong: 2x let the broken build PASS.
+      // Measured on this config, fixed against ?winbox=0: worst drop 1.00x
+      // against 1.84x, the latter landing exactly on the sample where the
+      // body's buffer x wraps. 1.25x sits between them with margin on both
+      // sides. The n = 32 card collapses 4.7x, so a bigger domain would make
+      // this easier -- this config is deliberately the harder one.
+      //
+      // A drop of ANY size is suspect with the fix in, because 200 steps of a
+      // slowly-developing wake cannot remove lit volume; the allowance is for
+      // sampling noise at the iso, not for physics.
+      const ok = worst < 1.25 && lit.every(l => l.frac > 0.01);
+      rows.push({ name: 'window', ok, detail: `worst drop ${worst.toFixed(2)}x over a wrap` });
+    }
+
     // --- M6.4b: innermost box wins -----------------------------------------
     if (want('stack')) {
       const a = await open('', 'stack (M6.4b)');
-      const imgA = await ev(Runtime, `${G}.debugRenderVolume(${o.size})`, 'debugRenderVolume');
+      const imgA = await ev(Runtime, `${G}.debugRenderFrame(${o.size})`, 'debugRenderFrame');
       const b = await open('&volstack=0', 'stack control (?volstack=0)');
-      const imgB = await ev(Runtime, `${G}.debugRenderVolume(${o.size})`, 'debugRenderVolume');
+      const imgB = await ev(Runtime, `${G}.debugRenderFrame(${o.size})`, 'debugRenderFrame');
       const bodyA = await ev(Runtime, `${G}.readBody()`, 'readBody');
 
       const stack = imgA.stack.map(v => levelVolume({ lo: v.lo, ext: v.ext, level: v.level, mult: 1 }));

@@ -68,6 +68,12 @@ override NZ : u32 = 1u;
 override UP_AXIS : u32 = 2u;
 override UP_SIGN : f32 = 1f;
 override HAS_BODY : u32 = 0u;
+// 0 = perspective (the default, and the one that reads as a picture),
+// 1 = ORTHOGRAPHIC. See camRay for why the second one exists.
+override PROJ : u32 = 0u;
+// Express the march interval in WINDOW coordinates (1, the default) or in the
+// buffer's own (0). See fs_main for what this is and is not worth.
+override WIN_BOX : u32 = 1u;
 
 struct VSOut {
   @builtin(position) pos : vec4<f32>,
@@ -128,6 +134,27 @@ fn camRay(uv: vec2<f32>) -> Cam {
   if (length(right) < 1e-6f) { right = cross(fwd, vec3<f32>(1f, 0f, 0f)); }
   right = normalize(right);
   let up = normalize(cross(right, fwd));
+  // PERSPECTIVE puts the eye at a point and fans the rays; ORTHOGRAPHIC makes
+  // them parallel and slides the ORIGIN across the image plane instead.
+  //
+  // THE ORTHOGRAPHIC MODE IS AN INSTRUMENT, and it earns its place by making a
+  // class of measurement possible rather than by looking better. Under it the
+  // image plane is an AFFINE MAP OF THE LATTICE: `rm.cam.w` is the half-height
+  // in L0 CELLS, so a pixel is a known number of cells, a plane in world space
+  // is a straight line at a computable row, and "where is that cut, in cells"
+  // stops being a question about foreshortening. Every mis-measurement in
+  // M6.5a's write-up -- an A/B at a step where the cut fell outside the frame,
+  // an image statistic censored by the frame edge -- is one a parallel
+  // projection with a known scale would have made impossible.
+  //
+  // A sphere's outline is then a circle rather than a conic, too, which is
+  // what lets a host predict a silhouette by closed form instead of by
+  // ray/sphere per pixel.
+  if (PROJ == 1u) {
+    let ox = (uv.x * 2f - 1f) * rm.look.x * rm.cam.w;
+    let oy = (uv.y * 2f - 1f) * rm.cam.w;
+    return Cam(eye + ox * right + oy * up, fwd);
+  }
   let px = (uv.x * 2f - 1f) * rm.look.x * rm.cam.w;
   let py = (uv.y * 2f - 1f) * rm.cam.w;
   return Cam(eye, normalize(fwd + px * right + py * up));
@@ -280,7 +307,44 @@ fn fs_main(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> {
   // The march is bounded by the LEVEL-0 volume, which covers the whole
   // domain: every refined box is inside it by construction, so one interval
   // is enough and a ray that misses it has nothing to show.
-  let span = rayBox(ray.o, ray.d, rm.boxLo[0].xyz, rm.boxLo[0].xyz + rm.boxExt[0].xyz);
+  //
+  // AND THE INTERVAL IS IN WINDOW COORDINATES, NOT BUFFER ONES (M8.3). THIS
+  // IS NOT COSMETIC -- IT IS THE WHOLE PICTURE, PERIODICALLY.
+  //
+  // The buffer is periodic and the body WRAPS THROUGH IT, but the wake does
+  // not: it trails 112 cells behind the plate whatever the plate's buffer
+  // position is. So the moment the body crosses the seam, its entire wake is
+  // on the far side of it -- and a march bounded by [0, N) stops dead at the
+  // seam and shows almost nothing. As the body falls on, more of the wake
+  // comes back inside [0, N) and the picture grows again, one wrap period at
+  // a time.
+  //
+  // MEASURED IN CELLS, under ?proj=ortho with the camera down a lattice axis,
+  // which makes the image an affine map of the grid and a cut plane a row that
+  // converts to a coordinate: on the falling card at the wrap (buffer
+  // x = 0.1, step 14600), the buffer box's lit region ENDS AT BUFFER
+  // x = -0.3 +- 0.25 cells. The box face is at -0.5. The plane IS the face,
+  // identified to within one pixel rather than by eye -- and the wake, which
+  // the window box shows running 49.5 cells further, is simply not drawn.
+  // In frame terms that is 8.22% of the picture lit against 38.45%.
+  // `?winbox=0` restores the buffer box for the A/B.
+  //
+  // WHY IT IS EASY TO MIS-MEASURE, since it was, twice: away from the seam
+  // the cut plane is far from the body and lands OUTSIDE the frame, so an A/B
+  // at an arbitrary step reads as 34 pixels in 160,000 and looks like
+  // nothing. The step to test is the one where the body's buffer position is
+  // near 0 or N. An image statistic clipped by the frame edge -- "the lit
+  // region reaches row 0" -- is likewise censored, not constant, and reading
+  // it as constant is what made this look like a non-problem.
+  //
+  // THE SAMPLING WAS NEVER WRONG, and that is worth keeping straight because
+  // it is what rules out the resample: boxLocal already wraps, and the L0
+  // volume agrees with the tree sampler to 9.5e-4 at every step including
+  // across a wrap. The field was always right; only the interval the ray was
+  // allowed to walk was stated in the wrong frame.
+  let woff = select(vec3<f32>(0f), winOffset(vec3<f32>(body.cx, body.cy, body.cz)), WIN_BOX == 1u);
+  let c0 = rm.boxLo[0].xyz + woff;
+  let span = rayBox(ray.o, ray.d, c0, c0 + rm.boxExt[0].xyz);
   if (span.y <= span.x) { return vec4(BG, 1f); }
 
   let tBody = traceBody(ray.o, ray.d, span.x, span.y);

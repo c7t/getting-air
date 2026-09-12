@@ -136,11 +136,28 @@ export function cameraBasis(eye, target, up = [0, 0, 1]) {
 
 // uv in [0,1]^2 with uv.y UP the screen (the quad's own convention in
 // d3_raymarch.wgsl), aspect = width/height.
-export function cameraRay(uv, { eye, fwd, right, up, tanHalfFov, aspect }) {
-  const px = (uv[0] * 2 - 1) * aspect * tanHalfFov;
-  const py = (uv[1] * 2 - 1) * tanHalfFov;
+//
+// TWO PROJECTIONS, and the second is an instrument. Perspective fans the rays
+// from a point; ORTHOGRAPHIC makes them parallel and slides the ORIGIN across
+// the image plane, with `halfHeight` in L0 CELLS. Under it the image is an
+// affine map of the lattice -- a pixel is a known number of cells and a plane
+// in the flow is a straight line at a computable row -- which is what makes a
+// cut measurable in cells instead of estimated through foreshortening.
+export function cameraRay(uv, { eye, fwd, right, up, tanHalfFov, aspect, ortho = false, halfHeight = 0 }) {
+  const sx = (uv[0] * 2 - 1) * aspect;
+  const sy = uv[1] * 2 - 1;
+  if (ortho) {
+    return { o: eye.map((e, k) => e + sx * halfHeight * right[k] + sy * halfHeight * up[k]),
+             d: fwd.slice() };
+  }
+  const px = sx * tanHalfFov, py = sy * tanHalfFov;
   return { o: eye.slice(), d: norm(fwd.map((f, k) => f + px * right[k] + py * up[k])) };
 }
+
+// CELLS PER PIXEL under the orthographic camera. One line, and it is the whole
+// reason that mode exists: an image measurement converts to lattice units with
+// no camera model at all.
+export function orthoScale(halfHeight, imageHeight) { return 2 * halfHeight / imageHeight; }
 
 // Slab method. Returns null when the ray misses, else the [t0, t1] interval
 // with t0 clamped to 0 so an eye INSIDE the box still marches.

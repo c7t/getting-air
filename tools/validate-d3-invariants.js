@@ -184,6 +184,25 @@ const CONFIGS = [
   // not.
   { name: 'body3-volstack', steps: 8, vol: true, volZ: 8,
     url: 'scenario=sphere&n=8&re=20&u0=0.05&q=19&bounceback=1&live=0&levels=3&rb=4&refine=body&interface=explode&vol=1' },
+  // M6.1/M6.4a ON A MOVING WINDOW, which nothing else here covers. Every
+  // other volume config is a sphere in a FIXED buffer, so the resample has
+  // never been scored on a run where the body WRAPS through the domain -- and
+  // "the volume agrees with the sampler" is exactly the claim that would fail
+  // if the window's offset leaked into one path and not the other.
+  //
+  // It cannot, by construction: the volume IS the buffer (the resample walks
+  // buffer positions and sampleTree wraps), and the window is a relabelling
+  // the solver applies only when measuring distance to a sponge face. But
+  // "cannot by construction" is what this file exists to disbelieve, and the
+  // question was asked from a phone looking at a clip.
+  //
+  // REFINED, so the stack's own box arithmetic is under the window too. That
+  // is where the periodic span matters: a shell around a body that wraps
+  // STRADDLES the seam twice a lap, and a bounding box taken as min..max is
+  // then the whole axis. This config is the one that can see it.
+  { name: 'card-vol-window', steps: 400, vol: true, volZ: 20, startsAtRest: true,
+    url: 'scenario=card&n=16&live=0&window=xyz&vol=1'
+       + '&levels=2&rb=4&refine=body&margin=3&interface=explode&dynamic=1&manageEvery=8' },
   // The same depth-3 tree with the MANAGER rebuilding it, on a PINNED body.
   // `drift3` below is what proves the allocator moves tiles; this one is its
   // control -- the criterion agrees with the initial set, so the manager
@@ -455,15 +474,31 @@ async function runConfig(Runtime, o, c, log) {
       let worst = 0, bad = 0, first = null;
       for (let i = 0; i < pick.length; i++) {
         const a = pick[i].u, b = probe[i].u;
-        // Relative to the field's own scale, not to each component: a
-        // velocity component that is legitimately ~0 would otherwise
-        // dominate a relative error it has no business dominating.
-        const mag = Math.max(1e-6, Math.hypot(b[0], b[1], b[2]));
-        const e = Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]) / mag;
-        if (e > worst) worst = e;
-        // 2^-10 is half-precision's mantissa step; 4x it leaves room for the
-        // rounding of each component without admitting a real disagreement.
-        if (e > 4 / 1024) { bad++; if (!first) first = { level: vol.info.level, p: pick[i].p, vol: a, tree: b, rel: e }; }
+        const diff = Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
+        // AN ABSOLUTE FLOOR AT HALF PRECISION'S OWN RESOLUTION, and it is not
+        // slack -- it is the format. binary16's smallest subnormal is 2^-24 =
+        // 5.96e-8, so anything below that is stored as ZERO and a "relative
+        // error" against it is a statement about the decoder, not the volume.
+        //
+        // The 1e-6 floor below was calibrated on the sphere cases, where the
+        // field is ~u0 = 0.05 EVERYWHERE and nothing ever gets near this. A
+        // scenario that starts AT REST does: `card`'s far field sits at 1e-8
+        // after 400 steps, the volume rounds it to 0, and the gate reported
+        // 156 disagreements of which every single one was flush-to-zero. A
+        // real transform error cannot hide under this -- it would put a
+        // different CELL'S value in the texel, which near the body is 1e-2,
+        // four orders up.
+        if (diff > 8 * 2 ** -24) {
+          // Relative to the field's own scale, not to each component: a
+          // velocity component that is legitimately ~0 would otherwise
+          // dominate a relative error it has no business dominating.
+          const mag = Math.max(1e-6, Math.hypot(b[0], b[1], b[2]));
+          const e = diff / mag;
+          if (e > worst) worst = e;
+          // 2^-10 is half-precision's mantissa step; 4x it leaves room for the
+          // rounding of each component without admitting a real disagreement.
+          if (e > 4 / 1024) { bad++; if (!first) first = { level: vol.info.level, p: pick[i].p, vol: a, tree: b, rel: e }; }
+        }
       }
       rows.push({ level: vol.info.level, res: vol.info.res, lo: vol.info.lo, mult: vol.info.mult,
                   bytes: vol.info.bytes, checked: pick.length, worst, bad });

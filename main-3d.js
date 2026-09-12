@@ -240,7 +240,7 @@ async function init() {
     // M6: the resample volume stack and the raymarcher.
     'vol', 'volbox', 'volBudget', 'volstack', 'volMargin',
     'view', 'volfield', 'volIso', 'volGain', 'volOpacity', 'volGamma', 'volStep', 'volSteps',
-    'azim', 'elev', 'dist', 'fov', 'camtarget',
+    'azim', 'elev', 'dist', 'fov', 'camtarget', 'winbox', 'proj',
     // M8.2a: the solid-interior reset, ?solideq=0 to disable for A/B.
     'solideq',
     // D1: the swept-cell force term, ?swept=0 to disable for A/B.
@@ -1840,18 +1840,25 @@ async function init() {
     }
   }
 
+  // ONE STATEMENT OF THE SLICE VIEW'S OVERRIDES, because there are now two
+  // pipelines built from them -- the canvas one here and the offscreen one
+  // debugRenderFrame builds for the movie tool. Two copies of a constants
+  // block that must match one WGSL file is exactly the shape of 238e48c, and
+  // a divergence would show as a movie that did not look like the page.
+  const renderConsts = {
+    ...dims, RB, SAMPLE_LEVELS, ...WINC,
+    // Pinned to 1 because the page pre-normalizes -- see U_SCALE/V_SCALE.
+    VORT_SCALE: 1.0,
+    // Below 1 lifts weak structure toward the top of the ramp instead of
+    // leaving it in the near-black background; these fields are smooth and
+    // have no vortex cores to protect from saturating.
+    VORT_GAMMA: numParam('vortGamma', 0.7),
+  };
   const renderPipe = await device.createRenderPipelineAsync({
     layout: device.createPipelineLayout({ bindGroupLayouts: [renderBGL] }),
     vertex: { module: renderModule, entryPoint: 'vs_main', constants: dims },
-    fragment: { module: renderModule, entryPoint: 'fs_main', targets: [{ format }], constants: {
-      ...dims, RB, SAMPLE_LEVELS, ...WINC,
-      // Pinned to 1 because the page pre-normalizes -- see U_SCALE/V_SCALE.
-      VORT_SCALE: 1.0,
-      // Below 1 lifts weak structure toward the top of the ramp instead of
-      // leaving it in the near-black background; these fields are smooth and
-      // have no vortex cores to protect from saturating.
-      VORT_GAMMA: numParam('vortGamma', 0.7),
-    } },
+    fragment: { module: renderModule, entryPoint: 'fs_main', targets: [{ format }],
+                constants: renderConsts },
     primitive: { topology: 'triangle-list' },
   });
 
@@ -2303,6 +2310,18 @@ async function init() {
   let camElev = numParam('elev', 18) * Math.PI / 180;
   let camDist = numParam('dist', 1.9) * Math.max(NX, NY, NZ);
   const CAM_FOV = numParam('fov', 38) * Math.PI / 180;
+  // PERSPECTIVE OR ORTHOGRAPHIC. The default reads as a picture; the other is
+  // an INSTRUMENT -- parallel rays and a known cells-per-pixel scale, so a
+  // plane in the flow lands at a computable row and can be measured in cells
+  // rather than estimated through foreshortening. The half-height is chosen
+  // so the two FRAME THE SAME at the target plane, which is what makes
+  // switching between them a comparison rather than a different experiment.
+  const camProj = urlParams.get('proj') || 'persp';
+  if (!['persp', 'ortho'].includes(camProj)) {
+    statusEl.textContent = `error: ?proj=${camProj} is not one of persp|ortho`;
+    return;
+  }
+  const CAM_ORTHO = camProj === 'ortho' ? 1 : 0;
   // The camera's UP is the scenario's own DOWN, negated -- the same field the
   // slice view's quarter turn reads. The solver has no opinion about down and
   // must not acquire one; this is the view's business.
@@ -2338,13 +2357,19 @@ async function init() {
   // truncation would cry wolf on the ordinary case.
   const volDepthNote = volClamped
     ? `   [volume stack stops at L${volStack[volStack.length - 1].level} of L${LEVELS - 1}]` : '';
-  let rayPipe = null, rayBG = null, rayBuf = null, rayOffscreen = null;
+  let rayPipe = null, rayBG = null, rayBuf = null;
+  // THE OFFSCREEN TARGET AND ITS TWO PIPELINES, shared by M6.4b's image
+  // difference and by tools/render-d3-movie.js. One texture, resized when a
+  // caller asks for a different frame size, and one pipeline per view in the
+  // offscreen format -- see debugRenderFrame below for why neither of them
+  // goes through the canvas.
+  const offscreen = { tex: null, w: 0, h: 0, volume: null, slice: null };
   // WHICH VIEW IS DRAWING. `?view=` chooses the initial one; the <select>
   // switches at runtime, and it can only offer `volume` where the volumes
   // exist -- which is `?vol=` and not `?view=`, since the volumes are the
   // memory and the view is free. So the raymarcher is built whenever there
   // is something for it to march, including under the slice view, where it
-  // costs one pipeline and makes debugRenderVolume reachable from the M6.1
+  // costs one pipeline and makes debugRenderFrame reachable from the M6.1
   // gate configs as well.
   let viewMode = VIEW;
   if (VIEW === 'volume' && !volStack.length) {
@@ -2372,7 +2397,12 @@ async function init() {
       code: await loadShader('shaders/d3_raymarch.wgsl'), label: 'd3_raymarch' });
     const rayConsts = { ...dims, ...WINC, HAS_BODY,
                         UP_AXIS: CAM_UP_AXIS, UP_SIGN: CAM_UP_SIGN,
-                        VOL_GAMMA: numParam('volGamma', 0.7) };
+                        VOL_GAMMA: numParam('volGamma', 0.7),
+                        PROJ: CAM_ORTHO,
+                        // ?winbox=0 marches the buffer's box instead of the
+                        // window's. Default 1; measured worth nothing, kept
+                        // because the window is the frame the picture is in.
+                        WIN_BOX: urlParams.get('winbox') === '0' ? 0 : 1 };
     const mkRayPipe = (fmt) => device.createRenderPipelineAsync({
       layout: device.createPipelineLayout({ bindGroupLayouts: [rayBGL] }),
       vertex: { module: rayModule, entryPoint: 'vs_main', constants: rayConsts },
@@ -2380,11 +2410,11 @@ async function init() {
       primitive: { topology: 'triangle-list' },
     });
     rayPipe = await mkRayPipe(format);
-    // Offscreen, in a FIXED format and at a FIXED size, for M6.4b's image
-    // difference. Deliberately not the canvas: a gate that rendered through
-    // the swap chain would be comparing two pictures at whatever size and
-    // device-pixel-ratio the browser happened to give each run.
-    rayOffscreen = { pipe: await mkRayPipe('rgba8unorm') };
+    // The offscreen twin, in the format debugRenderFrame reads. Built here
+    // rather than on first use because the volume view's whole reason to
+    // exist is to be looked at, and both of the things that look at it (the
+    // M6.4b gate and the movie tool) go through this pipeline.
+    offscreen.volume = await mkRayPipe('rgba8unorm');
     rayBG = device.createBindGroup({ layout: rayBGL, entries: [
       { binding: 0, resource: { buffer: rayBuf } },
       { binding: 1, resource: device.createSampler({ magFilter: 'linear', minFilter: 'linear' }) },
@@ -2401,7 +2431,11 @@ async function init() {
     if (!rayBuf) return;
     const aspect = aspectOverride || (canvas.width / Math.max(1, canvas.height));
     const b = new Float32Array(48);
-    b.set([camAzim, camElev, camDist, Math.tan(CAM_FOV / 2)], 0);
+    // cam.w is tan(fov/2) under perspective and the HALF-HEIGHT IN L0 CELLS
+    // under orthographic -- the same number scaled by the distance, so the two
+    // projections frame identically at the target plane.
+    const halfTan = Math.tan(CAM_FOV / 2);
+    b.set([camAzim, camElev, camDist, CAM_ORTHO ? camDist * halfTan : halfTan], 0);
     b.set([aspect, VOL_STEP, volIso, volGain], 4);
     b.set([volField, VOL_OPACITY, volStack.length, VOL_STEPS], 8);
     b.set([CAM_TARGET[0], CAM_TARGET[1], CAM_TARGET[2], CAM_FOLLOW], 12);
@@ -2498,39 +2532,96 @@ async function init() {
     return { field: VOL_FIELDS[volField], iso: volIso, gain: volGain };
   }
 
-  // THE GATE (M6.4b). The raymarcher rendered OFFSCREEN at a fixed size into
-  // a fixed format, returned as base64 RGBA. Two runs of two builds
-  // (?volstack=1 against ?volstack=0) then differ pixel by pixel, and
-  // d3-volume.mjs says independently which pixels are ALLOWED to differ: the
-  // ones whose ray touches a refined box. A render that changed everywhere
-  // would mean the box transform is wrong rather than that it got sharper.
-  async function debugRenderVolume(size) {
-    if (!rayOffscreen) return { skipped: 'no raymarcher (?view=slice)' };
-    const w = Math.max(16, Math.min(512, Math.round(size || 192)));
-    const h = w;
-    if (!rayOffscreen.tex || rayOffscreen.w !== w) {
-      if (rayOffscreen.tex) rayOffscreen.tex.destroy();
-      rayOffscreen.tex = device.createTexture({
-        size: [w, h], format: 'rgba8unorm', label: 'd3_ray_offscreen',
+  // The camera, from a tool. Same argument as debugSetVolume above: the drag
+  // and the URL cover a person, but a MOVIE has to turn the camera between
+  // frames, and reloading the page per frame would restart the flow.
+  // Returns the resolved state, so a caller reads what it got.
+  function debugSetCamera(opts = {}) {
+    if (!rayBuf) return { skipped: 'no raymarcher (?vol=0)' };
+    // Degrees in, radians held -- the same convention ?azim= and ?elev= use,
+    // because a caller that has to convert is a caller that will sometimes
+    // forget to.
+    if (opts.azim != null) camAzim = opts.azim * Math.PI / 180;
+    if (opts.elev != null) camElev = Math.max(-83, Math.min(83, opts.elev)) * Math.PI / 180;
+    if (opts.dist != null) camDist = Math.max(1e-3, opts.dist) * Math.max(NX, NY, NZ);
+    if (opts.dAzim != null) camAzim += opts.dAzim * Math.PI / 180;
+    if (opts.dElev != null) camElev = Math.max(-1.45, Math.min(1.45, camElev + opts.dElev * Math.PI / 180));
+    writeRayParams();
+    return { azim: camAzim * 180 / Math.PI, elev: camElev * 180 / Math.PI,
+             dist: camDist / Math.max(NX, NY, NZ) };
+  }
+
+  // ONE FRAME, RENDERED OFFSCREEN at a size the caller chooses, into a FIXED
+  // format, returned as base64 RGBA. Two callers, and they want the same
+  // three properties:
+  //
+  //   M6.4b's gate renders the same state twice in two builds and differs
+  //   them pixel by pixel. The frame tools/render-d3-movie.js writes is one
+  //   of 900 that have to be the same size and the same shape as each other.
+  //
+  // DELIBERATELY NOT THE CANVAS, for both. Going through the swap chain
+  // would make the result depend on whatever size and device-pixel-ratio the
+  // browser happened to give this run, would race the animation loop (so the
+  // state rendered is not the state that was asked for), and on a headless
+  // Chrome is not reliably readable at all. This path is encoded, submitted
+  // and mapped by the caller's own await.
+  //
+  // THE SLICE VIEW IS RENDERED THE SAME WAY, through a second pipeline in the
+  // offscreen format. It is not the more interesting picture of a tumbling
+  // plate, but it is the picture this project debugs with, and a movie mode
+  // that could only film one of the two views would send someone back to a
+  // screen recorder for the other.
+  async function debugRenderFrame(opts = {}) {
+    const o = typeof opts === 'number' ? { w: opts } : (opts || {});
+    const view = o.view || viewMode;
+    if (view === 'volume' && !rayPipe) return { skipped: 'no raymarcher (?vol=0)' };
+    if (!['slice', 'volume'].includes(view)) return { error: `no such view: ${view}` };
+    const w = Math.max(16, Math.min(2048, Math.round(o.w || 192)));
+    // THE SLICE'S HEIGHT FOLLOWS ITS PLANE unless the caller insists. That is
+    // resize()'s rule for the canvas and it is the same distortion either way:
+    // a slice drawn to an aspect that is not the plane's renders a sphere as
+    // an ellipse. The volume view has no such constraint -- a perspective
+    // camera carries the aspect -- so there the default is square.
+    const [pw, ph] = planeExtent(axis);
+    const h = Math.max(16, Math.min(2048, Math.round(
+      o.h || (view === 'slice' ? w * ph / pw : w))));
+    if (!offscreen.tex || offscreen.w !== w || offscreen.h !== h) {
+      if (offscreen.tex) offscreen.tex.destroy();
+      offscreen.tex = device.createTexture({
+        size: [w, h], format: 'rgba8unorm', label: 'd3_offscreen',
         usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
-      rayOffscreen.w = w;
+      offscreen.w = w; offscreen.h = h;
     }
-    writeRayParams(1);                       // square, so the aspect is not the canvas's
+    // The slice pipeline is built ON FIRST USE rather than alongside
+    // renderPipe: every validation config in the suite creates that one, and
+    // none of them wants a second copy of it in a format only a movie reads.
+    if (view === 'slice' && !offscreen.slice) {
+      offscreen.slice = await device.createRenderPipelineAsync({
+        layout: device.createPipelineLayout({ bindGroupLayouts: [renderBGL] }),
+        vertex: { module: renderModule, entryPoint: 'vs_main', constants: dims },
+        fragment: { module: renderModule, entryPoint: 'fs_main',
+          targets: [{ format: 'rgba8unorm' }], constants: renderConsts },
+        primitive: { topology: 'triangle-list' },
+      });
+    }
+    if (view === 'volume') writeRayParams(w / h);
     const rowBytes = Math.ceil(w * 4 / 256) * 256;
     const buf = device.createBuffer({ size: rowBytes * h, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
     const enc = device.createCommandEncoder();
-    encodeResample(enc); encodeScalar(enc);
+    if (view === 'volume') { encodeResample(enc); encodeScalar(enc); }
     const pass = enc.beginRenderPass({ colorAttachments: [{
-      view: rayOffscreen.tex.createView(),
-      clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: 'clear', storeOp: 'store' }]});
-    pass.setPipeline(rayOffscreen.pipe); pass.setBindGroup(0, rayBG); pass.draw(6); pass.end();
-    enc.copyTextureToBuffer({ texture: rayOffscreen.tex },
+      view: offscreen.tex.createView(),
+      clearValue: { r: 0.07, g: 0.07, b: 0.1, a: 1 }, loadOp: 'clear', storeOp: 'store' }]});
+    if (view === 'volume') { pass.setPipeline(offscreen.volume); pass.setBindGroup(0, rayBG); }
+    else { pass.setPipeline(offscreen.slice); pass.setBindGroup(0, renderBG); }
+    pass.draw(6); pass.end();
+    enc.copyTextureToBuffer({ texture: offscreen.tex },
       { buffer: buf, bytesPerRow: rowBytes, rowsPerImage: h }, { width: w, height: h, depthOrArrayLayers: 1 });
     device.queue.submit([enc.finish()]);
     await buf.mapAsync(GPUMapMode.READ);
     const raw = new Uint8Array(buf.getMappedRange().slice(0));
     buf.unmap(); buf.destroy();
-    writeRayParams();
+    if (view === 'volume') writeRayParams();
     // Tightly packed, row padding removed, then base64 -- a 192x192 image is
     // 147 KB of bytes and 196 KB of text, which goes through Runtime.evaluate
     // without ceremony where an array of 147456 numbers would not.
@@ -2538,10 +2629,14 @@ async function init() {
     for (let y = 0; y < h; y++) px.set(raw.subarray(y * rowBytes, y * rowBytes + w * 4), y * w * 4);
     let s = '';
     for (let i = 0; i < px.length; i += 8192) s += String.fromCharCode(...px.subarray(i, i + 8192));
-    return { w, h, rgba: btoa(s),
-             camera: { azim: camAzim, elev: camElev, dist: camDist, fov: CAM_FOV,
-                       upAxis: CAM_UP_AXIS, upSign: CAM_UP_SIGN,
-                       target: CAM_TARGET, follow: CAM_FOLLOW, aspect: 1 },
+    return { w, h, view, step, rgba: btoa(s),
+             camera: rayBuf ? { azim: camAzim, elev: camElev, dist: camDist, fov: CAM_FOV,
+                                upAxis: CAM_UP_AXIS, upSign: CAM_UP_SIGN,
+                                target: CAM_TARGET, follow: CAM_FOLLOW, aspect: w / h,
+                                // Under ?proj=ortho, the half-height in L0
+                                // CELLS -- so a caller converts pixels to
+                                // cells with no camera model at all.
+                                proj: camProj, orthoHalf: camDist * Math.tan(CAM_FOV / 2) } : null,
              stack: volStack.map(v => ({ level: v.level, lo: v.lo, ext: v.ext, res: v.res, h: v.h })) };
   }
 
@@ -4430,6 +4525,10 @@ async function init() {
       // the property worth being able to assert.
       volRefs: { q: Q_REF_SCALE, omega: V_SCALE, u: U_SCALE },
       camera: volStack.length ? { azim: camAzim, elev: camElev, dist: camDist, fov: CAM_FOV,
+                          // Under ?proj=ortho this is the half-height in L0
+                          // CELLS, so a tool converts pixels to cells with
+                          // 2 * orthoHalf / imageHeight and no camera model.
+                          proj: camProj, orthoHalf: camDist * Math.tan(CAM_FOV / 2),
                           upAxis: CAM_UP_AXIS, upSign: CAM_UP_SIGN, target: CAM_TARGET,
                           follow: CAM_FOLLOW, field: VOL_FIELDS[volField],
                           iso: volIso, gain: volGain } : null,
@@ -4449,8 +4548,8 @@ async function init() {
     readSubsampled, readDuctProfile, readStats, readBody, readPoolStats, debugCriterion,
     debugPoolUsage, debugCheckQCoverage, debugParentChildMiss,
     debugCheck21Balance, debugCheckGeometryCoverage, debugCheckRingParents, debugPoolState,
-    debugRunBalance, debugSampleTree, debugCheckTreeSample, debugReadVolume, debugRenderVolume,
-    debugSetVolume,
+    debugRunBalance, debugSampleTree, debugCheckTreeSample, debugReadVolume,
+    debugRenderFrame, debugSetVolume, debugSetCamera,
     debugHotspot, debugRunAndCollect, debugOccupancy,
     readInterfaceDiag, readFluxAcc,
     debugStepSync,

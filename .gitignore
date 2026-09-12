@@ -8,6 +8,11 @@ https.py
 *.pem
 *~
 *.mp4
+# tools/render-d3-movie.js writes here by default, in whichever container
+# format was asked for. *.mp4 was already ignored; the other two are the same
+# thing under a different --out=.
+*.gif
+*.webm
 *.log
 telemetry.log
 
