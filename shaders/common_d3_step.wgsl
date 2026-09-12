@@ -152,6 +152,11 @@ override USE_BOUNCEBACK : u32 = 0u;
 // body moves; `?solideq=0` restores the old behaviour for A/B, which is how
 // the measurements in the block below were taken.
 override SOLID_EQ : u32 = 1u;
+// Ladd's wall density. See common_d3_force.wgsl's RHO_W_LOCAL header for the
+// derivation: with rho_w pinned at 1 the coupling is not Galilean invariant,
+// by a term proportional to (rho - rho_w). The STEP has to take the same value
+// the FORCE does or the fluid feels a different force from the one reported.
+override RHO_W_LOCAL : u32 = 1u;
 
 // Width of the diffuse chi band, in lattice cells. 1.5 matches the 2D
 // dense kernel exactly.
@@ -220,6 +225,19 @@ fn step(@builtin(global_invocation_id) gid: vec3<u32>) {
   let phi = select(1e30f, get_phi3(p, body), HAS_BODY != 0u);
   let us = select(vec3<f32>(0f), bodyVelocity3(p, body), HAS_BODY != 0u);
 
+  // The wall density for Ladd's correction, from this cell's own pre-streaming
+  // populations. NOT circular -- the note this replaces worried about "this
+  // cell's own not-yet-gathered rho", and that is the POST-streaming one; the
+  // pre-streaming density is sitting in f_in and is the value the force kernel
+  // reads for the same cell at the same instant, which is what makes the two
+  // agree exactly. Only cells that can have a solid neighbour pay the loads.
+  var rhoW = 1f;
+  if (HAS_BODY != 0u && USE_BOUNCEBACK != 0u && RHO_W_LOCAL != 0u && phi < 2f) {
+    var sum = 0f;
+    for (var i = 0u; i < QN; i++) { sum += f_in[i * ncells + cell]; }
+    rhoW = sum;
+  }
+
   var f : array<f32, QN>;
   for (var i = 0u; i < QN; i++) {
     let sxi = i32(x) - ex[i];
@@ -231,10 +249,8 @@ fn step(@builtin(global_invocation_id) gid: vec3<u32>) {
       // population that was heading toward it (opp[i], since direction i's
       // source being solid puts the wall in direction opp[i] from here),
       // with Ladd's moving-wall correction for the body's local velocity.
-      // rho = 1 in the correction -- the standard near-incompressible
-      // approximation for this term specifically, which avoids a circular
-      // dependency on this cell's own not-yet-gathered rho.
-      let corr = 2f * wt[i] * dot(vec3<f32>(f32(ex[i]), f32(ey[i]), f32(ez[i])), us) / CS2;
+      // rhoW is this cell's own pre-streaming density -- see RHO_W_LOCAL.
+      let corr = 2f * wt[i] * rhoW * dot(vec3<f32>(f32(ex[i]), f32(ey[i]), f32(ez[i])), us) / CS2;
       f[i] = f_in[opp[i] * ncells + cell] + corr;
     } else if ((WALL_X | WALL_Y | WALL_Z) != 0u && wallSourceOutside3(x, y, z, i)) {
       // The source is inside the wall, so there is no fluid population to

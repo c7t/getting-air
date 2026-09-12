@@ -76,6 +76,57 @@ override CHI_EPS : f32 = 1.5f;
 // old force for an A/B.
 override SWEPT_FORCE : u32 = 1u;
 
+// --- THE WALL DENSITY IN LADD'S CORRECTION (plans/3D.md D3) ----------------
+//
+// THE MOMENTUM-EXCHANGE FORCE IS GALILEAN-INVARIANT IF AND ONLY IF THE
+// MOVING-WALL CORRECTION CARRIES THE LOCAL DENSITY. This is a derivation, not
+// a preference, and it is short enough to write out.
+//
+// Boost the whole problem by a uniform velocity V. Nothing physical changes,
+// so the force must not either. To first order in V the populations shift by
+//
+//     df_i = w_i * rho * (e_i . V) / cs^2
+//
+// and the body's velocity becomes u_w + V. Take the two halves of the sum
+// below in turn, over the links where the source is solid:
+//
+//     the 2*f_opp half changes by   + SUM 2 w_i rho   e_i (e_i.V) / cs^2
+//     the corr half changes by      - SUM 2 w_i rho_w e_i (e_i.V) / cs^2
+//
+// (the first picks up a sign because e_opp = -e_i). So the total change is
+//
+//     SUM 2 w_i (rho - rho_w) e_i (e_i . V) / cs^2
+//
+// which is EXACTLY ZERO iff rho_w is the density at that fluid node, and is
+// otherwise a force linear in V that no amount of resolution removes.
+//
+// WITH rho_w PINNED AT 1 -- which is what both step kernels and both force
+// kernels did until now, each calling it "the standard near-incompressible
+// approximation" -- the residual is proportional to (rho - 1), i.e. to the
+// compressibility, i.e. to Ma^2. That sounds negligible and is not: the
+// momentum exchange is a small NET of large per-link terms, so a 0.3% error
+// in each population, summed coherently over a whole surface, is tens of
+// percent of the drag. MEASURED, on the Galilean split at fixed grid, Re,
+// domain and blockage: Cd falls 15.5% at U = 0.0125 and 29.6% at U = 0.025 --
+// DOUBLING with U, which is the signature this predicts (the error goes as
+// (rho-1)*V ~ U^3 against a drag of U^2).
+//
+// AND THE FLOW IS NOT WHERE IT SHOWS. Enstrophy is exactly frame-invariant
+// and matches to 0.3% between the two frames on both the dense and the pool
+// path, while the reported Cd differs by 19% and 47%. So the fields agree and
+// only the READING differs, which is what makes this a force-kernel defect
+// and what makes the derivation above the whole story.
+//
+// IDENTICALLY ZERO ON A PINNED BODY, because corr itself is: u_w = 0 makes the
+// whole correction vanish whatever rho_w is. Every pinned gate in this suite
+// is bit-identical across it. `?rhow=0` restores the old constant for an A/B.
+//
+// THE STEP KERNELS TAKE THE SAME rho_w, and must: the force this kernel
+// reports has to be the force the fluid actually felt. They read the same
+// `f_in` at the same cell at the same instant, so the two agree exactly rather
+// than approximately.
+override RHO_W_LOCAL : u32 = 1u;
+
 // --- FINEST-WINS MASKING (plans/3D.md M4.1d) -------------------------------
 //
 // A cell under a refined block is integrated by common_d3_force_pool.wgsl
@@ -144,12 +195,22 @@ fn main(
       // solid-interior cell has no meaningful outgoing population to read
       // as momentum transfer.
       if (phi >= 0f) {
+        // The wall density, from this cell's own pre-streaming populations --
+        // see RHO_W_LOCAL. Only cells that can HAVE a solid neighbour pay for
+        // it: a link reaches at most one cell, so phi < 2 covers every cell
+        // the loop below can find one from, with a cell to spare.
+        var rhoW = 1f;
+        if (RHO_W_LOCAL != 0u && phi < 2f) {
+          var sum = 0f;
+          for (var i = 0u; i < QN; i++) { sum += f_in[i * ncells + cell]; }
+          rhoW = sum;
+        }
         for (var i = 0u; i < QN; i++) {
           let ei = vec3<f32>(f32(ex[i]), f32(ey[i]), f32(ez[i]));
           let sp = p - ei;
           if (get_phi3(sp, body) < 0f) {
             let fOpp = f_in[opp[i] * ncells + cell];
-            let corr = 2f * wt[i] * dot(ei, us) / CS2;
+            let corr = 2f * wt[i] * rhoW * dot(ei, us) / CS2;
             fb += -ei * (2f * fOpp + corr);
           }
         }

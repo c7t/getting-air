@@ -49,6 +49,10 @@ override USE_BOUNCEBACK : u32 = 0u;
 // See common_d3_step.wgsl's SOLID_EQ. Same default, same meaning; the two
 // kernels must agree, and main-3d.js passes one value to both.
 override SOLID_EQ : u32 = 1u;
+// Ladd's wall density, the pool's copy -- see common_d3_force.wgsl's
+// RHO_W_LOCAL header. Same value as the dense step and both force kernels;
+// main-3d.js passes one number to all four.
+override RHO_W_LOCAL : u32 = 1u;
 // Chi band in FINE cells. The band is a physical width, and a fine cell is
 // half a coarse cell, so the same physical band is 2x as many fine cells --
 // which is exactly the correction the 2D solver's K_EPS * dx_L1 makes, and
@@ -228,6 +232,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let phi = select(1e30f, get_phi3(p, body), HAS_BODY != 0u);
   let us = select(vec3<f32>(0f), bodyVelocity3(p, body), HAS_BODY != 0u);
 
+  // This cell's pre-streaming density, for Ladd's correction. Same rule and
+  // same guard as the dense step; the force kernel reads the same `f_in` at
+  // the same cell, so the force applied here and the force reported there are
+  // the same number rather than two approximations of it.
+  var rhoW = 1f;
+  if (HAS_BODY != 0u && USE_BOUNCEBACK != 0u && RHO_W_LOCAL != 0u && phi < 2f) {
+    var sum = 0f;
+    for (var i = 0u; i < QN; i++) { sum += f_in[i * poolPlane + cell]; }
+    rhoW = sum;
+  }
+
   var f: array<f32, QN>;
   for (var i = 0u; i < QN; i++) {
     let ei = vec3<i32>(ex[i], ey[i], ez[i]);
@@ -244,7 +259,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         fineToCoarseUnit3(s.y, origin.y),
         fineToCoarseUnit3(s.z, origin.z)) * L0_SCALE + L0_OFFSET;
       if (get_phi3(sp, body) < 0f) {
-        let corr = 2f * wt[i] * dot(vec3<f32>(f32(ei.x), f32(ei.y), f32(ei.z)), us) / CS2;
+        let corr = 2f * wt[i] * rhoW * dot(vec3<f32>(f32(ei.x), f32(ei.y), f32(ei.z)), us) / CS2;
         f[i] = f_in[opp[i] * poolPlane + cell] + corr;
         continue;
       }

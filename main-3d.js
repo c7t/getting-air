@@ -204,6 +204,8 @@ async function init() {
     'solideq',
     // D1: the swept-cell force term, ?swept=0 to disable for A/B.
     'swept',
+    // D3: Ladd's wall density, ?rhow=0 to restore the pinned 1 for A/B.
+    'rhow',
     // M8.2b: the fall scenario's two reference frames.
     'tow', 'stream',
     // M8.3: the moving window, per axis. ?window=x, ?window=0 to force it off.
@@ -961,6 +963,15 @@ async function init() {
   // reason SOLID_EQ is: the dense and pool paths must charge the same body
   // for the same thing.
   const SWEPT_FORCE = urlParams.get('swept') === '0' ? 0 : 1;
+  // D3. Ladd's moving-wall correction carries the LOCAL density rather than a
+  // pinned 1 -- see shaders/common_d3_force.wgsl's RHO_W_LOCAL header for why
+  // that is what makes the coupling Galilean invariant. Default ON; ?rhow=0
+  // restores the constant for an A/B. Identically zero on a PINNED body (the
+  // correction itself vanishes at u_w = 0), so every pinned gate is
+  // bit-identical. Passed to ALL FOUR kernels from here -- both step kernels
+  // and both force kernels -- because the force reported must be the force
+  // applied, and a mismatch there is invisible.
+  const RHO_W_LOCAL = urlParams.get('rhow') === '0' ? 0 : 1;
   const CHI_EPS = numParam('chiEps', 1.5);
   const sponge = params.sponge || { width: 0, u: [0, 0, 0] };
   const stepConstants = {
@@ -970,7 +981,7 @@ async function init() {
     WALL_X: params.walls.includes('x') ? 1 : 0,
     WALL_Y: params.walls.includes('y') ? 1 : 0,
     WALL_Z: params.walls.includes('z') ? 1 : 0,
-    HAS_BODY, USE_BOUNCEBACK, CHI_EPS, SOLID_EQ, ...WINC,
+    HAS_BODY, USE_BOUNCEBACK, CHI_EPS, SOLID_EQ, RHO_W_LOCAL, ...WINC,
     SPONGE_W: sponge.width, SPONGE_UX: sponge.u[0], SPONGE_UY: sponge.u[1], SPONGE_UZ: sponge.u[2],
     // M4.1a: skip cells a refined block covers. Folds out entirely when
     // there is no pool.
@@ -991,7 +1002,7 @@ async function init() {
   const forcePipe = HAS_BODY ? await device.createComputePipelineAsync({
     layout: device.createPipelineLayout({ bindGroupLayouts: [forceBGL] }),
     compute: { module: forceModule, entryPoint: 'main', constants: {
-      ...dims, WGX: WG[0], WGY: WG[1], WGZ: WG[2], USE_BOUNCEBACK, CHI_EPS, SWEPT_FORCE, ...WINC } },
+      ...dims, WGX: WG[0], WGY: WG[1], WGZ: WG[2], USE_BOUNCEBACK, CHI_EPS, SWEPT_FORCE, RHO_W_LOCAL, ...WINC } },
   }) : null;
   const physPipe = HAS_BODY ? await device.createComputePipelineAsync({
     layout: device.createPipelineLayout({ bindGroupLayouts: [physicsBGL] }),
@@ -1324,7 +1335,7 @@ async function init() {
       ...bodyFrameAt(1),
       OMEGA_FINE: 1 / TAU_FINE,
       FORCE_X: params.force[0], FORCE_Y: params.force[1], FORCE_Z: params.force[2],
-      HAS_BODY, USE_BOUNCEBACK, CHI_EPS, SOLID_EQ, ...WINC,
+      HAS_BODY, USE_BOUNCEBACK, CHI_EPS, SOLID_EQ, RHO_W_LOCAL, ...WINC,
       SPONGE_W: sponge.width, SPONGE_UX: sponge.u[0], SPONGE_UY: sponge.u[1], SPONGE_UZ: sponge.u[2],
     });
     avgPipe = await mk(avgBGL, avgModule, { ...poolConst, TAU_COARSE, DC_PRE });
@@ -1518,7 +1529,7 @@ async function init() {
         // a momentum per MACRO step because that is how often the body's pose
         // moves. See common_d3_force_pool.wgsl's SWEPT_WEIGHT header -- one
         // weight for both would over-charge a moving body by 2^m.
-        ...finePC, USE_BOUNCEBACK, CHI_EPS, SWEPT_FORCE,
+        ...finePC, USE_BOUNCEBACK, CHI_EPS, SWEPT_FORCE, RHO_W_LOCAL,
         DX_WEIGHT: 4 ** -m, SWEPT_WEIGHT: 8 ** -m, ...bodyFrameAt(m), ...WINC,
       });
       // Reads the pool buffer substep A will read, i.e. that level's time-t
@@ -1646,7 +1657,7 @@ async function init() {
           ...bodyFrameAt(m),
           OMEGA_FINE: 1 / tauAtLevel(m),
           FORCE_X: params.force[0], FORCE_Y: params.force[1], FORCE_Z: params.force[2],
-          HAS_BODY, USE_BOUNCEBACK, CHI_EPS, SOLID_EQ, ...WINC,
+          HAS_BODY, USE_BOUNCEBACK, CHI_EPS, SOLID_EQ, RHO_W_LOCAL, ...WINC,
           SPONGE_W: sponge.width, SPONGE_UX: sponge.u[0], SPONGE_UY: sponge.u[1], SPONGE_UZ: sponge.u[2],
         });
         // Explode reads the parent buffer holding time t -- the one the

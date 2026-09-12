@@ -456,25 +456,58 @@ re-argued. Two things are settled and load-bearing:
   read 1.0024 -- a 12% area error reported as physics. `make test` asserts it
   by COUNTING SOLID CELLS.
 
-- **A MOVING BODY ON THE POOL READS ~34% MORE DRAG THAN THE SAME BODY PINNED,
-  AND EVERY SWITCHABLE CAUSE IS RULED OUT** (plans/3D.md D3, OPEN). The
-  Galilean split at `?levels=2` gives Cd 1.3027 pinned against 1.9203 towed --
-  opposite in sign to D1, so it is not a worse version of it. Not the manager
-  (a STATIC tile set reads +40%), not its cadence, not the margin, not the
-  moving window (+43% with `?window=0`), not D1's swept term (+39% with
-  `?swept=0`), not the interface scheme (interp is worse), not tile size. **It
-  FALLS ~4x per rung of the body's own level** (+34% at depth 2, +7.8% at
-  depth 3), so it is a convergent discretization error of the pool's
-  moving-boundary treatment rather than a lost tile -- and the falling card,
-  which must live deep for stability, is therefore less exposed than the
-  depth-2 number suggests. `tow_amr_cases` pins both numbers as a REGRESSION
-  bound; re-baseline them downward when it is fixed, never widen them.
+- **NO MOVING-BODY DRAG NUMBER BELOW tau ~ 0.55 IS TRUSTWORTHY, on the dense
+  path OR the pool** (plans/3D.md D1/D3). The bounce-back moving-body coupling
+  degrades as tau -> 1/2. Measured by momentum budget in a periodic
+  sponge-free box, where the fluid's momentum can only change through the body
+  so `sum F` must equal `-dP` exactly, the force is short by
+  **16.6% / 3.6% / 1.5% / 0.0% at tau = 0.509 / 0.55 / 0.6 / 0.8**, with
+  `deficit * (tau - 1/2)` constant at ~1.6e-3 -- i.e. it goes as
+  1/(tau - 1/2), linear in Re at fixed U and D. The Galilean split says it
+  from the other side: at tau = 0.509 the dense path reads -18.5% across the
+  frame and the pool +47.3%, and **at tau = 0.6 both are flat to ~1% and agree
+  with each other to ~1%**. So the two are ONE defect on two discretizations,
+  not a dense bug and a pool bug. This is Lambda = (tau-1/2)^2 biting: 8.1e-5
+  at tau = 0.509, against the 3/16 at which halfway bounce-back places the
+  wall exactly halfway (benchmarks/d3.json's tolerances_note already records
+  that constant for the STATIC duct cases). A TRT collision, which fixes
+  Lambda independently of tau, is the standard remedy and would be a real
+  change to this solver.
 
-- **EVERY CROSS-LEVEL GATE HERE HAD A PINNED BODY UNTIL D3**, which is exactly
-  how a 34% error survived -- the same shape of hole D1 sat in one level down.
-  When adding a gate for machinery that a MOVING body exercises, check whether
-  anything in the suite actually moves one; `drift` translates with the fluid
-  force OFF and `spin` rotates with it OFF, so neither counts.
+- **AND IT SHARPENS M8.0 RATHER THAN CONTRADICTING IT.** M8.0 says the card's
+  stability margin is bought with RESOLUTION because tau = 1/2 + 6 u_t a / Re,
+  and that AMR is the stability mechanism rather than an optimization.
+  Accuracy now says the same thing for the same reason: `tauAtLevel` doubles
+  (tau - 1/2) per rung, so a body on a refined level has a proportionally more
+  accurate moving-body coupling as well as a more stable one.
+
+- **A PINNED BODY AT LOW tau IS FINE, which is why nothing caught this** --
+  sphere-Re200-D16 runs at tau = 0.512 and sits +7.0% against
+  Schiller-Naumann, because its wall-position error is a FIXED offset that
+  lands inside the standing staircase allowance. It is the MOVING coupling
+  that degrades, and until D1 nothing in this suite moved a body and measured
+  its drag. `tow_amr_cases` now gates the frame agreement at tau = 0.6 (towed
+  within 3% of pinned, measured 1.0%) and pins the tau = 0.509 number as a
+  regression marker.
+
+- **ENSTROPHY IS THE FRAME-INVARIANT DISCRIMINATOR, and it is what separated
+  "the flow is wrong" from "the reading is wrong".** Vorticity does not see a
+  uniform velocity shift, so two Galilean frames of one flow must report the
+  same enstrophy whatever their Cd says. They match to 0.3% on both paths
+  while Cd differs by 19% and 47% -- which retired the fresh-node refill as a
+  suspect in one measurement, after a whole entry had been written blaming it.
+  Reach for it before theorizing about a moving-body coupling.
+
+- **RULED OUT AND DERIVED, so it is not re-litigated: the wall density in
+  Ladd's correction.** The momentum-exchange force is Galilean invariant to
+  FIRST order in the frame velocity iff the correction carries the LOCAL
+  density rather than a pinned 1 (the two halves of the sum shift by
+  `+SUM 2 w_i rho e_i(e_i.V)/cs^2` and `-SUM 2 w_i rho_w e_i(e_i.V)/cs^2`, and
+  cancel exactly when rho_w = rho). All four kernels now do that
+  (`RHO_W_LOCAL`, `?rhow=0` to A/B, identically zero on a pinned body). **It
+  is worth 0.04%** -- front (rho > 1) and rear (rho < 1) cancel over a closed
+  surface. Kept because it is the correct formula and costs nothing, NOT
+  because it fixed anything.
 
 - **Bounce-back is the accurate solid coupling in 3D; diffuse (chi) is
   not.** Sphere Cd measures +7..13% against Schiller-Naumann with

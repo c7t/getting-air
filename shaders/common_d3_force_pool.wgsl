@@ -93,6 +93,12 @@ override CHI_EPS : f32 = 1.5f;
 // swept momentum by 2^m, which on a body-fitted shell is the whole term.
 override SWEPT_FORCE : u32 = 1u;
 
+// Ladd's wall density, the pool's copy. common_d3_force.wgsl's RHO_W_LOCAL
+// header carries the derivation and the measurement; nothing about it is
+// level-dependent, because rho is a lattice quantity and is the same number at
+// every level.
+override RHO_W_LOCAL : u32 = 1u;
+
 // dx^3 = 8^-m: the swept term's own weight, per the header. 0.125 at m = 1.
 override SWEPT_WEIGHT : f32 = 0.125f;
 
@@ -211,6 +217,12 @@ fn main(
       // coarse kernel's branch: only a FLUID cell with at least one link
       // into a solid neighbour contributes.
       if (phi >= 0f) {
+        var rhoW = 1f;
+        if (RHO_W_LOCAL != 0u && phi < 2f) {
+          var sum = 0f;
+          for (var i = 0u; i < QN; i++) { sum += f_in[i * poolPlane + cell]; }
+          rhoW = sum;
+        }
         for (var i = 0u; i < QN; i++) {
           let ei = vec3<f32>(f32(ex[i]), f32(ey[i]), f32(ez[i]));
           // The source in COARSE units is one FINE cell back, which is half
@@ -222,7 +234,7 @@ fn main(
             fineToCoarseUnit3(i32(fi.z) - ez[i], origin.z)) * L0_SCALE + L0_OFFSET;
           if (get_phi3(sp, body) < 0f) {
             let fOpp = f_in[opp[i] * poolPlane + cell];
-            let corr = 2f * wt[i] * dot(ei, us) / CS2;
+            let corr = 2f * wt[i] * rhoW * dot(ei, us) / CS2;
             fb += -ei * (2f * fOpp + corr);
           }
         }
