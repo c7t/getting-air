@@ -70,6 +70,25 @@
         <option value="1" selected>vorticity (out of plane)</option>
         <option value="2">velocity along normal</option>
       </select>
+      <!-- The volume view's field. One resample pass fills all four channels
+           (shaders/d3_volume_scalar.wgsl), so switching between them is a
+           uniform write and not a recompute. Shown only in the volume view;
+           the slice view's own <select> above takes its place. -->
+      <select id="sel-VOLFIELD" style="display:none">
+        <option value="0" selected>Q (vortex cores)</option>
+        <option value="1">|omega|</option>
+        <option value="2">|u|</option>
+        <option value="3">rho - 1</option>
+      </select>
+      <label for="sel-VIEW" style="width:auto">view</label>
+      <!-- `volume` needs the VOLUMES, which are ?vol= and not ?view=: the
+           textures are the memory and the view is free, so the option is
+           disabled rather than silently drawing a slice when there is
+           nothing to march. -->
+      <select id="sel-VIEW">
+        <option value="slice" selected>slice</option>
+        <option value="volume">volume</option>
+      </select>
       <button id="btn-PLAY">pause</button>
       <button id="btn-RESET">reset</button>
       <span class="hint" id="hint">?scenario=beltrami|duct|tgv &nbsp; ?n= ?q=19|27 ?tau= ?u0=</span>

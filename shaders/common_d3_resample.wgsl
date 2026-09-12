@@ -33,14 +33,26 @@
 
 @group(0) @binding(10) var volOut : texture_storage_3d<rgba16float, write>;
 
-// The box, in L0 cell units with cell centres at integers -- the frame
+// THE ORIGIN IS A UNIFORM AND THE SHAPE IS AN OVERRIDE, and the split is the
+// whole of M6.4a's dynamic story. A refined box FOLLOWS the body: a
+// translating sphere holds `inUse` constant while every tile changes hands,
+// so the set's SIZE is steady and its POSITION is not (M4.2b-iii). Baking the
+// origin in as an override would mean rebuilding the pipeline, the texture
+// and the bind group every time the box moved -- for a viewer, every few
+// frames. So the extent and the resolution are fixed at creation, where they
+// have to be (a texture has a size), and the origin slides through a uniform.
+//
+// A box that OUTGROWS its allocated extent is said out loud in #status rather
+// than silently clipped: a view that quietly shows part of a refined region
+// is a plausible picture of a hierarchy nobody chose, which is the failure
+// mode M5.0's refusal exists for.
+@group(0) @binding(11) var<uniform> volOrigin : vec4<f32>;
+
+// The box SHAPE, in L0 cell units with cell centres at integers -- the frame
 // common_d3_tree_sample.wgsl documents.
 override VOL_NX : u32 = 1u;
 override VOL_NY : u32 = 1u;
 override VOL_NZ : u32 = 1u;
-override VOL_OX : f32 = 0f;
-override VOL_OY : f32 = 0f;
-override VOL_OZ : f32 = 0f;
 // L0 cells per voxel on each axis. 1 means the volume matches L0; 0.25 means
 // four voxels per L0 cell, i.e. level-2 resolution.
 override VOL_HX : f32 = 1f;
@@ -53,7 +65,7 @@ override VOL_HZ : f32 = 1f;
 // then a copy rather than a resample -- which is what makes the 1x case
 // checkable against `mac` directly.
 fn volCentre(v: vec3<u32>) -> vec3<f32> {
-  return vec3<f32>(VOL_OX, VOL_OY, VOL_OZ)
+  return volOrigin.xyz
        + (vec3<f32>(v) + vec3<f32>(0.5f)) * vec3<f32>(VOL_HX, VOL_HY, VOL_HZ)
        - vec3<f32>(0.5f);
 }

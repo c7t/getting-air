@@ -169,6 +169,18 @@ function defaultConfigs(baseUrl) {
       url: `${baseUrl}/index-3d.html?scenario=fall&n=8&tow=0.04&bounceback=1&window=x`,
       checkBoots: true,
     },
+    // THE VOLUME VIEW under a boot smoke (plans/3D.md M6.3/M6.4). Same
+    // argument as the window above, and a little stronger: it adds a
+    // texture, two compute passes and a whole render pipeline that NO other
+    // configuration here reaches -- ?vol= is 0 by default and every 3D gate
+    // draws the slice view. tools/validate-d3-raymarch.js is the real gate
+    // and is standalone; this is the line that notices the page stopped
+    // booting. `?n=8&levels=2` keeps it to a few MiB.
+    {
+      name: 'd3-volume-boot',
+      url: `${baseUrl}/index-3d.html?scenario=sphere&n=8&re=100&bounceback=1&levels=2&refine=body&view=volume`,
+      checkBoots: true,
+    },
     // index-amr.html under the structural-invariant sweep. This is the page
     // the project SHIPS, it defaults to levels=3, and until now the sweep
     // only ever drove window.__CYL -- so the falling-card page's own 2:1

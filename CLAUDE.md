@@ -208,9 +208,8 @@ comment above `N_LEVELS`, not this file, for what's current.
 
 ## The 3D fork (`plans/3D.md`)
 
-**M0-M5 are done; M6 is in progress (M6.0 done -- the tree sampler and the
-slice view on it; M6.1-M6.3 are the resample volume, Q-criterion and the
-raymarcher). M8.0-M8.3 are done: the target Re runs, the solver sheds at the
+**M0-M6 are done -- M6.4's octree raymarcher included, so a refined run can
+now be LOOKED at at every level's own resolution. M8.0-M8.3 are done: the target Re runs, the solver sheds at the
 right frequency, the solid interior is held at the body's equilibrium, and a
 moving window (M8.3) makes a moving-body measurement converge at all.** Depth is real:
 `?levels=N` runs at any depth, static or `?dynamic=1`, the body lives
@@ -795,6 +794,43 @@ What exists today:
   A windowed page is otherwise visited by nothing in the standing suite, so
   `validate-all.js` boot-smokes one as `d3-window-boot`.
 
+- **THE VOLUME VIEW IS ONE DENSE VOLUME PER LEVEL AND THE INNERMOST BOX WINS
+  -- no per-ray tree descent** (`?view=volume`, M6.3/M6.4). sec 1.3's "do not
+  raymarch the octree pool, it is a research project" stays true OF THE POOL;
+  it is not true of this, and the two had been conflated. A level's refined
+  set is ONE COMPACT REGION because refinement is geometry-forced, so its
+  bounding box is small -- measured 24^3 L0 cells out of 192x128x128 -- and
+  three dense volumes over three such boxes are 98 MB against **2.25 GB** for
+  one uniform volume at the finest resolution. A ray sample is then 2-3 box
+  tests with the LAST hit winning, and it STEPS by the innermost box's voxel
+  size, so the near-wall sheet costs steps only where it is.
+  - **`?vol=N` is a MULTIPLE OF EACH LEVEL'S OWN RESOLUTION**, not voxels per
+    L0 cell -- level m already has 2^m cells per L0 cell, so the other
+    phrasing means three things in a three-level run. It meant them until a
+    gate asked for 4 at level 2 and got sixteen.
+  - **The scalar volume is `rgba16float` and every channel is NORMALIZED**
+    (`Q/qRef`, `|omega|/vRef`, `|u|/uRef`, `rho - 1`). Raw Q is ~1e-5, BELOW
+    binary16's smallest normal; dividing by the reference the criterion
+    already uses puts it at order 1 and removes the `float32-filterable`
+    dependency the mobile target may not have. One pass fills all four, so
+    `?volfield=` is a uniform write.
+  - **The tone curve is Reinhard, for `common_vortcolor.wgsl`'s reason.** A
+    clip makes the strongest structure's front face opaque and the render
+    degenerates into an isosurface of the iso value: measured on a Re = 300
+    sphere, near-wall Q is >100x the wake's, and clipped the wake vanished.
+  - **A CAMERA IS ONLY CHECKABLE THROUGH THE BODY'S SILHOUETTE.** "Is it
+    pointing at the interesting part" has no reference value; with the volume
+    switched off (`?volIso=` above every value) the render is the body alone
+    and the host predicts it by ray/sphere -- measured IoU 1.000.
+    `tools/validate-d3-raymarch.js` is the gate (M6.2's Q against
+    `d3-criterion.mjs` on the same fp16 texels, M6.3's transfer function,
+    M6.4b's image difference against `?volstack=0` with `d3-volume.mjs`
+    saying independently which pixels may differ: 234 differ, 0 outside).
+  - **`debugPoolState` reports `boxRatio` per level** (M6.4c) -- box-union
+    over refined-set volume, 1.04x/1.14x on a geometry-forced shell against
+    the ~4x at which boxes stop paying. M8.4 already measured **4.6** on a
+    wake-following criterion, so the successor is measured and waiting.
+
 - **THE TREE SAMPLER (`shaders/common_d3_tree_sample.wgsl`) IS THE ONLY
   THING HERE THAT SPANS LEVELS**, and it is what the slice view now samples
   (M6.0b). Every solver kernel is written for one level and reaches its
@@ -842,6 +878,18 @@ What exists today:
   body pumping momentum into a CLOSED BOX, so a long window does not settle,
   it diverges -- the field's max|u| and density range are printed beside the
   closure for that reason.
+
+- `tools/validate-d3-raymarch.js` — the volume renderer's gate (M6.2-M6.4b).
+  Standalone and opt-in; owns its own Chrome. Three claims, none of them "the
+  picture looks right": the scalar volume is the gradient of the velocity
+  volume (host Q via `d3-criterion.mjs` on the SAME fp16 texels), the
+  transfer function is normalized to the field (an A/B against an iso raised
+  above everything), and the stack changes the picture EXACTLY where a
+  refined box covers. `d3-volume.mjs` + `tools/test-d3-volume.js` are the
+  host statement of the boxes and the camera, mutation-checked.
+
+      node tools/validate-d3-raymarch.js
+      node tools/validate-d3-raymarch.js --cases=stack --size=256
 
 - `tools/validate-3d.js` + `benchmarks/d3.json` — the M1, M2 and M3 gates.
   Analytic PASS/FAIL for duct, Beltrami, spin and the bounce-back sphere;

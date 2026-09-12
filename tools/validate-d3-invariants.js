@@ -162,13 +162,28 @@ const CONFIGS = [
   // exactly on an L0 cell centre, so the resample is a COPY and any box
   // arithmetic error shows as a shift.
   //
-  // `refined` at 4x is the case the ballpark exists for -- the finest
-  // level's bounding box at full depth, which is 10 MB on the flagship
-  // against 2.25 GB for the same resolution over the whole domain.
+  // `refined` is the case the ballpark exists for -- the finest level's
+  // bounding box at ITS OWN full resolution, which is 10 MB on the flagship
+  // against 2.25 GB for the same resolution over the whole domain. ?vol=1,
+  // because ?vol= is a multiple of each level's own grid: at level 2 that is
+  // already 4 voxels per L0 cell.
   { name: 'body3-vol', steps: 8, vol: true, volZ: 16,
-    url: 'scenario=sphere&n=8&re=20&u0=0.05&q=19&bounceback=1&live=0&levels=3&rb=4&refine=body&interface=explode&vol=1' },
+    url: 'scenario=sphere&n=8&re=20&u0=0.05&q=19&bounceback=1&live=0&levels=3&rb=4&refine=body&interface=explode&vol=1&volstack=0' },
   { name: 'body3-vol-refined', steps: 8, vol: true, volZ: 16,
-    url: 'scenario=sphere&n=8&re=20&u0=0.05&q=19&bounceback=1&live=0&levels=3&rb=4&refine=body&interface=explode&vol=4&volbox=refined' },
+    url: 'scenario=sphere&n=8&re=20&u0=0.05&q=19&bounceback=1&live=0&levels=3&rb=4&refine=body&interface=explode&vol=1&volbox=refined' },
+  // M6.4a. THE STACK: one volume per level, each over that level's own
+  // bounding box, each at that level's own resolution -- and each scored
+  // against the sampler at ITS OWN points. The two rows above are its ends
+  // (one volume over the whole domain, one over the finest box); this is the
+  // row where the per-level origin, extent and scale all have to be right at
+  // once, which is the entire new thing in M6.4a.
+  //
+  // It is also where the box arithmetic is least forgiving: L1's box is
+  // RB = 4 L0 cells per block and L2's is 2, so a rung's worth of scale
+  // dropped anywhere shows up as one level disagreeing while the others do
+  // not.
+  { name: 'body3-volstack', steps: 8, vol: true, volZ: 8,
+    url: 'scenario=sphere&n=8&re=20&u0=0.05&q=19&bounceback=1&live=0&levels=3&rb=4&refine=body&interface=explode&vol=1' },
   // The same depth-3 tree with the MANAGER rebuilding it, on a PINNED body.
   // `drift3` below is what proves the allocator moves tiles; this one is its
   // control -- the criterion agrees with the initial set, so the manager
@@ -356,6 +371,14 @@ async function runConfig(Runtime, o, c, log) {
       + `  coverage ${cov.skipped ? 'skipped' : (cov.ok ? `ok (${cov.required} cells required)` : `${cov.nViolations} VIOLATIONS`)}`
       + `  pool ${ps.ok ? `ok (${ps.inUse} in use, ${ps.free} free${ps.dynamic ? ', dynamic' : ''})` : `${ps.problems.length} PROBLEMS`}`
       + `  ke=${Number(st.ke).toExponential(3)}`
+      // M6.4c. Box-union volume over refined-set volume, per level: how much
+      // M6.4's bounding boxes cost over the set they bound, and therefore
+      // whether they are still the right structure. Reported, never gated --
+      // a geometry-forced set measures ~1.35x, a wake-following one will not,
+      // and the point is that the number is visible before someone builds on
+      // the assumption rather than after.
+      + (ps.byLevel ? '  box/set ' + ps.byLevel.map(l =>
+          `L${l.level} ${l.boxRatio == null ? '-' : l.boxRatio.toFixed(2)}x`).join(' ') : '')
       + (ps2 && ps2.byLevel
         ? '  rms ' + ps2.byLevel.map(l => `L${l.level} ${Number(l.rms).toExponential(2)}${l.finite ? '' : ' NaN'}`).join(' ')
         : ''));
@@ -413,9 +436,16 @@ async function runConfig(Runtime, o, c, log) {
   // because until the raymarcher exists filling one every frame is cost
   // with no reader.
   if (c.vol) {
-    const vol = await evalOrThrow(Runtime, `${G}.debugReadVolume(${c.volZ ?? 0})`, 300000, 'debugReadVolume');
-    if (vol.skipped) res.volSkipped = vol.skipped;
-    else {
+    // EVERY VOLUME IN THE STACK, not just the base (M6.4a). The claim is one
+    // claim per level -- "this level's volume agrees with the sampler over
+    // this level's own box" -- and checking only the L0 one would leave the
+    // per-level origins, extents and scales, which are the entire new thing,
+    // unexercised. Ends at the first index the page has no volume for.
+    const rows = [];
+    let worstAll = 0, badAll = 0, firstAll = null;
+    for (let which = 0; which < 4; which++) {
+      const vol = await evalOrThrow(Runtime, `${G}.debugReadVolume(${c.volZ ?? 0}, ${which})`, 300000, 'debugReadVolume');
+      if (vol.skipped) { if (which === 0) res.volSkipped = vol.skipped; break; }
       // Every 7th texel, which is enough to catch a transform error (those
       // are wrong everywhere or nowhere) without shipping a megabyte of
       // points back through Runtime.evaluate.
@@ -433,13 +463,26 @@ async function runConfig(Runtime, o, c, log) {
         if (e > worst) worst = e;
         // 2^-10 is half-precision's mantissa step; 4x it leaves room for the
         // rounding of each component without admitting a real disagreement.
-        if (e > 4 / 1024) { bad++; if (!first) first = { p: pick[i].p, vol: a, tree: b, rel: e }; }
+        if (e > 4 / 1024) { bad++; if (!first) first = { level: vol.info.level, p: pick[i].p, vol: a, tree: b, rel: e }; }
       }
-      res.vol = { info: vol.info, checked: pick.length, worst, bad, first, ok: bad === 0 };
-      if (bad) res.pool.push({ at: 'end', n: bad, first: { kind: 'volumeDiffersFromSampler', ...first } });
-      log(`volume ${vol.info.res.join('x')} @${vol.info.mult}/L0 over ${vol.info.box}`
-        + ` (${(vol.info.bytes / 1048576).toFixed(1)} MiB): ${pick.length} texels,`
-        + ` worst rel ${worst.toExponential(2)} ${bad ? 'DIFFER' : 'match'}`);
+      rows.push({ level: vol.info.level, res: vol.info.res, lo: vol.info.lo, mult: vol.info.mult,
+                  bytes: vol.info.bytes, checked: pick.length, worst, bad });
+      worstAll = Math.max(worstAll, worst);
+      badAll += bad;
+      if (bad && !firstAll) firstAll = first;
+      log(`volume L${vol.info.level} ${vol.info.res.join('x')} @${vol.info.mult}x its own grid`
+        + ` at [${vol.info.lo.join(',')}] (${(vol.info.bytes / 1048576).toFixed(1)} MiB):`
+        + ` ${pick.length} texels, worst rel ${worst.toExponential(2)} ${bad ? 'DIFFER' : 'match'}`);
+      // Only the base volume exists under ?volstack=0 / ?volbox=refined, and
+      // the page says so by refusing index 1 -- so the loop's own exit is the
+      // report of how deep the stack is.
+      if (rows.length >= (vol.info.stack || 1)) break;
+    }
+    if (rows.length) {
+      res.vol = { levels: rows, checked: rows.reduce((a, r) => a + r.checked, 0),
+                  worst: worstAll, bad: badAll, first: firstAll, ok: badAll === 0,
+                  info: { res: rows[0].res, stack: rows.length } };
+      if (badAll) res.pool.push({ at: 'end', n: badAll, first: { kind: 'volumeDiffersFromSampler', ...firstAll } });
     }
   }
 
@@ -562,7 +605,7 @@ async function main() {
     // M6.1. Off in most configs -- the volume is ?vol=0 by default until the
     // raymarcher reads one -- so most rows say so rather than leaving a gap
     // that could be read as a pass.
-    const volTxt = x.vol ? (x.vol.ok ? `ok ${x.vol.info.res.join('x')}` : 'DIFFERS')
+    const volTxt = x.vol ? (x.vol.ok ? `ok x${x.vol.info.stack}` : 'DIFFERS')
       : (x.volSkipped ? 'skipped' : 'off');
     const ok = !x.bal.length && !x.ring.length && !x.cov.length && !x.pool.length && x.finite;
     if (!ok) exitCode = 1;

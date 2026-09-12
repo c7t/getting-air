@@ -1,0 +1,332 @@
+// THE OCTREE RAYMARCHER: one dense volume PER LEVEL, innermost box wins.
+// plans/3D.md M6.3 + M6.4b.
+//
+// WHAT MAKES THIS NOT A RESEARCH PROJECT. sec 1.3 says "do not attempt to
+// raymarch the quadtree/octree pool directly -- it is accurate and it is a
+// research project", and that stays true of the POOL: per-ray descent through
+// tiles, rings and free-list slots, with no coherence and no filtering. This
+// is the other thing, and the two had been conflated. A level's refined set
+// is ONE COMPACT REGION (geometry-forced refinement guarantees it -- the body
+// is one body), so its BOUNDING BOX is small: measured on the flagship case,
+// 24^3 L0 cells out of 192x128x128, i.e. 0.44% of the domain. Three dense
+// volumes over three such boxes are 49 MB against 2.25 GB for one uniform
+// volume at the finest resolution -- and a ray sample is then 2-3 box tests
+// with the LAST hit winning, no descent, no pointer chasing, no stack.
+//
+// THE HOLES ARE NOT WRONG. A level's box is solid and its refined set is a
+// shell, so the box contains cells that level does not have (measured 1.35x
+// on the flagship). The resample pass writes sampleTree, which FALLS BACK to
+// the coarsest level present -- so a hole holds the correct coarser value and
+// sampling the innermost covering box is right everywhere, not just where
+// that level exists.
+//
+// WHEN IT BREAKS, said before it does: bounding boxes pay because the refined
+// set is one region. A Q-criterion set following a shed wake is NOT -- it
+// breaks into scattered patches and a union of boxes degenerates toward the
+// full domain. debugPoolState reports box-union / set volume per level
+// (M6.4c) so the trigger is a number rather than a judgement call; above ~4x
+// the boxes have stopped paying and true traversal is the answer.
+//
+// @include "common_d3_window.wgsl"
+// @include "common_d3_geometry.wgsl"
+
+struct RayParams {
+  // azimuth, elevation (radians), distance (L0 cells), tan(fov/2)
+  cam   : vec4<f32>,
+  // aspect (w/h), step multiplier (voxels per ray step), iso, gain
+  look  : vec4<f32>,
+  // field index, opacity scale, level count, max ray steps
+  ctl   : vec4<f32>,
+  // the orbit target when not following the body, and w = follow flag
+  tgt   : vec4<f32>,
+  // Per level: the CONTINUOUS box (see d3-volume.mjs's header -- cell i spans
+  // [i-1/2, i+1/2), so a box of `ext` cells from index `lo` spans
+  // [lo-1/2, lo+ext-1/2)), and the extent with the voxel size in w.
+  boxLo : array<vec4<f32>, 4>,
+  boxExt: array<vec4<f32>, 4>,
+}
+
+@group(0) @binding(0) var<uniform> rm : RayParams;
+@group(0) @binding(1) var volSamp : sampler;
+// FIXED IN NUMBER, like every other per-level binding here, because WebGPU
+// has no array of buffers or of differently-sized textures. Levels the run
+// does not have are bound to a 1x1x1 dummy and rm.ctl.z folds them out.
+@group(0) @binding(2) var vol0 : texture_3d<f32>;
+@group(0) @binding(3) var vol1 : texture_3d<f32>;
+@group(0) @binding(4) var vol2 : texture_3d<f32>;
+@group(0) @binding(5) var vol3 : texture_3d<f32>;
+@group(0) @binding(6) var<storage, read> body : BodyState3D;
+
+override NX : u32 = 1u;
+override NY : u32 = 1u;
+override NZ : u32 = 1u;
+// Which world axis is UP for the camera, and its sign. The scenario declares
+// which way is DOWN (d3-scenarios.mjs's `down`, already read by the slice
+// view's quarter turn) and the host negates it. The SOLVER has no opinion
+// about down and must not acquire one: this is the view's business, exactly
+// as the slice rotation is.
+override UP_AXIS : u32 = 2u;
+override UP_SIGN : f32 = 1f;
+override HAS_BODY : u32 = 0u;
+
+struct VSOut {
+  @builtin(position) pos : vec4<f32>,
+  @location(0) uv : vec2<f32>,
+}
+
+const quad = array<vec2<f32>,6>(
+  vec2(-1f,-1f), vec2( 1f,-1f), vec2(-1f, 1f),
+  vec2(-1f, 1f), vec2( 1f,-1f), vec2( 1f, 1f)
+);
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi : u32) -> VSOut {
+  var out: VSOut;
+  out.pos = vec4(quad[vi], 0f, 1f);
+  out.uv  = quad[vi] * 0.5f + 0.5f;
+  return out;
+}
+
+fn axisVec(a: u32, s: f32) -> vec3<f32> {
+  return vec3<f32>(select(0f, s, a == 0u), select(0f, s, a == 1u), select(0f, s, a == 2u));
+}
+
+// The orbit frame: `up`, and the two axes orthogonal to it taken cyclically
+// so the triple is right-handed whichever axis up is. d3-volume.mjs's
+// orbitBasis is the same three lines in JS, and tools/test-d3-volume.js
+// scores the pair against each other -- a camera is not checkable by looking
+// at the picture it produces, which is the whole difficulty with a viewer.
+struct Orbit { e1 : vec3<f32>, e2 : vec3<f32>, up : vec3<f32> }
+fn orbitAxes() -> Orbit {
+  return Orbit(axisVec((UP_AXIS + 1u) % 3u, 1f),
+               axisVec((UP_AXIS + 2u) % 3u, UP_SIGN),
+               axisVec(UP_AXIS, UP_SIGN));
+}
+
+// WHERE THE CAMERA LOOKS, AND WHY IT IS COMPUTED HERE RATHER THAN HANDED IN.
+// A body-following camera needs the body's position, and a HOST-WRITTEN one
+// is as stale as the last readback: the picture then slides forward and snaps
+// back every time a refresh lands, which is a visible pumping rather than a
+// subtle lag. The slice view reads the body buffer directly for exactly this
+// reason (M8.3) -- same binding, same argument.
+fn camTarget() -> vec3<f32> {
+  if (rm.tgt.w > 0.5f && HAS_BODY == 1u) {
+    return vec3<f32>(body.cx, body.cy, body.cz);
+  }
+  return rm.tgt.xyz;
+}
+
+struct Cam { o : vec3<f32>, d : vec3<f32> }
+fn camRay(uv: vec2<f32>) -> Cam {
+  let ax = orbitAxes();
+  let t = camTarget();
+  let ca = cos(rm.cam.x); let sa = sin(rm.cam.x);
+  let ce = cos(rm.cam.y); let se = sin(rm.cam.y);
+  let eye = t + rm.cam.z * (ce * (ca * ax.e1 + sa * ax.e2) + se * ax.up);
+  let fwd = normalize(t - eye);
+  var right = cross(fwd, ax.up);
+  if (length(right) < 1e-6f) { right = cross(fwd, vec3<f32>(1f, 0f, 0f)); }
+  right = normalize(right);
+  let up = normalize(cross(right, fwd));
+  let px = (uv.x * 2f - 1f) * rm.look.x * rm.cam.w;
+  let py = (uv.y * 2f - 1f) * rm.cam.w;
+  return Cam(eye, normalize(fwd + px * right + py * up));
+}
+
+// Slab method, with t0 clamped to 0 so an eye INSIDE the box still marches.
+// Returns (t0, t1) with t1 < t0 on a miss.
+fn rayBox(o: vec3<f32>, d: vec3<f32>, c0: vec3<f32>, c1: vec3<f32>) -> vec2<f32> {
+  let inv = 1f / d;                       // +-inf on an axis-parallel ray
+  let a = (c0 - o) * inv;
+  let b = (c1 - o) * inv;
+  let lo = min(a, b);
+  let hi = max(a, b);
+  return vec2<f32>(max(max(lo.x, lo.y), max(lo.z, 0f)), min(hi.x, min(hi.y, hi.z)));
+}
+
+// Normalized position within box i, PERIODICALLY. The half-cell in `boxLo` is
+// already continuous (see RayParams), so the box map is one subtraction and
+// one division -- and it is the SAME map the resample kernel's volCentre
+// inverts, which is what makes the M6.1 gate (the volume scored against the
+// sampler at the same physical points) also a check on this line.
+//
+// THE WRAP IS NOT DEFENSIVE. With a moving window the body travels through a
+// periodic buffer and its refined shell travels with it, so the shell
+// STRADDLES THE SEAM twice per lap -- and the bounding box of a straddling
+// set, taken naively, is the whole domain. The host takes the smallest
+// periodic span instead (main-3d.js's refinedBoxL0), which can leave an
+// origin outside [0, N); wrapping here is what makes that box mean the cells
+// it actually covers. It is also a no-op for every box that does not
+// straddle, since a wrapped coordinate can only re-enter a box that already
+// spans nearly the whole axis.
+fn boxLocal(p: vec3<f32>, i: u32) -> vec3<f32> {
+  let n = vec3<f32>(f32(NX), f32(NY), f32(NZ));
+  var q = p - rm.boxLo[i].xyz;
+  q = q - n * floor(q / n);
+  return q / rm.boxExt[i].xyz;
+}
+
+// INNERMOST WINS. The stack is ordered coarsest-first, so the LAST box
+// containing the point is the finest one that does. Two or three tests, no
+// descent -- that is the entire difference from raymarching the pool.
+struct Hit { lv : u32, tc : vec3<f32> }
+fn levelAt(p: vec3<f32>) -> Hit {
+  var best = Hit(0u, boxLocal(p, 0u));
+  let n = u32(rm.ctl.z);
+  for (var i = 1u; i < n; i++) {
+    let tc = boxLocal(p, i);
+    if (all(tc <= vec3<f32>(1f))) { best = Hit(i, tc); }
+  }
+  return best;
+}
+
+// THE SAMPLER CLAMPS AT A BOX'S EDGE, and that is the right choice of the two
+// available rather than a free one. Trilinear at the last half-voxel of a
+// refined box has no neighbour inside the box, so it repeats the edge voxel
+// where the physically right value is the COARSER level's -- a half-fine-voxel
+// smear along the box face, which is 1/8 of an L0 cell at level 2. The
+// alternative, wrapping, would fetch the opposite face of the box: the whole
+// domain away, and wrong by the field itself rather than by a half voxel.
+// Blending the two levels across the face would remove it and is a different
+// feature (and one the slice view's dPlane argues AGAINST doing casually --
+// two samples from different levels do not sit at the same place).
+fn sampleLevel(i: u32, tc: vec3<f32>) -> vec4<f32> {
+  // textureSampleLevel, NOT textureSample: an explicit LOD has no implicit
+  // derivatives, so it is legal in the non-uniform control flow this branch
+  // necessarily is.
+  if (i == 1u) { return textureSampleLevel(vol1, volSamp, tc, 0f); }
+  if (i == 2u) { return textureSampleLevel(vol2, volSamp, tc, 0f); }
+  if (i == 3u) { return textureSampleLevel(vol3, volSamp, tc, 0f); }
+  return textureSampleLevel(vol0, volSamp, tc, 0f);
+}
+
+// Which channel of the scalar volume to show. d3_volume_scalar.wgsl fills all
+// four in one pass, so this is a uniform rather than a recompute.
+fn fieldOf(v: vec4<f32>) -> f32 {
+  let f = u32(rm.ctl.x);
+  if (f == 1u) { return v.y; }            // |omega| / vRef
+  if (f == 2u) { return v.z; }            // |u| / uRef
+  if (f == 3u) { return abs(v.w); }       // |rho - 1|
+  return v.x;                             // Q / qRef
+}
+
+// THE TRANSFER FUNCTION IS THREE THINGS: the `iso` subtracted in fs_main, the
+// tone curve below it, and this ramp. THE M1 LESSON APPLIES TO IT FIRST -- a
+// transfer function not normalized to the actual field renders a correct
+// simulation as a black screen -- and it cannot be normalized HERE, because
+// this shader has no idea what scale the flow is at. So the SCALAR VOLUME
+// carries the normalization instead (d3_volume_scalar.wgsl divides every
+// channel by the same reference the criterion and the slice view use), and
+// `iso` is then a dimensionless number whose default is the MEASURED one:
+// d3-criterion.mjs's Q_THRESHOLD, 0.1 of the body's own shear scale, which
+// flags zero blocks on a seeded initial field and 379-628 in a developed wake.
+fn volColor(t: f32) -> vec3<f32> {
+  let c = clamp(t, 0f, 1f);
+  let lo = mix(vec3(0.10, 0.16, 0.55), vec3(0.10, 0.75, 0.85), smoothstep(0f, 0.45f, c));
+  return mix(lo, vec3(1.0, 0.93, 0.45), smoothstep(0.45f, 1f, c));
+}
+
+// THE TONE CURVE, AND IT IS THE ONE common_vortcolor.wgsl ALREADY ARGUES FOR
+// -- Reinhard, a/(1+a), monotonic and asymptotic to 1 but never reaching it.
+// The same reason applies here and bites harder. A hard clip collapses
+// everything above the knee to one colour AND to one opacity, so the front
+// face of the strongest structure becomes opaque and the render degenerates
+// into a smooth isosurface of the iso value: measured on a Re = 300 sphere,
+// where the near-wall Q is over a hundred times the wake's, a clipped mapping
+// showed the boundary layer as a featureless shell and the wake not at all.
+// Compressing instead keeps both in one picture, which is the entire reason
+// to raymarch rather than to draw one isosurface.
+//
+// VOL_GAMMA then shapes the low end, exactly as it does on the 2D pages:
+// below 1 it lifts weak structure out of the background rather than leaving
+// it in a haze. The default matches the slice view's 0.7 for the same fields.
+override VOL_GAMMA : f32 = 0.7;
+fn volTone(x: f32) -> f32 {
+  let a = max(x, 0f);
+  return pow(a / (1f + a), VOL_GAMMA);
+}
+
+// THE BODY, BY SPHERE TRACING ITS OWN SDF -- not by thresholding the volume.
+// d3-body.mjs's shapes are TRUE signed distances (sphere and rounded box
+// exact, spheroid by the meridional Newton), which is what makes tracing them
+// valid rather than merely plausible, and it means the surface is drawn at
+// full precision instead of at whatever resolution the volume happens to be.
+// Returns the hit distance, or -1.
+fn traceBody(o: vec3<f32>, d: vec3<f32>, t0: f32, t1: f32) -> f32 {
+  if (HAS_BODY != 1u) { return -1f; }
+  var t = t0;
+  for (var i = 0u; i < 128u; i++) {
+    if (t > t1) { break; }
+    let phi = get_phi3(o + d * t, body);
+    if (phi < 0.05f) { return t; }
+    t += max(phi, 0.05f);
+  }
+  return -1f;
+}
+
+fn bodyNormal(p: vec3<f32>) -> vec3<f32> {
+  let e = 0.15f;
+  return normalize(vec3<f32>(
+    get_phi3(p + vec3<f32>(e, 0f, 0f), body) - get_phi3(p - vec3<f32>(e, 0f, 0f), body),
+    get_phi3(p + vec3<f32>(0f, e, 0f), body) - get_phi3(p - vec3<f32>(0f, e, 0f), body),
+    get_phi3(p + vec3<f32>(0f, 0f, e), body) - get_phi3(p - vec3<f32>(0f, 0f, e), body)));
+}
+
+const BG = vec3<f32>(0.05, 0.05, 0.09);
+
+@fragment
+fn fs_main(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> {
+  let ray = camRay(uv);
+  // The march is bounded by the LEVEL-0 volume, which covers the whole
+  // domain: every refined box is inside it by construction, so one interval
+  // is enough and a ray that misses it has nothing to show.
+  let span = rayBox(ray.o, ray.d, rm.boxLo[0].xyz, rm.boxLo[0].xyz + rm.boxExt[0].xyz);
+  if (span.y <= span.x) { return vec4(BG, 1f); }
+
+  let tBody = traceBody(ray.o, ray.d, span.x, span.y);
+  let tEnd = select(span.y, min(span.y, tBody), tBody >= 0f);
+
+  let iso = rm.look.z;
+  let gain = max(rm.look.w, 1e-6f);
+  let opacity = rm.ctl.y;
+  let maxSteps = u32(rm.ctl.w);
+
+  var acc = vec4<f32>(0f);
+  var t = span.x;
+  for (var i = 0u; i < maxSteps; i++) {
+    if (t >= tEnd || acc.w > 0.995f) { break; }
+    let p = ray.o + ray.d * t;
+    let hit = levelAt(p);
+    let lv = hit.lv;
+    // THE STEP IS THE INNERMOST BOX'S VOXEL SIZE, which is the payoff of the
+    // stack and not an optimization bolted onto it: a ray takes coarse steps
+    // through the coarse field and fine steps through the refined shell, so
+    // resolving the near-wall sheet costs steps only where that sheet is. A
+    // fixed finest step would march the whole domain at the finest rate --
+    // the same "2.25 GB against 10 MB" ratio, paid in time instead of memory.
+    let dt = max(rm.boxExt[lv].w * rm.look.y, 1e-3f);
+    let s = fieldOf(sampleLevel(lv, hit.tc));
+    let tone = volTone(max(s - iso, 0f) / gain);
+    if (tone > 0f) {
+      // Opacity per unit LENGTH, not per sample: with an adaptive step the
+      // naive per-sample alpha would make the refined region darker or
+      // brighter than the coarse one purely because it is sampled more often,
+      // which is a rendering artifact that looks exactly like physics.
+      let alpha = 1f - exp(-tone * opacity * dt);
+      let col = volColor(tone);
+      acc = vec4<f32>(acc.xyz + (1f - acc.w) * alpha * col, acc.w + (1f - acc.w) * alpha);
+    }
+    t += dt;
+  }
+
+  var rgb = acc.xyz + (1f - acc.w) * BG;
+  if (tBody >= 0f && tBody <= span.y) {
+    let n = bodyNormal(ray.o + ray.d * tBody);
+    // Two lights, one from the camera and a dim fill from `up`, so a smooth
+    // body is not a flat silhouette and its orientation is readable -- which
+    // for a TUMBLING card is the whole thing being looked at.
+    let lam = 0.35f + 0.5f * max(dot(n, -ray.d), 0f) + 0.15f * max(dot(n, orbitAxes().up), 0f);
+    rgb = acc.xyz + (1f - acc.w) * vec3<f32>(0.55f, 0.56f, 0.60f) * lam;
+  }
+  return vec4(rgb, 1f);
+}
