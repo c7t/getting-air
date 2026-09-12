@@ -922,6 +922,15 @@ What exists today:
     rather than the initial condition. Re = 1100 SURVIVING 26000 steps at
     `?levels=2` is itself new, and is M8.0's "AMR is the stability mechanism"
     holding.
+  - **FOUR AXES SWEPT, ONE ANSWER** -- span 1->2, Re 500->1100, release angle
+    0.15->1.047 rad, and I* 0.17->0.68 (`tools/probe-d3-tumble.js`). A
+    FOURFOLD change in inertia moves the peak net rotation 0.306 -> 0.361,
+    18%, and nothing crosses. **The suspect is now the plate's effective
+    THICKNESS, not a parameter**: the card is 4 cells thick at n = 32, the chi
+    band adds 0.75 coarse cells per side at `?levels=2`, so its aspect is
+    ~0.17 against a nominal 0.125. Aspect is a primary parameter of that
+    boundary. `?bounceback=1` (sharp, nominal thickness) and `?levels=3`
+    (band down to 0.375 cells) are the two cheap tests. UNRUN.
   - **FLUTTER IS AN ATTRACTOR: THE INITIAL CONDITION IS NOT THE OBSTACLE.**
     Released near VERTICAL (`?tilt=1.047`, 30 degrees off edge-on) the 2:1
     plate at Re = 1100 swoops IMMEDIATELY -- net/arc = **1.00** over the first
