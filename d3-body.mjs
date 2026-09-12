@@ -116,6 +116,30 @@ export function bodyVolume(shape) {
   }
 }
 
+// THE RADIUS OF THE SMALLEST SPHERE ABOUT THE CENTRE THAT CONTAINS THE BODY.
+//
+// The host statement of common_d3_geometry.wgsl's bodyCircumradius3, and it
+// exists for one consumer: bounding how fast ROTATION can bring the surface
+// toward a point that is standing still. A surface point at body-frame radius
+// r moves at |v + omega x r| <= |v| + |omega| * R, and a signed distance is
+// the distance to the NEAREST surface point, so |dphi/dt| is bounded by that
+// speed. That is what lets the geometry criterion refine ahead of a TURNING
+// body with one scalar instead of a second SDF evaluation at an extrapolated
+// pose, which is how the 2D side does it (amr_manage.wgsl's isNearBody).
+//
+// A bound, not the exact value, for the rounded box: its corner sits at
+// sqrt((a-r)^2 + (b-r)^2 + (c-r)^2) + r, which is at most length(a,b,c)
+// because the corner radius only rounds INWARD. Over-estimating is safe here
+// and under-estimating is not, so the unrounded half-diagonal is returned.
+export function bodyCircumradius(shape) {
+  switch (shape.kind) {
+    case SHAPE.SPHERE: return shape.a;
+    case SHAPE.SPHEROID: return Math.max(shape.a, shape.c);
+    case SHAPE.ROUNDBOX: return Math.hypot(shape.a, shape.b, shape.c);
+    default: throw new Error(`unknown shape kind ${shape.kind}`);
+  }
+}
+
 export function principalInertia(shape, m) {
   switch (shape.kind) {
     case SHAPE.SPHERE: { const i = 0.4 * m * shape.a ** 2; return [i, i, i]; }

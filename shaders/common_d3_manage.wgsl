@@ -179,12 +179,30 @@ fn blockWanted(b: vec3<u32>) -> bool {
   // boundary, and the body had moved MANAGE_EVERY * |v| = 0.08 cells since
   // the decision. Tiny, and enough, because a boundary is a boundary.
   //
-  // Rotation is deliberately not in this term. It matters for a long body
-  // spun about a short axis, and every body that currently uses
-  // ?refine=body is a sphere, for which it is exactly zero. Adding it
-  // speculatively would be an untested term in a criterion whose whole job
-  // is to be checkable.
-  let lead = MANAGE_EVERY * length(vec3<f32>(body.vx, body.vy, body.vz));
+  // AND ROTATION IS IN IT TOO (2026-09-11). It used to be deliberately left
+  // out, on the grounds that every body using ?refine=body was a sphere for
+  // which it is exactly zero. The card scenario made that false, and the 2D
+  // side had already solved it: amr_manage.wgsl's isNearBody evaluates the
+  // SDF at the CURRENT pose and at one extrapolated FORCE_REFINE_LOOKAHEAD
+  // macro-steps ahead -- advancing theta by omega as well as the position by
+  // v -- and takes the min. Its own header calls the two-pose sample "a
+  // deliberately cheap approximation, generous margin compensating for the
+  // coarse sampling".
+  //
+  // THIS IS THE SAME STATEMENT AS A BOUND RATHER THAN A SAMPLE, which is both
+  // cheaper and stronger. A surface point at body-frame radius r moves at
+  // |v + omega x r| <= |v| + |omega| * R, with R the body's circumradius; phi
+  // is the distance to the NEAREST surface point, so |dphi/dt| is bounded by
+  // that same speed and phi can fall by at most MANAGE_EVERY * that over one
+  // manager interval. No second get_phi3, and it holds at EVERY step of the
+  // interval rather than at the two sampled ones.
+  //
+  // It costs nothing where it did not apply: |omega| ~ 1e-4 on the falling
+  // sphere at R = 6 makes the term 0.01 cells against a margin of 2-3, so
+  // every existing sphere case is unmoved.
+  let lead = MANAGE_EVERY * (length(vec3<f32>(body.vx, body.vy, body.vz))
+                             + length(vec3<f32>(body.wx, body.wy, body.wz))
+                               * bodyCircumradius3(body));
   let reach = MARGIN + lead;
   let lo = vec3<f32>(b * RB) * BOX_SCALE;
   let hi = lo + f32(RB) * BOX_SCALE;

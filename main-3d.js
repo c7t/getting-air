@@ -85,7 +85,8 @@ import { reportFatal, reportNoWebGPU, reportNoAdapter } from './error-overlay.mj
 import { assembleShader } from './shader-loader.mjs';
 import { SUPPORTED_Q } from './lattice-3d.mjs';
 import { SCENARIOS, SCENARIO_NAMES, resolveScenario, nuFromTau, beltramiVelocityAt } from './d3-scenarios.mjs';
-import { packBodyState, unpackBodyState, BODY_FIELDS, sdfBody, qRotateInv } from './d3-body.mjs';
+import { packBodyState, unpackBodyState, BODY_FIELDS, sdfBody, qRotateInv,
+         bodyCircumradius } from './d3-body.mjs';
 import { parseWindowAxes, wrapDims, wrapDelta3, windowOffset3, windowCoord3,
          windowConstants } from './d3-window.mjs';
 import { Q_THRESHOLD, gradU, qOfGrad, checkFieldCoverage } from './d3-criterion.mjs';
@@ -3427,7 +3428,11 @@ async function init() {
     // GPU, not the startup position, because the body moves.
     const b = await readBody();
     const margin = Number.isFinite(MANAGE_MARGIN) ? MANAGE_MARGIN : geomForced.margin;
-    const lead = MANAGE_EVERY * Math.hypot(b.vx, b.vy, b.vz);
+    // Translation AND rotation, the same bound common_d3_manage.wgsl's
+    // blockWanted applies -- see its comment for why |omega| * circumradius is
+    // the right term and why it is a bound rather than 2D's extrapolated pose.
+    const lead = MANAGE_EVERY * (Math.hypot(b.vx, b.vy, b.vz)
+      + Math.hypot(b.wx, b.wy, b.wz) * bodyCircumradius(params.body.shape));
     const host = refineHierarchy(pool, {
       levels: LEVELS,
       want: nearBodyWant(geomForced.sdfAt([b.cx, b.cy, b.cz], [b.qw, b.qx, b.qy, b.qz]), margin + lead) });

@@ -46,7 +46,7 @@ const close = (a, b, tol, what) =>
   const root = path.join(__dirname, '..');
   const B = await import(path.join(root, 'd3-body.mjs'));
   const {
-    SHAPE, sdfBody, bodyVolume, principalInertia, qIdentity, qMul, qConj, qNormalize,
+    SHAPE, sdfBody, bodyVolume, principalInertia, bodyCircumradius, qIdentity, qMul, qConj, qNormalize,
     qFromAxisAngle, qRotate, qRotateInv, omegaFromL, rotationalEnergy, stepFreeBody,
     makeBodyState, BODY_FIELDS, packBodyState, unpackBodyState,
   } = B;
@@ -167,6 +167,46 @@ const close = (a, b, tol, what) =>
 
   // --- inertia -------------------------------------------------------------
   ok('volumes and principal moments match the textbook forms', () => {
+    // --- bodyCircumradius: a BOUND, scored against the real surface --------
+    //
+    // The geometry criterion refines ahead of a turning body by |omega| * R,
+    // so R that is too SMALL silently lets a seam cut the body -- the exact
+    // failure plans/3D.md M5.4a calls a hard one. Asserting the formula
+    // against itself would catch nothing, so each shape is scored against a
+    // brute-force search over its own surface: the bound must HOLD (no
+    // surface point outside it) and must be TIGHT (some surface point
+    // reaches it, except for the rounded box where inward rounding makes it
+    // deliberately loose).
+    for (const [name, shape, tight] of [
+      ['sphere', { kind: SHAPE.SPHERE, a: 3 }, true],
+      ['oblate spheroid', { kind: SHAPE.SPHEROID, a: 5, c: 1 }, true],
+      ['prolate spheroid', { kind: SHAPE.SPHEROID, a: 1, c: 5 }, true],
+      ['plate', { kind: SHAPE.ROUNDBOX, a: 16, b: 16, c: 2, r: 0 }, true],
+      ['rounded plate', { kind: SHAPE.ROUNDBOX, a: 16, b: 16, c: 2, r: 0.5 }, false],
+    ]) {
+      const R = bodyCircumradius(shape);
+      // Farthest point of the SOLID from the centre, found by marching out
+      // along many directions until the SDF turns positive.
+      let far = 0;
+      const N = 40;
+      for (let i = 0; i <= N; i++) {
+        for (let j = 0; j <= 2 * N; j++) {
+          const th = Math.PI * i / N, ph = Math.PI * j / N;
+          const d = [Math.sin(th) * Math.cos(ph), Math.sin(th) * Math.sin(ph), Math.cos(th)];
+          // Bisect the surface crossing along this ray, out to 4R.
+          let lo = 0, hi = 4 * R;
+          if (sdfBody(d.map(v => v * hi), shape) < 0) throw new Error(`${name}: 4R is still inside`);
+          for (let k = 0; k < 50; k++) {
+            const mid = 0.5 * (lo + hi);
+            if (sdfBody(d.map(v => v * mid), shape) < 0) lo = mid; else hi = mid;
+          }
+          far = Math.max(far, lo);
+        }
+      }
+      assert.ok(far <= R + 1e-6, `${name}: circumradius ${R} does not contain the body (found ${far})`);
+      if (tight) close(far, R, 1e-3 * R, `${name}: circumradius is tight`);
+    }
+
     close(bodyVolume({ kind: SHAPE.SPHERE, a: 3 }), 4 / 3 * Math.PI * 27, 1e-9, 'sphere volume');
     const m = 5;
     assert.deepStrictEqual(principalInertia({ kind: SHAPE.SPHERE, a: 3 }, m).map(v => +v.toFixed(9)),

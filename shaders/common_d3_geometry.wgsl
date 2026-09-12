@@ -178,6 +178,26 @@ fn get_phi3(p: vec3<f32>, s: BodyState3D) -> f32 {
   return sdRoundBox(lp, vec3<f32>(s.a, s.b, s.c), s.r);
 }
 
+// THE RADIUS OF THE SMALLEST SPHERE ABOUT THE CENTRE THAT CONTAINS THE BODY.
+//
+// Exists to bound how fast ROTATION can bring the surface toward a point that
+// is standing still -- see blockWanted in common_d3_manage.wgsl. A surface
+// point at body-frame radius r moves at |v + omega x r| <= |v| + |omega| * R,
+// and phi is the distance to the NEAREST surface point, so |dphi/dt| is
+// bounded by that same speed. One scalar, no second SDF evaluation.
+//
+// The rounded box's corner sits at sqrt((a-r)^2 + (b-r)^2 + (c-r)^2) + r,
+// which is at most length(a,b,c) -- the corner radius only rounds INWARD --
+// so the unrounded half-diagonal is a safe bound and is what is returned.
+// d3-body.mjs's bodyCircumradius is the host statement of the same thing and
+// make test scores them against a brute-force search over each surface.
+fn bodyCircumradius3(s: BodyState3D) -> f32 {
+  let kind = u32(s.shape);
+  if (kind == 0u) { return s.a; }                        // SPHERE
+  if (kind == 1u) { return max(s.a, s.c); }              // SPHEROID (a, a, c)
+  return length(vec3<f32>(s.a, s.b, s.c));               // ROUNDBOX
+}
+
 // Local solid velocity at world point p: v + omega x r.
 fn bodyVelocity3(p: vec3<f32>, s: BodyState3D) -> vec3<f32> {
   let r = bodyDelta3(p, s);
