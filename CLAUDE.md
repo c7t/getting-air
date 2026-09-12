@@ -922,6 +922,17 @@ What exists today:
     rather than the initial condition. Re = 1100 SURVIVING 26000 steps at
     `?levels=2` is itself new, and is M8.0's "AMR is the stability mechanism"
     holding.
+  - **FLUTTER IS AN ATTRACTOR: THE INITIAL CONDITION IS NOT THE OBSTACLE.**
+    Released near VERTICAL (`?tilt=1.047`, 30 degrees off edge-on) the 2:1
+    plate at Re = 1100 swoops IMMEDIATELY -- net/arc = **1.00** over the first
+    2000 steps, 79 degrees all one way, more net rotation than any other case
+    reaches in 26000 -- and then relaxes onto the same bounded limit cycle,
+    `net` oscillating in 0.05..0.31 while `arc` climbs linearly to 2.74. The
+    same attractor is reached from `tilt` 0.15 and from 1.047. So the release
+    angle is settled and `i_star` is the axis left.
+  - **`net` IS A WANDERING QUANTITY UNDER FLUTTER**, so read the SERIES, not
+    the end: 0.120 final against a 0.306 maximum on the same run. Tumbling is
+    `net` growing without bound, which a single end-of-run number cannot show.
   - **THE 2:1 PLATE GLIDES, AND THAT IS THE REAL SIGNAL**: v = (0.024,
     -0.022, 0.009), a lateral speed nearly equal to its descent, against the
     square plate's (0.031, 0.003, 0.003) straight down. Fluttering WITH GLIDE
