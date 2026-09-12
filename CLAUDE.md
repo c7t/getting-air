@@ -528,6 +528,24 @@ re-argued. Two things are settled and load-bearing:
   converges to no-slip as the band narrows, so "convergent and not converged"
   is the accurate phrase, not "non-physical".
 
+- **THE DIFFUSE BODY CONVERGES AT SECOND ORDER IN THE BAND WIDTH, TO THE
+  NUMBER BOUNCE-BACK GIVES DIRECTLY.** Measured, D = 12, Re = 100, pinned,
+  band in coarse cells 1.5 / 0.75 / 0.375: Cd 5.080 / 2.413 / 1.721, a
+  difference ratio of 3.85 against 4 for halving. Richardson to zero band
+  gives 1.478 (+35% over Schiller-Naumann) against BOUNCE-BACK's 1.3951
+  (+28%) on the same body. So chi at best MATCHES bounce-back's accuracy and
+  its whole advantage is the moving case -- and the two converging to one
+  answer is the check that says it regularizes the same problem rather than
+  solving a different one. **The frame consistency survives sharpening**
+  (-0.2% at depth 3, -1.9% on a sub-cell dense band), which was the thing most
+  at risk since a narrower band is a stiffer force. **At a FIXED physical band
+  refining is worse** (2.017 at depth 3 against 1.721 dense), because a
+  sub-cell dense band makes `tanh` nearly a step and is quietly approximating
+  bounce-back. So the shipping combination is BOTH knobs: refine so the band
+  is several cells wide at the body's own level (smooth, quiet,
+  frame-consistent) while its PHYSICAL width is small (a body near the right
+  size).
+
 - **THE CHI BAND IS A FIXED NUMBER OF CELLS AT THE LEVEL THAT RESOLVES THE
   BODY, so its PHYSICAL width halves per rung of refinement** (`CHI_SCALE =
   2^-m`, with `phi` in L0 units at every level): 1.5 coarse units dense, 0.75

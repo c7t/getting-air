@@ -590,7 +590,18 @@ SCENARIOS.fall = {
       // needs, and the tools size their windows from it.
       tSettle: u_t / gEff,
       convective: n / u_t,
-      cdReference: cd,
+      // THE REFERENCE MUST BE KEYED TO THE RELATIVE SPEED THE LEG ACTUALLY
+      // RUNS AT, not to `re`. `re` sets the VISCOSITY and, for a free fall,
+      // is the Reynolds number of the target terminal velocity `u_t` -- which
+      // is what g_eff is derived from above and is correct there. A prescribed
+      // leg runs at `uRel`, and when that differs from `u_t` the flow's
+      // Reynolds number is uRel * D / nu, a different number. Reported against
+      // `re` it looked like a probe leg was +474% over Schiller-Naumann when
+      // the honest figure was +365%: the wrong reference, not the wrong
+      // measurement. No gate reads this (the prescribed cases score against
+      // each other or against recorded values), but a log that lies is how a
+      // number gets quoted later.
+      cdReference: prescribed ? schillerNaumann(Math.abs(uRelSigned) * n / nu) : cd,
     };
   },
   macro: (dims, p) => seedMacro3Perturbed(dims, () => [p.stream, 0, 0],
