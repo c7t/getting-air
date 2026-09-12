@@ -111,22 +111,51 @@ export function refineNearBody(pool, sdf, margin) {
 // that cannot be shared is shaders/common_d3_manage.wgsl's `blockWanted`,
 // which must agree with this character for character -- M4.2b-i's
 // bit-identical gate is what holds those two together.
+// sqrt(3), ROUNDED UP, and the SAME LITERAL common_d3_manage.wgsl uses. A cube
+// of half-edge h has circumradius h*sqrt(3), and that radius BOUNDS how far the
+// SDF can fall inside the box -- rounding it down would make the bound false by
+// a hair. Sharing the literal rather than each side computing Math.sqrt(3) or
+// sqrt(3f) keeps the host and the kernel from disagreeing about a borderline
+// block, which debugRunBalance compares as exact set equality.
+const SQRT3_UP = 1.7320509;
+
+// The depth of the branch-and-bound below. 3 leaves a residual slack of
+// RB*sqrt(3)/16 = 0.43 L0 cells at RB=4; see the shader's own header for the
+// measured cost/waste table that picked it.
+const BLOCK_BB_DEPTH = 3;
+
+// DOES ANY POINT OF THIS BLOCK COME WITHIN `margin` OF THE BODY?
+//
+// The host statement of common_d3_manage.wgsl's boxNearBody, and its header
+// carries the full reasoning: a 9-point corner+centre sample answers the wrong
+// question (the minimum over 9 POINTS is not the minimum over the SOLID BLOCK,
+// and the gap is the covering radius s*sqrt(5)/4 = 2.24 cells at RB=4), so it
+// could declare a block clear while it held cells inside the margin. A signed
+// distance is 1-Lipschitz, so ONE evaluation at a box centre brackets the
+// minimum over the whole box as phi(c) - R <= min <= phi(c); that decides most
+// boxes outright and only the ambiguous shell subdivides. Conservative at every
+// depth: it can over-refine, never miss. Recursive here, three bounded loops in
+// the kernel, same decisions.
 export function nearBodyWant(sdf, margin) {
-  return ({ lo, hi }) => {
-    // Distance from the body to the block's box, evaluated at the closest
-    // point of the box to the body centre is NOT enough for a general SDF,
-    // so sample the box corners and centre and take the minimum |phi|. With
-    // RB=4 the box is small against the bodies here and this is exact
-    // enough; a body smaller than a block would need a finer test, which
-    // the caller would notice as a body that fails to refine.
-    let best = Infinity;
+  const near = (c, h, depth) => {
+    const R = h * SQRT3_UP;
+    const phi = sdf(c);
+    if (phi - R > margin) return false;      // provably clear
+    if (phi <= margin) return true;          // the centre itself is inside
+    // The deepest level is the only place the answer is a BOUND rather than a
+    // decision: having failed to reject, accept. That is where the residual
+    // slack lives.
+    if (depth === 0) return true;
+    const hh = h / 2;
     for (let i = 0; i < 8; i++) {
-      const p = [i & 1 ? hi[0] : lo[0], i & 2 ? hi[1] : lo[1], i & 4 ? hi[2] : lo[2]];
-      best = Math.min(best, sdf(p));
+      const cc = [c[0] + (i & 1 ? hh : -hh), c[1] + (i & 2 ? hh : -hh), c[2] + (i & 4 ? hh : -hh)];
+      if (near(cc, hh, depth - 1)) return true;
     }
-    best = Math.min(best, sdf([(lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, (lo[2] + hi[2]) / 2]));
-    return best <= margin;
+    return false;
   };
+  return ({ lo, hi }) => near(
+    [(lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, (lo[2] + hi[2]) / 2],
+    (hi[0] - lo[0]) / 2, BLOCK_BB_DEPTH);
 }
 
 // --- neighbour resolution -------------------------------------------------

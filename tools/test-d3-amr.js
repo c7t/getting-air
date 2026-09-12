@@ -473,22 +473,61 @@ const close = (a, b, tol, what) =>
     assert.ok(r.violations.every(v => v.block === hole));
   });
 
-  ok('geometry coverage is an INDEPENDENT route: it catches a body smaller than a block', () => {
-    // refineNearBody samples a block's corners and centre, so a body that
-    // fits between those samples refines nothing -- its own header says so.
-    // The cell-granular scan is what turns that from a comment into a
-    // failure, which is the whole reason it does not reuse that predicate.
+  ok('the block test CATCHES a body smaller than a block (it used to miss it)', () => {
+    // THIS TEST USED TO ASSERT THE OPPOSITE, and the assertion it carried --
+    // `activeSlots === 0`, captioned "the premise of this test is that the
+    // block test misses it" -- is the bug nearBodyWant was rebuilt to remove
+    // (2026-09-11). The old predicate took the minimum of the SDF over a
+    // block's 8 corners plus its centre, so a body sitting in the gap between
+    // those nine samples refined NOTHING. Here block (0,0,0) spans cells 0..3
+    // and the body sits at cell (1,1,1): both the corner (0,0,0) and the
+    // centre (2,2,2) are sqrt(3) away, well outside R + margin, so all nine
+    // samples said "clear" about a block the body is sitting inside.
+    //
+    // Lipschitz branch and bound cannot make that mistake: phi(c) - R is a
+    // LOWER bound on the whole box, so a box is only rejected when it is
+    // PROVABLY clear, and this one is not. The test is kept, with its sign
+    // flipped, because the case is the sharpest statement of what changed.
     const p = makePool({ dims: [32, 32, 32], rb: 4 });
-    // Centred ON a cell, so the cell scan sees it, but small enough to slip
-    // between the block's own corner and centre samples: block (0,0,0)
-    // spans cells 0..3, and both (0,0,0) and its centre (2,2,2) are sqrt(3)
-    // away, well outside R + margin.
     const c = [1, 1, 1], R = 0.6, margin = 0.1;
     const sdf = (q) => Math.hypot(q[0] - c[0], q[1] - c[1], q[2] - c[2]) - R;
     const { blockSlot, activeSlots } = refineNearBody(p, sdf, margin);
-    assert.strictEqual(activeSlots, 0, 'the premise of this test is that the block test misses it');
+    assert.ok(activeSlots > 0, 'the block test must no longer miss a body smaller than a block');
     const r = checkGeometryCoverage(p, blockSlot, sdf, margin);
-    assert.ok(r.violations.length > 0, 'the cell-granular scan must catch what the block test missed');
+    assert.strictEqual(r.nViolations, 0,
+      'and the cell-granular scan must now agree that nothing is uncovered');
+  });
+
+  ok('the block test is CONSERVATIVE: it never misses, on shapes that defeated the old one', () => {
+    // The property the rewrite actually buys, asserted directly rather than
+    // on one lucky case: over many poses of a thin ROTATED plate -- the shape
+    // the card scenario put through the old test, and the one whose sharp
+    // corners defeated it -- the block predicate must never call a block
+    // clear that the CELL-GRANULAR scan then finds cells in. Scored against
+    // checkGeometryCoverage, which shares no arithmetic with it.
+    const p = makePool({ dims: [32, 32, 32], rb: 4 });
+    const half = [7, 3.5, 1], margin = 1.5;
+    let rnd = (() => { let s = 20260911; return () => { s = (s * 1103515245 + 12345) & 0x7fffffff; return s / 0x7fffffff; }; })();
+    for (let t = 0; t < 12; t++) {
+      // A random orientation as three orthonormal columns, from a quaternion.
+      let q = [rnd() - 0.5, rnd() - 0.5, rnd() - 0.5, rnd() - 0.5];
+      const n = Math.hypot(...q); q = q.map(v => v / n);
+      const [w, x, y, z] = q;
+      const A = [[1 - 2 * (y * y + z * z), 2 * (x * y + w * z), 2 * (x * z - w * y)],
+                 [2 * (x * y - w * z), 1 - 2 * (x * x + z * z), 2 * (y * z + w * x)],
+                 [2 * (x * z + w * y), 2 * (y * z - w * x), 1 - 2 * (x * x + y * y)]];
+      const ctr = [16 + (rnd() - 0.5) * 4, 16 + (rnd() - 0.5) * 4, 16 + (rnd() - 0.5) * 4];
+      const sdf = (pt) => {
+        const d = [pt[0] - ctr[0], pt[1] - ctr[1], pt[2] - ctr[2]];
+        const l = [0, 1, 2].map(i => d[0] * A[i][0] + d[1] * A[i][1] + d[2] * A[i][2]);
+        const g = [0, 1, 2].map(i => Math.abs(l[i]) - half[i]);
+        return Math.hypot(...g.map(v => Math.max(v, 0))) + Math.min(Math.max(...g), 0);
+      };
+      const { blockSlot } = refineNearBody(p, sdf, margin);
+      const r = checkGeometryCoverage(p, blockSlot, sdf, margin);
+      assert.strictEqual(r.nViolations, 0,
+        `pose ${t}: the block test left ${r.nViolations} cells uncovered`);
+    }
   });
 
 

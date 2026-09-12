@@ -166,6 +166,92 @@ override BOX_SCALE : f32 = 1.0f;
 // limitation: a body small against a block can fall between the samples.
 // d3-amr.mjs's checkGeometryCoverage is the independent cell-granular route
 // that catches that, and tools/validate-d3-invariants.js is what runs it.
+// sqrt(3), ROUNDED UP. A cube of half-edge h has circumradius h*sqrt(3), and
+// that radius is used to BOUND how far the SDF can fall inside the box -- so
+// rounding it down would make the bound false by a hair and the test
+// non-conservative in exactly the way this whole function exists to avoid.
+// d3-amr.mjs carries the same literal so the host and the kernel cannot
+// disagree about a borderline block.
+const SQRT3_UP = 1.7320509f;
+
+// The eight octant directions of a box, as +-1 per axis.
+fn octantSign(k: u32) -> vec3<f32> {
+  return vec3<f32>(select(-1f, 1f, (k & 1u) != 0u),
+                   select(-1f, 1f, (k & 2u) != 0u),
+                   select(-1f, 1f, (k & 4u) != 0u));
+}
+
+// DOES ANY POINT OF THIS CUBE COME WITHIN `reach` OF THE BODY?
+//
+// LIPSCHITZ BRANCH AND BOUND, and it replaces a 9-point sample that was both
+// WRONG AND MORE EXPENSIVE (2026-09-11). The old test took the minimum of the
+// SDF over the 8 corners plus the centre and compared that to `reach`. But the
+// minimum over 9 POINTS is not the minimum over the SOLID BLOCK: a point of the
+// block far from all nine samples can be much nearer the body than any of them.
+// The gap is the COVERING RADIUS of that 9-point set -- exactly s*sqrt(5)/4 for
+// a cube of edge s, the deep hole sitting on a FACE at (0, s/4, s/2),
+// equidistant from a corner and the centre -- so the old test could declare a
+// block clear while it held cells inside `reach`, by up to 2.24 L0 cells at
+// RB = 4. Measured: it MISSES 10-33 blocks per pose on every box geometry
+// tried, including a fat cube. Smooth spheres escape it, which is why it
+// survived until the card scenario put a thin rotated plate through it.
+//
+// THE FIX IS TO BOUND RATHER THAN SAMPLE. A signed distance is 1-Lipschitz, so
+// ONE evaluation at a box's centre already brackets the minimum over the whole
+// box: phi(c) - R <= min <= phi(c), with R the box's circumradius. That decides
+// most boxes outright -- reject when phi(c) - R > reach, accept when
+// phi(c) <= reach -- and only the ambiguous shell needs subdividing. Every
+// answer is conservative at every depth: it can over-refine, never miss.
+//
+// DEPTH 3, AND THE DEPTH IS BOUGHT WITH THROUGHPUT RATHER THAN ACCURACY.
+// Measured against the true set over many poses and geometries:
+//
+//     depth 0   +9..20% extra blocks   0 missed   1.00 SDF evals/block
+//     depth 1   +4.7..8.7%             0 missed   1.2-1.4
+//     depth 2   +2.4..4.1%             0 missed   1.4-1.9
+//     depth 3   +1.3..2.3%             0 missed   1.7-2.4
+//     old 9-pt  +0.0%                  10-33 MISSED   9.00
+//
+// The old test wastes nothing -- it is tight, it is just unsafe -- so any
+// conservative test costs tiles and the only question is how many. A level-1
+// tile is ~152 KB and is STEPPED TWICE PER MACRO STEP, every step, while this
+// runs once per block per manager pass (every MANAGE_EVERY steps). So trading
+// 0.7 more evaluations for 13% fewer tiles is overwhelmingly worth it, and
+// slot exhaustion is a HARD failure here (M5.4a), not a degradation.
+//
+// NO RECURSION, because WGSL has none: three bounded loops with the reject test
+// as the `continue`. Worst case 1 + 8 + 64 + 512 evaluations, average 2.
+fn boxNearBody(c0: vec3<f32>, h0: f32, reach: f32) -> bool {
+  let R0 = h0 * SQRT3_UP;
+  let p0 = get_phi3(c0, body);
+  if (p0 - R0 > reach) { return false; }
+  if (p0 <= reach) { return true; }
+  let h1 = h0 * 0.5f; let R1 = R0 * 0.5f;
+  for (var i = 0u; i < 8u; i++) {
+    let c1 = c0 + octantSign(i) * h1;
+    let p1 = get_phi3(c1, body);
+    if (p1 - R1 > reach) { continue; }
+    if (p1 <= reach) { return true; }
+    let h2 = h1 * 0.5f; let R2 = R1 * 0.5f;
+    for (var j = 0u; j < 8u; j++) {
+      let c2 = c1 + octantSign(j) * h2;
+      let p2 = get_phi3(c2, body);
+      if (p2 - R2 > reach) { continue; }
+      if (p2 <= reach) { return true; }
+      let h3 = h2 * 0.5f; let R3 = R2 * 0.5f;
+      for (var k = 0u; k < 8u; k++) {
+        let c3 = c2 + octantSign(k) * h3;
+        // THE DEEPEST LEVEL IS THE ONLY PLACE THE ANSWER IS A BOUND RATHER
+        // THAN A DECISION: accept unless provably clear. That is where the
+        // residual slack lives, and it is R3 = RB * BOX_SCALE * sqrt(3) / 16
+        // -- 0.43 L0 cells at RB = 4, against the old test's 2.24.
+        if (get_phi3(c3, body) - R3 <= reach) { return true; }
+      }
+    }
+  }
+  return false;
+}
+
 fn blockWanted(b: vec3<u32>) -> bool {
   if (HAS_BODY == 0u) { return false; }
   // REFINE AHEAD BY WHERE THE BODY WILL BE, not only where it is. This
@@ -205,17 +291,8 @@ fn blockWanted(b: vec3<u32>) -> bool {
                                * bodyCircumradius3(body));
   let reach = MARGIN + lead;
   let lo = vec3<f32>(b * RB) * BOX_SCALE;
-  let hi = lo + f32(RB) * BOX_SCALE;
-  var best = 1e30f;
-  for (var k = 0u; k < 8u; k++) {
-    let p = vec3<f32>(
-      select(lo.x, hi.x, (k & 1u) != 0u),
-      select(lo.y, hi.y, (k & 2u) != 0u),
-      select(lo.z, hi.z, (k & 4u) != 0u));
-    best = min(best, get_phi3(p, body));
-  }
-  best = min(best, get_phi3((lo + hi) * 0.5f, body));
-  return best <= reach;
+  let half = 0.5f * f32(RB) * BOX_SCALE;
+  return boxNearBody(lo + vec3<f32>(half), half, reach);
 }
 
 // --- THE 2:1 CASCADE, M5.5 -------------------------------------------------
