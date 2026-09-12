@@ -410,6 +410,151 @@ const close = (a, b, tol, what) =>
     assert.ok(p.body.x.every((c, i) => Math.abs(c - p.dims[i] / 2) < 1e-9), 'body should start centred');
   });
 
+  // --- fall: the Galilean split (plans/3D.md D1) ---------------------------
+  //
+  // The sweep is only an instrument if sliding the split changes NOTHING
+  // except the frame, so these assert the invariant parts stay invariant --
+  // the domain, the body's place in it, the reference area and the relative
+  // speed -- and that the two ENDS of the sweep still resolve to exactly the
+  // pure tow and the pure stream this suite already measures.
+  const fallLeg = (tow, stream) => resolveScenario('fall', { n: 12, re: 300, tow, stream });
+
+  ok('fall: the pure tow and the pure stream are unchanged by the split', () => {
+    const tow = fallLeg(0.04, 0);
+    assert.strictEqual(tow.pinned, false, 'a towed body moves');
+    assert.strictEqual(tow.noFluidForce, true, 'a towed body is on rails; the force is recorded, not applied');
+    close(tow.body.v[0], 0.04, 1e-12, 'tow body velocity');
+    assert.deepStrictEqual(tow.gravity, [0, 0, 0], 'a towed body is not falling');
+    assert.deepStrictEqual(tow.window, [1, 0, 0], 'a towed body needs the window to follow it');
+    close(tow.sponge.u[0], 0, 1e-12, 'a tow moves through STILL fluid');
+    close(tow.body.x[0], tow.dims[0] - 2 * 12, 1e-9, 'a tow sits 2n from the far end, wake room behind');
+
+    const str = fallLeg(0, 0.04);
+    assert.strictEqual(str.pinned, true, 'a streamed body is pinned');
+    assert.strictEqual(str.noFluidForce, false);
+    close(str.body.v[0], 0, 1e-12, 'a pinned body does not move');
+    assert.deepStrictEqual(str.window, [0, 0, 0], 'a pinned body has nothing for a window to follow');
+    close(str.sponge.u[0], 0.04, 1e-12, 'a streamed body sits in a freestream');
+    close(str.body.x[0], 2 * 12, 1e-9, 'a streamed body sits 2n from the inlet');
+  });
+
+  ok('fall: a free fall is untouched by either knob existing', () => {
+    const f = fallLeg(0, 0);
+    assert.strictEqual(f.pinned, false);
+    assert.strictEqual(f.noFluidForce, false, 'a free fall is driven BY the fluid force');
+    assert.ok(f.gravity[0] > 0, 'a free fall has gravity');
+    assert.strictEqual(f.uRel, null, 'a free fall has no prescribed relative speed -- its speed is the answer');
+    assert.deepStrictEqual(f.window, [1, 0, 0]);
+    close(f.body.x[0], f.dims[0] - 2 * 12, 1e-9, 'a falling body leaves its wake behind it');
+  });
+
+  ok('fall: sliding the split changes the frame and NOTHING else', () => {
+    const U = 0.04;
+    const legs = [0, 0.25, 0.5, 0.75, 1].map(a => fallLeg(a * U, a * U - U));
+    const ref = legs[0];
+    for (const leg of legs) {
+      // The one thing the flow may depend on, held fixed by construction.
+      close(leg.uRelSigned, -U, 1e-12, 'relative speed must not move across the sweep');
+      close(leg.uRel, U, 1e-12, 'the Cd normalization must not move across the sweep');
+      assert.deepStrictEqual(leg.dims, ref.dims, 'same domain');
+      close(leg.area, ref.area, 1e-12, 'same reference area');
+      close(leg.nu, ref.nu, 1e-12, 'same viscosity');
+      close(leg.body.x[0], ref.body.x[0], 1e-9, 'same place in the domain');
+      close(leg.sponge.width, ref.sponge.width, 1e-12, 'same sponge');
+      // On rails in one of the two ways there are: the pinned end does not
+      // integrate at all, every other leg integrates with the fluid force
+      // switched off. Either way the trajectory is prescribed, which is what
+      // makes the legs comparable.
+      assert.ok(leg.pinned || leg.noFluidForce, 'every leg must be on rails');
+      // NO LEG MAY EXCEED THE RELATIVE SPEED. A split that let a velocity
+      // grow past U would change the Mach number alongside the frame, and
+      // the sweep would no longer be one variable.
+      assert.ok(Math.max(Math.abs(leg.tow), Math.abs(leg.sponge.u[0])) <= U + 1e-12,
+        `leg tow=${leg.tow} stream=${leg.sponge.u[0]} exceeds U=${U}`);
+    }
+    // The ends ARE the two legs the suite already measures.
+    assert.strictEqual(legs[0].pinned, true, 'a = 0 is the pinned leg');
+    assert.strictEqual(legs[4].pinned, false, 'a = U is the towed leg');
+    close(legs[4].sponge.u[0], 0, 1e-12, 'a = U tows through still fluid');
+  });
+
+  ok('fall: a body towed in -x is a tow, not a free fall', () => {
+    // `tow > 0` would have read this as "no tow": gravity back on, the force
+    // applied, a different experiment reported under the same name.
+    const leg = fallLeg(-0.04, 0);
+    assert.strictEqual(leg.noFluidForce, true);
+    assert.deepStrictEqual(leg.gravity, [0, 0, 0]);
+    close(leg.uRelSigned, 0.04, 1e-12);
+    close(leg.body.x[0], 2 * 12, 1e-9, 'a body moving -x leaves its wake at +x, so it needs room there');
+  });
+
+  // --- card: the blunt-plate measurement leg (plans/3D.md D1) --------------
+  //
+  // THE ALIGNMENT IS THE WHOLE VALUE OF THE CASE, so it is asserted by
+  // COUNTING CELLS rather than by checking a coordinate: the claim is "the
+  // discrete body IS the nominal box", and only a count says that.
+  const cardLeg = (o) => resolveScenario('card',
+    { n: 16, re: 200, u_t: 0.05, span: 1, aspect: 0.125, tilt: 0, ...o });
+
+  // Solid cells along one axis: centres are integers, a box of half-extent h
+  // about `centre` owns the cells with |i - centre| < h.
+  const solidSpan = (centre, h, extent) => {
+    let count = 0;
+    for (let i = 0; i < extent; i++) if (Math.abs(i - centre) < h) count++;
+    return count;
+  };
+
+  ok('card: a prescribed, untilted plate is EXACTLY its nominal box on the lattice', () => {
+    for (const leg of [cardLeg({ tow: 0, stream: -0.05 }), cardLeg({ tow: 0.05, stream: 0 })]) {
+      // World axes are (thickness, chord, span) = (x, y, z) -- qFlat's
+      // permutation -- and the half-extents pair with them in that order.
+      const a = leg.n / 2, b = leg.span * leg.n / 2, c = leg.aspect * leg.n / 2;
+      const want = [2 * c, 2 * a, 2 * b];
+      for (const [i, h] of [c, a, b].entries()) {
+        const got = solidSpan(leg.body.x[i], h, leg.dims[i]);
+        assert.strictEqual(got, want[i],
+          `axis ${'xyz'[i]}: ${got} solid cells against the nominal ${want[i]}`);
+      }
+      // ...which is what makes `area` the frontal area rather than 12% over it.
+      close(solidSpan(leg.body.x[1], a, leg.dims[1]) * solidSpan(leg.body.x[2], b, leg.dims[2]),
+        leg.area, 1e-9, 'discrete frontal area must equal the one Cd is normalized by');
+    }
+  });
+
+  ok('card: a half-integer half-extent snaps the other way', () => {
+    // n = 24 makes the semi-thickness 1.5, which wants a cell CENTRE where
+    // the integer half-extents want a corner. One rule, two cases, and a
+    // version that snapped every axis the same way would be one cell short
+    // on this one.
+    const leg = resolveScenario('card',
+      { n: 24, re: 200, u_t: 0.05, span: 1, aspect: 0.125, tilt: 0, tow: 0, stream: -0.05 });
+    close(leg.aspect * leg.n / 2, 1.5, 1e-12, 'this case exists for the half-integer');
+    assert.strictEqual(solidSpan(leg.body.x[0], 1.5, leg.dims[0]), 3, 'thickness must be 2c = 3 cells');
+    assert.strictEqual(solidSpan(leg.body.x[1], 12, leg.dims[1]), 24, 'chord must be 2a = 24 cells');
+  });
+
+  ok('card: a free fall and a tilted leg are NOT snapped', () => {
+    // The free-fall card is the published case and every recorded number for
+    // it predates this; a tilted plate cannot be lattice-aligned at all.
+    const free = resolveScenario('card', { n: 16 });
+    assert.ok(free.body.x.every(v => Number.isInteger(v) || Math.abs(v - Math.round(v)) < 1e-9),
+      `a free fall keeps its plain centring, got ${free.body.x}`);
+    const tilted = cardLeg({ tow: 0, stream: -0.05, tilt: 0.15 });
+    assert.ok(Math.abs(tilted.body.x[1] - Math.round(tilted.body.x[1])) < 1e-9,
+      'a tilted prescribed leg is not snapped either -- there is nothing to align to');
+  });
+
+  ok('card: the prescribed domain is wider than the free-fall one', () => {
+    // A bluff body at the free-fall domain's 5% blockage carries a wall
+    // correction the size of the effect a literature comparison is after.
+    const free = resolveScenario('card', { n: 16 });
+    const leg = cardLeg({ tow: 0, stream: -0.05 });
+    assert.ok(leg.blockage < free.blockage / 2,
+      `prescribed blockage ${leg.blockage} should be far under the free fall's ${free.blockage}`);
+    assert.ok(leg.blockage < 0.02, `prescribed blockage ${leg.blockage} should be under 2%`);
+    assert.deepStrictEqual(free.dims, [96, 80, 64], 'the FREE-fall domain must not move');
+  });
+
   ok('resolveScenario rejects an unknown name instead of falling back', () => {
     assert.throws(() => resolveScenario('duckt'), /unknown scenario/);
   });

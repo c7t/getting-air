@@ -65,6 +65,37 @@
 override USE_BOUNCEBACK : u32 = 0u;
 override CHI_EPS : f32 = 1.5f;
 
+// THE SWEPT-CELL TERM, the pool's copy. common_d3_force.wgsl's SWEPT_FORCE
+// header is the statement of what it is and why it is first order in the
+// drag. Two things differ here, and the second is a factor of 2^m.
+//
+// dt = 1 IN L0 UNITS, not in this level's. The body's pose is published once
+// per MACRO-step by d3_physics.wgsl and both fine substeps see the same one,
+// so cells change hands once per macro-step however deep this level is. A
+// per-level dt here would report a body moving 2^m times too fast.
+//
+// WHICH IS EXACTLY WHY DX_WEIGHT IS THE WRONG WEIGHT FOR IT, and assuming
+// otherwise is a factor of 2 per level. The two terms are momentum over
+// DIFFERENT intervals:
+//
+//   the LINK sum is one FINE substep's momentum exchange, sampled once and
+//   weighted dx^3 / dt_fine = dx^2. That already absorbs the substep count:
+//   a macro-step transfers it TWICE, and 2 * dx^3 = dx^2 at dx = 1/2. This
+//   is DX_WEIGHT and it is unchanged.
+//
+//   the SWEPT sum is a cell's whole momentum handed over ONCE PER MACRO-STEP,
+//   because that is how often the pose moves. So its interval is dt_coarse,
+//   not dt_fine, and its weight is dx^3 / 1 = dx^3 = 8^-m -- DX_WEIGHT times
+//   dx, i.e. HALF of it at level 1 and a quarter at level 2.
+//
+// Hence a second accumulator and a second override rather than one multiply
+// at the bottom. Sharing DX_WEIGHT would have over-charged a moving body's
+// swept momentum by 2^m, which on a body-fitted shell is the whole term.
+override SWEPT_FORCE : u32 = 1u;
+
+// dx^3 = 8^-m: the swept term's own weight, per the header. 0.125 at m = 1.
+override SWEPT_WEIGHT : f32 = 0.125f;
+
 // --- THE PARENT-UNIT TO L0 CONVERSION (plans/3D.md M5.4b) -----------------
 //
 // fineToCoarseUnit3 returns a position in the PARENT LEVEL's cell units, and
@@ -142,6 +173,13 @@ fn main(
 ) {
   var fb = vec3<f32>(0f);
   var tb = vec3<f32>(0f);
+  // The swept term rides in its own accumulator because it carries a
+  // different weight -- see the SWEPT_WEIGHT header. `rArm` is hoisted with
+  // them so the torque can be taken ONCE, at the bottom, on the WEIGHTED
+  // force: a cross product inside either branch would have to know the
+  // weights, and the two branches do not carry the same ones.
+  var fs = vec3<f32>(0f);
+  var rArm = vec3<f32>(0f);
 
   let FB = poolFB();
   let fz = gid.z % FB;
@@ -165,6 +203,7 @@ fn main(
     // cannot end up referred to a different image of the body than the
     // force that produced it.
     let r = bodyDelta3(p, body);
+    rArm = r;
     let us = bodyVelocity3(p, body);
 
     if (USE_BOUNCEBACK != 0u) {
@@ -187,7 +226,21 @@ fn main(
             fb += -ei * (2f * fOpp + corr);
           }
         }
-        tb = cross(r, fb);
+      }
+      // Outside the `phi >= 0` arm: half of this term lives on cells that are
+      // SOLID now and about to be handed back. `p` is already in L0 units,
+      // which is the frame the body lives in, so the pose probe needs no
+      // further conversion -- unlike the link test above, whose NEIGHBOUR
+      // position does.
+      if (SWEPT_FORCE != 0u) {
+        let solidNow = phi < 0f;
+        if (solidNow != (get_phi3Ahead(p, body, 1f) < 0f)) {
+          var mc = vec3<f32>(0f);
+          for (var i = 0u; i < QN; i++) {
+            mc += f_in[i * poolPlane + cell] * vec3<f32>(f32(ex[i]), f32(ey[i]), f32(ez[i]));
+          }
+          fs += select(-mc, mc, !solidNow);
+        }
       }
     } else {
       let chi = chiFromPhiEps3(phi, CHI_EPS * CHI_SCALE);
@@ -219,13 +272,16 @@ fn main(
         }
         let ustar = m / max(rho, 1e-6f);
         fb = -(rho * chi * (us - ustar));
-        tb = cross(r, fb);
       }
     }
   }
 
-  fb *= DX_WEIGHT;
-  tb *= DX_WEIGHT;
+  // ONE place where the weights are applied, and the torque follows the
+  // force it is the moment of. `fb` holds the link (or penalty) sum at
+  // dx^(D-1) and `fs` the swept sum at dx^D -- see the SWEPT_WEIGHT header
+  // for why those differ by a factor of dx.
+  fb = fb * DX_WEIGHT + fs * SWEPT_WEIGHT;
+  tb = cross(rArm, fb);
 
   wg_f0[lid] = fb.x; wg_f1[lid] = fb.y; wg_f2[lid] = fb.z;
   wg_f3[lid] = tb.x; wg_f4[lid] = tb.y; wg_f5[lid] = tb.z;

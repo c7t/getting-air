@@ -610,5 +610,60 @@
       "decay_rate_control_all_L3": -0.0009501
     }
   ],
-  "sphere_amr_dynamic_note": "M4.2b-i's gate, and it is an EXACT equality rather than a tolerance. ?dynamic=1 makes the pool's block->slot map writable by a kernel -- a free-list stack, a coarsen pass and a refine pass -- instead of uploaded once. The body in this case is PINNED, so the geometry criterion wants exactly the same 160 blocks at every re-evaluation, and a manager that decides 'no change' must therefore change NOTHING. Any drift at all means the machinery perturbs the run when it is not supposed to act, which is the one thing that has to be true before M4.2b-ii lets it act. Same reasoning as M4.1a's bit-identical gate: introduce the machinery against an unchanged answer, THEN make it load-bearing. The criterion in shaders/common_d3_manage.wgsl is deliberately character-for-character the one d3-amr.mjs's refineNearBody applies on the host -- same eight corners, same centre, same margin -- because a criterion that disagreed by one block would break this gate with no way to tell it from a real allocator defect. DEPTH 3 (sphere-amr-dynamic-L3-Re20-D16, plans/3D.md M5.6) makes the same equality claim against a manager that now runs at EVERY level: a decide-and-close chain over the tree, then drain/coarsen finest-first and refine/fill coarsest-first (M5.5b). There is far more machinery to perturb the answer than at depth 2 and none of it may. Measured 2026-09-10, RTX 4080: Cd 2.9015, bit-identical to the static depth-3 run. It is the PHYSICS partner to validate-d3-invariants.js's body3-dynamic, which makes the structural version of the same claim, and to drift3, which is the case where the manager must actually act -- neither of those scores a field, and this one cannot see a manager that moves tiles correctly but transfers them wrongly."
+  "sphere_amr_dynamic_note": "M4.2b-i's gate, and it is an EXACT equality rather than a tolerance. ?dynamic=1 makes the pool's block->slot map writable by a kernel -- a free-list stack, a coarsen pass and a refine pass -- instead of uploaded once. The body in this case is PINNED, so the geometry criterion wants exactly the same 160 blocks at every re-evaluation, and a manager that decides 'no change' must therefore change NOTHING. Any drift at all means the machinery perturbs the run when it is not supposed to act, which is the one thing that has to be true before M4.2b-ii lets it act. Same reasoning as M4.1a's bit-identical gate: introduce the machinery against an unchanged answer, THEN make it load-bearing. The criterion in shaders/common_d3_manage.wgsl is deliberately character-for-character the one d3-amr.mjs's refineNearBody applies on the host -- same eight corners, same centre, same margin -- because a criterion that disagreed by one block would break this gate with no way to tell it from a real allocator defect. DEPTH 3 (sphere-amr-dynamic-L3-Re20-D16, plans/3D.md M5.6) makes the same equality claim against a manager that now runs at EVERY level: a decide-and-close chain over the tree, then drain/coarsen finest-first and refine/fill coarsest-first (M5.5b). There is far more machinery to perturb the answer than at depth 2 and none of it may. Measured 2026-09-10, RTX 4080: Cd 2.9015, bit-identical to the static depth-3 run. It is the PHYSICS partner to validate-d3-invariants.js's body3-dynamic, which makes the structural version of the same claim, and to drift3, which is the case where the manager must actually act -- neither of those scores a field, and this one cannot see a manager that moves tiles correctly but transfers them wrongly.",
+  "plate_note": "THE BLUNT PLATE (plans/3D.md D1), and it is the first body in this suite whose Cd can be put beside a literature value WITHOUT the staircase caveat every sphere case carries. The card is a ROUNDBOX with r = 0 whose body frame is a PERMUTATION of the world axes, so at tilt = 0 its surface lies on cell faces and the discrete body IS the nominal box -- provided it is PLACED right, which is the one subtlety and is unit-tested by COUNTING CELLS (tools/test-d3-scenarios.js). A cell is solid when its centre has phi < 0, so an integer half-extent needs the centre at a cell CORNER and a half-integer half-extent needs it at a cell CENTRE; get it wrong and the plate is one cell short per axis. MEASURED: centred on cell centres at n = 16 the discrete plate was 15 x 15 x 1 rather than 16 x 16 x 2, and the pinned Cd read 1.0024 -- an area error of 12% reported as physics. Snapped, the SAME case reads 1.2081. THE LITERATURE VALUE is 1.18 for a square flat plate normal to the flow on frontal area, rising to 1.98 as the span goes to infinity (Hoerner, Fluid-Dynamic Drag, ch. 3; Blevins, Applied Fluid Dynamics Handbook, table 10-4: 1.18 at b/h = 1, 1.2 at 5, 1.5 at 20, 1.98 at infinity). The plateau holds above Re ~ 1e3 because separation is fixed at the EDGES rather than by a boundary layer, which is why a sharp-edged bluff body has a Reynolds-independent drag at all. MEASURED 2026-09-11, RTX 4080, Re = 200, blockage 1.56%, 20 chord/U: Cd = 1.2081 at n = 16 and 1.2031 at n = 24 -- +2.4% and +2.0% against 1.18, and MOVING ONLY 0.4% BETWEEN RESOLUTIONS. That flatness is the point: the sphere cases sit at +7..13% and fall with resolution because their discrete surface has more area than the smooth one, and this body has no such error to converge away. cd_tol_rel = 0.10 sits 4x above the measured offset and far inside the +18% a one-cell area error produced, so it catches a geometry regression rather than admitting one. THE TOWED LEG IS SCORED AGAINST THE PINNED ONE, NOT AGAINST LITERATURE, and that is deliberate: they are one flow in two inertial frames (the Galilean split, tools/probe-d3-galilean.js), so their agreement is a claim with NO reference value in it and is exactly what the swept-cell force term (shaders/common_d3_force.wgsl's SWEPT_FORCE) exists to make true. Scoring it against literature would fold the coupling defect together with the discretization and neither would be visible. Measured at the half split (a = 0.5): -3.21% in this harness, against the SPHERE's -9.7% at the same split -- consistent with the mechanism, since a normal plate's swept cells sit in a stagnation region where the near-surface slip the missing term is proportional to is small. THE FULL TOW (a = 1) IS NOT A CASE HERE AND SHOULD NOT BE ADDED YET: measured at n = 16, tau = 0.512 it went NON-FINITE. A one-to-two-cell-thick plate translating along its own normal flips its entire face on and off at once, which is the harshest version of the moving-staircase problem in the suite; that is an open question, not a tolerance to widen. CONFIRMED TO FIRE, not merely to pass: the SAME half-tow case run with ?swept=0 -- the swept-cell force term removed -- reads -8.33% against the 6% bound and FAILS, while the pinned leg is BIT-IDENTICAL across that switch (1.2066 either way), which is the term's own claim that it is identically zero on a body that does not move. AND THE FIRST VERSION OF THIS GATE WAS VACUOUS, which is worth recording because it passed: validate-3d.js's checksOf() had no `plate` branch, returned [], and `[].every()` is true, so all three cases printed PASS while nothing was scored -- INCLUDING the ?swept=0 run at -8.33%. checksOf() now returns an explicit failing check for any scenario it does not recognize, so the next group wired in cannot repeat it.",
+  "plate_cases": [
+    {
+      "name": "plate-pinned-Re200-C16",
+      "n": 16,
+      "re": 200,
+      "u_t": 0.05,
+      "aspect": 0.125,
+      "span": 1,
+      "tilt": 0,
+      "tow": 0,
+      "stream": -0.05,
+      "q": 19,
+      "bounceback": true,
+      "settle_convective": 20,
+      "cd_tol_rel": 0.1,
+      "lateral_tol": 0.02,
+      "settle_tol": 0.02
+    },
+    {
+      "name": "plate-pinned-Re200-C24",
+      "n": 24,
+      "re": 200,
+      "u_t": 0.05,
+      "aspect": 0.125,
+      "span": 1,
+      "tilt": 0,
+      "tow": 0,
+      "stream": -0.05,
+      "q": 19,
+      "bounceback": true,
+      "settle_convective": 16,
+      "cd_tol_rel": 0.1,
+      "lateral_tol": 0.02,
+      "settle_tol": 0.02
+    },
+    {
+      "name": "plate-half-tow-Re200-C16",
+      "n": 16,
+      "re": 200,
+      "u_t": 0.05,
+      "aspect": 0.125,
+      "span": 1,
+      "tilt": 0,
+      "tow": 0.025,
+      "stream": -0.025,
+      "q": 19,
+      "bounceback": true,
+      "settle_convective": 20,
+      "lateral_tol": 0.05,
+      "settle_tol": 0.05,
+      "cd_matches": "plate-pinned-Re200-C16",
+      "cd_matches_tol": 0.06
+    }
+  ]
 }

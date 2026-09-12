@@ -440,6 +440,37 @@ SCENARIOS.fall = {
   // two frames. That isolates the moving-body coupling from resolution,
   // blockage and the drag correlation all at once -- none of which a
   // comparison against Schiller-Naumann can separate.
+  //
+  // BOTH AT ONCE IS THE THIRD MODE, AND IT TURNS THAT PAIR INTO A SWEEP
+  // (plans/3D.md D1). `tow` and `stream` are independent signed speeds: the
+  // body moves at `tow`, the fluid (initial condition AND sponge target) sits
+  // at `stream`, and the only thing the flow can depend on is the DIFFERENCE
+  //
+  //     uRelSigned = stream - tow
+  //
+  // because a rigid translation of body and fluid together is a change of
+  // inertial frame and nothing else. So holding that difference fixed and
+  // sliding the SPLIT is a one-parameter family of the SAME physical problem,
+  // whose pinned end (tow = 0) is the validated path this suite already uses
+  // and whose towed end (stream = 0) is the moving-body coupling under test.
+  // Any dependence on the split is a defect, measured with no reference value
+  // and no second domain -- see tools/probe-d3-galilean.js.
+  //
+  // Two endpoints of that family have EXACT answers, which is what makes it
+  // an instrument rather than a comparison:
+  //   uRelSigned = 0 (tow == stream)   F is exactly zero, because a uniform
+  //       feq(1, u) field is a fixed point of the whole scheme: the moving-
+  //       wall bounce-back returns feq_i exactly (feq_i - feq_opp is the
+  //       correction term, identically), and the momentum-exchange sum
+  //       pairs i with opp(i) with equal link counts on a closed body.
+  //   tow = 0                          the pinned leg, already gated.
+  // Neither is a tolerance on measured data, so a run that misses them is
+  // reporting a defect rather than a discretization.
+  //
+  // BOTH SPEEDS ARE SIGNED. A sweep at fixed relative speed U runs
+  // tow = a, stream = a - U for a in [0, U], which keeps every velocity in
+  // the domain bounded by U -- the split must not smuggle in a Mach number
+  // change alongside the frame change.
   defaults: { n: 12, re: 100, u_t: 0.04, rho_b: 4, tow: 0, stream: 0, perturb: 0, seed: 12345 },
   walls: [],
   // Long in the fall direction and no longer than it needs to be across:
@@ -458,7 +489,17 @@ SCENARIOS.fall = {
     // The balance above, solved for the acceleration.
     const gEff = u_t * u_t * cd * area / (2 * rho_b * V);
     const shape = { kind: SHAPE.SPHERE, a: R };
-    const towed = p.tow > 0, streamed = p.stream > 0;
+    // SIGNED, and `!== 0` rather than `> 0`: a Galilean split runs one of
+    // these NEGATIVE (see the header), and `> 0` would have read a body towed
+    // in -x as a free fall -- gravity back on, force applied, a different
+    // experiment reported under the same name.
+    const towed = p.tow !== 0, streamed = p.stream !== 0;
+    // `prescribed` is "somebody is moving on rails", which is what separates
+    // the measurement legs from the free fall; `uRelSigned` is the only thing
+    // the FLOW can depend on, and every arm below keys off one of those two
+    // rather than off which knob happens to be set.
+    const prescribed = towed || streamed;
+    const uRelSigned = p.stream - p.tow;
     // WHERE THE BODY SITS IS THE SAME ARRANGEMENT IN BOTH FRAMES, and under
     // the moving window it stays that way (plans/3D.md M8.3). A streamed
     // body sits 2n from the INLET, so its own wake has the other 14n and is
@@ -473,19 +514,34 @@ SCENARIOS.fall = {
     // it ran out, and M8.2b measured Cd still RISING at 8 D/U (0.951 -> 1.067
     // against the streamed 1.362) because the room behind it was still
     // growing while the measurement was being taken.
-    const x0 = streamed ? 2 * n : d[0] - 2 * n;
+    //
+    // WHICH END IS "AHEAD" IS THE BODY'S MOTION RELATIVE TO THE FLUID, not
+    // which knob is set: a split leg has both set, and keying off `streamed`
+    // would flip the domain around halfway through a sweep that is supposed
+    // to change one thing. A free fall has no prescribed speed and falls
+    // along +x, so it takes the same arm as a tow.
+    const bodyRelSign = prescribed ? Math.sign(p.tow - p.stream) : 1;
+    const x0 = bodyRelSign >= 0 ? d[0] - 2 * n : 2 * n;
     // `v` at construction, not a vx assignment afterwards: packBodyState
     // reads `s.v[0]`, so setting `body.vx` writes a field nothing packs and
     // the body silently stays put. (It did, for one measurement.)
     const body = makeBodyState({ shape, x: [x0, d[1] / 2, d[2] / 2], density: rho_b,
-                                 v: p.tow > 0 ? [p.tow, 0, 0] : [0, 0, 0] });
+                                 v: [p.tow, 0, 0] });
     return {
-      nu, tau, re, R, D: n, dims: d, body, pinned: streamed,
+      nu, tau, re, R, D: n, dims: d, body,
+      // PINNED means the body does not move, which is "the fluid is on rails
+      // and the body is not" -- NOT "a freestream was asked for". A split leg
+      // has both and the body must move.
+      pinned: streamed && !towed,
       // A towed run integrates nothing: constant velocity, force recorded.
       // A streamed run does not move the body at all.
       noFluidForce: towed, tow: p.tow, stream: p.stream,
-      // The relative speed under test, whichever frame it is expressed in.
-      uRel: towed ? p.tow : (streamed ? p.stream : null),
+      // The relative speed under test, whichever frame it is expressed in,
+      // and the SIGNED version alongside it: Cd is normalized by the
+      // magnitude, but which way the drag points is the sign, and a tool that
+      // infers that from `tow > 0` gets a split leg backwards.
+      uRel: prescribed ? Math.abs(uRelSigned) : null,
+      uRelSigned: prescribed ? uRelSigned : null,
       area, cd, rho_b, u_t,
       // THE MOVING WINDOW, on the axis the body travels along, and ONLY
       // where the body actually moves: a pinned streamed body has nothing to
@@ -497,7 +553,10 @@ SCENARIOS.fall = {
       // put a moving discontinuity -- the sponge band's edge -- into the
       // narrow direction for no reason. A tumbling plate is the case that
       // changes that answer, and it can say so itself.
-      window: streamed ? [0, 0, 0] : [1, 0, 0],
+      // Keyed on whether the BODY MOVES, not on which knob is set: a split
+      // leg streams AND tows, and `streamed` would switch the window off
+      // under a body that is still travelling.
+      window: streamed && !towed ? [0, 0, 0] : [1, 0, 0],
       // FALLS ALONG +x, the long axis. Nothing about the solver prefers an
       // axis; the domain does.
       gravity: towed ? [0, 0, 0] : [gEff, 0, 0],
@@ -521,7 +580,10 @@ SCENARIOS.fall = {
       // freestream -- this is a body falling through still fluid, not a body
       // held in a flow.
       // Still fluid for a fall or a tow; the freestream for a streamed run.
-      sponge: { width: Math.max(6, Math.round(n / 2)), u: [streamed ? p.stream : 0, 0, 0] },
+      // `p.stream` directly -- it is already 0 when unset, and the guard it
+      // replaces read as if a freestream were conditional on something other
+      // than its own value.
+      sponge: { width: Math.max(6, Math.round(n / 2)), u: [p.stream, 0, 0] },
       force: [0, 0, 0],
       blockage: area / (d[1] * d[2]),
       // Time to terminal is ~U_T/g_eff; the natural unit for how long a run
@@ -531,7 +593,7 @@ SCENARIOS.fall = {
       cdReference: cd,
     };
   },
-  macro: (dims, p) => seedMacro3Perturbed(dims, () => [p.stream > 0 ? p.stream : 0, 0, 0],
+  macro: (dims, p) => seedMacro3Perturbed(dims, () => [p.stream, 0, 0],
                                           p.perturb * p.u_t, p.seed),
 };
 
@@ -602,10 +664,35 @@ SCENARIOS.fall = {
 // ~23000 -- which is the combination nothing in the suite gates: `drift`
 // translates with the fluid force OFF, `spin` rotates with it OFF, and no
 // other body rotates at all.
+//
+// `tow` AND `stream` ARE HERE TOO, and on a plate they buy something the
+// sphere's pair cannot (plans/3D.md D1). Exactly as in `fall`, the body moves
+// at `tow`, the fluid sits at `stream`, only the difference is physical, and
+// sliding the split at a fixed difference is the same flow seen from a moving
+// frame. Two reasons this matters more on the plate than on the sphere:
+//
+//   A BROADSIDE PLATE HAS NO STAIRCASE ERROR. It is a ROUNDBOX with r = 0
+//   whose body frame is a PERMUTATION of the world axes, so at `tilt` = 0 its
+//   surface lies exactly on cell faces and the discrete body IS the intended
+//   body -- no more area than the smooth one, no effective diameter to
+//   exceed the nominal. Every other body in this suite is a sphere carrying a
+//   standing +7..13% offset against Schiller-Naumann for exactly that reason,
+//   and that offset is wide enough to hide most defects. This is the first
+//   case here whose Cd can be put next to a literature value without it.
+//
+//   ITS SEPARATION IS FIXED BY ITS EDGES, not by a boundary layer, so Cd is
+//   nearly Reynolds-independent above Re ~ 1e3 and a textbook number exists:
+//   1.18 for a SQUARE plate normal to the flow, rising to 1.98 as the span
+//   goes to infinity (Hoerner, Fluid-Dynamic Drag, ch. 3; Blevins, Applied
+//   Fluid Dynamics Handbook, table 10-4 -- 1.18 at b/h = 1, 1.2 at 5, 1.5 at
+//   20, 1.98 at infinity). At the Re this solver can reach the measured value
+//   should sit somewhat ABOVE the plateau, because below ~1e3 the viscous
+//   contribution has not yet become negligible; that is a stated expectation,
+//   not a tolerance to tune.
 SCENARIOS.card = {
   name: 'card',
   defaults: { n: 32, aspect: 0.125, span: 1, re: 500, u_t: 0.05, i_star: 0.17,
-              tilt: 0.15, perturb: 0, seed: 12345 },
+              tilt: 0.15, perturb: 0, seed: 12345, tow: 0, stream: 0 },
   walls: [],
   // Long in the fall direction, and WIDE ACROSS IT, which is where this
   // differs from `fall`. A tumbling plate does not fall straight: it
@@ -613,8 +700,24 @@ SCENARIOS.card = {
   // its own descent. The moving window handles that (window: all three axes,
   // not `fall`'s x alone), but the SPONGE band still has to sit outside the
   // near wake on every face.
-  dims: ({ n, span }) => [Math.round(6 * n), Math.round(5 * n),
-                          Math.round(Math.max(3 * n, 2 * span * n + 2 * n))],
+  //
+  // A PRESCRIBED LEG GETS A WIDER DOMAIN, and it has to: the free-fall domain
+  // puts 5.0% of its cross-section behind the plate at the defaults, and a
+  // bluff body at 5% blockage carries a wall correction of order +12% -- the
+  // same size as the effect a literature comparison is trying to resolve. The
+  // prescribed domain is 8n across both lateral axes, i.e. 1.56%, which is
+  // the blockage the validated sphere cases already run at. A free fall is
+  // untouched: it needs LENGTH to fall down, not width, and widening it would
+  // move every recorded number in this file for no gain.
+  dims: (p) => {
+    const { n, span } = p;
+    const prescribed = (p.tow || 0) !== 0 || (p.stream || 0) !== 0;
+    return prescribed
+      ? [Math.round(8 * n), Math.round(8 * n),
+         Math.round(Math.max(8 * n, 2 * span * n + 6 * n))]
+      : [Math.round(6 * n), Math.round(5 * n),
+         Math.round(Math.max(3 * n, 2 * span * n + 2 * n))];
+  },
   derive: (p) => {
     const { n, aspect, span, re, u_t, i_star } = p;
     // Body half-extents. The BODY frame is (chord, span, thickness) on
@@ -661,30 +764,91 @@ SCENARIOS.card = {
     // Composed in WORLD order: qRotate(q, .) maps body to world, so a further
     // world-frame rotation multiplies on the LEFT.
     const qFlat = qFromAxisAngle([1, 1, 1], 2 * Math.PI / 3);
+    // THE GALILEAN SPLIT, character for character the one `fall` carries --
+    // see that scenario's header for why both speeds are signed and why the
+    // arms key off `prescribed` and `uRelSigned` rather than off which knob
+    // happens to be set.
+    const towed = p.tow !== 0, streamed = p.stream !== 0;
+    const prescribed = towed || streamed;
+    const uRelSigned = p.stream - p.tow;
+    const bodyRelSign = prescribed ? Math.sign(p.tow - p.stream) : 1;
+    // WHERE THE PLATE SITS ON THE LATTICE, and for a measurement leg this is
+    // not a detail -- it is the difference between a body with no
+    // discretization error and one with a 12% area error.
+    //
+    // A cell is solid when its CENTRE has phi < 0, so an axis-aligned box of
+    // half-extent h occupies the cells with |delta| < h. Cell centres sit at
+    // integers, so:
+    //   h INTEGER      -> the centre must sit at a HALF-integer (a cell
+    //                     corner), and the count is exactly 2h.
+    //                     Centred on a cell centre instead, |delta| < h
+    //                     EXCLUDES both end cells and the count is 2h - 1.
+    //   h HALF-INTEGER -> the centre must sit at a cell CENTRE, count 2h.
+    // Get it wrong and the plate is one cell short on that axis. MEASURED, at
+    // n = 16 span = 1 aspect = 0.125 with the centre on cell centres: the
+    // discrete plate was 15 x 15 x 1 rather than 16 x 16 x 2, i.e. a frontal
+    // area of 225 against the 256 `area` normalizes Cd by -- 12% low, and the
+    // pinned Cd came out 1.00 against the square-plate 1.18 almost entirely
+    // because of it.
+    //
+    // PRESCRIBED, AXIS-ALIGNED LEGS ONLY. A tilted plate cannot be aligned to
+    // the lattice at all and a free fall tilts immediately, so there is
+    // nothing to snap to; those keep the plain centring and every recorded
+    // free-fall number is unchanged. The world axes here are
+    // (thickness, chord, span) = (x, y, z) -- qFlat's permutation -- so the
+    // half-extents pair with them in that order.
+    const snap = (centre, h) => (Number.isInteger(h) ? Math.round(centre) + 0.5 : Math.round(centre));
+    const aligned = prescribed && p.tilt === 0;
+    const x0 = bodyRelSign >= 0 ? d[0] - 2 * n : 2 * n;
+    const place = aligned
+      ? [snap(x0, c), snap(d[1] / 2, a), snap(d[2] / 2, b)]
+      : [x0, d[1] / 2, d[2] / 2];
     const body = makeBodyState({
       shape, density: rho_b,
-      x: [d[0] - 2 * n, d[1] / 2, d[2] / 2],
+      x: place,
       q: qMul(qFromAxisAngle([0, 0, 1], p.tilt), qFlat),
+      v: [p.tow, 0, 0],
     });
     return {
-      nu, tau, re, R: a, D: n, dims: d, body, pinned: false,
+      nu, tau, re, R: a, D: n, dims: d, body,
+      pinned: streamed && !towed,
+      noFluidForce: towed,
+      tow: p.tow, stream: p.stream,
+      uRel: prescribed ? Math.abs(uRelSigned) : null,
+      uRelSigned: prescribed ? uRelSigned : null,
       area, cd, rho_b, u_t, aspect, span, i_star,
-      gravity: [gEff, 0, 0], gEff,
+      // A PRESCRIBED LEG IS NOT FALLING. Gravity would accelerate nothing (the
+      // body is on rails either way) but it would be reported, and a case
+      // whose stated forcing is not the forcing it runs under is the kind of
+      // lie this file's headers exist to prevent.
+      gravity: prescribed ? [0, 0, 0] : [gEff, 0, 0], gEff,
       // ALL THREE AXES (plans/3D.md M8.3's own note: "A tumbling plate is
       // the case that changes that answer, and it can say so itself"). A
       // plate that tumbles translates across the domain as fast as it falls
-      // down it, so an x-only window loses it sideways.
-      window: [1, 1, 1],
-      sponge: { width: Math.max(6, Math.round(n / 2)), u: [0, 0, 0] },
+      // down it, so an x-only window loses it sideways. A PINNED plate has
+      // nothing for a window to follow; a towed one travels on x alone,
+      // because it is on rails and cannot turn.
+      window: prescribed ? (towed ? [1, 0, 0] : [0, 0, 0]) : [1, 1, 1],
+      sponge: { width: Math.max(6, Math.round(n / 2)), u: [p.stream, 0, 0] },
       force: [0, 0, 0],
       blockage: area / (d[1] * d[2]),
       tSettle: u_t / gEff,
       convective: n / u_t,
-      cdReference: cd,
+      // THE REFERENCE IS THE SHAPE'S, NOT THE TRANSIENT'S. For a free fall
+      // `cd` is the 1.1 that sets g_eff and is explicitly "the transient, not
+      // the answer"; for a prescribed leg there is a real literature value to
+      // be measured against, and it is the square-plate 1.18 of the header --
+      // for a SQUARE plate, so it is reported only at span = 1 and left null
+      // otherwise rather than quietly extrapolated off Blevins' table.
+      cdReference: prescribed ? (span === 1 ? 1.18 : null) : cd,
       down: [1, 0, 0],
     };
   },
-  macro: (dims, p) => seedMacro3Perturbed(dims, () => [0, 0, 0],
+  // Seeded at the freestream, which is 0 for a free fall or a pure tow and
+  // the prescribed value otherwise -- the same single expression `fall` uses,
+  // for the same reason: a conditional here would be a second place for the
+  // two to disagree about what the far field is.
+  macro: (dims, p) => seedMacro3Perturbed(dims, () => [p.stream, 0, 0],
                                           p.perturb * p.u_t, p.seed),
 };
 

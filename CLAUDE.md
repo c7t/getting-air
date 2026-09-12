@@ -395,11 +395,66 @@ re-argued. Two things are settled and load-bearing:
   property makes the fix provably free: it cannot change a pinned-body
   number, and does not. It is ALSO the fresh-node refill -- a cell entering
   the fluid arrives at equilibrium with the body's velocity -- done every
-  step because that is cheaper than detecting when to do it. **2D does not
-  have this problem**: its falling card uses chi, and its one moving
-  bounce-back body (`index-reentry.html`, tau=0.509) is KINEMATIC and runs
-  clean. Why 2D is fine and 3D was not is NOT established -- see
-  plans/3D.md M8.2a before assuming.
+  step because that is cheaper than detecting when to do it. **2D DOES NOT
+  HAVE THIS PROBLEM, AND AS OF 2026-09-11 THE REASON IS ESTABLISHED: 2D HAS
+  NO MOVING BOUNCE-BACK BODY AT ALL.** `USE_BOUNCEBACK` is set from a URL
+  parameter in exactly one file, `main-cylinder.js`, and that body is PINNED;
+  `main.js`, `main-amr.js`, `main-reentry.js` and `main-reentry-amr.js` never
+  set the override, so every moving 2D body -- the falling card and both
+  reentry pages included -- runs the DIFFUSE (chi) coupling.
+  `main-reentry.js:270` says so outright, and the commit that introduced 2D
+  bounce-back (04bac4b) is explicit that it was for the pinned cylinder:
+  "Ladd's moving-wall correction included for parity ... though it's exactly
+  0 for the pinned cylinder validation case". So the earlier note here, that
+  reentry is a moving bounce-back body, was wrong on the coupling.
+
+  That matters beyond the bookkeeping: chi never partitions cells into solid
+  and fluid, so NOTHING EVER CHANGES HANDS, and the whole class of
+  covered/fresh-node defects -- including plans/3D.md's D1, the swept-cell
+  momentum the force kernel could not see -- cannot arise in 2D. 3D cannot
+  follow: its diffuse sphere Cd is +49..131%. There is no 2D precedent to
+  inherit here, neither a solution nor a recorded dead end.
+
+- **A MOVING BODY IS CHARGED FOR THE FLUID IT SWEEPS UP, and before
+  2026-09-11 it was not** (`SWEPT_FORCE`, both 3D force kernels, `?swept=0`
+  to A/B; plans/3D.md D1). A moving body's discrete surface is a staircase
+  that CHANGES: each step, cells on the leading face cross into the solid and
+  `SOLID_EQ` destroys their momentum, and cells on the trailing face cross
+  back carrying the `feq(1, u_body)` last written into them. NEITHER CROSSES A
+  LINK, so a momentum exchange summed over bounce-back links cannot see
+  either, and the fluid's momentum changes anyway. It is FIRST ORDER in the
+  drag, not a correction to it -- the swept rate is `A * u_body` cells per
+  step -- which is how a body-scale error hid inside a surface integral.
+  **IDENTICALLY ZERO ON A PINNED BODY** (v = omega = 0 makes the pose one step
+  ahead the pose now), so every sphere gate is bit-identical across it, and
+  measures so.
+
+- **THE INSTRUMENT FOR ANY MOVING-BODY CLAIM IS THE GALILEAN SPLIT, NOT A
+  RESOLUTION LADDER** (`tools/probe-d3-galilean.js`; `fall` and `card` both
+  take signed `?tow=` and `?stream=`). The body moves at `tow`, the fluid sits
+  at `stream`, only the DIFFERENCE is physical, so holding it fixed and
+  sliding the split is one flow seen from a moving frame -- same grid, same
+  Re, same domain, same blockage, and the reference value is the other legs
+  rather than a paper. Cd(a) must be flat in a. **A resolution ladder cannot
+  do this job**: M8.2c read the tow/stream gap as resolution because it
+  assumed a missing momentum term goes as `A U^2` with no D dependence, but
+  the real term goes as `A * u_body * dU` with `dU` a boundary-layer slip,
+  which also shrinks with resolution. That claim is retracted in part; the
+  split found the same defect at ONE resolution, falling 31% linearly in the
+  body's own speed.
+
+- **THE BROADSIDE PLATE IS THE ONLY BODY HERE WITH NO STAIRCASE ERROR, and it
+  is the first whose Cd is comparable to literature without a caveat**
+  (`?scenario=card&tilt=0` with `tow`/`stream`, `plate_cases`). A ROUNDBOX
+  with r = 0 whose body frame permutes the world axes lies exactly on cell
+  faces. Measured Cd 1.2066 (chord 16) and 1.2012 (chord 24) against the
+  square-plate 1.18 -- +2.3% and +1.8%, and 0.4% APART, where every sphere
+  case sits at +7..13% and moves several percent per rung. **But only if it is
+  PLACED right**: a cell is solid when its CENTRE has phi < 0, so an integer
+  half-extent needs the body on a cell CORNER and a half-integer one needs a
+  cell CENTRE. Centred naively the plate was 15x15x1 instead of 16x16x2 and Cd
+  read 1.0024 -- a 12% area error reported as physics. `make test` asserts it
+  by COUNTING SOLID CELLS.
 
 - **Bounce-back is the accurate solid coupling in 3D; diffuse (chi) is
   not.** Sphere Cd measures +7..13% against Schiller-Naumann with
@@ -642,6 +697,25 @@ What exists today:
   bind-group-layout failure is NOT an exception: it poisons every pipeline
   built on it and the only symptom is `Invalid PipelineLayout is invalid due
   to a previous error`.
+
+- `tools/probe-d3-galilean.js` — the moving-body coupling measured against
+  ITSELF (D1). Sweeps the tow/stream split at a fixed relative speed and
+  reports Cd against the split, plus an optional MOMENTUM BUDGET leg in a
+  periodic sponge-free box (`?scenario=drift`) where the fluid's momentum can
+  only change through the body, so `sum F` must equal `-dP` and the residual
+  is the force the kernel is not measuring. Reports, does not gate.
+
+      node tools/probe-d3-galilean.js                     # the sphere sweep
+      node tools/probe-d3-galilean.js --budget            # the mechanism
+      node tools/probe-d3-galilean.js --scenario=card --n=16 --re=200 \
+           "--scenarioExtra=tilt=0&span=1&aspect=0.125&u_t=0.05"
+
+  Two traps it now documents from having hit them: the budget's first version
+  was 80% its own INITIAL CONDITION (SOLID_EQ filling the body interior on
+  step 1 is `|S| * u_body` of momentum appearing at once), and `drift` is a
+  body pumping momentum into a CLOSED BOX, so a long window does not settle,
+  it diverges -- the field's max|u| and density range are printed beside the
+  closure for that reason.
 
 - `tools/validate-3d.js` + `benchmarks/d3.json` — the M1, M2 and M3 gates.
   Analytic PASS/FAIL for duct, Beltrami, spin and the bounce-back sphere;

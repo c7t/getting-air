@@ -33,6 +33,49 @@ override WGZ : u32 = 4u;
 override USE_BOUNCEBACK : u32 = 0u;
 override CHI_EPS : f32 = 1.5f;
 
+// --- THE SWEPT-CELL TERM (plans/3D.md D1) ----------------------------------
+//
+// THE MOMENTUM EXCHANGE OVER THE BOUNCE-BACK LINKS IS NOT THE WHOLE MOMENTUM
+// TRANSFER, and for a MOVING body the part it misses is first order in the
+// drag rather than a correction to it.
+//
+// A moving body's discrete surface is a staircase that CHANGES. Every step,
+// cells on the leading face cross from fluid to solid and are overwritten
+// with feq(1, u_body) by SOLID_EQ, destroying whatever fluid momentum they
+// held; cells on the trailing face cross the other way and JOIN the fluid
+// carrying the feq(1, u_body) that SOLID_EQ last wrote into them. Neither
+// crosses a link, so neither appears in the sum above -- and the fluid's
+// momentum changes anyway. Momentum that the fluid gained and the body was
+// never charged for is drag the body never felt.
+//
+// IT IS NOT SMALL. The swept rate is A * u_body cells per step and each cell
+// carries a momentum mismatch of order the near-surface slip, so the missing
+// force goes as A * u_body * dU while the drag goes as (1/2) Cd A U^2. At
+// D = 12, Re = 100 that ratio is ~0.3, MEASURED: the Galilean split
+// (tools/probe-d3-galilean.js) reports Cd falling 31% linearly in the body's
+// own speed with the grid, the Reynolds number, the domain and the blockage
+// all held fixed -- which no resolution effect can do, because a resolution
+// effect cannot depend on which inertial frame the same grid is described in.
+// The momentum budget in a periodic sponge-free box was 48% short before this
+// term and closes with it.
+//
+// WHY THIS IS THE WHOLE ACCOUNT. In a periodic domain with no other forcing
+// the fluid's momentum can change for exactly one reason, so the body's force
+// must be MINUS the fluid's momentum rate. Splitting that rate by where it
+// happens gives two terms and only two: what crosses the links, and what
+// changes hands. This is the second one, written out.
+//
+// BOUNCE-BACK ONLY. Under the diffuse (chi) coupling there is no sharp
+// partition and no SOLID_EQ overwrite -- a cell in the band is penalized, not
+// destroyed -- so there is nothing changing hands to account for.
+//
+// PROVABLY FREE ON A PINNED BODY, exactly as SOLID_EQ is: with v = 0 and
+// omega = 0 the pose one step ahead IS the pose now, every cell tests equal
+// and the term is identically zero. Every validated sphere case in this suite
+// is pinned and is bit-identical across this change. `?swept=0` restores the
+// old force for an A/B.
+override SWEPT_FORCE : u32 = 1u;
+
 // --- FINEST-WINS MASKING (plans/3D.md M4.1d) -------------------------------
 //
 // A cell under a refined block is integrated by common_d3_force_pool.wgsl
@@ -110,8 +153,31 @@ fn main(
             fb += -ei * (2f * fOpp + corr);
           }
         }
-        tb = cross(r, fb);
       }
+      // THE SWEPT-CELL TERM -- see the SWEPT_FORCE header. Outside the
+      // `phi >= 0` arm above on purpose: half of it lives on cells that are
+      // SOLID right now and are about to be handed back to the fluid.
+      if (SWEPT_FORCE != 0u) {
+        let solidNow = phi < 0f;
+        if (solidNow != (get_phi3Ahead(p, body, 1f) < 0f)) {
+          // This cell's own momentum, as the next step will find it. For a
+          // cell about to be buried that is real fluid; for one about to be
+          // freed it is the feq(1, u_body) SOLID_EQ last wrote, i.e. exactly
+          // u_body -- the same expression either way, which is why there is
+          // one branch here and not two.
+          var mc = vec3<f32>(0f);
+          for (var i = 0u; i < QN; i++) {
+            mc += f_in[i * ncells + cell] * vec3<f32>(f32(ex[i]), f32(ey[i]), f32(ez[i]));
+          }
+          // Fluid -> solid: the fluid is about to LOSE mc and the body is
+          // what takes it. Solid -> fluid: the body gives mc back.
+          fb += select(-mc, mc, !solidNow);
+        }
+      }
+      // ONE cross product for both contributions, after both are in: they act
+      // at the same arm, and the earlier `tb = cross(r, fb)` inside the link
+      // loop's arm would have silently dropped the swept term's torque.
+      tb = cross(r, fb);
     } else {
       let chi = chiFromPhiEps3(phi, CHI_EPS);
       if (chi >= 1e-6f) {

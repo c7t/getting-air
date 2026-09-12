@@ -33,7 +33,7 @@ const {
 } = require('./lib/browser-lifecycle');
 const { caseUrl, runDuctCase, runBeltramiCase, runTgvReport, runConserveCase } = require('./lib/d3-metrics');
 const {
-  caseUrl: bodyCaseUrl, runSphereCase, runSphereShedCase, runSpinCase,
+  caseUrl: bodyCaseUrl, runSphereCase, runPlateCase, runSphereShedCase, runSpinCase,
 } = require('./lib/d3-body-metrics');
 
 const REPO_ROOT = path.join(__dirname, '..');
@@ -65,8 +65,15 @@ function checksOf(r) {
   if (r.scenario === 'tgv') return [x.finiteCheck];
   if (r.scenario === 'spin') return [x.angCheck, x.lCheck, x.qCheck, x.movedCheck];
   if (r.scenario === 'sphere-shed') return [x.stCheck, x.shedCheck, x.planarCheck, ...(x.cdCheck ? [x.cdCheck] : [])];
-  if (r.scenario.startsWith('sphere')) return [x.cdCheck, x.settledCheck, x.lateralCheck, ...(x.convergeCheck ? [x.convergeCheck] : [])];
-  return [];
+  if (r.scenario.startsWith('sphere') || r.scenario === 'plate') return [x.cdCheck, x.settledCheck, x.lateralCheck, ...(x.convergeCheck ? [x.convergeCheck] : [])];
+  // A SCENARIO THIS FUNCTION DOES NOT KNOW HAS NO CHECKS, AND `[].every()` IS
+  // TRUE, so falling through here reports PASS on a case nothing examined.
+  // That is not hypothetical: the `plate` group shipped for one run scoring
+  // nothing, and the run that PROVED it -- the same case with ?swept=0, whose
+  // Cd moved from -3.2% to -8.3% against a 6% bound -- printed "All cases
+  // PASS". Anything unrecognized is a wiring mistake and says so.
+  return [{ pass: false, label: `no checks defined for scenario "${r.scenario}"`,
+            measured: null, target: 'a checksOf branch' }];
 }
 
 const pad = (s, n) => String(s).padEnd(n);
@@ -121,6 +128,12 @@ async function main() {
     // sphere_amr_note. Ordered after the dense spheres because it reads one
     // of their results.
     { scenario: 'sphere', key: 'sphere-amr', run: runSphereCase, cases: bench.sphere_amr_cases, gate: true, body: true },
+    // D1. THE FIRST NON-SPHERE BODY WITH A GATE, and the first whose Cd is
+    // scored against literature with no staircase caveat -- a broadside
+    // ROUNDBOX at tilt = 0 is EXACTLY its nominal box on the lattice, so the
+    // +7..13% every sphere case carries simply is not there. Ordered last
+    // because the half-tow leg reads the pinned leg's own Cd.
+    { scenario: 'card', key: 'plate', run: runPlateCase, cases: bench.plate_cases, gate: true, body: true },
   ].filter(g => !opts.skip.includes(g.key || g.scenario))
    .map(g => ({ ...g, cases: g.cases.filter(c => wanted(c.name)) }))
    .filter(g => g.cases.length);
@@ -259,7 +272,7 @@ async function main() {
       c2 = `St ${x.st == null ? 'NONE' : x.st.toFixed(4)} (${x.st == null ? '-' : (x.stErr * 100).toFixed(1) + '%'})`;
       c3 = `Cd ${x.cd.toFixed(3)} amp ${e3(x.amp)}`;
       checks = [x.stCheck, x.shedCheck, x.planarCheck, ...(x.cdCheck ? [x.cdCheck] : [])];
-    } else if (r.scenario.startsWith('sphere')) {
+    } else if (r.scenario.startsWith('sphere') || r.scenario === 'plate') {
       c2 = `Cd ${x.cd.toFixed(4)} (${(x.relErr * 100).toFixed(1)}%)`;
       c3 = `lat ${e3(x.lateral)}`;
       checks = [x.cdCheck, x.settledCheck, x.lateralCheck, ...(x.convergeCheck ? [x.convergeCheck] : [])];
@@ -276,7 +289,7 @@ async function main() {
              : (r.scenario === 'beltrami' || r.scenario === 'amr' || r.scenario === 'amr-box') ? e3(x.maxL2rel)
              : r.scenario === 'spin' ? `${e3(x.angCheck.measured)} rad`
              : r.scenario === 'sphere-shed' ? `StErr ${x.st == null ? '-' : (x.stErr * 100).toFixed(1) + '%'}`
-             : r.scenario.startsWith('sphere') ? `ref ${x.cdRef.toFixed(3)}` : '-', 14)
+             : (r.scenario.startsWith('sphere') || r.scenario === 'plate') ? `ref ${x.cdRef.toFixed(3)}` : '-', 14)
       + padL(c2, 20) + padL(c3, 20) + padL(ok ? 'PASS' : 'FAIL', 10));
   }
 

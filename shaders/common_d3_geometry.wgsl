@@ -168,14 +168,55 @@ fn bodyDelta3(p: vec3<f32>, s: BodyState3D) -> vec3<f32> {
   return winWrapDelta(p - vec3<f32>(s.cx, s.cy, s.cz));
 }
 
-// World-space signed distance.
-fn get_phi3(p: vec3<f32>, s: BodyState3D) -> f32 {
-  let d = bodyDelta3(p, s);
-  let lp = qRotInv(bodyQuat(s), d);
+// THE SHAPE DISPATCH, on a position already in the BODY frame. Factored out
+// of get_phi3 so that get_phi3Ahead below can ask the same question about the
+// same body at a different POSE without a second copy of the shape table --
+// a shape added to one and not the other would make the swept-cell term see a
+// different body from the one the fluid is bouncing off.
+fn sdfLocal3(lp: vec3<f32>, s: BodyState3D) -> f32 {
   let kind = u32(s.shape);
   if (kind == SHAPE_SPHERE) { return sdSphere(lp, s.a); }
   if (kind == SHAPE_SPHEROID) { return sdSpheroid(lp, s.a, s.c); }
   return sdRoundBox(lp, vec3<f32>(s.a, s.b, s.c), s.r);
+}
+
+// World-space signed distance.
+fn get_phi3(p: vec3<f32>, s: BodyState3D) -> f32 {
+  return sdfLocal3(qRotInv(bodyQuat(s), bodyDelta3(p, s)), s);
+}
+
+// THE SAME SIGNED DISTANCE, ONE STEP AHEAD -- the body advanced by `dt` at
+// its current velocity and angular velocity, with everything else held.
+//
+// WHAT IT IS FOR (plans/3D.md D1). A moving body's discrete surface is a
+// staircase that CHANGES, so every step a handful of cells cross between
+// fluid and solid. The momentum those cells carry is created or destroyed,
+// and the momentum exchange over the bounce-back links cannot see it -- it
+// only sees what crosses a link. Charging the body for it needs to know
+// WHICH cells are about to change hands, and that is this function against
+// get_phi3: opposite signs means this cell changes hands on the next step.
+//
+// FORWARD, NOT BACKWARD, and the macro-step order is why. Per step the order
+// is force -> physics -> step (main-3d.js's encodeSteps), so the force kernel
+// sees the body at the pose the PREVIOUS step used and `f_in` still holding
+// real fluid in the cells the NEXT step is about to bury. Looking back
+// instead would name the cells whose data was already overwritten.
+//
+// PREDICTED WITH THE CURRENT VELOCITY, so it is EXACT for a body on rails
+// (?tow=, ?stream=, ?dynamic= drift) and first order in the fluid force for a
+// free one -- physics integrates v += F/m before moving, and F/m is ~3e-4 of
+// v on every case in this suite. The geometry criterion already refines ahead
+// on exactly this prediction (common_d3_manage.wgsl's MARGIN + manageEvery *
+// |v|), so this is the same statement made in a second place, not a new
+// assumption.
+//
+// The two unit quaternions multiply to a unit quaternion, so there is no
+// renormalization here; this is a one-step geometric probe and not the
+// integrator, which takes its own midpoint step on the rotation group.
+fn get_phi3Ahead(p: vec3<f32>, s: BodyState3D, dt: f32) -> f32 {
+  let c = vec3<f32>(s.cx, s.cy, s.cz) + vec3<f32>(s.vx, s.vy, s.vz) * dt;
+  let q = qMul(expMapQ(vec3<f32>(s.wx, s.wy, s.wz), dt), bodyQuat(s));
+  return sdfLocal3(qRotInv(q, winWrapDelta(p - c)), s);
 }
 
 // THE RADIUS OF THE SMALLEST SPHERE ABOUT THE CENTRE THAT CONTAINS THE BODY.

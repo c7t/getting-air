@@ -202,6 +202,8 @@ async function init() {
     'vol', 'volbox', 'volBudget',
     // M8.2a: the solid-interior reset, ?solideq=0 to disable for A/B.
     'solideq',
+    // D1: the swept-cell force term, ?swept=0 to disable for A/B.
+    'swept',
     // M8.2b: the fall scenario's two reference frames.
     'tow', 'stream',
     // M8.3: the moving window, per axis. ?window=x, ?window=0 to force it off.
@@ -951,6 +953,14 @@ async function init() {
   // BOTH step kernels from here, because the dense and pool paths must agree
   // about what is inside a body.
   const SOLID_EQ = urlParams.get('solideq') === '0' ? 0 : 1;
+  // D1. Charge the body for the momentum of the cells its moving surface
+  // buries and frees -- see shaders/common_d3_force.wgsl's SWEPT_FORCE
+  // header. Default ON; ?swept=0 restores the link-only force for an A/B.
+  // Identically zero on a PINNED body, so every validated sphere case is
+  // bit-identical across it. Passed to BOTH force kernels from here, for the
+  // reason SOLID_EQ is: the dense and pool paths must charge the same body
+  // for the same thing.
+  const SWEPT_FORCE = urlParams.get('swept') === '0' ? 0 : 1;
   const CHI_EPS = numParam('chiEps', 1.5);
   const sponge = params.sponge || { width: 0, u: [0, 0, 0] };
   const stepConstants = {
@@ -981,7 +991,7 @@ async function init() {
   const forcePipe = HAS_BODY ? await device.createComputePipelineAsync({
     layout: device.createPipelineLayout({ bindGroupLayouts: [forceBGL] }),
     compute: { module: forceModule, entryPoint: 'main', constants: {
-      ...dims, WGX: WG[0], WGY: WG[1], WGZ: WG[2], USE_BOUNCEBACK, CHI_EPS, ...WINC } },
+      ...dims, WGX: WG[0], WGY: WG[1], WGZ: WG[2], USE_BOUNCEBACK, CHI_EPS, SWEPT_FORCE, ...WINC } },
   }) : null;
   const physPipe = HAS_BODY ? await device.createComputePipelineAsync({
     layout: device.createPipelineLayout({ bindGroupLayouts: [physicsBGL] }),
@@ -1503,7 +1513,13 @@ async function init() {
       // below it because refinement is cell-centred. See the shader.
       const m = LEVELS - 1;
       forcePoolPipe = await mk(forcePoolBGL, forcePoolModule, {
-        ...finePC, USE_BOUNCEBACK, CHI_EPS, DX_WEIGHT: 4 ** -m, ...bodyFrameAt(m), ...WINC,
+        // TWO WEIGHTS, NOT ONE. dx^(D-1) = 4^-m for the link sum, which is a
+        // momentum per FINE timestep; dx^D = 8^-m for the swept sum, which is
+        // a momentum per MACRO step because that is how often the body's pose
+        // moves. See common_d3_force_pool.wgsl's SWEPT_WEIGHT header -- one
+        // weight for both would over-charge a moving body by 2^m.
+        ...finePC, USE_BOUNCEBACK, CHI_EPS, SWEPT_FORCE,
+        DX_WEIGHT: 4 ** -m, SWEPT_WEIGHT: 8 ** -m, ...bodyFrameAt(m), ...WINC,
       });
       // Reads the pool buffer substep A will read, i.e. that level's time-t
       // state, matching the coarse kernel's own pre-streaming read.
@@ -2648,10 +2664,23 @@ async function init() {
   // for an incompressible periodic flow), so this is the reporting surface
   // for the tgv scenario -- see d3-scenarios.mjs on why tgv reports rather
   // than gates.
+  //
+  // TOTAL MASS AND TOTAL MOMENTUM RIDE ALONG, and they are not decoration:
+  // they are the discriminator tools/analyze-d3-interface.js already uses at
+  // the coarse/fine seam, and the same argument applies to a moving body.
+  // In a PERIODIC domain with no sponge and no body force, the only thing
+  // that can change the fluid's momentum is the body, so d(momentum)/dt must
+  // equal minus the force the body reports -- and the two disagreeing says
+  // the force is not the whole momentum transfer, which no drag comparison
+  // can say (plans/3D.md D1). Summed over EVERY cell including the solid
+  // interior, because the host cannot cheaply ask which cells those are;
+  // under SOLID_EQ the interior contributes a constant `|S| * u_body`, so its
+  // contribution to a DIFFERENCE is the few cells that changed hands.
   async function readStats() {
     const m = await readMacro();
     const at = (x, y, z, c) => m[4 * ((((z + NZ) % NZ) * NY + ((y + NY) % NY)) * NX + ((x + NX) % NX)) + 1 + c];
     let ke = 0, ens = 0, maxSpeed = 0, rhoMin = Infinity, rhoMax = -Infinity, finite = true;
+    let mass = 0, px = 0, py = 0, pz = 0;
     for (let z = 0; z < NZ; z++) {
       for (let y = 0; y < NY; y++) {
         for (let x = 0; x < NX; x++) {
@@ -2660,6 +2689,7 @@ async function init() {
           if (!Number.isFinite(rho + ux + uy + uz)) { finite = false; continue; }
           const sp2 = ux * ux + uy * uy + uz * uz;
           ke += 0.5 * sp2;
+          mass += rho; px += rho * ux; py += rho * uy; pz += rho * uz;
           if (sp2 > maxSpeed) maxSpeed = sp2;
           if (rho < rhoMin) rhoMin = rho;
           if (rho > rhoMax) rhoMax = rho;
@@ -2674,6 +2704,10 @@ async function init() {
     return {
       step, ke: ke / n3, enstrophy: ens / n3, dissipation: 2 * params.nu * (ens / n3),
       maxSpeed: Math.sqrt(maxSpeed), rhoMin, rhoMax, finite,
+      // EXTENSIVE, not per-cell: these are compared against a FORCE, which is
+      // also extensive, so dividing by the cell count here would put a factor
+      // of NCELLS into every budget that used them.
+      mass, px, py, pz,
     };
   }
 

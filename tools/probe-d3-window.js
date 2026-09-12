@@ -115,7 +115,12 @@ async function runLeg(Runtime, o, leg, log) {
   // feels is -x). Comparing the raw numbers would report the Galilean pair
   // as disagreeing by 200% and the mistake would look exactly like a
   // coupling bug -- which is the whole thing this pair exists to detect.
-  const cdSign = p.tow > 0 ? -1 : 1;
+  // From `uRelSigned`, the scenario's own statement of which way the fluid
+  // moves PAST the body, rather than from `tow > 0`: since the Galilean split
+  // (plans/3D.md D1) a leg can tow AND stream at once, and "is `tow` set"
+  // stopped being the same question. Identical on both legs here -- a pure
+  // tow has uRelSigned = -tow and a pure stream +stream.
+  const cdSign = Math.sign(p.uRelSigned ?? (p.tow > 0 ? -1 : 1)) || 1;
   // Every leg here is one of the two PRESCRIBED frames, so the relative speed
   // is known up front and the convective time is a constant. A free fall has
   // no `uRel` -- its speed is what is being measured -- and belongs to M8.2c

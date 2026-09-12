@@ -66,6 +66,18 @@ function caseUrl(baseUrl, scenario, c, extra) {
   // everywhere else, so the steady cases stay bit-identical.
   if (c.perturb) p.set('perturb', c.perturb);
   if (c.seed) p.set('seed', c.seed);
+  // PLATE knobs (plans/3D.md D1's blunt-plate case). `tow` and `stream` are
+  // the Galilean split -- `!= null` and not truthiness, because 0 is a
+  // meaningful value for both and is exactly what the PINNED leg sets.
+  if (c.aspect != null) p.set('aspect', c.aspect);
+  if (c.span != null) p.set('span', c.span);
+  if (c.tilt != null) p.set('tilt', c.tilt);
+  if (c.u_t != null) p.set('u_t', c.u_t);
+  if (c.i_star != null) p.set('i_star', c.i_star);
+  if (c.tow != null) p.set('tow', c.tow);
+  if (c.stream != null) p.set('stream', c.stream);
+  if (c.omax != null) p.set('omax', c.omax);
+  if (c.swept != null) p.set('swept', c.swept);
   return `${baseUrl}/index-3d.html?${p}${extra ? `&${extra}` : ''}`;
 }
 
@@ -106,6 +118,113 @@ async function runSphereCase(Runtime, opts, c, log) {
     steps: settle, cd, cdRef, relErr, drift, lateral,
     cdCheck: checkTol('CdRelErr', relErr, 0, c.cd_tol_rel),
     settledCheck: checkTol('settleDrift', drift, 0, c.settle_tol ?? 0.01),
+    lateralCheck: checkTol('lateral/Cd', lateral, 0, c.lateral_tol ?? 0.02),
+  };
+}
+
+// --- plate: A BLUNT BODY WITH NO STAIRCASE (plans/3D.md D1) -----------------
+//
+// WHY A PLATE, WHEN THIS SUITE ALREADY MEASURES A SPHERE. Two reasons, and
+// the second is the one that makes it a gate rather than another data point.
+//
+// IT IS A DIFFERENT SHAPE, and that is worth more here than any individual
+// fix. Every body in this suite was a smooth SPHERE until M8.6, and the card
+// found three independent correctness bugs in the refinement criterion inside
+// an hour because a smooth sphere exercises none of them. plans/3D.md says so
+// in its own process note; this is that note acted on for the force path.
+//
+// AND IT HAS NO STAIRCASE ERROR. The card is a ROUNDBOX with r = 0 whose body
+// frame is a PERMUTATION of the world axes, so at tilt = 0 its surface lies
+// exactly on cell faces: the discrete body IS the intended body. The sphere
+// cases carry a standing +7..13% offset against Schiller-Naumann for exactly
+// the opposite reason, and that offset is wide enough to hide a defect the
+// size of the one D1 turned out to be. This is the first case in this suite
+// whose Cd can be put beside a literature value without it.
+//
+// THE LITERATURE VALUE, and its honest caveat. A square flat plate normal to
+// the flow has Cd = 1.18 on frontal area, rising to 1.98 as the span goes to
+// infinity (Hoerner, Fluid-Dynamic Drag, ch. 3; Blevins, Applied Fluid
+// Dynamics Handbook, table 10-4). That plateau holds above Re ~ 1e3 because
+// separation is fixed at the EDGES rather than by a boundary layer, which is
+// the whole reason a sharp-edged bluff body has a Reynolds-independent drag
+// at all. Below it the viscous contribution has not yet become negligible and
+// the measured value should sit somewhat ABOVE 1.18. The tolerance here is
+// therefore ONE-SIDED in spirit and wide in fact, and `cd_tol_rel` is set
+// from measurement rather than from the plateau -- read benchmarks/d3.json's
+// plate_note before moving it.
+//
+// THE PAIR IS THE POINT. A pinned leg (`stream`) and a towed leg (`tow`) of
+// the SAME plate in the SAME domain must agree, because they are one flow in
+// two inertial frames -- see tools/probe-d3-galilean.js. The pinned leg is
+// scored against literature; the towed leg is scored against the PINNED LEG,
+// which is a claim with no reference value in it and is what the swept-cell
+// force term (shaders/common_d3_force.wgsl's SWEPT_FORCE) exists to make
+// true. Scoring the towed leg against literature instead would fold the
+// coupling defect together with the discretization and neither would be
+// visible.
+async function runPlateCase(Runtime, opts, c, log) {
+  const p = await evalOrThrow(Runtime, 'window.__D3.getParams()', 20000, 'getParams');
+  // The plate's convective time is chord/U on the RELATIVE speed, which is
+  // what the flow actually sees -- `convective` is keyed to u_t, the target
+  // terminal velocity of the free fall this scenario was built for, and on a
+  // prescribed leg that is a different number.
+  const conv = Math.max(1, Math.round(p.D / p.uRel));
+  const settle = Math.round((c.settle_convective || 30) * conv);
+  if (log) {
+    log(`chord=${p.D} span=${p.span} thickness=${(p.aspect * p.D).toFixed(1)} cells  Re=${p.re} `
+      + `tau=${p.tau.toFixed(4)} domain ${p.NX}x${p.NY}x${p.NZ} blockage ${(p.blockage * 100).toFixed(2)}%`);
+    log(`  ${p.pinned ? 'PINNED in a freestream' : `TOWED at ${p.tow}`}, uRel=${p.uRel}`
+      + `  ${conv} steps per chord/U, settling ${settle}`);
+  }
+
+  // SAMPLED EVERY STEP, NOT READ AT THE END, and on a towed plate that is not
+  // noise reduction -- it is the alias. A moving bounce-back body's force
+  // oscillates with a period of exactly 1/U steps and an amplitude comparable
+  // to the drag, so a single final sample is one PHASE of the staircase.
+  // tools/probe-d3-window.js's header records the wrong conclusion that cost.
+  // The pinned leg has no such oscillation and is unaffected by averaging.
+  const warm = Math.round(settle * 0.7);
+  await evalOrThrow(Runtime, `window.__D3.debugStepSync(${warm})`, ((opts.timeout || 600) + 60) * 1000, 'debugStepSync');
+  const run = await evalOrThrow(Runtime, `window.__D3.debugRunAndCollect(${settle - warm}, 1)`,
+    ((opts.timeout || 600) + 60) * 1000, 'debugRunAndCollect');
+  const b = await evalOrThrow(Runtime, 'window.__D3.readBody()', 60000, 'readBody');
+
+  // Drag is along the RELATIVE flow and the two frames disagree about which
+  // way that points; the scenario states it, so nothing here has to guess.
+  const sign = Math.sign(p.uRelSigned) || 1;
+  const rows = run.history.filter(r => Number.isFinite(r[3]));
+  const cds = rows.map(r => sign * r[3]);
+  const cd = cds.length ? cds.reduce((x, y) => x + y, 0) / cds.length : NaN;
+  const rms = cds.length ? Math.sqrt(cds.reduce((s2, v) => s2 + (v - cd) ** 2, 0) / cds.length) : NaN;
+  const cdRef = p.cdReference;
+  const relErr = (cd - cdRef) / cdRef;
+  // SETTLING IS HALF-WINDOW MEAN AGAINST HALF-WINDOW MEAN, never a mean
+  // against a SINGLE sample -- and on a moving body that distinction is the
+  // difference between a number and noise. runSphereCase can compare against
+  // one early `readBody` because its body is pinned and its force is steady
+  // to three digits; a towed plate's instantaneous force swings with an RMS
+  // of TEN TIMES its own mean as the staircase phase sweeps, so one sample is
+  // a phase, not a level. Measured before this was fixed: the half-tow leg
+  // reported "settled to 1294%" on a run whose two half-window means agree to
+  // about 1%. Same trap as the sampling rate, one level up.
+  const half = Math.floor(cds.length / 2);
+  const meanOf = (a) => (a.length ? a.reduce((x, y) => x + y, 0) / a.length : NaN);
+  const firstHalf = meanOf(cds.slice(0, half)), secondHalf = meanOf(cds.slice(half));
+  const drift = Math.abs(secondHalf - firstHalf) / Math.abs(cd);
+  // A broadside plate in axial flow is symmetric in both lateral directions,
+  // so lift and side force must vanish -- an independent check that catches a
+  // transposed axis or a wrong torque arm, neither of which moves Cd.
+  const lateral = Math.hypot(b.cl, b.cs) / Math.abs(cd);
+  if (log) {
+    log(`  Cd=${cd.toFixed(4)} +-${rms.toFixed(3)} vs the square-plate ${cdRef} (${(relErr * 100).toFixed(1)}%)`
+      + `  settled to ${(drift * 100).toFixed(2)}%  lateral/Cd=${lateral.toExponential(2)}`);
+  }
+  return {
+    D: p.D, re: p.re, tau: p.tau, span: p.span, aspect: p.aspect,
+    pinned: !!p.pinned, tow: p.tow, uRel: p.uRel, steps: settle,
+    cd, cdRms: rms, cdRef, relErr, drift, lateral,
+    cdCheck: checkTol('CdRelErr', relErr, 0, c.cd_tol_rel),
+    settledCheck: checkTol('settleDrift', drift, 0, c.settle_tol ?? 0.02),
     lateralCheck: checkTol('lateral/Cd', lateral, 0, c.lateral_tol ?? 0.02),
   };
 }
@@ -284,4 +403,4 @@ async function runSpinCase(Runtime, opts, c, log) {
   };
 }
 
-module.exports = { evalExpr, checkTol, caseUrl, runSphereCase, runSphereShedCase, runSpinCase, quatAngle, projectLateral };
+module.exports = { evalExpr, checkTol, caseUrl, runSphereCase, runPlateCase, runSphereShedCase, runSpinCase, quatAngle, projectLateral };
