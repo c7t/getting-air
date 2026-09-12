@@ -56,7 +56,7 @@ const BASE = 'scenario=card&n=32&live=0&span=2&re=1100&tilt=1.047'
 
 const DEFAULTS = {
   baseUrl: 'https://localhost:4444', port: 9333,
-  steps: 26000, every: 100, report: 2000, sweep: null, extra: '',
+  steps: 26000, every: 100, report: 2000, sweep: null, legs: null, extra: '',
   keepOpen: false, quiet: false,
 };
 
@@ -74,6 +74,12 @@ function parseArgs(argv) {
       const eq = v.indexOf('=');
       if (eq < 0) { console.error('--sweep= wants name=v1,v2,...'); process.exit(2); }
       o.sweep = { name: v.slice(0, eq), values: v.slice(eq + 1).split(',') };
+    } else if (a.startsWith('--legs=')) {
+      // One LEG per '|'-separated query fragment. --sweep varies one
+      // parameter's value; this varies whatever each leg wants, which is what
+      // a comparison between two different mechanisms needs (`bounceback=1`
+      // against `levels=3` are not two values of one knob).
+      o.legs = a.slice(7).split('|').filter(Boolean);
     } else if (a === '--quiet') o.quiet = true;
     else if (a === '--keepOpen') o.keepOpen = true;
     else { console.error(`unknown argument: ${a}`); process.exit(2); }
@@ -85,6 +91,22 @@ async function ev(Runtime, expr, what, timeoutMs = 900000) {
   const r = await Runtime.evaluate({ expression: expr, awaitPromise: true, returnByValue: true, timeout: timeoutMs });
   if (r.exceptionDetails) throw new Error(`${what}: ${r.exceptionDetails.text}`);
   return r.result.value;
+}
+
+// LATER WINS, and it has to. A leg appended to BASE as `...&levels=2&...&levels=3`
+// is read by URLSearchParams.get as the FIRST occurrence, so the leg is
+// silently ignored and the run reports on the base configuration under the
+// leg's name. That happened: a `levels=3` leg came back BIT-IDENTICAL to the
+// `levels=2` run, which is the only reason it was caught. This codebase's own
+// rule is that a parameter silently DROPPED is worse than one rejected, and a
+// duplicated one is that failure wearing a hat.
+function mergeQuery(...parts) {
+  const q = new URLSearchParams();
+  for (const part of parts) {
+    if (!part) continue;
+    for (const [k, v] of new URLSearchParams(part)) q.set(k, v);
+  }
+  return q.toString();
 }
 
 // Least-squares slope of `y` against `x`, for "is net still growing at the end
@@ -112,11 +134,33 @@ async function runLeg(Runtime, watch, Page, o, url, label) {
   let prev = await ev(Runtime, 'window.__D3.readBody()', 'readBody');
   const O = [0, 0, 0], ts = [], nets = [];
   const x0 = prev.dx;
-  let arc = 0, netMax = 0, stopped = null, last = prev, reached = 0;
+  let arc = 0, netMax = 0, stopped = null, last = prev, reached = 0, frozen = 0;
   for (let s = o.every; s <= o.steps; s += o.every) {
     await ev(Runtime, `window.__D3.debugStepSync(${o.every})`, 'debugStepSync');
     const b = await ev(Runtime, 'window.__D3.readBody()', 'readBody');
     if (!Number.isFinite(b.cx + b.qw + b.wx + b.vx)) { stopped = `body state non-finite at step ${s}`; break; }
+    // A FROZEN BODY INTEGRATES INTO A PERFECT TUMBLE, which is how this
+    // instrument lied once and must not again. When a run dies the page stops
+    // advancing but debugStepSync keeps returning, so every readBody comes
+    // back IDENTICAL -- and a constant non-zero omega integrated forever is
+    // `net` growing linearly without bound, which is exactly the signature
+    // this tool calls tumbling. Observed 2026-09-12: a bounce-back leg froze
+    // at |v| = 0.2 (the body's own v_max clamp, i.e. it had blown up) with
+    // `fell` stuck at 119 cells, and was duly reported as 10.03 revolutions
+    // with net/arc climbing to 0.94.
+    //
+    // The tell is that NOTHING changes, position included. A real tumble
+    // moves the plate; a dead one does not.
+    if (b.dx === prev.dx && b.cx === prev.cx && b.qw === prev.qw && b.wx === prev.wx) {
+      frozen += o.every;
+      if (frozen >= 5 * o.every) { stopped = `body state FROZEN for ${frozen} steps at ${s} -- the run stopped advancing`; break; }
+    } else { frozen = 0; }
+    // The velocity clamp is the other end of the same story: a body pinned at
+    // its own v_max has already lost, whatever the trajectory does afterwards.
+    if (b.v_max && Math.hypot(b.vx, b.vy, b.vz) >= 0.999 * b.v_max) {
+      stopped = `|v| hit the body's v_max clamp (${b.v_max}) at step ${s} -- it blew up`;
+      break;
+    }
     O[0] += 0.5 * (prev.wx + b.wx) * o.every;
     O[1] += 0.5 * (prev.wy + b.wy) * o.every;
     O[2] += 0.5 * (prev.wz + b.wz) * o.every;
@@ -133,6 +177,16 @@ async function runLeg(Runtime, watch, Page, o, url, label) {
         + ` ${b.vx.toFixed(3).padStart(6)} ${b.vy.toFixed(3).padStart(6)} ${b.vz.toFixed(3).padStart(6)}`);
     }
   }
+  // THE PAGE CAN FAIL WITHOUT THE BODY GOING NON-FINITE. M5.4a latches
+  // `error: out of pool slots` into #status and stops advancing -- and
+  // debugStepSync keeps returning while it does, so a leg would report a
+  // clean trajectory for a run that stopped solving. Checked at the END of
+  // every leg and not only at navigation, which is where it cannot yet have
+  // happened.
+  if (!stopped) {
+    try { await assertPageHealthy(Runtime, watch, label); }
+    catch (e) { stopped = e.message.split('\n')[0]; }
+  }
   const half = Math.floor(ts.length / 2);
   // Revolutions per 1000 steps over the LAST HALF -- the growth rate, which
   // is what separates a tumble from a bounded rock. Zero for flutter whatever
@@ -145,7 +199,10 @@ async function runLeg(Runtime, watch, Page, o, url, label) {
   // numbers, two spans) `net` stayed inside 0.05..0.31 revolutions and its
   // last-half growth was indistinguishable from zero. A plate cannot rock
   // through three quarters of a NET revolution and still be rocking.
-  const verdict = (netEnd > 0.75 && growth > 0.005) ? 'TUMBLING'
+  // A LEG THAT DID NOT SURVIVE HAS NO VERDICT. Whatever it accumulated before
+  // it died is not evidence about tumbling.
+  const verdict = stopped ? 'INVALID -- run did not survive'
+    : (netEnd > 0.75 && growth > 0.005) ? 'TUMBLING'
     : netMax > 0.75 ? 'TUMBLING (transient -- net exceeded 3/4 turn)'
       : arcRev > 0.25 ? 'fluttering' : 'falling flat';
   return { label, netEnd, netMax, arcRev, growth, reached, stopped, verdict,
@@ -155,9 +212,10 @@ async function runLeg(Runtime, watch, Page, o, url, label) {
 
 async function main() {
   const o = parseArgs(process.argv.slice(2));
-  const legs = o.sweep
-    ? o.sweep.values.map(v => ({ label: `${o.sweep.name}=${v}`, q: `${o.sweep.name}=${v}` }))
-    : [{ label: 'base', q: '' }];
+  const legs = o.legs ? o.legs.map(q => ({ label: q, q }))
+    : o.sweep
+      ? o.sweep.values.map(v => ({ label: `${o.sweep.name}=${v}`, q: `${o.sweep.name}=${v}` }))
+      : [{ label: o.extra || 'base', q: '' }];
 
   const server = await ensureServer(o.baseUrl, REPO_ROOT);
   const chrome = await ensureChrome(o.port);
@@ -174,8 +232,7 @@ async function main() {
   const rows = [];
   try {
     for (const leg of legs) {
-      const url = `${o.baseUrl}/index-3d.html?${BASE}`
-        + (leg.q ? `&${leg.q}` : '') + (o.extra ? `&${o.extra}` : '');
+      const url = `${o.baseUrl}/index-3d.html?${mergeQuery(BASE, leg.q, o.extra)}`;
       try {
         rows.push(await runLeg(Runtime, watch, Page, o, url, leg.label));
       } catch (err) {
