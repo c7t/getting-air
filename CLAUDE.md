@@ -528,6 +528,29 @@ re-argued. Two things are settled and load-bearing:
   converges to no-slip as the band narrows, so "convergent and not converged"
   is the accurate phrase, not "non-physical".
 
+- **CHI CARRIES THE FALLING CARD, AND AT A NARROW BAND IT REPRODUCES
+  BOUNCE-BACK'S TERMINAL VELOCITY TO 0.7%** (plans/3D.md D4). Re = 500,
+  n = 32, 26000 steps: `v_x` = 0.0316 / 0.0358 / 0.0428 at band 1.5 / 0.75 /
+  0.375 coarse cells against bounce-back's 0.0425, with the free-fall balance
+  |f|/mg at 1.00 throughout and neither coupling tumbling. The 22% slower fall
+  at the DEFAULT band is the fat body quantitatively -- v ~ 1/sqrt(Cd), and the
+  pinned-plate ladder predicts 0.79 against a measured 0.78 -- not a second
+  defect. **0.375 coarse cells is what `?levels=3` gives for free at the
+  default `chiEps`**, because the band is a fixed number of cells at the body's
+  own level. chi's density field is also 5x quieter (+-0.3% against +-1.7%),
+  which matters because rho excursions are what precede a blowup.
+
+- **THE COUPLING DOES NOT MOVE THE Re = 500 STABILITY WALL, AND THAT IS THE
+  TAXONOMY BEARING OUT.** Four ways to 26000-30000 steps on the card: today's
+  default clean at 26000, a pre-D1 build (`?swept=0&rhow=0`) dead at ~25000,
+  `?swept=0` clean at 30000, chi at band 0.375 clean at 26000. **The
+  divergence STEP is a single draw good to a factor of two and is not a
+  discriminator** -- do NOT read the one death as "D1's fix extended the
+  card's life". What IS established: the blowup is the FIRST tau limit (ghost
+  modes undamped as omega -> 2), a property of the BULK collision operator, so
+  no boundary treatment touches it. chi buys the moving-boundary limit and the
+  noise; only TRT/MRT buys the NaNs. See plans/TRT.md.
+
 - **THE DIFFUSE BODY CONVERGES AT SECOND ORDER IN THE BAND WIDTH, TO THE
   NUMBER BOUNCE-BACK GIVES DIRECTLY.** Measured, D = 12, Re = 100, pinned,
   band in coarse cells 1.5 / 0.75 / 0.375: Cd 5.080 / 2.413 / 1.721, a

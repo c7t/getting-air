@@ -260,8 +260,32 @@ They are not exclusive, and the strongest argument for doing TRT anyway is that
 it also buys (a) and (b) -- the NaNs -- which chi does nothing for, and the
 NaNs are what currently stop the card at Re = 500.
 
-**The measurement that would decide it** is chi on the CARD specifically,
-because the plate is where the two arguments diverge most sharply: the band
-adds an ABSOLUTE thickness to a body whose defining property is being thin. A
-chord-16 plate is 2 cells thick and the default band is 1.5. See plans/3D.md
-D4 for the sphere ladder; the plate version is the open question.
+**That measurement has now been made** (plans/3D.md D4). chi carries the card:
+at Re = 500, n = 32, both couplings close the free-fall balance to 1.00, and
+narrowing the band walks the terminal velocity onto bounce-back's --
+`v_x` = 0.0316 / 0.0358 / 0.0428 at band 1.5 / 0.75 / 0.375 against
+bounce-back's 0.0425, i.e. **0.7% apart at the narrow band**. So the diffuse
+error really is just the band, the band really is a knob, and `?levels=3` turns
+it down for free.
+
+**AND THE Re = 500 STABILITY WALL IS UNMOVED BY EITHER COUPLING**, which is
+this note's sec 2(b) bearing out under measurement. Four configurations to
+26000-30000 steps: today's default clean at 26000, a pre-D1 build dead at
+~25000, `?swept=0` clean at 30000, and chi at band 0.375 clean at 26000. The
+divergence STEP is a single draw good to a factor of two and is not a
+discriminator -- but the shape is: **nothing about the boundary changes the
+wall, because the wall is the bulk collision operator.**
+
+**So the split of labour is now measured, not argued:**
+
+    limit                            chi      TRT
+    (a) ghost instability, the NaNs   no      yes
+    (b) wall position / Lambda        n/a     yes
+    (c) moving-body force reading    yes      yes
+    staircase force noise (295%)     yes       no
+    body is the right size            no      yes
+
+chi is available today and fixes the column the card needs to MEASURE
+something. TRT is the only thing on the list that lets the card RUN at its own
+Reynolds number. They are complementary, and the case for doing both is
+stronger than the case for either.
