@@ -916,12 +916,19 @@ What exists today:
   - **THE CARD FLUTTERS, IT DOES NOT TUMBLE**, and five configurations say
     so (n = 32, 26000 steps, chi). net/arc revolutions: 0.04/0.44 at the
     default, 0.12/0.76 at tilt 0.7, 0.10/1.03 at `?levels=2`, 0.09/0.91 at
-    span 2, and **0.07/1.80 at the TARGET Re = 1100**. `arc` quadruples while
-    `net` stays put -- more rocking, not one more degree of turning over --
-    which is the regime being wrong rather than the initial condition, and it
-    puts a number on D4's "neither coupling tumbling". Re = 1100 SURVIVING
-    26000 steps at `?levels=2` is itself new, and is M8.0's "AMR is the
-    stability mechanism" holding.
+    span 2, 0.07/1.80 at the TARGET Re = 1100, and **0.18/2.41 at Re = 1100
+    with a 2:1 plate** -- the closest any of them comes. `arc` grows 5x while
+    `net` never reaches a fifth of a turn, which is the regime being wrong
+    rather than the initial condition. Re = 1100 SURVIVING 26000 steps at
+    `?levels=2` is itself new, and is M8.0's "AMR is the stability mechanism"
+    holding.
+  - **THE 2:1 PLATE GLIDES, AND THAT IS THE REAL SIGNAL**: v = (0.024,
+    -0.022, 0.009), a lateral speed nearly equal to its descent, against the
+    square plate's (0.031, 0.003, 0.003) straight down. Fluttering WITH GLIDE
+    sits immediately next to tumbling in Pesavento & Wang. Span and Re have
+    both now been swept with the same answer, so the untried axis is
+    `i_star` -- 0.17 throughout, and the boundary in that diagram is a curve
+    in I*-Re rather than a Reynolds threshold.
 
       node tools/render-d3-movie.js                      # the card, 30 s
       node tools/render-d3-movie.js --view=slice --seconds=10 --fps=24
