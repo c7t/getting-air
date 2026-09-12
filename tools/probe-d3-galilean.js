@@ -69,6 +69,7 @@
 //   node tools/probe-d3-galilean.js --u=0.025 --n=12 --re=160 --td=16
 //   node tools/probe-d3-galilean.js --splits=0,1            # just the ends
 //   node tools/probe-d3-galilean.js --budget                # the mechanism
+//   node tools/probe-d3-galilean.js --diffuse               # the other coupling
 //   node tools/probe-d3-galilean.js --scenario=card --n=24 --re=300 \
 //        --scenarioExtra=tilt=0,span=1,aspect=0.125 --u=0.03
 
@@ -101,6 +102,16 @@ const DEFAULTS = {
   // The budget leg runs a DIFFERENT scenario (`drift`), so it takes its own
   // extras: `?tau=` is one of drift's knobs and is not one of `fall`'s, and
   // a single --extra= would be rejected by whichever page did not own it.
+  // THE COUPLING IS A LEG OF THIS EXPERIMENT, not a constant. Momentum
+  // exchange reads INDIVIDUAL populations over a subset of directions, which
+  // is not a moment, so non-hydrodynamic ("ghost") content leaks into it; the
+  // diffuse penalty reads rho and u*, which ARE moments and which ghosts are
+  // orthogonal to by construction. If the frame dependence is ghost content,
+  // the two couplings must behave completely differently -- and the split is
+  // the one instrument that can ask, because it needs no reference value and
+  // the diffuse sphere has no trustworthy one (+49..131% against
+  // Schiller-Naumann; see benchmarks/d3.json's sphere_tolerances_note).
+  diffuse: false,
   extra: '', budgetExtra: 'tau=0.509', budgetSteps: 0, timeout: 900, keepOpen: false,
 };
 
@@ -125,6 +136,7 @@ function parseArgs(argv) {
     else if (a.startsWith('--budgetSteps=')) o.budgetSteps = parseInt(a.slice(14));
     else if (a.startsWith('--timeout=')) o.timeout = parseInt(a.slice(10));
     else if (a === '--budget') o.budget = true;
+    else if (a === '--diffuse') o.diffuse = true;
     else if (a === '--keepOpen') o.keepOpen = true;
     else { console.error(`unknown argument: ${a}`); process.exit(2); }
   }
@@ -271,7 +283,8 @@ async function main() {
       // sweep changes the FRAME and not the Mach number.
       const tow = a * o.u, stream = a * o.u - o.u;
       const q = [
-        `scenario=${o.scenario}`, `n=${o.n}`, `re=${o.re}`, 'q=19', 'bounceback=1', 'live=0',
+        `scenario=${o.scenario}`, `n=${o.n}`, `re=${o.re}`, 'q=19', 'live=0',
+        ...(o.diffuse ? [] : ['bounceback=1']),
         `tow=${tow}`, `stream=${stream}`,
         ...(o.scenarioExtra ? [o.scenarioExtra] : []),
       ].join('&');

@@ -509,7 +509,39 @@ re-argued. Two things are settled and load-bearing:
   surface. Kept because it is the correct formula and costs nothing, NOT
   because it fixed anything.
 
-- **Bounce-back is the accurate solid coupling in 3D; diffuse (chi) is
+- **FOR A BODY THAT MOVES AT LOW tau, THE DIFFUSE COUPLING IS FRAME-CONSISTENT
+  AND NOISELESS AND BOUNCE-BACK IS NEITHER** (plans/3D.md D4). Measured on the
+  Galilean split at D = 12, Re = 100, tau = 0.509 -- the configuration where
+  bounce-back is worst:
+
+      coupling        pinned    a=1      frame gap   force rms/mean
+      bounce-back     1.3951   1.1373      -18.5%         295%
+      diffuse (chi)   5.0433   5.1419       +2.0%          0.5%
+
+  Nine times better on the frame and six hundred on the noise, AND PREDICTED:
+  momentum exchange is a raw sum of individual populations over a SUBSET of
+  directions, which is not a moment, so ghost content enters it; the diffuse
+  penalty reads `rho` and `u*`, which ARE moments and which ghosts are
+  orthogonal to. **The price is that the body is the wrong SIZE** -- diffuse
+  Cd is +362% over Schiller-Naumann here, an effective D of ~26 for a nominal
+  12. It is a REGULARIZATION, not a wrong model: Brinkman penalization
+  converges to no-slip as the band narrows, so "convergent and not converged"
+  is the accurate phrase, not "non-physical".
+
+- **THE CHI BAND IS A FIXED NUMBER OF CELLS AT THE LEVEL THAT RESOLVES THE
+  BODY, so its PHYSICAL width halves per rung of refinement** (`CHI_SCALE =
+  2^-m`, with `phi` in L0 units at every level): 1.5 coarse units dense, 0.75
+  at depth 2, 0.375 at depth 3. So AMR shrinks the diffuse coupling's only
+  real error automatically, at the same time as it doubles (tau - 1/2) for
+  bounce-back's. **That is why the coupling choice is live again**: 2D chose
+  chi because a phone was resolution-starved and a fat body was the lesser
+  evil, 3D chose bounce-back because it is sharp and second-order, and neither
+  argument survives AMR unchanged. `common_d3_amr_step1.wgsl` used to claim
+  the scaling preserved a constant PHYSICAL width, which is the opposite of
+  what it does; corrected 2026-09-11.
+
+- **Bounce-back is the accurate solid coupling in 3D FOR A PINNED BODY;
+  diffuse (chi) is
   not.** Sphere Cd measures +7..13% against Schiller-Naumann with
   bounce-back, and +49..131% with diffuse — converging from above with
   resolution, the same open diffuse-interface-width issue recorded above for

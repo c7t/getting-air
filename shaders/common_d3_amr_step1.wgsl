@@ -311,11 +311,28 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let rhoDen = max(rho, 1e-6f);
   let ustar = m / rhoDen;
 
-  // CHI_EPS arrives in COARSE units and is halved: a fine cell is half a
-  // coarse cell, so the same physical band width is twice as many fine
-  // cells. Getting this wrong makes the solid boundary sharper or blurrier
-  // on the refined level than on the level around it -- a discontinuity in
-  // the body itself at the interface.
+  // CHI_EPS arrives in COARSE units and is scaled by 2^-m, which makes the
+  // band a FIXED NUMBER OF CELLS AT THIS LEVEL and therefore PHYSICALLY
+  // THINNER with every rung. `phi` is a distance in L0 units here, so eps
+  // must be too: 1.5 coarse units on the dense grid, 0.75 at level 1
+  // (= 1.5 fine cells), 0.375 at level 2.
+  //
+  // THE TEXT THIS REPLACES SAID THE OPPOSITE -- that the halving preserves
+  // "the same physical band width" -- and that is not what the arithmetic
+  // does. common_d3_force_pool.wgsl's CHI_SCALE header had it right ("a
+  // fixed number of CELLS at the level that resolves it"), so one constant
+  // carried two contradictory justifications. Corrected 2026-09-11; the
+  // constant did not change, only the account of it.
+  //
+  // AND THE BEHAVIOUR IS THE ONE WORTH HAVING. The diffuse coupling's
+  // dominant error is that the body is the wrong SIZE -- the band adds
+  // effective radius and Cd converges FROM ABOVE (benchmarks/d3.json's
+  // sphere_tolerances_note). A band that shrinks with refinement is that
+  // error converging away; a physically constant one would have been an
+  // error refinement could never remove. The seam argument the old text
+  // made does not apply either: M5.4 puts the body entirely on the finest
+  // level with no coarse/fine seam inside its margin, so no two levels ever
+  // evaluate chi at the same physical place.
   let chi = select(0f, chiFromPhiEps3(phi, CHI_EPS * CHI_SCALE),
                    HAS_BODY != 0u && USE_BOUNCEBACK == 0u);
   let F = rho * chi * (us - ustar) + vec3<f32>(FORCE_X, FORCE_Y, FORCE_Z);
