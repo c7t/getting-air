@@ -593,6 +593,15 @@ SCENARIOS.fall = {
 // tau0 -- and the body must then sit on a refined level, where
 // tauAtLevel doubles the margin per rung. AMR is not an optimization for
 // this case; it is the stability mechanism.
+//
+// AND IT MEASURES AS ONE (M8.7): on a controlled A/B the falling SPHERE at
+// D = 12, Re = 300 dies at ~8000 steps dense and runs past 20000 under
+// ?levels=2, and this card with its rotation frozen (?omax=0) dies by 5000
+// dense and runs past 16000 under AMR. The one configuration where AMR
+// loses is this card with its rotation FREE -- ~9000 against dense's
+// ~23000 -- which is the combination nothing in the suite gates: `drift`
+// translates with the fluid force OFF, `spin` rotates with it OFF, and no
+// other body rotates at all.
 SCENARIOS.card = {
   name: 'card',
   defaults: { n: 32, aspect: 0.125, span: 1, re: 500, u_t: 0.05, i_star: 0.17,
