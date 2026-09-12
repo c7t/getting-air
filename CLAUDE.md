@@ -922,6 +922,20 @@ What exists today:
     rather than the initial condition. Re = 1100 SURVIVING 26000 steps at
     `?levels=2` is itself new, and is M8.0's "AMR is the stability mechanism"
     holding.
+  - **SIX LEVERS, ONE ANSWER, AND EVERY ONE MOVES `arc` NOT `net`** -- span
+    1->2, Re 500->1100, release 0.15->1.047 rad, I* 0.17->0.68, chi band
+    0.75->0.375, and the plate pre-thinned so its EFFECTIVE thickness is the
+    nominal 4 cells. Arc rises 40% across the thickness axis; net max rises
+    20% to 0.367 with DECELERATING increments, converging on ~0.4 rather than
+    a revolution. **`?bounceback=1` is not available at tau = 0.50436** -- it
+    blew up at step 5000 with |v| pinned at v_max -- so an exact-thickness
+    body and Re = 1100 are currently mutually exclusive here.
+  - **THE SUSPECT LEFT IS THE THIRD DIMENSION.** Pesavento & Wang is 2D
+    (infinite span, no tips); a finite plate sheds TIP VORTICES, the classic
+    suppressor of autorotation. The domain is already periodic on every axis,
+    so a plate whose span exactly fills z has no tips -- but `card`'s dims put
+    z = 2*span*n + 2n, so the gap is built in. Making it 2*span*n for a
+    spanwise-periodic leg is a few lines in `d3-scenarios.mjs`.
   - **FOUR AXES SWEPT, ONE ANSWER** -- span 1->2, Re 500->1100, release angle
     0.15->1.047 rad, and I* 0.17->0.68 (`tools/probe-d3-tumble.js`). A
     FOURFOLD change in inertia moves the peak net rotation 0.306 -> 0.361,
