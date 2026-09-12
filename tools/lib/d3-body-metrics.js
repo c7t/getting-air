@@ -162,7 +162,13 @@ async function runSphereCase(Runtime, opts, c, log) {
 // true. Scoring the towed leg against literature instead would fold the
 // coupling defect together with the discretization and neither would be
 // visible.
-async function runPlateCase(Runtime, opts, c, log) {
+// SERVES ANY BODY ON RAILS, not only the plate: a pinned leg and a towed leg
+// of the same body differ by nothing this runner cares about, and the towed
+// SPHERE case (plans/3D.md D3) needs exactly the same treatment -- every-step
+// sampling, half-window settling, a sign taken from the scenario. Named for
+// the case that motivated it; generalized rather than copied, because the two
+// would have drifted apart on the alias handling first.
+async function runPrescribedCase(Runtime, opts, c, log) {
   const p = await evalOrThrow(Runtime, 'window.__D3.getParams()', 20000, 'getParams');
   // The plate's convective time is chord/U on the RELATIVE speed, which is
   // what the flow actually sees -- `convective` is keyed to u_t, the target
@@ -171,8 +177,13 @@ async function runPlateCase(Runtime, opts, c, log) {
   const conv = Math.max(1, Math.round(p.D / p.uRel));
   const settle = Math.round((c.settle_convective || 30) * conv);
   if (log) {
-    log(`chord=${p.D} span=${p.span} thickness=${(p.aspect * p.D).toFixed(1)} cells  Re=${p.re} `
-      + `tau=${p.tau.toFixed(4)} domain ${p.NX}x${p.NY}x${p.NZ} blockage ${(p.blockage * 100).toFixed(2)}%`);
+    // The plate reports its own shape; a sphere has none of these fields and
+    // says so by their absence rather than by printing `undefined`.
+    const shape = p.span != null
+      ? `chord=${p.D} span=${p.span} thickness=${(p.aspect * p.D).toFixed(1)} cells`
+      : `D=${p.D}`;
+    log(`${shape}  Re=${p.re} tau=${p.tau.toFixed(4)} domain ${p.NX}x${p.NY}x${p.NZ} `
+      + `blockage=${(p.blockage * 100).toFixed(2)}%${p.amr ? ` levels=${p.levels} RB=${p.rb} ${p.activeSlots} tiles` : ' dense'}`);
     log(`  ${p.pinned ? 'PINNED in a freestream' : `TOWED at ${p.tow}`}, uRel=${p.uRel}`
       + `  ${conv} steps per chord/U, settling ${settle}`);
   }
@@ -216,7 +227,8 @@ async function runPlateCase(Runtime, opts, c, log) {
   // transposed axis or a wrong torque arm, neither of which moves Cd.
   const lateral = Math.hypot(b.cl, b.cs) / Math.abs(cd);
   if (log) {
-    log(`  Cd=${cd.toFixed(4)} +-${rms.toFixed(3)} vs the square-plate ${cdRef} (${(relErr * 100).toFixed(1)}%)`
+    log(`  Cd=${cd.toFixed(4)} +-${rms.toFixed(3)}`
+      + (cdRef != null ? ` vs the reference ${cdRef} (${(relErr * 100).toFixed(1)}%)` : ' (no literature reference)')
       + `  settled to ${(drift * 100).toFixed(2)}%  lateral/Cd=${lateral.toExponential(2)}`);
   }
   return {
@@ -403,4 +415,4 @@ async function runSpinCase(Runtime, opts, c, log) {
   };
 }
 
-module.exports = { evalExpr, checkTol, caseUrl, runSphereCase, runPlateCase, runSphereShedCase, runSpinCase, quatAngle, projectLateral };
+module.exports = { evalExpr, checkTol, caseUrl, runSphereCase, runPrescribedCase, runSphereShedCase, runSpinCase, quatAngle, projectLateral };

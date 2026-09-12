@@ -33,7 +33,7 @@ const {
 } = require('./lib/browser-lifecycle');
 const { caseUrl, runDuctCase, runBeltramiCase, runTgvReport, runConserveCase } = require('./lib/d3-metrics');
 const {
-  caseUrl: bodyCaseUrl, runSphereCase, runPlateCase, runSphereShedCase, runSpinCase,
+  caseUrl: bodyCaseUrl, runSphereCase, runPrescribedCase, runSphereShedCase, runSpinCase,
 } = require('./lib/d3-body-metrics');
 
 const REPO_ROOT = path.join(__dirname, '..');
@@ -65,7 +65,7 @@ function checksOf(r) {
   if (r.scenario === 'tgv') return [x.finiteCheck];
   if (r.scenario === 'spin') return [x.angCheck, x.lCheck, x.qCheck, x.movedCheck];
   if (r.scenario === 'sphere-shed') return [x.stCheck, x.shedCheck, x.planarCheck, ...(x.cdCheck ? [x.cdCheck] : [])];
-  if (r.scenario.startsWith('sphere') || r.scenario === 'plate') return [x.cdCheck, x.settledCheck, x.lateralCheck, ...(x.convergeCheck ? [x.convergeCheck] : [])];
+  if (r.scenario.startsWith('sphere') || r.scenario === 'plate' || r.scenario === 'tow-amr') return [x.cdCheck, x.settledCheck, x.lateralCheck, ...(x.convergeCheck ? [x.convergeCheck] : [])];
   // A SCENARIO THIS FUNCTION DOES NOT KNOW HAS NO CHECKS, AND `[].every()` IS
   // TRUE, so falling through here reports PASS on a case nothing examined.
   // That is not hypothetical: the `plate` group shipped for one run scoring
@@ -133,7 +133,14 @@ async function main() {
     // ROUNDBOX at tilt = 0 is EXACTLY its nominal box on the lattice, so the
     // +7..13% every sphere case carries simply is not there. Ordered last
     // because the half-tow leg reads the pinned leg's own Cd.
-    { scenario: 'card', key: 'plate', run: runPlateCase, cases: bench.plate_cases, gate: true, body: true },
+    { scenario: 'card', key: 'plate', run: runPrescribedCase, cases: bench.plate_cases, gate: true, body: true },
+    // D3. THE MOVING-BODY CROSS-LEVEL CASE, and the hole it fills is the one
+    // D1 sat in: every other cross-level gate here has a PINNED body, so the
+    // moving half of the pool force path was exercised by nothing. Scored
+    // against RECORDED values, not physics -- the towed leg is ~34% high and
+    // that is the open defect, so these are the numbers that must NOT MOVE
+    // until it is fixed. Read benchmarks/d3.json's tow_amr_note first.
+    { scenario: 'fall', key: 'tow-amr', run: runPrescribedCase, cases: bench.tow_amr_cases, gate: true, body: true },
   ].filter(g => !opts.skip.includes(g.key || g.scenario))
    .map(g => ({ ...g, cases: g.cases.filter(c => wanted(c.name)) }))
    .filter(g => g.cases.length);
@@ -174,7 +181,13 @@ async function main() {
           // against literature -- see benchmarks/d3.json's
           // sphere_tolerances_note. Substituting the check here keeps that
           // distinction in one place instead of forking the runner.
-          if (g.diffuse && c.cd_recorded != null) {
+          // RECORDED-VALUE SCORING, for any case whose claim is "this number
+          // must not move" rather than "this agrees with physics". Keyed on
+          // the CASE carrying `cd_recorded`, not on the group being the
+          // diffuse one: D3's towed-AMR pair makes the same kind of claim for
+          // a different reason, and a second copy of this branch is how the
+          // two would drift apart.
+          if (c.cd_recorded != null) {
             const rel = (res.cd - c.cd_recorded) / c.cd_recorded;
             res.cdCheck = { pass: Math.abs(rel) <= c.cd_tol_rel_recorded, label: 'CdVsRecorded',
                             measured: rel, target: 0, tol: c.cd_tol_rel_recorded };
@@ -272,7 +285,7 @@ async function main() {
       c2 = `St ${x.st == null ? 'NONE' : x.st.toFixed(4)} (${x.st == null ? '-' : (x.stErr * 100).toFixed(1) + '%'})`;
       c3 = `Cd ${x.cd.toFixed(3)} amp ${e3(x.amp)}`;
       checks = [x.stCheck, x.shedCheck, x.planarCheck, ...(x.cdCheck ? [x.cdCheck] : [])];
-    } else if (r.scenario.startsWith('sphere') || r.scenario === 'plate') {
+    } else if (r.scenario.startsWith('sphere') || r.scenario === 'plate' || r.scenario === 'tow-amr') {
       c2 = `Cd ${x.cd.toFixed(4)} (${(x.relErr * 100).toFixed(1)}%)`;
       c3 = `lat ${e3(x.lateral)}`;
       checks = [x.cdCheck, x.settledCheck, x.lateralCheck, ...(x.convergeCheck ? [x.convergeCheck] : [])];
@@ -289,7 +302,8 @@ async function main() {
              : (r.scenario === 'beltrami' || r.scenario === 'amr' || r.scenario === 'amr-box') ? e3(x.maxL2rel)
              : r.scenario === 'spin' ? `${e3(x.angCheck.measured)} rad`
              : r.scenario === 'sphere-shed' ? `StErr ${x.st == null ? '-' : (x.stErr * 100).toFixed(1) + '%'}`
-             : (r.scenario.startsWith('sphere') || r.scenario === 'plate') ? `ref ${x.cdRef.toFixed(3)}` : '-', 14)
+             : (r.scenario.startsWith('sphere') || r.scenario === 'plate' || r.scenario === 'tow-amr')
+               ? `ref ${(x.recorded ?? x.cdRef ?? NaN).toFixed(3)}` : '-', 14)
       + padL(c2, 20) + padL(c3, 20) + padL(ok ? 'PASS' : 'FAIL', 10));
   }
 

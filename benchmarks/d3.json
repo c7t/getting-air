@@ -665,5 +665,48 @@
       "cd_matches": "plate-pinned-Re200-C16",
       "cd_matches_tol": 0.06
     }
+  ],
+  "tow_amr_note": "THE MOVING-BODY CROSS-LEVEL CASE (plans/3D.md D3), and it exists because of a HOLE rather than a number: every other cross-level gate in this file has a PINNED body -- sphere_amr_cases reproduces the dense Cd to 0.07% and its depth-3 sibling to 1.4%, both stationary -- so the MOVING half of the pool force path was exercised by nothing at all. That is the same shape of hole D1 sat in one level down, and it is why a 34% error survived. THE PAIR IS ONE BODY IN TWO INERTIAL FRAMES, the Galilean split of tools/probe-d3-galilean.js: `tow` and `stream` are signed and only their DIFFERENCE is physical, so the pinned leg (tow = 0, stream = -U) and the towed leg (tow = U, stream = 0) are the same flow in the same domain at the same blockage on the same grid, and their Cd MUST AGREE. SCORED AGAINST RECORDED VALUES, NOT AGAINST EACH OTHER AND NOT AGAINST PHYSICS, because they do NOT agree: the towed leg reads ~34% high, which is D3 itself. A cd_matches bound would have to be widened to 0.4 to go green, and a bound that wide guards nothing. These are the numbers that must NOT MOVE while the defect stands, and they are the ones to RE-BASELINE DOWNWARD when it is fixed -- at which point the right form of this gate is the towed leg scored against the pinned one at a few percent. Do not widen them; a regression bound that has to grow is reporting a regression. REPRODUCIBILITY IS THE REASON THE BOUNDS ARE NOT TIGHTER. CLAUDE.md records AMR Cd as reproducible only to ~1e-3 for a PINNED 2D body, because pool slots are handed out by an atomicSub free list and the per-workgroup fixed-point truncation regroups with them. A body that MOVES hands every tile over repeatedly, so the spread is larger; the bounds below were set from a same-build repeat, as CLAUDE.md requires for any AMR Cd claim, and not from a single draw. WHAT IS ALREADY RULED OUT, so a future run does not re-measure it: the manager (a static tile set reads +40%), its cadence (manageEvery 1 and 16 agree to 0.2%), the refinement margin, the moving window (+43% with ?window=0), D1's swept-cell term (+39% with ?swept=0), the interface scheme (interp is worse at +46%), and tile size (RB=8 reads +43%). The excess FALLS ~4x per rung of the body's own level (+34% at depth 2, +7.8% at depth 3), so it is a convergent discretization error of the pool's moving-boundary treatment rather than a lost tile or a wrong constant. MEASURED 2026-09-11, RTX 4080, 16 D/U: pinned 1.3026, towed 1.9126 (+46.8%). A SAME-BUILD REPEAT reproduced BOTH to every printed digit, so the bounds here are 1% and 2% -- an order of magnitude above the observed spread and well inside the defect they guard. That spread is smaller than CLAUDE.md's standing ~1e-3 warning for AMR Cd would predict; the warning still stands for build-vs-build claims, but this configuration is not where it bites. CONFIRMED TO FIRE: the same pair with ?swept=0 (D1's force term removed) moves the TOWED leg to 1.8047, -5.6% and outside its bound, while the PINNED leg does not move at all -- which is also an independent check of the swept term's claim that it is identically zero on a body that does not move.",
+  "tow_amr_cases": [
+    {
+      "name": "sphere-amr-pin-Re100-D12",
+      "n": 12,
+      "re": 160,
+      "u_t": 0.04,
+      "tow": 0,
+      "stream": -0.025,
+      "q": 19,
+      "bounceback": true,
+      "levels": 2,
+      "rb": 4,
+      "refine": "body",
+      "interface": "explode",
+      "dynamic": 1,
+      "settle_convective": 16,
+      "lateral_tol": 0.05,
+      "settle_tol": 0.03,
+      "cd_recorded": 1.3026,
+      "cd_tol_rel_recorded": 0.01
+    },
+    {
+      "name": "sphere-amr-tow-Re100-D12",
+      "n": 12,
+      "re": 160,
+      "u_t": 0.04,
+      "tow": 0.025,
+      "stream": 0,
+      "q": 19,
+      "bounceback": true,
+      "levels": 2,
+      "rb": 4,
+      "refine": "body",
+      "interface": "explode",
+      "dynamic": 1,
+      "settle_convective": 16,
+      "lateral_tol": 0.1,
+      "settle_tol": 0.1,
+      "cd_recorded": 1.9126,
+      "cd_tol_rel_recorded": 0.02
+    }
   ]
 }

@@ -456,6 +456,26 @@ re-argued. Two things are settled and load-bearing:
   read 1.0024 -- a 12% area error reported as physics. `make test` asserts it
   by COUNTING SOLID CELLS.
 
+- **A MOVING BODY ON THE POOL READS ~34% MORE DRAG THAN THE SAME BODY PINNED,
+  AND EVERY SWITCHABLE CAUSE IS RULED OUT** (plans/3D.md D3, OPEN). The
+  Galilean split at `?levels=2` gives Cd 1.3027 pinned against 1.9203 towed --
+  opposite in sign to D1, so it is not a worse version of it. Not the manager
+  (a STATIC tile set reads +40%), not its cadence, not the margin, not the
+  moving window (+43% with `?window=0`), not D1's swept term (+39% with
+  `?swept=0`), not the interface scheme (interp is worse), not tile size. **It
+  FALLS ~4x per rung of the body's own level** (+34% at depth 2, +7.8% at
+  depth 3), so it is a convergent discretization error of the pool's
+  moving-boundary treatment rather than a lost tile -- and the falling card,
+  which must live deep for stability, is therefore less exposed than the
+  depth-2 number suggests. `tow_amr_cases` pins both numbers as a REGRESSION
+  bound; re-baseline them downward when it is fixed, never widen them.
+
+- **EVERY CROSS-LEVEL GATE HERE HAD A PINNED BODY UNTIL D3**, which is exactly
+  how a 34% error survived -- the same shape of hole D1 sat in one level down.
+  When adding a gate for machinery that a MOVING body exercises, check whether
+  anything in the suite actually moves one; `drift` translates with the fluid
+  force OFF and `spin` rotates with it OFF, so neither counts.
+
 - **Bounce-back is the accurate solid coupling in 3D; diffuse (chi) is
   not.** Sphere Cd measures +7..13% against Schiller-Naumann with
   bounce-back, and +49..131% with diffuse — converging from above with
