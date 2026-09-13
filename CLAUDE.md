@@ -881,13 +881,33 @@ What exists today:
     the image: an image statistic cannot separate a speckled volume from a
     raymarcher undersampling a clean one, and M6.5a is the standing lesson on
     trusting image statistics here.
-  - **A FLAT PLATE IS THE PATHOLOGICAL CASE FOR BOUNDING BOXES, and the card
-    is already past the threshold M6.4c set.** `boxRatio` is 1.04-1.14 on a
-    geometry-forced SPHERE shell -- nearly isotropic, so its box is tight --
-    but the card's refined set is a thin SLAB in a fat box and measures
-    **12.29 at L2**, against the ~4x at which M6.4c says boxes stop paying.
-    So the successor (true per-ray descent, M8.5) is not merely measured and
-    waiting; the falling card is a case that already wants it.
+  - **`boxRatio` WAS READING THE SEAM CROSSING AS GEOMETRY, and the "flat
+    plates are pathological for boxes" claim built on it is RETRACTED**
+    (2026-09-12). `poolStateAt`'s bbox was a plain min..max in BUFFER
+    coordinates; with a moving window the shell straddles the seam twice a lap
+    and min..max is then nearly the whole axis. It now uses the same
+    `axisSpan` the volume boxes have used since M6.4. Measured on the card at
+    L2: **12.29 at a straddling step, ~2.0 away from one** -- so the statistic
+    was mostly reporting where in its lap the body happened to be, and the
+    honest number is comfortably UNDER M6.4c's ~4x threshold. A wrapped span
+    has `hi` BELOW `lo`, so `bbox` now carries `ext` explicitly and
+    `d3-volume.mjs`'s `boxRatio` prefers it; feeding it a wrapped span with no
+    `ext` is REFUSED rather than silently negated, and `make test` gates that.
+    Same class as M6.5a: a quantity that is fine in buffer coordinates and
+    meaningless in window ones.
+  - **THE VOLUME'S EXTENT IS FIXED AT CREATION AND A ROTATING BODY OUTGROWS
+    IT** -- `?volMargin=` is slack added ONCE, to the step-0 box, and only the
+    ORIGIN moves thereafter (a texture has a size). A plate turning edge-on to
+    broadside swings its AXIS-ALIGNED bbox by far more than a sphere's, so the
+    set walks out of a box that was correctly sized at step 0. Measured on the
+    card at ?levels=3, L2 y-extent against its volume: 0.80 at rest, **1.20 at
+    peak |omega|**, and the overflow tracks |omega| rather than the step
+    number. The box then CLIPS the refined region and the render shows a hard
+    rectangular boundary -- which is the OPPOSITE geometry to the speckle
+    above (box wider than set) and a different artifact. `?volMargin=4` covers
+    the measured peak on this case (`?volBudget=512` with it); the principled
+    fix, unrun, is to size a rotating body's box from its BOUNDING SPHERE
+    (2*sqrt(a^2+b^2+c^2)) rather than from one pose.
   - **`debugPoolState` reports `boxRatio` per level** (M6.4c) -- box-union
     over refined-set volume, 1.04x/1.14x on a geometry-forced shell against
     the ~4x at which boxes stop paying. M8.4 already measured **4.6** on a

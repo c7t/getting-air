@@ -235,6 +235,18 @@ const close = (a, b, tol, msg) => ok(Math.abs(a - b) <= tol, `${msg}: ${a} vs ${
   ok(r.boxBlocks === 1728, 'the box is inclusive of both ends');
   close(r.ratio, 1728 / 1280, 1e-12, 'the flagship shell measured 1.35x');
   ok(boxRatio(null, 0) === null, 'no set, no ratio');
+
+  // A WRAPPED SPAN, which is what a moving window produces twice a lap. `hi`
+  // is BELOW `lo` and hi - lo + 1 is negative, so the extent has to be carried
+  // rather than recovered. Without this the seam crossing reads as geometry --
+  // measured 12.29 against a true 2.0 on the card before it was fixed.
+  const w = boxRatio({ lo: [46, 0, 0], hi: [5, 11, 11], ext: [8, 12, 12] }, 1280);
+  ok(w.boxBlocks === 8 * 12 * 12, 'a wrapped span uses its own extent');
+  close(w.ratio, 1152 / 1280, 1e-12, 'and is SMALLER than the axis, not larger');
+  // The mutation this is really guarding: fall back to hi - lo + 1 on this
+  // input and the answer is negative, not merely wrong.
+  ok(boxRatio({ lo: [46, 0, 0], hi: [5, 11, 11] }, 1280) === null,
+    'a wrapped span with no extent is refused, not silently negated');
 }
 
 console.log(`test-d3-volume: ${checks} checks passed`);

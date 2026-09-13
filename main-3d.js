@@ -3946,13 +3946,32 @@ async function init() {
     // as many blocks ahead as it coarsens behind, so the count is constant
     // while every tile changes hands. The box moves, and that is what
     // M4.2b-iii is actually claiming.
-    let lo = [1e9, 1e9, 1e9], hi = [-1, -1, -1];
+    //
+    // PERIODIC, VIA `axisSpan` -- min..max IS WRONG HERE AND WAS WRONG UNTIL
+    // 2026-09-12. With a moving window the body travels through a periodic
+    // buffer and its shell travels with it, so twice a lap the shell
+    // STRADDLES THE SEAM; taken as min..max its box is then nearly the whole
+    // axis. The volume boxes have used the periodic span since M6.4 for
+    // exactly this reason (see `axisSpan`'s own header) and this reporting
+    // path simply never got it, so `boxRatio` -- M6.4c's "are boxes still the
+    // right structure" number -- read the seam crossing as geometry. Measured
+    // on the card: 12.29 at L2 at a straddling step against 2.0 away from
+    // one, i.e. the statistic was mostly reporting where in its lap the body
+    // happened to be. Same class as M6.5a: a quantity that is fine in buffer
+    // coordinates and meaningless in window ones.
+    const used = pool.nb.map((n) => new Uint8Array(n));
     for (let id = 0; id < pool.nBlocks; id++) {
       if (bs[id] < 0) continue;
       const b = pool.blockOf(id);
-      for (let a = 0; a < 3; a++) { lo[a] = Math.min(lo[a], b[a]); hi[a] = Math.max(hi[a], b[a]); }
+      for (let a = 0; a < 3; a++) used[a][b[a]] = 1;
     }
-    const bbox = inUse ? { lo, hi } : null;
+    const spans = used.map((u, a) => axisSpan(u, pool.nb[a]));
+    const lo = spans.map((s) => (s ? s.lo : 1e9));
+    const hi = spans.map((s, a) => (s ? (s.lo + s.len - 1) % pool.nb[a] : -1));
+    // `hi` can be BELOW `lo` when the span wraps, so the extent is carried
+    // explicitly rather than left to be recovered as hi - lo by every reader.
+    const ext = spans.map((s) => (s ? s.len : 0));
+    const bbox = inUse ? { lo, hi, ext, wraps: spans.map((s, a) => !!s && s.lo + s.len > pool.nb[a]) } : null;
     // M6.4c. BOX-UNION VOLUME OVER REFINED-SET VOLUME, in blocks: how much
     // M6.4's bounding boxes cost over the set they bound, and therefore
     // whether they are still the right structure. They work because a

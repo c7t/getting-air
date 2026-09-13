@@ -77,9 +77,16 @@ export function volumeStack({ dims, levelBoxes = [], mult = 1, levels = 1, bytes
 // the boxes have stopped paying and true per-ray descent is the answer
 // (plans/3D.md M6.4's "when this breaks"), which is why this is a number
 // rather than a warning.
+// `ext` WINS OVER hi - lo + 1 WHEN IT IS THERE, because a periodic span can
+// WRAP and then `hi` is below `lo`. A caller on a windowed run hands the
+// extent explicitly; hi - lo + 1 on a wrapped span is negative, and before
+// 2026-09-12 this quietly reported the seam crossing as geometry.
 export function boxRatio(bbox, inUse) {
   if (!bbox || !inUse) return null;
-  const v = (bbox.hi[0] - bbox.lo[0] + 1) * (bbox.hi[1] - bbox.lo[1] + 1) * (bbox.hi[2] - bbox.lo[2] + 1);
+  const ext = bbox.ext
+    || [0, 1, 2].map((k) => bbox.hi[k] - bbox.lo[k] + 1);
+  if (ext.some((e) => e <= 0)) return null;
+  const v = ext[0] * ext[1] * ext[2];
   return { boxBlocks: v, ratio: v / inUse };
 }
 
