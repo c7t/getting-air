@@ -856,6 +856,38 @@ What exists today:
     `d3-criterion.mjs` on the same fp16 texels, M6.3's transfer function,
     M6.4b's image difference against `?volstack=0` with `d3-volume.mjs`
     saying independently which pixels may differ: 234 differ, 0 outside).
+  - **THE REFINED BOXES ONLY FOLLOW THE BODY FROM THE LIVE FRAME LOOP, and
+    before 2026-09-12 the OFFSCREEN path did not refresh them at all.**
+    `refreshVolumeBoxes` is driven by the status cadence; `debugRenderFrame`
+    and `debugReadVolume` run with `live=0` and no frame loop, so both now
+    await it themselves. **Every clip `tools/render-d3-movie.js` filmed at
+    ?levels>=2 with ?dynamic=1 had refined volumes pinned to step 0**:
+    measured, the card's body travelled (128,80,96) -> (180,26,96) over 2000
+    steps while both box origins sat unmoved at their initial values.
+    **A STALE BOX IS WORSE THAN NO BOX**, because the stack rule is INNERMOST
+    BOX WINS -- it does not fall back to L0, it OVERRIDES L0 over its whole
+    extent with coarse data replicated onto a fine grid. This is M6.4a's
+    known-missing gate ("a refined box tracking a moving body is exercised
+    only by eye") collecting.
+  - **A VOXEL THAT READS A COARSER LEVEL THAN THE VOLUME IT IS STORED IN IS
+    WHERE THE SPECKLE IS** (`tools/probe-d3-volume-crunch.js`). A level's
+    volume is a dense grid over a BOUNDING BOX while the refined set inside it
+    is not box-shaped, so those voxels get coarse data replicated onto a fine
+    grid -- and Q is a squared velocity GRADIENT, so replication differentiates
+    into stipple. Measured on the card at ?levels=3, normalized |lap Q| on the
+    two populations: **2.52x (dynamic) and 8.14x (static)**, with **48-63% of
+    structured voxels in the box reading a coarser level**. That is the
+    dominant population, not an edge effect. Measure it in the VOLUME, never in
+    the image: an image statistic cannot separate a speckled volume from a
+    raymarcher undersampling a clean one, and M6.5a is the standing lesson on
+    trusting image statistics here.
+  - **A FLAT PLATE IS THE PATHOLOGICAL CASE FOR BOUNDING BOXES, and the card
+    is already past the threshold M6.4c set.** `boxRatio` is 1.04-1.14 on a
+    geometry-forced SPHERE shell -- nearly isotropic, so its box is tight --
+    but the card's refined set is a thin SLAB in a fat box and measures
+    **12.29 at L2**, against the ~4x at which M6.4c says boxes stop paying.
+    So the successor (true per-ray descent, M8.5) is not merely measured and
+    waiting; the falling card is a case that already wants it.
   - **`debugPoolState` reports `boxRatio` per level** (M6.4c) -- box-union
     over refined-set volume, 1.04x/1.14x on a geometry-forced shell against
     the ~4x at which boxes stop paying. M8.4 already measured **4.6** on a

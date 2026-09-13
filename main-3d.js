@@ -2478,6 +2478,12 @@ async function init() {
   async function debugReadVolume(z, which = 0, what = 'vel') {
     if (!volGPU.length) return { skipped: 'no volume (?vol=0)' };
     if (which >= volGPU.length) return { skipped: `no volume ${which} (stack of ${volGPU.length})` };
+    // SAME REASON AS debugRenderFrame: the boxes are moved by the live frame
+    // loop, and a tool reading the volume runs with `live=0`. Without this a
+    // check reads a volume whose box the body left thousands of steps ago and
+    // scores it against a sampler that is perfectly correct -- i.e. it
+    // measures staleness and calls it disagreement.
+    await refreshVolumeBoxes();
     const v = volStack[which], g = volGPU[which];
     const [nx, ny] = v.res;
     const zz = Math.min(v.res[2] - 1, Math.max(0, z | 0));
@@ -2618,7 +2624,24 @@ async function init() {
         primitive: { topology: 'triangle-list' },
       });
     }
-    if (view === 'volume') writeRayParams(w / h);
+    // THE BOXES MUST BE MADE TO FOLLOW THE BODY HERE, because nothing else on
+    // this path does it (2026-09-12). `refreshVolumeBoxes` is driven by the
+    // LIVE frame loop's status cadence, and an offscreen render runs with
+    // `live=0` and no frame loop at all -- so every clip
+    // `tools/render-d3-movie.js` ever filmed at ?levels>=2 with ?dynamic=1 had
+    // refined volumes pinned to wherever the body was at step 0.
+    //
+    // IT IS WORSE THAN HAVING NO REFINED VOLUME. The stack rule is INNERMOST
+    // BOX WINS, so a stale box does not politely fall back to L0 -- it
+    // OVERRIDES L0 over its whole extent with coarse data replicated onto a
+    // fine grid, and Q is a squared velocity gradient, so that replication
+    // differentiates into stipple. Measured on the card at ?levels=3: the body
+    // travelled from (128,80,96) to (180,26,96) over 2000 steps while both box
+    // origins sat at their step-0 values, and 100% of the L2 volume's voxels
+    // read a level COARSER than the volume they were stored in.
+    //
+    // Awaited BEFORE the encoder exists: it does its own readbacks and submits.
+    if (view === 'volume') { await refreshVolumeBoxes(); writeRayParams(w / h); }
     const rowBytes = Math.ceil(w * 4 / 256) * 256;
     const buf = device.createBuffer({ size: rowBytes * h, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
     const enc = device.createCommandEncoder();
