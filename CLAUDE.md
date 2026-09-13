@@ -581,6 +581,33 @@ re-argued. Two things are settled and load-bearing:
   the scaling preserved a constant PHYSICAL width, which is the opposite of
   what it does; corrected 2026-09-11.
 
+- **TRT WAS BUILT, MEASURED, AND DOES NOT HELP THE CARD; the code stays on
+  branch `worktree-3d-trt` and is NOT merged** (plans/TRT.md sec 8.10-8.14).
+  It fixes the STATIC wall exactly as the theory says -- duct error down
+  3-6x at Lambda = 3/16, pinned sphere +7% -> +4% over Schiller-Naumann --
+  and makes both of the card's real limits WORSE: the moving-body force
+  deficit DOUBLES (16.6% -> 36.2% at tau = 0.509), and the stability wall
+  RISES at this project's Mach numbers (the sphere dies at tau = 0.50218
+  where BGK survives, at every Lambda tried; at tau_+ = 0.503 the odd tau
+  must stay below ~0.75, 270x under the magic value, and the f64 host
+  collision reproduces the blow-up so it is the scheme, not the shader).
+  Do not re-argue "TRT fixes Lambda and is the standard remedy" from
+  plans/3D.md's older text; the measurement is in. The literature agrees
+  on the shape (plans/TRT.md sec 8.14): the stable choice near omega -> 2
+  is an OVER-relaxed odd sector, and the operators documented there are
+  regularized/recursive-regularized (D3Q19) and cumulant/KBC (D3Q27).
+  **What the TRT work found instead: THE f32 LATTICE WEIGHTS DID NOT SUM
+  TO 1** (`lattice-3d.mjs` `WEIGHT_ULP_TWEAK`) -- fround(1/3) + 6 fround(1/18)
+  + 12 fround(1/36) = 1 + 1.49e-8, so every 3D collision injected
+  omega * rho * 1.49e-8 of mass per step, a uniform density rise of
+  2.6e-8/step that read as a velocity deficit GROWING WITH RUN LENGTH; the
+  tau = 0.6 duct gate's recorded error was 80% this. A gate whose error
+  grows with the run is measuring a drift. The 2D lattice (D2Q9,
+  1 + 7.5e-9) deliberately still has it: `main` is the published site.
+  **And the recorded 0.06% AMR-vs-dense sphere "invariance" was a
+  coincidence** of BGK's per-level wall offsets; against dense at the same
+  finest resolution (`sphere-Re20-D32`) AMR is +1.2%.
+
 - **Bounce-back is the accurate solid coupling in 3D FOR A PINNED BODY;
   diffuse (chi) is
   not.** Sphere Cd measures +7..13% against Schiller-Naumann with
