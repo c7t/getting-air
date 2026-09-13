@@ -930,12 +930,20 @@ What exists today:
     a revolution. **`?bounceback=1` is not available at tau = 0.50436** -- it
     blew up at step 5000 with |v| pinned at v_max -- so an exact-thickness
     body and Re = 1100 are currently mutually exclusive here.
-  - **THE SUSPECT LEFT IS THE THIRD DIMENSION.** Pesavento & Wang is 2D
-    (infinite span, no tips); a finite plate sheds TIP VORTICES, the classic
-    suppressor of autorotation. The domain is already periodic on every axis,
-    so a plate whose span exactly fills z has no tips -- but `card`'s dims put
-    z = 2*span*n + 2n, so the gap is built in. Making it 2*span*n for a
-    spanwise-periodic leg is a few lines in `d3-scenarios.mjs`.
+  - **THE TWO SUSPECTS LEFT ARE BOTH THE DOMAIN, and plans/3D.md M6.5 lists
+    five avenues with costs.** (a) **NARROW DOMAINS DAMP**, and `card`'s
+    free-fall box is narrow: blockage **5.00% at span 1, 6.67% at span 2,
+    8.00% at span 4**, against the 1.56% its own prescribed legs use -- and
+    the scenario header already says 5% carries a wall correction of order
+    +12%. **This confounds the span result**: going 1 -> 2 raised net max AND
+    tightened the box, so the true span effect is larger than measured.
+    Widen before sweeping span again. (b) **TIP VORTICES** -- P&W is 2D
+    (infinite span, no tips) and a finite plate sheds them; the domain is
+    already periodic, so a plate whose span exactly FILLS z has none, but
+    `card`'s dims put z = 2*span*n + 2n so the gap is built in. Both need a
+    few lines in `d3-scenarios.mjs`, and they pull OPPOSITE ways on the same
+    axis (widen z for clearance, fill z to remove tips) -- two experiments,
+    not one knob.
   - **FOUR AXES SWEPT, ONE ANSWER** -- span 1->2, Re 500->1100, release angle
     0.15->1.047 rad, and I* 0.17->0.68 (`tools/probe-d3-tumble.js`). A
     FOURFOLD change in inertia moves the peak net rotation 0.306 -> 0.361,
