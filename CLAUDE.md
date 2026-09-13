@@ -795,6 +795,35 @@ What exists today:
   A windowed page is otherwise visited by nothing in the standing suite, so
   `validate-all.js` boot-smokes one as `d3-window-boot`.
 
+- **EVERY SHARED STAGING BUFFER MUST BE SERIALIZED, AND THE SERIALIZATION
+  BELONGS AT THE BUFFER** (`serializedOn` in `main-3d.js`). A reader submits a
+  copy into the staging buffer and then awaits `mapAsync`; a second reader
+  entering that gap encodes a copy into a buffer that is pending map, which is
+  a validation error -- "Buffer (unlabeled) used in submit while pending map"
+  -- and it takes the DEVICE with it. The callers cannot own this because they
+  are a mix: the sync-step paths AWAIT their readback, while the frame loop
+  fires `checkPoolExhausted` and `refreshVolumeBoxes` off the 250 ms status
+  cadence deliberately UNAWAITED. Only the buffer sees both.
+  - **IT IS A DEPTH BUG, WHICH IS WHY `?levels=2` NEVER SHOWED IT.** Each of
+    those refreshes does one readback PER REFINED LEVEL, so depth 3 doubles
+    the window, and `mapAsync` resolves only once the queue drains -- so a
+    frame that resamples and marches a 4x-resolution L2 volume can outlast the
+    cadence on its own. The two conditions arrive together. Measured on
+    `card` at `?levels=3`: **30 map-race errors in 13 s and a dead device**,
+    against 0 over 90 s with the fix.
+  - **CHAIN AT THE BUFFER, DROP AT THE CALLER.** An awaited caller wants an
+    answer, so the buffer QUEUES; the cadence callers poll a current value and
+    are single-flighted, so a refresh slower than the cadence cannot
+    accumulate one pending call per tick forever.
+  - **IT HAD ALREADY BEEN FIXED ONCE, FOR `bodyStaging` ONLY**, under a
+    comment claiming the chain "covers every future caller". It covered that
+    one buffer. `readBody` now goes through `serializedOn` too, so there is
+    one mechanism rather than a third copy waiting to be written.
+  - **A DEBUGSTEPSYNC TOOL CANNOT REPRODUCE IT**, because it awaits every
+    readback -- the race lives only on the rAF path. It takes a LIVE page and
+    real elapsed wall time, which is a shape nothing in the standing suite
+    has.
+
 - **THE VOLUME VIEW IS ONE DENSE VOLUME PER LEVEL AND THE INNERMOST BOX WINS
   -- no per-ray tree descent** (`?view=volume`, M6.3/M6.4). sec 1.3's "do not
   raymarch the octree pool, it is a research project" stays true OF THE POOL;

@@ -2261,7 +2261,21 @@ async function init() {
   // A box that has OUTGROWN its allocated extent is said out loud rather than
   // clipped in silence -- the alternative is a view that shows part of a
   // refined region and looks exactly like one that shows all of it.
-  async function refreshVolumeBoxes() {
+  //
+  // SINGLE-FLIGHT, because the frame loop fires this without awaiting it. The
+  // staging buffer underneath is serialized (see `serializedOn`), so an
+  // overlapping call is no longer an error -- but it would QUEUE, and a
+  // refresh that takes longer than the 250 ms cadence would then accumulate
+  // one pending refresh per tick forever. Dropping is right here where
+  // chaining is right there: these are polls of a current value, so a
+  // skipped one is superseded by the next tick rather than lost.
+  let volBoxInFlight = null;
+  function refreshVolumeBoxes() {
+    if (volBoxInFlight) return volBoxInFlight;
+    volBoxInFlight = refreshVolumeBoxesNow().finally(() => { volBoxInFlight = null; });
+    return volBoxInFlight;
+  }
+  async function refreshVolumeBoxesNow() {
     if (!DYNAMIC || volStack.length < 2) return;
     volBoxTight = false;
     for (let i = 1; i < volStack.length; i++) {
@@ -3069,7 +3083,18 @@ async function init() {
   // WHILE it is running rather than from the error message afterwards.
   // ?slotWarn=0 silences it.
   const SLOT_WARN = numParam('slotWarn', 0.85);
-  async function checkPoolExhausted() {
+  // Single-flight, for `refreshVolumeBoxes`'s reason: the frame loop fires
+  // this unawaited on the status cadence while the sync-step paths await it,
+  // and the latch it sets is MONOTONIC -- so a caller that arrives mid-poll
+  // is served by the poll already running rather than starting a second one.
+  let poolCheckInFlight = null;
+  function checkPoolExhausted() {
+    if (!DYNAMIC || poolExhausted) return Promise.resolve(poolExhausted);
+    if (poolCheckInFlight) return poolCheckInFlight;
+    poolCheckInFlight = checkPoolExhaustedNow().finally(() => { poolCheckInFlight = null; });
+    return poolCheckInFlight;
+  }
+  async function checkPoolExhaustedNow() {
     if (!DYNAMIC || poolExhausted) return poolExhausted;
     // EVERY LEVEL, not just level 1 (M5.5b). Each level owns its own free
     // list and its own refusal counter, and the level that runs out is the
@@ -3773,7 +3798,41 @@ async function init() {
   const blockSlotStaging = AMR
     ? device.createBuffer({ size: Math.max(...L.slice(1).map(l => l.nBlocks)) * 4, usage: U.MAP_READ | U.COPY_DST })
     : null;
-  async function readBlockSlot(m = 1) {
+
+  // ONE STAGING BUFFER PER KIND MEANS THE READBACKS MUST BE SERIALIZED, AND
+  // THE SERIALIZATION BELONGS AT THE BUFFER (2026-09-12).
+  //
+  // A reader submits a copy into the staging buffer and then awaits
+  // `mapAsync`. If a SECOND reader runs in that gap it encodes a copy into a
+  // buffer that is pending map, which is a validation error -- "Buffer
+  // (unlabeled) used in submit while pending map" -- and it takes the device
+  // with it.
+  //
+  // The callers are a mix, which is why no single one of them can own this:
+  // the sync-step paths AWAIT their readback, while the frame loop fires
+  // `checkPoolExhausted` and `refreshVolumeBoxes` off the 250 ms status
+  // cadence DELIBERATELY unawaited (a latch that stops the next frame is soon
+  // enough, and a per-frame round trip is not). Only the buffer sees both.
+  //
+  // IT IS A DEPTH BUG, WHICH IS WHY ?levels=2 NEVER SHOWED IT. Each of those
+  // two refreshes does one readback PER REFINED LEVEL, so depth 3 doubles the
+  // window; and `mapAsync` resolves only once the queue drains, so a frame
+  // that resamples and marches a 4x-resolution L2 volume can outlast the
+  // cadence on its own. The two conditions arrive together.
+  //
+  // CHAIN, don't drop: an awaited caller wants an answer. The fire-and-forget
+  // callers are single-flighted separately, so the chain cannot build a
+  // backlog. A rejected link must not poison the chain, hence the `.catch`
+  // on the tail but NOT on what the caller gets back.
+  function serializedOn(tailRef, fn) {
+    return (...args) => {
+      const next = tailRef.tail.then(() => fn(...args));
+      tailRef.tail = next.then(() => {}, () => {});
+      return next;
+    };
+  }
+  const blockSlotTail = { tail: Promise.resolve() };
+  const readBlockSlot = serializedOn(blockSlotTail, async (m = 1) => {
     const bytes = L[m].nBlocks * 4;
     const enc = device.createCommandEncoder();
     enc.copyBufferToBuffer(L[m].blockSlot, 0, blockSlotStaging, 0, bytes);
@@ -3782,7 +3841,7 @@ async function init() {
     const v = new Int32Array(blockSlotStaging.getMappedRange(0, bytes)).slice();
     blockSlotStaging.unmap();
     return v;
-  }
+  });
 
   // POOL BOOKKEEPING, read back from the GPU. blockSlot and slotToBlock are
   // inverses of each other, and freeCount + inUse must equal the slot
@@ -3798,7 +3857,10 @@ async function init() {
   // the invariants below are checked against what the GPU actually holds.
   const poolStateStaging = AMR ? device.createBuffer({
     size: Math.max(16, ...L.slice(1).map(l => l.slots * 4)), usage: U.MAP_READ | U.COPY_DST }) : null;
-  async function readI32(src, bytes) {
+  // Serialized for the reason above: `checkPoolExhausted` reads through this
+  // one, once per refined level, and the frame loop does not await it.
+  const poolStateTail = { tail: Promise.resolve() };
+  const readI32 = serializedOn(poolStateTail, async (src, bytes) => {
     const enc = device.createCommandEncoder();
     enc.copyBufferToBuffer(src, 0, poolStateStaging, 0, bytes);
     device.queue.submit([enc.finish()]);
@@ -3806,7 +3868,7 @@ async function init() {
     const v = new Int32Array(poolStateStaging.getMappedRange(0, bytes)).slice();
     poolStateStaging.unmap();
     return v;
-  }
+  });
   // Per level, and the top-level fields still report LEVEL 1 so a caller
   // that predates the hierarchy reads what it always read. `byLevel` is the
   // surface the tools use: as of M5.6 tools/validate-d3-invariants.js takes
@@ -4262,13 +4324,13 @@ async function init() {
   // (in promise)" out of whichever caller happened to be second. Chaining is
   // cheaper than a second staging buffer and covers every future caller
   // rather than the two that exist. A failed read does not poison the chain.
-  let bodyReadChain = Promise.resolve();
-  function readBody() {
-    if (!HAS_BODY) return Promise.resolve(null);
-    const next = bodyReadChain.then(readBodyNow);
-    bodyReadChain = next.catch(() => {});
-    return next;
-  }
+  //
+  // THIS WAS FIXED HERE FIRST AND ONLY HERE, which is why it came back on the
+  // AMR staging buffers at ?levels=3 (2026-09-12). `serializedOn` is this
+  // same chain, factored out, and blockSlot and poolState now go through it
+  // too -- so reach for that rather than writing a third copy of this.
+  const readBody = serializedOn({ tail: Promise.resolve() },
+    async () => (HAS_BODY ? readBodyNow() : null));
   async function readBodyNow() {
     const enc = device.createCommandEncoder();
     enc.copyBufferToBuffer(bodyBuf, 0, bodyStaging, 0, BODY_FIELDS.length * 4);
@@ -4582,7 +4644,7 @@ async function init() {
       // than that anyway. Deliberately NOT awaited into the frame path --
       // the latch stops the next frame, which is soon enough for a condition
       // that is already unrecoverable.
-      if (live) checkPoolExhausted();
+      if (live) checkPoolExhausted().catch(() => {});
       if (poolExhausted) { requestAnimationFrame(frame); return; }
       // The window's travel, for the status line only -- the VIEW pans in the
       // shader from the body buffer itself (M8.3), because a host-refreshed
