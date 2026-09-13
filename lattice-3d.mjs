@@ -43,21 +43,86 @@ export const SUPPORTED_Q = [19, 27];
 // D2Q9) -- the velocity sets differ in isotropy order, not in cs2.
 export const CS2 = 1 / 3;
 
-// Weights by shell (|e|^2 = 0, 1, 2, 3). These are the standard sets; the
-// moment conditions in tools/test-lattice-3d.js are what actually pin them
-// down, so a typo here fails a test rather than quietly detuning cs2.
-const WEIGHTS = {
-  19: [1 / 3, 1 / 18, 1 / 36],
-  27: [8 / 27, 2 / 27, 1 / 54, 1 / 216],
-};
-
-// Exact-fraction source for the WGSL emitter, so the shader carries
-// `1.0f/18.0f` rather than a truncated decimal that would have to be
-// checked for f32 agreement digit by digit. Parallel to WEIGHTS by index.
+// Weights by shell (|e|^2 = 0, 1, 2, 3), as exact fractions. These are the
+// standard sets; the moment conditions in tools/test-lattice-3d.js are what
+// actually pin them down, so a typo here fails a test rather than quietly
+// detuning cs2. Parallel to WEIGHT_ULP_TWEAK and WEIGHT_MULTIPLICITY by index.
 const WEIGHT_FRACTIONS = {
   19: [[1, 3], [1, 18], [1, 36]],
   27: [[8, 27], [2, 27], [1, 54], [1, 216]],
 };
+// How many directions carry each shell's weight.
+const WEIGHT_MULTIPLICITY = {
+  19: [1, 6, 12],
+  27: [1, 6, 12, 8],
+};
+
+// THE f32 WEIGHTS MUST SUM TO EXACTLY 1, AND THE ROUNDED FRACTIONS DO NOT.
+// fround(1/3) + 6 fround(1/18) + 12 fround(1/36) = 1 + 1.49e-8, and
+// D3Q27's set is 1 + 7.45e-9. Every collision computes feq_i = w_i rho (...),
+// so sum_i feq_i = rho (1 + 1.49e-8) and `f - omega (f - feq)` INJECTS
+// omega * rho * 1.49e-8 of mass per cell per step. Measured 2026-09-12
+// (plans/TRT.md sec 8.2): the dense duct at tau = 0.6 gained mass at 2.6e-8
+// per step, uniformly, with the momentum settled -- so the velocity px/mass
+// fell linearly in time and the tau = 0.6 duct gate's "wall-position error"
+// of 1.6e-3 was mostly this, growing with the run length (3x the settle
+// time DOUBLED it). The moment conditions are violated by the same 1e-8 and
+// that is harmless: a cs2 off by 1e-8 is a pressure off by 1e-8, while a
+// conservation law off by 1e-8 compounds linearly for as long as the run
+// lasts.
+//
+// So each shell weight is the correctly rounded f32 of its fraction moved by
+// a SMALL INTEGER number of f32 ulps, chosen exhaustively over |k| <= 4 so
+// that (a) the multiplicity-weighted sum is EXACTLY 1 in real arithmetic --
+// which it then also is in f32, since every partial sum is a multiple of
+// 2^-29 below 1 -- and (b) among those, the second moment sum w e_x^2 stays
+// as close to 1/3 as the plain rounding had it (2.5e-9; 1/3 is not an f32,
+// so it cannot be exact and nothing compounds it). tools/test-lattice-3d.js
+// asserts the exact sum, the tweak bound, and the moment conditions on the
+// same values. The host and the shader use the SAME values: latticeWGSL
+// emits them as 17-significant-digit decimals, which a correctly rounding
+// WGSL front end maps back to the identical f32.
+const WEIGHT_ULP_TWEAK = {
+  19: [1, -4, 2],
+  27: [-1, 1, -1, 0],
+};
+
+// One f32 ulp of x, for the tweak above. frexp-free: the exponent of x is
+// that of the largest power of two not exceeding |x|.
+function f32ulp(x) {
+  const e = Math.floor(Math.log2(Math.abs(x)));
+  return 2 ** (e - 23);
+}
+
+function tweakedWeights(Q) {
+  return WEIGHT_FRACTIONS[Q].map(([num, den], s) => {
+    const base = Math.fround(num / den);
+    const w = base + WEIGHT_ULP_TWEAK[Q][s] * f32ulp(base);
+    if (Math.fround(w) !== w) throw new Error(`D3Q${Q} shell ${s} weight ${w} is not an f32`);
+    return w;
+  });
+}
+
+const WEIGHTS = {
+  19: tweakedWeights(19),
+  27: tweakedWeights(27),
+};
+
+// The exact-arithmetic sum of the multiplicity-weighted f32 weights, for the
+// test. Exact in f64 because every weight is a multiple of 2^-29 and the
+// partial sums stay below 2.
+export function weightSum(Q) {
+  return WEIGHTS[Q].reduce((acc, w, s) => acc + w * WEIGHT_MULTIPLICITY[Q][s], 0);
+}
+
+// The fraction each shell's weight was rounded from, and how many ulps it
+// was moved -- exported so the test can bound the tweak rather than trust it.
+export function weightProvenance(Q) {
+  return WEIGHT_FRACTIONS[Q].map(([num, den], s) => ({
+    exact: num / den, f32: WEIGHTS[Q][s], ulps: WEIGHT_ULP_TWEAK[Q][s],
+    ulp: f32ulp(Math.fround(num / den)), multiplicity: WEIGHT_MULTIPLICITY[Q][s],
+  }));
+}
 
 // Per-axis enumeration order. +1 before -1 before 0 is what makes the first
 // member of each opposite pair the POSITIVE one (so e_1 is +x, not -x) and
@@ -163,13 +228,12 @@ function wrapList(items, perLine, indent) {
 export function latticeWGSL(Q) {
   const v = velocities(Q);
   const opp = opposites(Q);
-  const fr = WEIGHT_FRACTIONS[Q];
   const sh = shellRanges(Q);
   const pad = (n) => String(n).padStart(2, ' ');
-  const wtItems = v.map(([x, y, z]) => {
-    const [num, den] = fr[x * x + y * y + z * z];
-    return `${num}.0f/${den}.0f`;
-  });
+  // Decimal literals of the f32-exact tweaked weights (see WEIGHT_ULP_TWEAK),
+  // NOT `1.0f/18.0f`: the fraction would round back to the value whose sum
+  // is not 1. 17 significant digits round-trip any f32 exactly.
+  const wtItems = v.map(([x, y, z]) => `${WEIGHTS[Q][x * x + y * y + z * z].toPrecision(17)}f`);
   return `// GENERATED FILE -- do not edit. Source: lattice-3d.mjs (latticeWGSL(${Q})),
 // regenerate with \`node tools/gen-lattice-3d.js\`, guarded by
 // tools/test-lattice-3d.js (which also re-checks the moment conditions

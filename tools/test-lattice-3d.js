@@ -184,6 +184,31 @@ const TOL = 1e-6;
       }
     });
 
+    ok(`D3Q${Q}: the f32 weights sum to EXACTLY 1, from the shader's own literals`, () => {
+      // The zeroth moment is a CONSERVATION law and it compounds: a sum of
+      // 1 + 1.49e-8 (what the rounded fractions give) injects
+      // omega * rho * 1.49e-8 of mass per cell per step, measured as a
+      // uniform density rise of 2.6e-8/step on the tau = 0.6 duct
+      // (lattice-3d.mjs, WEIGHT_ULP_TWEAK). So this one is exact, not TOL.
+      // Every wt entry is a multiple of 2^-29 and the partial sums stay below
+      // 2, so the f64 sum here is the exact sum. Sum in shell order, all
+      // orders being exact.
+      let sum = 0;
+      for (let i = 0; i < Q; i++) sum += L.wt[i];
+      assert.strictEqual(sum, 1, `sum of the shader's f32 weights = ${sum}, want exactly 1`);
+      assert.strictEqual(LAT.weightSum(Q), 1, 'host weightSum');
+      // And every entry is an f32 the shader parses back to the same bits.
+      for (let i = 0; i < Q; i++) assert.strictEqual(Math.fround(L.wt[i]), L.wt[i], `wt[${i}] is not an f32`);
+    });
+
+    ok(`D3Q${Q}: each weight is within 4 ulps of its exact fraction`, () => {
+      for (const p of LAT.weightProvenance(Q)) {
+        assert.ok(Math.abs(p.f32 - p.exact) <= 4.5 * p.ulp,
+          `weight ${p.f32} is ${(p.f32 - p.exact) / p.ulp} ulps from ${p.exact}`);
+        assert.ok(Math.abs(p.ulps) <= 4, `tweak of ${p.ulps} ulps is larger than documented`);
+      }
+    });
+
     ok(`D3Q${Q}: moment conditions (0th..4th) hold to f32 precision`, () => {
       const M = moments(L, CS2);
       assert.ok(Math.abs(M.m0 - 1) < TOL, `sum w = ${M.m0}, want 1`);
@@ -241,10 +266,15 @@ const TOL = 1e-6;
           const v = velocities(Q)[i];
           m0 += f; mx += f * v[0]; my += f * v[1]; mz += f * v[2];
         }
-        assert.ok(Math.abs(m0 - rho) < 1e-12, `sum feq = ${m0}, want rho = ${rho}`);
-        assert.ok(Math.abs(mx - rho * ux) < 1e-12, `x momentum ${mx}, want ${rho * ux}`);
-        assert.ok(Math.abs(my - rho * uy) < 1e-12, `y momentum ${my}, want ${rho * uy}`);
-        assert.ok(Math.abs(mz - rho * uz) < 1e-12, `z momentum ${mz}, want ${rho * uz}`);
+        // sum feq = rho (1 + 4.5 (cs2_f32 - 1/3) u^2): the weights sum to
+        // exactly 1 but the second moment is 1/3 only to ~2.5e-9 (1/3 is not
+        // an f32), so the equilibrium's mass is exact to ~1.5e-10 at |u| = 0.12.
+        assert.ok(Math.abs(m0 - rho) < 1e-9, `sum feq = ${m0}, want rho = ${rho}`);
+        // And sum feq e = rho u (1 + 3 (cs2_f32 - 1/3)): 7.5e-9 relative.
+        const mtol = 1e-8 * rho * Math.hypot(ux, uy, uz) + 1e-15;
+        assert.ok(Math.abs(mx - rho * ux) < mtol, `x momentum ${mx}, want ${rho * ux}`);
+        assert.ok(Math.abs(my - rho * uy) < mtol, `y momentum ${my}, want ${rho * uy}`);
+        assert.ok(Math.abs(mz - rho * uz) < mtol, `z momentum ${mz}, want ${rho * uz}`);
       }
     });
   }
