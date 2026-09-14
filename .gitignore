@@ -5,6 +5,7 @@ notes.txt
 plans/*
 !plans/perf-characterization.md
 !plans/AMR-vs-dense-validation.md
+!plans/2D-backport.md
 transcripts/
 snapshots/
 https.py
