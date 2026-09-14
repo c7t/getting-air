@@ -24,6 +24,7 @@ GPU) and that is what made M4/M5 survivable. Build the 2D equivalent first.
 | B1 | Post-collision Dupuis-Chopard `fneq` factor | **yes, a live bug** | 2D uses the pre-collision form on post-collision populations | S (code) / L (re-baseline) |
 | B2 | `cascade21`: 2:1 as ONE closure on the WANT set | **yes** | replaces 3 live balance bugs, an unbounded fixed-point loop, and closes a measured refinement defect on the shipped page | M |
 | B3 | One kernel per stage + a `parent_{dense,pool}` accessor | **yes** | deletes ~1100 lines of near-duplicate WGSL across 6 kernel pairs | M |
+| B3a | The same sweep in JS: the AMR pages duplicate each other | **yes, prerequisite for B3/B4** | 40 shared functions, 3,319 duplicated lines, 18 already drifted; 1,129 lines are byte-identical and extractable behind a bit-identity gate | M |
 | B4 | The body lives entirely on the finest level | **yes, already true** | makes finest-wins masking in 3 force kernels provably dead code | S |
 | B5 | The window is a translation of the SPONGE | **half already true in 2D AMR, not in `main.js`** | removes window bookkeeping from 5 hot kernels; retires `card-total.mjs`'s problem | M |
 | B6 | Explode/coalesce at the coarse/fine interface | **yes, but measure first** | 2D's interface is not conservative, and nothing in 2D measures that | L |
@@ -185,8 +186,9 @@ and after, and reproducible on a same-build repeat first.
 
 3. **The five-copy problem is not confined to the shaders.** B3 counts six
    duplicated WGSL kernel pairs; the same rule had five copies in JS, and two
-   had already drifted. Expect more of this in `main-*-amr.js` -- worth a
-   sweep of its own before B3 rather than during it.
+   had already drifted. Measured across the five AMR pages afterwards: 40
+   shared functions, 3,319 duplicated lines, 18 already drifted. **Tracked as
+   B3a**, which blocks B3 and B4.
 
 ### B0b — the interface instrument (prerequisite for B1 and B6)
 
@@ -382,6 +384,73 @@ before believing either direction.
 too. It is genuinely cheaper per cell on what is usually the majority of live
 cells, and the *point* of the accessor split is that this asymmetry then costs
 two functions instead of six files. Do not "unify" L0 into a pool.
+
+### B3a — the same sweep, in JS
+
+**Measured 2026-09-14**, after B0 found one rule in five copies. Across
+`main-amr.js`, `main-cylinder-amr.js`, `main-reentry-amr.js`,
+`main-tgv-amr.js` and `main-channel-amr.js`, counting brace-matched function
+bodies with comments and whitespace stripped:
+
+```
+42 shared function names
+ - excluding init() and frame(), which ARE the page and should differ:
+   40 names, 3,319 duplicated lines
+ - 18 of those have already DRIFTED between copies
+ - 1,129 duplicated lines are byte-identical across every copy
+```
+
+`init()` is 3,019 lines in all five and `frame()` 276, with five variants
+each. Those are the pages themselves and are not the target; a page per
+scenario is the 2D side's actual design, and B3's WGSL work is what reduces
+what they each have to say. Everything else on the list is a rule that exists
+once and is written down between two and five times.
+
+**Take the byte-identical ones first**, because the gate is exact and the
+review is trivial:
+
+| function | copies | lines | note |
+|---|---|---|---|
+| `allocLevelPool` | 5 | 97 | the pool allocator itself |
+| `debugSnapshotLoad` | 3 | 99 | |
+| `debugDeactivateBlock` | 3 | 42 | |
+| `debugProbeGhostFill` | 3 | 30 | |
+| `debugInjectSyntheticField` | 3 | 18 | |
+| `debugReadCardState`, `debugReadPool`, `debugReadDiag` | 2-3 | 13-26 | |
+| `debugListActiveBlocks`, `resize`, `loadShader` | 5 | 9-12 | |
+
+**Then the three that a later stage is about to touch**, which is why this is
+a prerequisite and not tidying:
+
+- **`tauAtLevel` -- 5 copies, 2 variants, and `card-params.mjs` already
+  exports and tests it.** `main-amr.js` delegates to it; the other four still
+  inline `for (i < m) t = 2*t - 0.5`. Same answer today. This is the identical
+  duplication B0 removed from `amr2d.mjs`, still live in four pages, on a
+  *physics* rule. Cheapest item on the list.
+- **`debugCheckGeometryCoverage` -- 3 copies, 2 variants, 100 lines**, and B4
+  changes what question it asks. Extract it BEFORE B4, or B4 is three edits
+  and a chance to land in two of them.
+- **`debugSnapshotSave` -- 3 copies, 3 variants, 103 lines**, i.e. fully
+  drifted already, and B2 and B3 both move the snapshot's shape.
+
+**One thing on the list that is NOT drift, checked rather than assumed.**
+`S_Advance` reports 2 variants, and CLAUDE.md calls it dimension-agnostic and
+verbatim -- so this looked like rot in the scheduler. It is not: the
+*schedule* is identical in all five, and the whole difference is
+`main-amr.js`'s `beginPass`/`skipGroup` instrumentation -- the `?bench=1`
+pass-group attribution sweep and its `legacyGhostPLs` second pipeline set,
+which exist so the bench harness can A/B without a page reload. A deliberate
+main-amr.js-only capability. **And the related worry is also cleared:**
+`?ghostcopy=1` selects `DIRECT_GHOST: 0` at pipeline creation on every page
+(`main-cylinder-amr.js:1198` as well as `main-amr.js:1351`), so
+`--extra=ghostcopy=1` does A/B the real legacy path across the whole suite,
+exactly as CLAUDE.md says. Do not "fix" either of these.
+
+**Gate: bit-identical, per extraction.** Each is a pure code motion.
+`tools/amr-diff.js` against a pre-change snapshot for anything touching the
+solver; for the debug-only ones, B0's own gate shape -- run a
+`validate-all.js` config before and after and require the same numbers, on a
+build whose repeat-reproducibility was established first.
 
 ### B4 — the body lives entirely on the finest level
 
@@ -653,16 +722,20 @@ current).
 B0   host module + mutation-checked tests        ──┐
 B0b  interface instrument (mass/momentum drift)  ──┤ prerequisites
                                                    │
-B4   finest-level-only + hard failure            ◄──┘  (smallest, proves B0)
+B3a  JS duplication sweep                        ──┤ (blocks B3 and B4)
+                                                   │
+B4   finest-level-only + hard failure            ◄──┘  (smallest, proves B0;
+                                                      take B3a's geometry-
+                                                      coverage extraction first)
 B7   chi band ladder                                  (independent, cheap)
 B8   SOLID_EQ                                         (independent, free)
-B2   cascade21                                   ◄── needs B0
-B3   kernel unification, manage LAST              ◄── needs B2
-B5   window = sponge translation                  ◄── independent of B2/B3,
-                                                      but smaller after B3
-B1   post-collision rescale                       ◄── needs B0b
-B9   lattice weights                                  (independent; re-baseline)
-B6   explode/coalesce                             ◄── needs B0b, B1, B3, B4
+B2   cascade21                                    ◄── needs B0
+B3   kernel unification, manage LAST               ◄── needs B2 and B3a
+B5   window = sponge translation                   ◄── independent of B2/B3,
+                                                       but smaller after B3
+B1   post-collision rescale                        ◄── needs B0b
+B9   lattice weights                                   (independent; re-baseline)
+B6   explode/coalesce                              ◄── needs B0b, B1, B3, B4
 ```
 
 B4, B7 and B8 are deliberately first among the real changes: each is small,
