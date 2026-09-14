@@ -25,7 +25,7 @@ GPU) and that is what made M4/M5 survivable. Build the 2D equivalent first.
 | B1 | Post-collision Dupuis-Chopard `fneq` factor | **yes, a live bug** | 2D uses the pre-collision form on post-collision populations | S (code) / L (re-baseline) |
 | B2 | `cascade21`: 2:1 as ONE closure on the WANT set | **yes** | replaces 3 live balance bugs, an unbounded fixed-point loop, and closes a measured refinement defect on the shipped page | M |
 | B3 | One kernel per stage + a `parent_{dense,pool}` accessor | **yes** | deletes ~1100 lines of near-duplicate WGSL across 6 kernel pairs | M |
-| B3a | The same sweep in JS: the AMR pages duplicate each other | **yes, prerequisite for B3/B4** | 40 shared functions, 3,319 duplicated lines, 18 already drifted; 1,129 lines are byte-identical and extractable behind a bit-identity gate | M |
+| B3a | The same sweep in JS: the AMR pages duplicate each other | **largely DONE** | duplication outside `init`/`frame` 3,319 → 2,419 lines; byte-identical 1,129 → 613. Found a stranded comment and two always-true gates on the way | M |
 | B4 | The body lives entirely on the finest level | **yes, already true** | makes finest-wins masking in 3 force kernels provably dead code | S |
 | B5 | The window is a translation of the SPONGE | **half already true in 2D AMR, not in `main.js`** | removes window bookkeeping from 5 hot kernels; retires `card-total.mjs`'s problem | M |
 | B6 | Explode/coalesce at the coarse/fine interface | **yes, but measure first** | 2D's interface is not conservative, and nothing in 2D measures that | L |
@@ -514,6 +514,67 @@ solver; for the debug-only ones, B0's own gate shape -- run a
 `validate-all.js` config before and after and require the same numbers, on a
 build whose repeat-reproducibility was established first.
 
+### B3a — LARGELY DONE (2026-09-14)
+
+Four commits. Duplication outside `init`/`frame` is down from 3,319 lines to
+2,419; the byte-identical share from 1,129 to 613.
+
+```
+B3a-1  loadShader, resize, tauAtLevel          -408 lines  (TEN pages each,
+                                                            not five)
+B3a-2  allocLevelPool                           -380
+B3a-3  readPoolIndirection, listActiveBlocks    -203
+B3a-4  two always-true geometry-coverage stubs   -15
+```
+
+**THREE THINGS FOUND BY DOING IT, and each is worth more than the lines.**
+
+1. **`make check` CANNOT GATE A CODE MOTION IN THESE FILES.** My extraction
+   script had an off-by-one and left the `f` of `function allocLevelPool`
+   behind in five pages, as a bare expression statement. `node --check` is a
+   PARSE check: `f` on its own line is syntactically valid. Every page threw
+   `ReferenceError: f is not defined` at module evaluation and never defined
+   its global, and `make check` was green throughout. **`validate-all.js`'s
+   BOOT SMOKE is what caught it** — which is exactly the gap CLAUDE.md records
+   that config being added for after 238e48c. Boot-smoke every page after any
+   code motion here, every time.
+
+2. **A DOC COMMENT HAD BEEN STRANDED FIFTY LINES FROM ITS FUNCTION, in three
+   files.** `debugActivateBlock`'s description sat above `readPoolIndirection`,
+   which had been inserted between them; a second, newer comment was later
+   written above the function, so it had half its documentation adjacent and
+   half orphaned. Found because the extraction tooling prints the first and
+   last line of every block before deleting it — without that it would have
+   been deleted silently. **Any scripted surgery here should print what it is
+   about to cut.**
+
+3. **`debugCheckGeometryCoverage` WAS NEVER THREE COPIES.** It is one
+   implementation and two STUBS, distributed backwards:
+
+   ```
+   main-amr.js           has a body (the falling card)   NO coverage check
+   main-reentry-amr.js   has a body                      NO coverage check
+   main-cylinder-amr.js  has a body                      the real check
+   main-tgv-amr.js       HAS_BODY = 0                    stub: {ok:true}
+   main-channel-amr.js   HAS_BODY = 0                    stub: {ok:true}
+   ```
+
+   And the stubs defeat a design decision: `tools/lib/amr-invariants.js`
+   PROBES for the function and reports it SKIPPED when absent precisely so a
+   missing check "can't quietly look greener than it is". Returning `{ok:true}`
+   converts that honest skip into a green tick standing for nothing. Deleted.
+
+   **So B3a's entry for it is closed, and B4's just got bigger:** the shipped
+   falling-card page and the reentry page both move a body through a refined
+   region **with no geometry-coverage gate at all**. B4 has to write one for
+   them, not just change the predicate in an existing one.
+
+**What is left**, all still byte-identical and none of it blocking:
+`debugSnapshotLoad` (2 dup copies, 99 lines), `debugDeactivateBlock` (84),
+`debugProbeGhostFill` (60), `debugInjectSyntheticField`, `debugReadCardState`,
+`debugReadPool`, `debugReadDiag`. `debugSnapshotSave` is 3 copies in 3
+variants and should wait for B2/B3, which move the snapshot's shape anyway.
+
 ### B4 — the body lives entirely on the finest level
 
 **2D already asserts this** — `debugCheckGeometryCoverage`: every leaf tile
@@ -837,7 +898,7 @@ current).
 B0   host module + mutation-checked tests        ──┐ DONE
 B0b  interface instrument (mass/momentum drift)  ──┤ DONE
                                                    │
-B3a  JS duplication sweep                        ──┤ (blocks B3 and B4)
+B3a  JS duplication sweep                        ──┤ LARGELY DONE
                                                    │
 B4   finest-level-only + hard failure            ◄──┘  (smallest, proves B0;
                                                       take B3a's geometry-
