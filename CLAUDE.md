@@ -920,6 +920,66 @@ What exists today:
     construction. r8uint is not storage-writable in core WebGPU (the same wall
     r16float hit), so 4 B is the floor. It is counted in `?volBudget=`: an
     allocation the budget cannot see is one that OOMs instead of refusing.
+  - **A REFINED BOX'S PLACEMENT LIVES IN TWO BUFFERS AND THEY MUST MOVE
+    TOGETHER** (M6.4e, 2026-09-13, `?volsync=0` to A/B). The resample's
+    `originBuf` says what is written INTO a box's texture; the ray params'
+    `boxLo` says where the raymarcher reads it back OUT of world space.
+    `refreshVolumeBoxesNow` used to read and apply ONE LEVEL AT A TIME, so it
+    wrote L1's origin and then `await readBlockSlot(2)` yielded to the event
+    loop -- and every frame drawn during that readback showed L1's freshly
+    resampled contents at L1's STALE position. The picture shifts EN MASSE by
+    whole cells and snaps back when the refresh lands. Every readback now
+    happens before every write, with no await between the first write and the
+    publish.
+    **MEASURED, card `?levels=3`, 150 s a leg** (`tools/probe-d3-volbox-sync.js`):
+    **710 of 4357 rendered frames -- 16.3% -- against 0**, max gap 362 ms
+    against 0.2 ms, at the same update count (125/132) and the same frame
+    count. Free.
+    **A DEPTH BUG, like `serializedOn`'s**: at `?levels=2` the loop runs once
+    and the only await is BEFORE the only write, so no gap exists to observe.
+    **AND IT LOOKS LIKE A FAR-FIELD FAULT because the INNERMOST box is applied
+    LAST**, with only synchronous code between its write and the publish -- so
+    the level covering the plate is always in register and the one that is not
+    is L1, which at `?volMargin=4` spans 80x72x112 of a 192x160x192 domain.
+    "Near the body is fine, further out shifts" is the signature of the apply
+    ORDER, not of anything physical.
+    **NOTHING IN THE STANDING SUITE CAN SEE IT**, for the reason `serializedOn`
+    records: it lives between an unawaited refresh and the frame loop, and a
+    `debugStepSync` tool has no frame loop. `debugVolBoxSync()` keeps the count
+    on the page so a live run can be asked.
+  - **A REFINED BOX IS ONLY USED WHERE ITS VOXEL CAME FROM ITS OWN LEVEL**
+    (M6.4f, 2026-09-13, `?volfallback=0` to A/B). M6.4d fixed what replication
+    did to the GRADIENT; this is the other half. `levelAt` took the innermost
+    containing box unconditionally, so across the majority of a box that its
+    refined set does not cover -- 58% of structured voxels measured, more again
+    at `?volMargin=4` -- the ray was handed a coarser level's value replicated
+    onto a fine grid, and then sampled it at the FINE voxel size. It now
+    descends and takes the first box that both contains the point AND owns its
+    data, falling through to L0.
+    **9.36% of pixels change, worst 37/255**, so it is not cosmetic.
+    Descending rather than scanning is what keeps it to one companion fetch in
+    the common case; falling back also coarsens `dt`, so the guess was that it
+    would pay for itself. COST: see `debugBenchRender` below.
+    **NEVER PRICE A SHADER ON THE ANIMATION THREAD.** Three attempts at this
+    number went wrong the same way. A frame rate read off the rAF loop is the
+    DISPLAY's: 1152x720 and 2560x1440 BOTH read 59.9 fps on both legs, because
+    the frame costs under 16.6 ms either way, and "equal" was really "capped".
+    Disabling vsync separates the legs but puts the browser's frame pacing in
+    the number instead. `debugBenchRender` is the instrument -- N draws in ONE
+    command buffer, one submit, `onSubmittedWorkDone`, no presentation and no
+    readback (debugRenderFrame's copy and map cost more than the draw), minimum
+    of its batches as `bench-d3-interface.js` does. A build-vs-build claim
+    still needs a same-build repeat.
+    **`debugRenderFrame` IS ALSO OFF THE ANIMATION THREAD AND STILL CANNOT DO
+    IT: 1181 ms per call at 1024^2 against a 4.7 ms draw** -- base64 of 4 MiB
+    and the CDP round trip, 250x the thing being timed. Off-thread is
+    necessary and not sufficient.
+    **AND THE COST IS BELOW THE FLOOR.** A same-build repeat differs by 6.2%,
+    the A/B by 3.9% -- with the SIGN not even stable across instruments -- so
+    the honest statement is |cost| < ~6% of a 1024^2 render, at four times the
+    live view's pixel count, against a change worth 9.36% of the picture.
+    Tightening it means A/B-ing both pipelines inside ONE page; the
+    fresh-Chrome-per-leg shape is what the 6% is.
   - **`boxRatio` WAS READING THE SEAM CROSSING AS GEOMETRY, and the "flat
     plates are pathological for boxes" claim built on it is RETRACTED**
     (2026-09-12). `poolStateAt`'s bbox was a plain min..max in BUFFER

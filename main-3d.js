@@ -95,6 +95,9 @@
 //   ?volfallback= 1 (default) uses a refined box only where its voxel came
 //                from that level, falling back outward elsewhere; 0 restores
 //                innermost-box-wins-unconditionally. See VOL_FALLBACK.
+//   ?volsync=    1 (default) applies every refined box's origin and its ray
+//                placement with no await between them; 0 restores the
+//                pre-M6.4e staggered apply, for the A/B.
 //   ?volh=       1 (default) differences each voxel over ITS OWN SOURCE
 //                CELL; 0 restores the pre-M6.4d fixed one-voxel stride, for
 //                the A/B. See d3_volume_scalar.wgsl's VOL_HSRC.
@@ -244,7 +247,7 @@ async function init() {
     'explin', 'orphans', 'dynamic', 'manageEvery', 'slotHeadroom', 'amrskip',
     'manageMargin', 'manageStart',
     // M6: the resample volume stack and the raymarcher.
-    'vol', 'volbox', 'volBudget', 'volstack', 'volMargin', 'volh',
+    'vol', 'volbox', 'volBudget', 'volstack', 'volMargin', 'volh', 'volsync',
     'volfallback',
     'view', 'volfield', 'volIso', 'volGain', 'volOpacity', 'volGamma', 'volStep', 'volSteps',
     'azim', 'elev', 'dist', 'fov', 'camtarget', 'winbox', 'proj',
@@ -2323,6 +2326,40 @@ async function init() {
   // one pending refresh per tick forever. Dropping is right here where
   // chaining is right there: these are polls of a current value, so a
   // skipped one is superseded by the next tick rather than lost.
+  //
+  // AND THE APPLY IS ATOMIC (M6.4e, 2026-09-13, `?volsync=0` to A/B). Two
+  // buffers say where a refined box is and BOTH have to move together: the
+  // resample's own `originBuf`, which decides what gets written INTO the
+  // texture, and the ray params' `boxLo`, which decides where the raymarcher
+  // reads it OUT of world space. Publish one without the other and the box's
+  // whole contents are displaced by the difference.
+  //
+  // The old shape read and applied one level at a time, so the L1 origin was
+  // written and then `await readBlockSlot(2)` yielded to the event loop --
+  // and every frame that rendered during that readback drew L1's freshly
+  // resampled contents through L1's STALE placement. The picture shifts en
+  // masse by whole cells and snaps back when the refresh finishes.
+  //
+  // A DEPTH BUG, the same family as `serializedOn`'s: at `?levels=2` the loop
+  // runs once and the only await is BEFORE the only write, so there is no gap
+  // to observe. It needs a second refined level to exist at all.
+  //
+  // NOT NEAR THE BODY, WHICH IS WHY IT READS AS A FAR-FIELD FAULT: the
+  // innermost box is applied LAST, with nothing but synchronous code between
+  // its write and `writeRayParams`, so the finest level -- the one covering
+  // the plate -- is always consistent. It is L1, which at ?volMargin=4 spans
+  // 80x72x112 of a 192x160x192 domain, that goes out of register.
+  //
+  // The fix is to do every readback FIRST and every write after, with no
+  // await between the first write and the publish. That also removes a
+  // second inconsistency the per-level version had: innermost-box-wins means
+  // a correctly-placed L2 could be composited over a stale L1.
+  const VOL_SYNC = numParam('volsync', 1) > 0 ? 1 : 0;
+  // Frames rendered, for the gate below. A counter and not a timestamp
+  // because the question is "could anything have been DRAWN in the gap",
+  // which a duration only implies.
+  let volFrameSeq = 0;
+  const volSyncStat = { updates: 0, partialFrames: 0, maxGapMs: 0 };
   let volBoxInFlight = null;
   function refreshVolumeBoxes() {
     if (volBoxInFlight) return volBoxInFlight;
@@ -2332,9 +2369,22 @@ async function init() {
   async function refreshVolumeBoxesNow() {
     if (!DYNAMIC || volStack.length < 2) return;
     volBoxTight = false;
+    // EVERY READBACK FIRST. This is the only part that awaits, and hoisting it
+    // out of the apply is the whole of the fix -- see the header above.
+    // `?volsync=0` leaves the reads interleaved, which is the old behaviour
+    // and the leg the gate measures against.
+    const boxes = [];
+    if (VOL_SYNC) {
+      for (let i = 1; i < volStack.length; i++) {
+        boxes[i] = boxFromBlockSlot(volStack[i].level, await readBlockSlot(volStack[i].level), 0);
+      }
+    }
+    // ---- NO `await` BELOW THIS LINE WHEN VOL_SYNC IS ON ----
+    let firstWrite = -1, tFirst = 0;
     for (let i = 1; i < volStack.length; i++) {
       const v = volStack[i];
-      const box = boxFromBlockSlot(v.level, await readBlockSlot(v.level), 0);
+      const box = VOL_SYNC ? boxes[i]
+        : boxFromBlockSlot(v.level, await readBlockSlot(v.level), 0);
       if (!box) continue;
       const lo = v.lo.slice();
       for (let k = 0; k < 3; k++) {
@@ -2350,8 +2400,18 @@ async function init() {
       v.c0 = lo.map(c => c - 0.5);
       v.c1 = lo.map((c, k) => c + v.ext[k] - 0.5);
       device.queue.writeBuffer(volGPU[i].originBuf, 0, new Float32Array([lo[0], lo[1], lo[2], 0]));
+      if (firstWrite < 0) { firstWrite = volFrameSeq; tFirst = performance.now(); }
     }
     writeRayParams();
+    // THE GAP, MEASURED: frames drawn between the first origin write and the
+    // publish that makes it meaningful. Zero BY CONSTRUCTION when VOL_SYNC is
+    // on, which is exactly why it is worth counting -- a claim of "no await
+    // here" is one refactor away from being false, and this notices.
+    if (firstWrite >= 0) {
+      volSyncStat.updates++;
+      volSyncStat.partialFrames += volFrameSeq - firstWrite;
+      volSyncStat.maxGapMs = Math.max(volSyncStat.maxGapMs, performance.now() - tFirst);
+    }
   }
 
   // --- M6.3/M6.4b: the raymarcher ------------------------------------------
@@ -4805,6 +4865,10 @@ async function init() {
     debugCheck21Balance, debugCheckGeometryCoverage, debugCheckRingParents, debugPoolState,
     debugRunBalance, debugSampleTree, debugCheckTreeSample, debugReadVolume,
     debugRenderFrame, debugBenchRender, debugSetVolume, debugSetCamera,
+    // M6.4e. `partialFrames` must be 0: any frame drawn between a refined
+    // box's origin write and the ray params that place it renders that box's
+    // contents at the wrong world position.
+    debugVolBoxSync: () => ({ ...volSyncStat, sync: VOL_SYNC, frames: volFrameSeq }),
     debugHotspot, debugRunAndCollect, debugOccupancy,
     readInterfaceDiag, readFluxAcc,
     debugStepSync,
@@ -4812,6 +4876,9 @@ async function init() {
 
   let lastStatus = 0;
   async function frame() {
+    // Counted for refreshVolumeBoxesNow's gap check: "how many frames could
+    // have been drawn between a box moving and the raymarcher being told".
+    volFrameSeq++;
     const enc = device.createCommandEncoder();
     if (live) encodeSteps(enc, STEPS_PER_FRAME);
     // AFTER the steps and before the render, so the volume is the state the
