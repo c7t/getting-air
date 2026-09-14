@@ -50,8 +50,13 @@
 // window.__CYL exposes the same shape main-tgv.js's dense harness does
 // (reset, getStep, getParams, readField) plus the AMR invariant-sweep
 // surface tools/lib/amr-invariants.js needs (debugStepSync returning
-// {step}, debugCheck21Balance, debugCheckGeometryCoverage -- trivially
-// {ok:true}, no body to check coverage against -- debugReadCardState).
+// {step}, debugCheck21Balance, debugReadCardState). NOT
+// debugCheckGeometryCoverage: this page has no body (HAS_BODY = 0), so
+// tools/lib/amr-invariants.js's probe reports it SKIPPED, which is what that
+// file's "a missing optional check is reported as skipped, never as a pass"
+// design intends. It used to be defined here as a stub returning {ok:true} --
+// a green tick standing for nothing, which is exactly what the probe exists
+// to avoid.
 
 import { reportFatal, reportNoWebGPU, reportNoAdapter } from './error-overlay.mjs';
 import { loadShader } from './shader-loader.mjs';
@@ -1005,13 +1010,6 @@ async function init() {
     decode: readF, cellIndex: cellIndexJS,
   });
 
-  // No body -- HAS_BODY=0 means isNearBody(At) is unconditionally false in
-  // every manage shader, so there's nothing for a geometry-coverage check
-  // to assert. Trivially passing.
-  async function debugCheckGeometryCoverage() {
-    return { ok: true, violations: [] };
-  }
-
   async function debugReadCardState() {
     const stage = device.createBuffer({ size: 104, usage: U.MAP_READ | U.COPY_DST });
     const enc = device.createCommandEncoder();
@@ -1087,7 +1085,6 @@ async function init() {
     debugReadCardState,
     debugCheck21Balance,
     debugConservedTotals,
-    debugCheckGeometryCoverage,
     debugListActiveBlocks,
     setAutoRefine,
     isAutoRefine: () => autoRefine,
