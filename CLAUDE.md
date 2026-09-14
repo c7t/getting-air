@@ -866,9 +866,16 @@ What exists today:
     steps while both box origins sat unmoved at their initial values.
     **A STALE BOX IS WORSE THAN NO BOX**, because the stack rule is INNERMOST
     BOX WINS -- it does not fall back to L0, it OVERRIDES L0 over its whole
-    extent with coarse data replicated onto a fine grid. This is M6.4a's
-    known-missing gate ("a refined box tracking a moving body is exercised
-    only by eye") collecting.
+    extent with coarse data replicated onto a fine grid.
+    **BUT IT IS NOT WHAT A LIVE PAGE SHOWS**, and the commit that fixed it
+    said otherwise: the frame loop has refreshed the boxes on its 250 ms
+    cadence since M6.4a, and `debugRenderFrame`/`debugReadVolume` are reachable
+    only from `window.__D3`. So this is a MOVIE and TOOL defect, whole and
+    entire. The live speckle is the next entry, which that commit diagnosed
+    correctly and did not change. (Its claim to be quoting an M6.4a
+    "known-missing gate" is also withdrawn -- no such line has ever been in
+    the repo; a history search finds the phrase only in the commit that
+    quotes it.)
   - **A VOXEL THAT READS A COARSER LEVEL THAN THE VOLUME IT IS STORED IN IS
     WHERE THE SPECKLE IS** (`tools/probe-d3-volume-crunch.js`). A level's
     volume is a dense grid over a BOUNDING BOX while the refined set inside it
@@ -881,6 +888,38 @@ What exists today:
     the image: an image statistic cannot separate a speckled volume from a
     raymarcher undersampling a clean one, and M6.5a is the standing lesson on
     trusting image statistics here.
+  - **AND THE AMPLIFIER IS THE GRADIENT PASS'S FIXED STENCIL** (M6.4d,
+    2026-09-12, `?volh=0` to A/B). Replication alone is only a plateau; what
+    turns it into stipple is that `d3_volume_scalar.wgsl` differenced EVERY
+    voxel over one voxel, `VOL_H` being a pipeline constant for the whole
+    texture. The resample samples the tree NEAREST, so a source cell's voxels
+    are BIT-IDENTICAL -- the difference is exactly zero across the plateau and
+    the entire source-cell jump across the one voxel at its edge, over a step
+    2^(level-src) too small. So the staircase is differentiated, and Q, being
+    a squared gradient, squares the result.
+    **This is `common_d3_tree_sample.wgsl`'s OWN standing rule** -- "any finite
+    difference taken from it must use the sampler's own `h`" -- which this pass
+    structurally could not obey, because the resample threw `TreeSample.level`
+    away. It now writes it to a companion `rgba8uint` volume and the stencil
+    reaches ONE SOURCE CELL: `stride = max(1, round(2^-src / h))` voxels,
+    stated in `d3-volume.mjs`'s `stencilStride` and mirrored in `strideFor`.
+    **IT IS BIT-IDENTICAL WHERE THE VOLUME ALREADY HAS THE DATA** (stride 1 at
+    `?vol=1`), so M6.4b's sharp near-wall sheet is untouched and only the
+    replicated population moves -- gated exactly that way, not to a tolerance,
+    by `validate-d3-raymarch.js --cases=volh`: 0 of 4096 at-level voxels
+    differ across the A/B, 5111 of 5120 replicated ones do.
+    **WORTH 4.9x ON THE CARD** (`probe-d3-volume-crunch.js --legs=full,fixedh`,
+    n=32 `?levels=3`, 1000 steps): normalized |lap Q| on the replicated voxels
+    falls 0.4695 -> 0.0959 while the at-level ones hold at 0.1328 -> 0.1318,
+    with `boxRatio` 1.884 and `inUse` 6192 IDENTICAL across the pair. The
+    replicated-over-at-level ratio inverts, 3.54 -> 0.73: coarse data is now
+    SMOOTHER than refined data, which is what it should be.
+    **THE COMPANION IS PAID FOR BY THE SMALL BOXES ONLY.** 4 B/voxel, and the
+    L0 volume gets a 1x1x1 dummy with `WRITE_LEVEL`/`VOL_HSRC` folded to 0 --
+    its own spacing is already the coarsest in the tree, so its stride is 1 by
+    construction. r8uint is not storage-writable in core WebGPU (the same wall
+    r16float hit), so 4 B is the floor. It is counted in `?volBudget=`: an
+    allocation the budget cannot see is one that OOMs instead of refusing.
   - **`boxRatio` WAS READING THE SEAM CROSSING AS GEOMETRY, and the "flat
     plates are pathological for boxes" claim built on it is RETRACTED**
     (2026-09-12). `poolStateAt`'s bbox was a plain min..max in BUFFER

@@ -202,6 +202,30 @@ async function main() {
         const v = stack[which];
         const wrap = v.level === 0 && v.ext.every((e, k) => e === [p.NX, p.NY, p.NZ][k]);
         const host = hostQSlab({ slabs, res: v.res, h: v.h, wrap, qOfGrad, omegaOfGrad });
+        // M6.4d. `hostQSlab` differences at a FIXED one-voxel stride, which is
+        // what the kernel does for a voxel the volume's own level covers and
+        // NOT what it does for one filled from a coarser level -- there the
+        // stencil reaches a whole source cell. So the comparison is restricted
+        // to the at-level population, where the host formula is exact, and the
+        // replicated one is gated by the `volh` case instead.
+        //
+        // COUNTED AND PRINTED rather than silently filtered: a config whose
+        // box grew until every voxel was replicated would otherwise pass this
+        // by comparing nothing at all, and the count is the only thing that
+        // would say so. On this config it is 0 -- a static run defaults
+        // ?volMargin=0, so the box is the shell's tight bbox.
+        const srcLvl = new Int32Array(scl.texels.length);
+        for (let i = 0; i < scl.texels.length; i += 4096) {
+          const pts = scl.texels.slice(i, i + 4096).map((t) => t.p);
+          const r = await ev(Runtime, `${G}.debugSampleTree(${JSON.stringify(pts)})`, 'debugSampleTree');
+          for (let j = 0; j < r.length; j++) srcLvl[i + j] = r[j].level;
+        }
+        let skipped = 0;
+        for (let i = 0; i < srcLvl.length; i++) if (srcLvl[i] < v.level) skipped++;
+        if (skipped === srcLvl.length) {
+          throw new Error(`L${v.level}: every voxel in the slab is replicated from a coarser`
+            + ' level, so this case would compare nothing -- see M6.4d');
+        }
         // Scaled by the SLAB's own maximum, not per texel: Q is a difference
         // of two Frobenius norms and is legitimately near zero over most of a
         // volume, so a per-texel relative error would be dominated by
@@ -211,14 +235,16 @@ async function main() {
         for (const hq of host) { qMax = Math.max(qMax, Math.abs(hq.q)); omMax = Math.max(omMax, hq.omega); }
         let worstQ = 0, worstOm = 0, worstU = 0;
         for (let i = 0; i < host.length; i++) {
+          if (srcLvl[i] < v.level) continue;
           const g = scl.texels[i].v;
           worstQ = Math.max(worstQ, Math.abs(g[0] * p.volRefs.q - host[i].q) / Math.max(qMax, 1e-30));
           worstOm = Math.max(worstOm, Math.abs(g[1] * p.volRefs.omega - host[i].omega) / Math.max(omMax, 1e-30));
           worstU = Math.max(worstU, Math.abs(g[2] * p.volRefs.u - host[i].speed) / Math.max(1e-9, host[i].speed));
         }
-        per.push({ level: v.level, res: v.res, texels: host.length, qMax, worstQ, worstOm, worstU });
+        per.push({ level: v.level, res: v.res, texels: host.length - skipped, qMax, worstQ, worstOm, worstU });
         console.log(`    L${v.level} ${v.res.join('x')}: max|Q| ${qMax.toExponential(2)}`
-          + `  worst Q ${worstQ.toExponential(2)}  |omega| ${worstOm.toExponential(2)}  |u| ${worstU.toExponential(2)}`);
+          + `  worst Q ${worstQ.toExponential(2)}  |omega| ${worstOm.toExponential(2)}  |u| ${worstU.toExponential(2)}`
+          + `  (${host.length - skipped} at-level texels, ${skipped} replicated and skipped)`);
       }
       // 1% of the slab's own maximum. The inputs are IDENTICAL fp16 texels,
       // so the only sources of disagreement are f32-against-f64 arithmetic in
@@ -435,6 +461,173 @@ async function main() {
       const ok = differForbidden === 0 && differAllowed > 0.05 * Math.max(1, allowed);
       rows.push({ name: 'stack (M6.4b)', ok,
                   detail: `${differAllowed} allowed / ${differForbidden} forbidden, ${allowed} could` });
+    }
+
+    // --- M6.4d: the gradient stencil reaches one SOURCE cell ---------------
+    //
+    // A level's volume is a dense grid over a bounding box and the refined set
+    // inside it is a shell, so most of the box is filled from a COARSER level.
+    // The resample samples NEAREST, so those voxels come in bit-identical
+    // blocks, and differencing them at the volume's own spacing turns the
+    // replication staircase into speckle. `?volh=1` (the default) differences
+    // each voxel over its own source cell instead.
+    //
+    // TWO CLAIMS, AND THE FIRST IS THE ONE THAT MAKES THE CHANGE SAFE:
+    //
+    //   1. IT IS A NO-OP WHERE THE VOLUME ALREADY HAS THE DATA. Every voxel
+    //      the refined level actually covers must be BIT-IDENTICAL across the
+    //      A/B -- not close, identical, because its stride is 1 either way and
+    //      the arithmetic is the same instructions on the same texels. This is
+    //      what says M6.4b's sharp near-wall sheet is untouched.
+    //   2. AND IT CHANGES THE REPLICATED ONES. Something has to move, or the
+    //      flag is wired to nothing -- the failure 96547af had no control for.
+    //
+    // The classifier is `debugSampleTree`, i.e. the SHADER's own walk, so this
+    // asks what the resample actually read rather than what the box implies.
+    if (want('volh')) {
+      // `?volMargin=2` IS PART OF THE CASE, not a tweak to make it pass. A
+      // STATIC run defaults the margin to 0, so the box is the tight bbox of
+      // the shell and a small sphere's shell very nearly fills it -- the first
+      // run of this gate found 4096 at-level voxels and ZERO replicated ones,
+      // i.e. nothing for the stride to act on. The configuration that shows
+      // the artifact pads the box (the flagship clip runs ?volMargin=4), and
+      // padding is exactly what puts a known-coarse ring inside a refined
+      // level's volume.
+      const AB = '&volMargin=2&volh=';
+      const a = await open(`${AB}1`, 'volh (M6.4d)');
+      const which = a.volume.count - 1;
+      if (which < 1) throw new Error(`no refined volume in the stack (count ${a.volume.count})`);
+
+      // THE SLICE IS CHOSEN, NOT ASSUMED TO BE THE MIDDLE, and the score is
+      // min(at-level, replicated): a slice with only one population cannot
+      // test either claim, and the middle of a body-fitted box is exactly
+      // where the refined set is solid.
+      const classify = async (z) => {
+        const scl = await ev(Runtime, `${G}.debugReadVolume(${z}, ${which}, 'scl')`, 'debugReadVolume');
+        const lv = new Int32Array(scl.texels.length);
+        for (let i = 0; i < scl.texels.length; i += 4096) {
+          const pts = scl.texels.slice(i, i + 4096).map((t) => t.p);
+          const r = await ev(Runtime, `${G}.debugSampleTree(${JSON.stringify(pts)})`, 'debugSampleTree');
+          for (let j = 0; j < r.length; j++) lv[i + j] = r[j].level;
+        }
+        let at = 0, co = 0;
+        for (let i = 0; i < lv.length; i++) { if (lv[i] >= scl.info.level) at++; else co++; }
+        return { scl, lv, at, co };
+      };
+      const nz = a.volume.stack[which].res[2];
+      let pick = null;
+      for (let z = 0; z < nz; z += Math.max(1, Math.floor(nz / 8))) {
+        const c = await classify(z);
+        console.log(`    z=${z}: ${c.at} at-level, ${c.co} replicated`);
+        if (!pick || Math.min(c.at, c.co) > Math.min(pick.at, pick.co)) pick = { ...c, z };
+      }
+      if (!pick || pick.co === 0) {
+        throw new Error('no slice of the refined volume holds a replicated voxel'
+          + ' -- the box covers its set exactly, so there is nothing for M6.4d to act on');
+      }
+      const { scl: sclA, lv: lvl, z: zc } = pick;
+      const volLevel = sclA.info.level;
+      console.log(`    slice z=${zc}: ${pick.at} at-level, ${pick.co} replicated`);
+
+      await open(`${AB}0`, 'volh control (?volh=0)');
+      const sclB = await ev(Runtime, `${G}.debugReadVolume(${zc}, ${which}, 'scl')`, 'debugReadVolume');
+      if (sclB.texels.length !== sclA.texels.length) {
+        throw new Error('the A/B produced different volume shapes -- not a control');
+      }
+
+      // Bit-identical on the at-level population; SOMETHING different on the
+      // replicated one. Q is channel 0.
+      let atLevel = 0, atLevelDiff = 0, coarse = 0, coarseDiff = 0;
+      for (let i = 0; i < sclA.texels.length; i++) {
+        const qa = sclA.texels[i].v[0], qb = sclB.texels[i].v[0];
+        const same = Object.is(qa, qb);
+        if (lvl[i] >= volLevel) { atLevel++; if (!same) atLevelDiff++; }
+        else { coarse++; if (!same) coarseDiff++; }
+      }
+
+      // AND THE SPECKLE ITSELF, by the statistic probe-d3-volume-crunch.js
+      // uses: the normalized in-plane Laplacian of Q, averaged over the
+      // replicated population only, where structure exists to speckle.
+      const [nx, ny] = sclA.info.res;
+      const crunch = (t) => {
+        const q = t.map((x) => x.v[0]);
+        let acc = 0, n = 0;
+        for (let y = 1; y < ny - 1; y++) {
+          for (let x = 1; x < nx - 1; x++) {
+            const i = y * nx + x;
+            if (lvl[i] >= volLevel) continue;
+            const c = q[i];
+            const n4 = q[i + 1] + q[i - 1] + q[i + nx] + q[i - nx];
+            const mag = Math.abs(c) + Math.abs(n4) / 4;
+            if (mag < 0.05) continue;
+            acc += Math.abs(4 * c - n4) / (mag + 2 ** -14); n++;
+          }
+        }
+        return n ? acc / n : null;
+      };
+      const cA = crunch(sclA.texels), cB = crunch(sclB.texels);
+
+      // The two structural claims GATE; the crunch statistic gates only when
+      // it has a population to average over. A young wake at 200 steps can
+      // leave the replicated ring below the structure floor, and a gate that
+      // fails on an empty average is reporting its own sample size.
+      const ok = atLevelDiff === 0 && coarseDiff > 0
+        && (cA == null || cB == null || cA < cB);
+      console.log(`    at-level ${atLevel} voxels, ${atLevelDiff} differ (must be 0)`);
+      console.log(`    replicated ${coarse} voxels, ${coarseDiff} differ (must be > 0)`);
+      console.log(`    crunch on the replicated population: ${cA?.toFixed(4)} with,`
+        + ` ${cB?.toFixed(4)} without (${cB && cA ? (cB / cA).toFixed(2) : '-'}x)`);
+      rows.push({ name: 'volh (M6.4d)', ok,
+                  detail: `${atLevelDiff}/${atLevel} at-level differ, ${coarseDiff}/${coarse} replicated,`
+                    + ` crunch ${cA == null ? '-' : cA.toFixed(3)} vs ${cB == null ? '-' : cB.toFixed(3)}` });
+    }
+    // --- M6.4d/M6.4f: the source-level companion says the truth ------------
+    //
+    // BOTH features rest on one buffer. M6.4d picks a voxel's stencil from it
+    // and M6.4f decides which box the ray may use from it, so a companion that
+    // is merely plausible would make both of them confidently wrong in the
+    // same direction -- and neither's own gate would notice, because both ask
+    // whether the flag CHANGED something, not whether it changed it where it
+    // should have.
+    //
+    // The claim is exact and there is nothing to tolerance: the companion holds
+    // what `sampleTree` returned at that voxel, and `debugSampleTree` is that
+    // same shader walk asked from the host at the same point. Every texel, or
+    // it is wrong.
+    if (want('srclevel')) {
+      const p = await open('&volMargin=2', 'srclevel (M6.4d/f)');
+      const per = [];
+      for (let which = 1; which < p.volume.count; which++) {
+        const zc = Math.floor(p.volume.stack[which].res[2] / 2);
+        const lvl = await ev(Runtime, `${G}.debugReadVolume(${zc}, ${which}, 'lvl')`, 'debugReadVolume');
+        if (lvl.skipped) throw new Error(`L${which}: ${lvl.skipped}`);
+        let bad = 0, first = null, hist = {};
+        for (let i = 0; i < lvl.texels.length; i += 4096) {
+          const chunk = lvl.texels.slice(i, i + 4096);
+          const r = await ev(Runtime, `${G}.debugSampleTree(${JSON.stringify(chunk.map((t) => t.p))})`,
+            'debugSampleTree');
+          for (let j = 0; j < r.length; j++) {
+            const got = chunk[j].src, want_ = r[j].level;
+            hist[got] = (hist[got] || 0) + 1;
+            if (got !== want_) { bad++; if (!first) first = { p: chunk[j].p, got, want: want_ }; }
+          }
+        }
+        per.push({ level: lvl.info.level, texels: lvl.texels.length, bad, hist });
+        console.log(`    L${lvl.info.level} ${lvl.info.res.join('x')}: ${lvl.texels.length} texels,`
+          + ` ${bad} disagree with debugSampleTree`
+          + `  levels seen ${JSON.stringify(hist)}`);
+        if (first) console.log(`      first: at ${first.p.map((v) => v.toFixed(2))}`
+          + ` companion says ${first.got}, sampler says ${first.want}`);
+      }
+      // A SLAB THAT IS ALL ONE LEVEL PROVES NOTHING -- it would pass against a
+      // companion hardwired to that number. ?volMargin=2 is there to guarantee
+      // both populations, and this is the assertion that it did.
+      const mixed = per.every((r) => Object.keys(r.hist).length > 1);
+      const ok = per.length > 0 && per.every((r) => r.bad === 0) && mixed;
+      if (!mixed) console.log('    !! a slab holds only ONE source level -- nothing is discriminated');
+      rows.push({ name: 'srclevel (M6.4d/f)', ok,
+                  detail: `${per.reduce((a, r) => a + r.bad, 0)} disagree of `
+                    + `${per.reduce((a, r) => a + r.texels, 0)}, ${mixed ? 'mixed' : 'SINGLE-LEVEL'}` });
     }
   } finally {
     await client.close();

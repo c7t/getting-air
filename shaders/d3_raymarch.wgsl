@@ -42,6 +42,9 @@ struct RayParams {
   // Per level: the CONTINUOUS box (see d3-volume.mjs's header -- cell i spans
   // [i-1/2, i+1/2), so a box of `ext` cells from index `lo` spans
   // [lo-1/2, lo+ext-1/2)), and the extent with the voxel size in w.
+  // boxLo[i].w is the entry's LEVEL, which is not its index: volumeStack drops
+  // a level with no tiles, so the stack can be (0, 2). VOL_FALLBACK needs it
+  // to ask "did this voxel come from MY level".
   boxLo : array<vec4<f32>, 4>,
   boxExt: array<vec4<f32>, 4>,
 }
@@ -56,6 +59,14 @@ struct RayParams {
 @group(0) @binding(4) var vol2 : texture_3d<f32>;
 @group(0) @binding(5) var vol3 : texture_3d<f32>;
 @group(0) @binding(6) var<storage, read> body : BodyState3D;
+// M6.4f. The source level per voxel, the companion common_d3_resample.wgsl
+// writes. Only levels 1..3 have one -- level 0's data is never a coarser
+// level's replicated onto a finer grid, because there is no coarser level.
+// uint, so textureLoad and integer coordinates: a filtered level number is
+// not a level number.
+@group(0) @binding(7) var lvl1 : texture_3d<u32>;
+@group(0) @binding(8) var lvl2 : texture_3d<u32>;
+@group(0) @binding(9) var lvl3 : texture_3d<u32>;
 
 override NX : u32 = 1u;
 override NY : u32 = 1u;
@@ -68,6 +79,10 @@ override NZ : u32 = 1u;
 override UP_AXIS : u32 = 2u;
 override UP_SIGN : f32 = 1f;
 override HAS_BODY : u32 = 0u;
+// M6.4f. 1 = a box is only used where its voxel came from its own level;
+// 0 = innermost box wins unconditionally, which is the pre-M6.4f behaviour and
+// the leg the A/B measures against.
+override VOL_FALLBACK : u32 = 0u;
 // 0 = perspective (the default, and the one that reads as a picture),
 // 1 = ORTHOGRAPHIC. See camRay for why the second one exists.
 override PROJ : u32 = 0u;
@@ -193,18 +208,61 @@ fn boxLocal(p: vec3<f32>, i: u32) -> vec3<f32> {
   return q / rm.boxExt[i].xyz;
 }
 
-// INNERMOST WINS. The stack is ordered coarsest-first, so the LAST box
-// containing the point is the finest one that does. Two or three tests, no
-// descent -- that is the entire difference from raymarching the pool.
+// M6.4f. Did entry i's voxel at `tc` actually COME from level i, or is it a
+// coarser level's value replicated onto i's finer grid? The resample records
+// the answer per voxel; this reads it back with integer coordinates, because
+// a filtered level number is not a level number.
+//
+// `>=` and not `==`: the level-m volume resamples with the same unrestricted
+// sampleTree as everything else, so inside a level-(m+1) refined region its
+// voxels legitimately hold level-(m+1) data -- undersampled onto m's grid, but
+// its own level's or finer, which is what "not replicated" means here.
+fn srcAtLeast(i: u32, tc: vec3<f32>) -> bool {
+  let lv = u32(rm.boxLo[i].w);
+  var d = vec3<u32>(1u);
+  if (i == 1u) { d = textureDimensions(lvl1); }
+  else if (i == 2u) { d = textureDimensions(lvl2); }
+  else if (i == 3u) { d = textureDimensions(lvl3); }
+  else { return true; }
+  let f = vec3<f32>(d);
+  let c = vec3<i32>(clamp(tc * f, vec3<f32>(0f), f - vec3<f32>(1f)));
+  var src = 0u;
+  if (i == 1u) { src = textureLoad(lvl1, c, 0).r; }
+  else if (i == 2u) { src = textureLoad(lvl2, c, 0).r; }
+  else { src = textureLoad(lvl3, c, 0).r; }
+  return src >= lv;
+}
+
+// INNERMOST WINS -- BUT ONLY WHERE THE INNERMOST BOX ACTUALLY HAS THE DATA
+// (M6.4f, `?volfallback=0` to A/B).
+//
+// A level's volume is a dense grid over a BOUNDING BOX and its refined set is
+// a shell, so most of the box is filled from a coarser level, replicated onto
+// the finer grid -- 58% of the structured voxels on the flagship card, and
+// more again at ?volMargin=4. Taking the innermost box unconditionally hands
+// the ray that replication: a plateau it then samples at the FINE voxel size,
+// so it pays fine steps and fine interpolation for data that has neither.
+// M6.4d fixed what that did to the GRADIENT; this is the other half, which is
+// what the picture is made of.
+//
+// FALLING BACK IS ALSO CHEAPER, and that is not a coincidence: `dt` is the
+// chosen box's voxel size, so a ray crossing a replicated region now steps at
+// the resolution the data actually has instead of 2^m times finer.
+//
+// DESCENDING, so the first box that both contains p and owns its data wins and
+// the rest are never touched. That bounds the extra fetches by the number of
+// boxes actually entered -- typically one, and none at all outside them.
 struct Hit { lv : u32, tc : vec3<f32> }
 fn levelAt(p: vec3<f32>) -> Hit {
-  var best = Hit(0u, boxLocal(p, 0u));
   let n = u32(rm.ctl.z);
-  for (var i = 1u; i < n; i++) {
+  for (var k = n; k > 1u; k--) {
+    let i = k - 1u;
     let tc = boxLocal(p, i);
-    if (all(tc <= vec3<f32>(1f))) { best = Hit(i, tc); }
+    if (all(tc <= vec3<f32>(1f))) {
+      if (VOL_FALLBACK != 1u || srcAtLeast(i, tc)) { return Hit(i, tc); }
+    }
   }
-  return best;
+  return Hit(0u, boxLocal(p, 0u));
 }
 
 // THE SAMPLER CLAMPS AT A BOX'S EDGE, and that is the right choice of the two

@@ -92,6 +92,12 @@
 //   ?volBudget=  MiB over the whole stack, default 256; REFUSES past it.
 //   ?volMargin=  blocks of slack around a refined box (default 2 dynamic,
 //                0 static), so a box that follows a body has room to move.
+//   ?volfallback= 1 (default) uses a refined box only where its voxel came
+//                from that level, falling back outward elsewhere; 0 restores
+//                innermost-box-wins-unconditionally. See VOL_FALLBACK.
+//   ?volh=       1 (default) differences each voxel over ITS OWN SOURCE
+//                CELL; 0 restores the pre-M6.4d fixed one-voxel stride, for
+//                the A/B. See d3_volume_scalar.wgsl's VOL_HSRC.
 //   ?volfield=   q (default) | omega | speed | rho -- which channel of the
 //                scalar volume the transfer function eats. All four are
 //                filled by one pass, so this is a uniform, not a recompute.
@@ -238,7 +244,8 @@ async function init() {
     'explin', 'orphans', 'dynamic', 'manageEvery', 'slotHeadroom', 'amrskip',
     'manageMargin', 'manageStart',
     // M6: the resample volume stack and the raymarcher.
-    'vol', 'volbox', 'volBudget', 'volstack', 'volMargin',
+    'vol', 'volbox', 'volBudget', 'volstack', 'volMargin', 'volh',
+    'volfallback',
     'view', 'volfield', 'volIso', 'volGain', 'volOpacity', 'volGamma', 'volStep', 'volSteps',
     'azim', 'elev', 'dist', 'fov', 'camtarget', 'winbox', 'proj',
     // M8.2a: the solid-interior reset, ?solideq=0 to disable for A/B.
@@ -2064,6 +2071,16 @@ async function init() {
   }
   const VOL_STACK = AMR && volBoxMode === 'domain' && numParam('volstack', 1) > 0;
   const VOL_MARGIN = Math.max(0, Math.round(numParam('volMargin', DYNAMIC ? 2 : 0)));
+  // M6.4d, and ON by default: the gradient pass differences each voxel over
+  // the source cell its data actually came from rather than over one voxel.
+  // `?volh=0` restores the old fixed stride so the two can be rendered
+  // side by side -- the control 96547af did not have.
+  const VOL_HSRC = numParam('volh', 1) > 0 ? 1 : 0;
+  // M6.4f. A refined box is used only where its voxel came from its OWN level;
+  // elsewhere the stack falls back outward instead of overriding the coarser
+  // level with that level's own data replicated onto a finer grid. `?volfallback=0`
+  // restores innermost-box-wins-unconditionally for the A/B.
+  const VOL_FALLBACK = numParam('volfallback', 1) > 0 ? 1 : 0;
 
   // THE SMALLEST PERIODIC INTERVAL covering a set of block indices on one
   // axis -- the largest circular GAP removed, rather than min..max.
@@ -2144,7 +2161,13 @@ async function init() {
       return;
     }
     if (volStack.length > MAX_VOL_LEVELS) { volStack = volStack.slice(0, MAX_VOL_LEVELS); volClamped = true; }
-    const bytes = volStack.reduce((a, v) => a + v.bytes, 0);
+    // M6.4d's companion is 4 B/voxel on the REFINED levels only (see the
+    // lvlTex creation below for why L0 is a dummy). Counted here rather than
+    // left out of the budget: a refusal is the whole point of the budget, and
+    // an allocation the budget cannot see is one that OOMs instead.
+    const lvlBytes = (VOL_HSRC || VOL_FALLBACK)
+      ? volStack.reduce((a, v) => a + (v.level > 0 ? v.voxels * 4 : 0), 0) : 0;
+    const bytes = volStack.reduce((a, v) => a + v.bytes, 0) + lvlBytes;
     if (bytes > VOL_BUDGET_MB * 1048576) {
       statusEl.textContent = `error: ?vol=${VOL_MULT} needs `
         + volStack.map(v => `L${v.level} ${v.res.join('x')}`).join(' + ')
@@ -2196,11 +2219,18 @@ async function init() {
       { binding: 10, visibility: GPUShaderStage.COMPUTE,
         storageTexture: { access: 'write-only', format: 'rgba16float', viewDimension: '3d' } },
       { binding: 11, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+      // M6.4d's source-level companion. 12 rather than the next free number
+      // by accident: renderBGL_entries owns 0..9 and this layout already
+      // appends 10 and 11, so 12 is the first one nothing else in the
+      // sampler's world speaks for.
+      { binding: 12, visibility: GPUShaderStage.COMPUTE,
+        storageTexture: { access: 'write-only', format: 'rgba8uint', viewDimension: '3d' } },
     ]});
     const sclBGL = device.createBindGroupLayout({ entries: [
       { binding: 0, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float', viewDimension: '3d' } },
       { binding: 1, visibility: GPUShaderStage.COMPUTE,
         storageTexture: { access: 'write-only', format: 'rgba16float', viewDimension: '3d' } },
+      { binding: 2, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'uint', viewDimension: '3d' } },
     ]});
     const resampleCode = await loadShader(`shaders/d3_resample_q${Q}.wgsl`);
     const scalarCode = await loadShader('shaders/d3_volume_scalar.wgsl');
@@ -2216,6 +2246,21 @@ async function init() {
         label });
       const velTex = mk(`d3_vol_vel_L${v.level}`);
       const sclTex = mk(`d3_vol_scl_L${v.level}`);
+      // M6.4d. FULL SIZE ONLY WHERE IT IS READ. The L0 volume's own spacing
+      // is already the coarsest in the tree, so its stride is 1 by
+      // construction and it gets a 1x1x1 dummy -- the companion is paid for
+      // by the small refined boxes and not by the 50 MB domain volume. A
+      // binding cannot be optional; the WRITE and the READ are, through
+      // WRITE_LEVEL and VOL_HSRC, and both fold at pipeline creation.
+      const wantLvl = (VOL_HSRC || VOL_FALLBACK) && v.level > 0;
+      const lvlTex = device.createTexture({
+        size: wantLvl ? v.res : [1, 1, 1], dimension: '3d', format: 'rgba8uint',
+        // COPY_SRC for the same reason velTex has it: the gate scores the
+        // companion against debugSampleTree, and a buffer no check can read is
+        // one two features now rest on and nothing verifies.
+        usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING
+             | GPUTextureUsage.COPY_SRC,
+        label: `d3_vol_lvl_L${v.level}` });
       const originBuf = device.createBuffer({ size: 16, usage: U.UNIFORM | U.COPY_DST });
       device.queue.writeBuffer(originBuf, 0, new Float32Array([v.lo[0], v.lo[1], v.lo[2], 0]));
       const pipe = await device.createComputePipelineAsync({
@@ -2223,7 +2268,8 @@ async function init() {
         compute: { module: resampleModule, entryPoint: 'main',
           constants: { ...dims, RB, SAMPLE_LEVELS,
             VOL_NX: v.res[0], VOL_NY: v.res[1], VOL_NZ: v.res[2],
-            VOL_HX: v.h[0], VOL_HY: v.h[1], VOL_HZ: v.h[2] } },
+            VOL_HX: v.h[0], VOL_HY: v.h[1], VOL_HZ: v.h[2],
+            WRITE_LEVEL: wantLvl ? 1 : 0 } },
       });
       const sclPipe = await device.createComputePipelineAsync({
         layout: device.createPipelineLayout({ bindGroupLayouts: [sclBGL] }),
@@ -2234,18 +2280,26 @@ async function init() {
             // Only the level-0 box over the WHOLE domain has a neighbour on
             // the other side of its own face.
             VOL_WRAP: (v.level === 0 && v.ext.every((e, k) => e === [NX, NY, NZ][k])) ? 1 : 0,
+            // FROM VOL_HSRC, NOT FROM `wantLvl`. They were the same thing
+            // until M6.4f gave the companion a second consumer -- and then
+            // `?volh=0` still got the source-cell stencil, because the
+            // companion was allocated for the RAY's sake. The A/B silently
+            // became a no-op and the volh gate caught it.
+            VOL_HSRC: (VOL_HSRC && v.level > 0) ? 1 : 0, VOL_LEVEL: v.level,
             Q_REF: Q_REF_SCALE, OM_REF: V_SCALE, U_REF: U_SCALE } },
       });
       volGPU.push({
-        level: v.level, velTex, sclTex, originBuf, pipe, sclPipe,
+        level: v.level, velTex, sclTex, lvlTex, hasLvl: !!wantLvl, originBuf, pipe, sclPipe,
         disp: v.res.map(r => Math.ceil(r / 4)),
         bg: device.createBindGroup({ layout: volBGL, entries: [
           ...treeSampleEntries(),
           { binding: 10, resource: velTex.createView() },
-          { binding: 11, resource: { buffer: originBuf } }]}),
+          { binding: 11, resource: { buffer: originBuf } },
+          { binding: 12, resource: lvlTex.createView() }]}),
         sclBG: device.createBindGroup({ layout: sclBGL, entries: [
           { binding: 0, resource: velTex.createView() },
-          { binding: 1, resource: sclTex.createView() }]}),
+          { binding: 1, resource: sclTex.createView() },
+          { binding: 2, resource: lvlTex.createView() }]}),
       });
     }
   }
@@ -2399,6 +2453,9 @@ async function init() {
     const dummyVol = device.createTexture({
       size: [1, 1, 1], dimension: '3d', format: 'rgba16float',
       usage: GPUTextureUsage.TEXTURE_BINDING, label: 'd3_vol_dummy' });
+    const dummyLvl = device.createTexture({
+      size: [1, 1, 1], dimension: '3d', format: 'rgba8uint',
+      usage: GPUTextureUsage.TEXTURE_BINDING, label: 'd3_lvl_dummy' });
     const rayBGL = device.createBindGroupLayout({ entries: [
       { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
       { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
@@ -2406,6 +2463,12 @@ async function init() {
         binding: 2 + i, visibility: GPUShaderStage.FRAGMENT,
         texture: { sampleType: 'float', viewDimension: '3d' } })),
       { binding: 6, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
+      // M6.4f's source-level companions, one per REFINED level: 7, 8, 9 are
+      // stack entries 1, 2, 3. Entry 0 has none and needs none -- level 0's
+      // data is never a coarser level's, because there is no coarser level.
+      ...Array.from({ length: MAX_VOL_LEVELS - 1 }, (_, i) => ({
+        binding: 7 + i, visibility: GPUShaderStage.FRAGMENT,
+        texture: { sampleType: 'uint', viewDimension: '3d' } })),
     ]});
     const rayModule = device.createShaderModule({
       code: await loadShader('shaders/d3_raymarch.wgsl'), label: 'd3_raymarch' });
@@ -2416,7 +2479,8 @@ async function init() {
                         // ?winbox=0 marches the buffer's box instead of the
                         // window's. Default 1; measured worth nothing, kept
                         // because the window is the frame the picture is in.
-                        WIN_BOX: urlParams.get('winbox') === '0' ? 0 : 1 };
+                        WIN_BOX: urlParams.get('winbox') === '0' ? 0 : 1,
+                        VOL_FALLBACK: VOL_FALLBACK };
     const mkRayPipe = (fmt) => device.createRenderPipelineAsync({
       layout: device.createPipelineLayout({ bindGroupLayouts: [rayBGL] }),
       vertex: { module: rayModule, entryPoint: 'vs_main', constants: rayConsts },
@@ -2435,7 +2499,10 @@ async function init() {
       ...Array.from({ length: MAX_VOL_LEVELS }, (_, i) => ({
         binding: 2 + i,
         resource: (volGPU[i] ? volGPU[i].sclTex : dummyVol).createView() })),
-      { binding: 6, resource: { buffer: bodyBuf } }]});
+      { binding: 6, resource: { buffer: bodyBuf } },
+      ...Array.from({ length: MAX_VOL_LEVELS - 1 }, (_, i) => ({
+        binding: 7 + i,
+        resource: (volGPU[i + 1] ? volGPU[i + 1].lvlTex : dummyLvl).createView() }))]});
   }
 
   // The uniform, rebuilt whenever anything in it moves -- a camera drag, a
@@ -2455,7 +2522,11 @@ async function init() {
     b.set([CAM_TARGET[0], CAM_TARGET[1], CAM_TARGET[2], CAM_FOLLOW], 12);
     for (let i = 0; i < MAX_VOL_LEVELS; i++) {
       const v = volStack[i];
-      b.set(v ? [v.c0[0], v.c0[1], v.c0[2], 1] : [0, 0, 0, 0], 16 + 4 * i);
+      // w is the entry's LEVEL, not a present flag and not its index:
+      // volumeStack drops a level with no tiles, so the stack can be (0, 2)
+      // and M6.4f's "did this voxel come from MY level" needs the real one.
+      // Presence is rm.ctl.z, which already folds absent entries out.
+      b.set(v ? [v.c0[0], v.c0[1], v.c0[2], v.level] : [0, 0, 0, 0], 16 + 4 * i);
       // w is the voxel size the ray steps by inside this box -- the SMALLEST
       // of the three, so an anisotropic box does not step past a voxel on its
       // finest axis.
@@ -2478,6 +2549,15 @@ async function init() {
   async function debugReadVolume(z, which = 0, what = 'vel') {
     if (!volGPU.length) return { skipped: 'no volume (?vol=0)' };
     if (which >= volGPU.length) return { skipped: `no volume ${which} (stack of ${volGPU.length})` };
+    // M6.4d/M6.4f both rest on the source-level companion being RIGHT, and
+    // until it is readable nothing can say so. Refused rather than returned
+    // empty where it does not exist: level 0 has no companion by design, and
+    // an all-zero slab would read as "every voxel came from L0", which is the
+    // very answer the check is trying to distinguish.
+    if (what === 'lvl' && !volGPU[which].hasLvl) {
+      return { skipped: `no source-level companion for stack entry ${which}`
+        + ` (level ${volStack[which].level}${VOL_HSRC || VOL_FALLBACK ? '' : ', and ?volh=0&volfallback=0'})` };
+    }
     // SAME REASON AS debugRenderFrame: the boxes are moved by the live frame
     // loop, and a tool reading the volume runs with `live=0`. Without this a
     // check reads a volume whose box the body left thousands of steps ago and
@@ -2490,22 +2570,28 @@ async function init() {
     // 256-byte row alignment is a copyTextureToBuffer requirement, not a
     // suggestion: an unpadded bytesPerRow is a validation error, and a
     // validation error here is silent.
-    const rowBytes = Math.ceil(nx * 8 / 256) * 256;
+    // 4 B/texel for the rgba8uint companion against 8 for the two rgba16float
+    // volumes, so the row stride is not one constant.
+    const bpt = what === 'lvl' ? 4 : 8;
+    const rowBytes = Math.ceil(nx * bpt / 256) * 256;
     const buf = device.createBuffer({ size: rowBytes * ny, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
     const enc = device.createCommandEncoder();
     encodeResample(enc);
     if (what === 'scl') encodeScalar(enc);
-    enc.copyTextureToBuffer({ texture: what === 'scl' ? g.sclTex : g.velTex, origin: { x: 0, y: 0, z: zz } },
+    const srcTex = what === 'scl' ? g.sclTex : what === 'lvl' ? g.lvlTex : g.velTex;
+    enc.copyTextureToBuffer({ texture: srcTex, origin: { x: 0, y: 0, z: zz } },
       { buffer: buf, bytesPerRow: rowBytes, rowsPerImage: ny }, { width: nx, height: ny, depthOrArrayLayers: 1 });
     device.queue.submit([enc.finish()]);
     await buf.mapAsync(GPUMapMode.READ);
-    const raw = new Uint16Array(buf.getMappedRange().slice(0));
+    const mapped = buf.getMappedRange().slice(0);
+    const raw = what === 'lvl' ? new Uint8Array(mapped) : new Uint16Array(mapped);
     buf.unmap(); buf.destroy();
     const out = [];
     for (let y = 0; y < ny; y++) {
       for (let x = 0; x < nx; x++) {
-        const o = (y * rowBytes) / 2 + x * 4;
-        const c = [half(raw[o]), half(raw[o + 1]), half(raw[o + 2]), half(raw[o + 3])];
+        const o = what === 'lvl' ? y * rowBytes + x * 4 : (y * rowBytes) / 2 + x * 4;
+        const c = what === 'lvl' ? [raw[o], raw[o + 1], raw[o + 2], raw[o + 3]]
+          : [half(raw[o]), half(raw[o + 1]), half(raw[o + 2]), half(raw[o + 3])];
         out.push({
           p: [v.lo[0] + (x + 0.5) * v.h[0] - 0.5,
               v.lo[1] + (y + 0.5) * v.h[1] - 0.5,
@@ -2514,7 +2600,9 @@ async function init() {
           // velocity volume is (u, rho) and the scalar one is four separately
           // normalized fields. A caller that read `u` out of the scalar
           // volume would get Q in x and be none the wiser.
-          ...(what === 'scl' ? { v: c } : { u: c.slice(0, 3), rho: c[3] }),
+          ...(what === 'scl' ? { v: c }
+            : what === 'lvl' ? { src: c[0] }
+            : { u: c.slice(0, 3), rho: c[3] }),
         });
       }
     }
@@ -2591,6 +2679,69 @@ async function init() {
   // plate, but it is the picture this project debugs with, and a movie mode
   // that could only film one of the two views would send someone back to a
   // screen recorder for the other.
+  // THE RAYMARCHER'S COST, OFF THE ANIMATION THREAD. plans/3D.md M6.4f.
+  //
+  // NOT rAF, and that is the whole point. A frame rate read off the frame loop
+  // is the DISPLAY's: at 1152x720 and again at 2560x1440 an A/B of this shader
+  // read 59.9 fps on both legs, because the frame costs under 16.6 ms either
+  // way. Disabling vsync makes the two legs differ but then measures the
+  // browser's frame pacing as well as the shader. So this encodes `reps` draws
+  // into ONE command buffer, submits it, and waits for the queue -- no
+  // presentation, no compositor, no rAF.
+  //
+  // AND NOT debugRenderFrame, WHICH IS ALSO OFF THE ANIMATION THREAD and is
+  // the obvious thing to reach for. MEASURED at 1024x1024 on the flagship
+  // card: **1181 ms per call against a 4.7 ms draw**, i.e. 250x the thing
+  // being timed. It is not the copyTextureToBuffer -- it is base64 of 4 MiB
+  // and the CDP round trip that returns it. That tool exists to produce an
+  // IMAGE; timing through it would report its own encoder.
+  //
+  // AND IT REPORTS THE MINIMUM OF ITS BATCHES, which is bench-d3-interface.js's
+  // rule on this desktop -- the median moves several percent between runs and
+  // the minimum is the one that is reproducible.
+  //
+  // The resample and gradient passes are deliberately NOT encoded: the volume
+  // does not change between reps, and the question is what the RAY costs.
+  async function debugBenchRender(opts = {}) {
+    if (!rayPipe || !offscreen.volume) return { skipped: 'no raymarcher (?vol=0)' };
+    const w = Math.max(16, Math.min(4096, Math.round(opts.w || 1024)));
+    const h = Math.max(16, Math.min(4096, Math.round(opts.h || 1024)));
+    const reps = Math.max(1, Math.min(512, Math.round(opts.reps || 32)));
+    const batches = Math.max(1, Math.min(64, Math.round(opts.batches || 5)));
+    if (!offscreen.tex || offscreen.w !== w || offscreen.h !== h) {
+      if (offscreen.tex) offscreen.tex.destroy();
+      offscreen.tex = device.createTexture({
+        size: [w, h], format: 'rgba8unorm', label: 'd3_offscreen',
+        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
+      offscreen.w = w; offscreen.h = h;
+    }
+    await refreshVolumeBoxes();
+    writeRayParams(w / h);
+    const view = offscreen.tex.createView();
+    const once = () => {
+      const enc = device.createCommandEncoder();
+      for (let i = 0; i < reps; i++) {
+        const pass = enc.beginRenderPass({ colorAttachments: [{
+          view, clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: 'clear', storeOp: 'store' }]});
+        pass.setPipeline(offscreen.volume); pass.setBindGroup(0, rayBG);
+        pass.draw(6); pass.end();
+      }
+      device.queue.submit([enc.finish()]);
+      return device.queue.onSubmittedWorkDone();
+    };
+    await once();                       // warm: pipeline, caches, clocks
+    const ms = [];
+    for (let b = 0; b < batches; b++) {
+      const t0 = performance.now();
+      await once();
+      ms.push((performance.now() - t0) / reps);
+    }
+    ms.sort((a, b) => a - b);
+    writeRayParams();
+    return { w, h, reps, batches, msPerFrame: ms[0], median: ms[(ms.length - 1) >> 1],
+             spread: (ms[ms.length - 1] - ms[0]) / ms[0], all: ms };
+  }
+
   async function debugRenderFrame(opts = {}) {
     const o = typeof opts === 'number' ? { w: opts } : (opts || {});
     const view = o.view || viewMode;
@@ -4653,7 +4804,7 @@ async function init() {
     debugPoolUsage, debugCheckQCoverage, debugParentChildMiss,
     debugCheck21Balance, debugCheckGeometryCoverage, debugCheckRingParents, debugPoolState,
     debugRunBalance, debugSampleTree, debugCheckTreeSample, debugReadVolume,
-    debugRenderFrame, debugSetVolume, debugSetCamera,
+    debugRenderFrame, debugBenchRender, debugSetVolume, debugSetCamera,
     debugHotspot, debugRunAndCollect, debugOccupancy,
     readInterfaceDiag, readFluxAcc,
     debugStepSync,

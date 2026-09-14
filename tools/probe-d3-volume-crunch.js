@@ -62,16 +62,31 @@ const BASE = 'scenario=card&n=32&live=0&span=2&re=1100&tilt=1.047&aspect=0.1016'
 //           the wrong shape" from "newly-created tiles carry a transient".
 //   flat    ?volstack=0: one L0 volume and no refined boxes at all, so there
 //           is no box/set mismatch available to have. Speckle must go.
-const LEGS = { full: '', static: 'dynamic=0', flat: 'volstack=0' };
+//   fixedh  ?volh=0: M6.4d's control. Same boxes, same set, same mismatch --
+//           only the gradient pass's stencil goes back to one voxel. This is
+//           the leg that says whether the stride is the mechanism, because it
+//           holds everything the other three legs vary.
+//
+// READ `fixedh` AGAINST `full`, NOT AGAINST `flat`. `flat` removes the
+// refined boxes and therefore removes the refined DATA too, so it is a
+// control for "is the box the cause" and not for "is the stencil the cure".
+//
+// A CAVEAT ON `static` that predates M6.4d: ?dynamic=0 freezes the refined
+// set while the card keeps falling, so the body LEAVES the shell -- a
+// coarse/fine seam through the body, which plans/3D.md calls a hard
+// requirement violation. Its numbers describe a fully stale box, not the
+// "frozen ragged edge" this leg's name suggests. Kept because a stale box is
+// itself worth a number; not to be read as the edge's own contribution.
+const LEGS = { full: '', static: 'dynamic=0', flat: 'volstack=0', fixedh: 'volh=0' };
 
 const DEFAULTS = {
   baseUrl: 'https://localhost:4444', port: 9333,
-  steps: 2000, legs: ['full', 'static', 'flat'],
+  steps: 2000, legs: ['full', 'fixedh', 'flat'],
 };
 
 const HELP = `probe-d3-volume-crunch.js -- where the volume render's speckle comes from
   --steps=N     steps before measuring (default ${DEFAULTS.steps})
-  --legs=a,b    ${Object.keys(LEGS).join(',')} (default all)
+  --legs=a,b    ${Object.keys(LEGS).join(',')} (default ${DEFAULTS.legs.join(',')})
 
 Each leg gets its OWN Chrome and tears it down again -- see measureLeg for why
 that is not the usual one-tab-reused pattern. There is deliberately no

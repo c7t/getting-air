@@ -51,6 +51,9 @@
 
 @group(0) @binding(0) var velIn  : texture_3d<f32>;
 @group(0) @binding(1) var sclOut : texture_storage_3d<rgba16float, write>;
+// The level each voxel's data came from, written by common_d3_resample.wgsl.
+// See VOL_HSRC. A 1x1x1 dummy on the L0 volume, which never reads it.
+@group(0) @binding(2) var lvlIn  : texture_3d<u32>;
 
 override VOL_NX : u32 = 1u;
 override VOL_NY : u32 = 1u;
@@ -69,6 +72,33 @@ override VOL_HZ : f32 = 1f;
 // neighbour and the stencil has to shorten instead.
 override VOL_WRAP : u32 = 0u;
 
+// M6.4d. THE STENCIL REACHES ONE SOURCE CELL, NOT ONE VOXEL, and until
+// 2026-09-12 it always reached one voxel.
+//
+// A level's volume is a dense grid over a BOUNDING BOX while the refined set
+// inside it is a shell, so most of the box is filled from a COARSER level --
+// 48-63% of the structured voxels on the flagship card, measured. The
+// resample samples the tree NEAREST, so all the voxels inside one source cell
+// are BIT-IDENTICAL. Differencing that plateau at VOL_H gives exactly zero
+// through the interior and the entire source-cell jump across a single voxel
+// at its edge, divided by a step 2^(level-src) too small: the replication
+// staircase differentiated into isolated speckle, which is the stipple a
+// ?levels=3 card render shows along its vortex tubes.
+//
+// THE FIX IS common_d3_tree_sample.wgsl's OWN RULE -- "any finite difference
+// taken from it must use the sampler's own h" -- which this pass could not
+// obey while h was one pipeline constant for the whole texture. Now the
+// resample hands over the source level per voxel and the stride follows.
+//
+// IT IS A NO-OP WHERE THE VOLUME ALREADY HAS THE DATA (src == level gives
+// stride 1 at ?vol=1), so the refined region renders bit-identically and only
+// the replicated population moves. `?volh=0` sets this to 0 and restores the
+// old fixed stride, which is how that claim is measured rather than asserted.
+override VOL_HSRC : u32 = 0u;
+// This volume's own level, so the shader can tell "the data is mine" from
+// "the data is a coarser level's, replicated".
+override VOL_LEVEL : u32 = 0u;
+
 // The normalizations. All three default to 1, which makes this kernel report
 // raw lattice quantities -- correct, and useless at fp16, which is why the
 // host always sets them.
@@ -84,11 +114,24 @@ override U_REF  : f32 = 1f;
 // precisely the seam region the view exists to look at. So the shortened
 // stencil reports its own width and the caller divides by that.
 struct Tap { ip : i32, im : i32, sep : f32 }
-fn tap(i: i32, n: i32, h: f32) -> Tap {
-  if (VOL_WRAP == 1u) { return Tap((i + 1) % n, ((i - 1) % n + n) % n, 2f * h); }
-  let ip = min(i + 1, n - 1);
-  let im = max(i - 1, 0);
+fn tap(i: i32, n: i32, h: f32, stride: i32) -> Tap {
+  // Never past the volume: a stride wider than the texture would collapse
+  // ip onto im and divide by zero. Clamping is right rather than refusing --
+  // a box thinner than one source cell has no wider difference to take.
+  let d = max(1, min(stride, n - 1));
+  if (VOL_WRAP == 1u) { return Tap(((i + d) % n + n) % n, ((i - d) % n + n) % n, 2f * f32(d) * h); }
+  let ip = min(i + d, n - 1);
+  let im = max(i - d, 0);
   return Tap(ip, im, f32(ip - im) * h);
+}
+
+// d3-volume.mjs's `stencilStride`, in WGSL. floor(x + 0.5) and not `round`:
+// WGSL rounds half-to-EVEN and JS's Math.round is half-UP, and one rule
+// stated in two languages should not differ on a case merely because the box
+// extents that reach it are rare.
+fn strideFor(srcLevel: u32, h: f32) -> i32 {
+  if (VOL_HSRC != 1u || srcLevel >= VOL_LEVEL) { return 1; }
+  return max(1, i32(floor(exp2(-f32(srcLevel)) / h + 0.5f)));
 }
 
 fn uAt(x: i32, y: i32, z: i32) -> vec3<f32> {
@@ -99,9 +142,16 @@ fn uAt(x: i32, y: i32, z: i32) -> vec3<f32> {
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (gid.x >= VOL_NX || gid.y >= VOL_NY || gid.z >= VOL_NZ) { return; }
   let v = vec3<i32>(gid);
-  let tx = tap(v.x, i32(VOL_NX), VOL_HX);
-  let ty = tap(v.y, i32(VOL_NY), VOL_HY);
-  let tz = tap(v.z, i32(VOL_NZ), VOL_HZ);
+  // The level THIS voxel was filled from -- not the volume's own level, which
+  // is only what it was filled INTO. See VOL_HSRC.
+  // An `if` and not `select`, which evaluates both arms: VOL_HSRC is an
+  // override, so this folds away entirely and the L0 volume -- the big one --
+  // pays no fetch at all for a companion texture it does not have.
+  var src : u32 = VOL_LEVEL;
+  if (VOL_HSRC == 1u) { src = textureLoad(lvlIn, v, 0).r; }
+  let tx = tap(v.x, i32(VOL_NX), VOL_HX, strideFor(src, VOL_HX));
+  let ty = tap(v.y, i32(VOL_NY), VOL_HY, strideFor(src, VOL_HY));
+  let tz = tap(v.z, i32(VOL_NZ), VOL_HZ, strideFor(src, VOL_HZ));
 
   // J[j] = du/dx_j, so J[j][i] is du_i/dx_j -- the same indexing
   // common_d3_criterion.wgsl's qAt uses, deliberately, because these two are

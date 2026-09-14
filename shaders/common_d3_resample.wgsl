@@ -48,6 +48,25 @@
 // mode M5.0's refusal exists for.
 @group(0) @binding(11) var<uniform> volOrigin : vec4<f32>;
 
+// THE LEVEL EACH VOXEL'S DATA ACTUALLY CAME FROM (M6.4d). `sampleTree`
+// already returns it and this pass used to throw it away; the gradient pass
+// (d3_volume_scalar.wgsl) needs it, because a voxel filled from a coarser
+// level is one of a replicated block and must be differenced over the SOURCE
+// cell rather than over one voxel. d3-volume.mjs's `stencilStride` is the
+// host statement of that rule.
+//
+// rgba8uint AND NOT r8uint: r8 is not a storage-writable format in core
+// WebGPU (the same wall d3_volume_scalar.wgsl's header hit with r16float), so
+// 4 bytes per voxel is the floor. It is paid ONLY by the refined levels --
+// the L0 volume gets a 1x1x1 dummy and WRITE_LEVEL = 0, because its own
+// spacing is already the coarsest in the tree and its stride is 1 by
+// construction. On the flagship that is the 12 MB volume, not the 50 MB one.
+@group(0) @binding(12) var lvlOut : texture_storage_3d<rgba8uint, write>;
+
+// 0 for the L0 volume, whose companion is a 1x1x1 dummy. A binding cannot be
+// optional, so the WRITE is.
+override WRITE_LEVEL : u32 = 0u;
+
 // The box SHAPE, in L0 cell units with cell centres at integers -- the frame
 // common_d3_tree_sample.wgsl documents.
 override VOL_NX : u32 = 1u;
@@ -78,4 +97,5 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   // never touches w, so the gradient pass reads three contiguous halves of
   // each texel rather than striding past a density it does not want.
   textureStore(volOut, vec3<i32>(gid), vec4<f32>(s.v.yzw, s.v.x));
+  if (WRITE_LEVEL == 1u) { textureStore(lvlOut, vec3<i32>(gid), vec4<u32>(s.level, 0u, 0u, 0u)); }
 }

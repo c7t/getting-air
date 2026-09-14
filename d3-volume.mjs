@@ -230,3 +230,42 @@ export function rayTouchesRefined(o, d, stack, tMax = Infinity) {
 export function stackUnwrapped(stack, dims) {
   return stack.slice(1).every((v) => v.c0.every((c, k) => c >= -0.5 && v.c1[k] <= dims[k] - 0.5));
 }
+
+// THE STENCIL STRIDE (M6.4d). How far apart, IN VOXELS, the gradient pass's
+// central difference should reach for a voxel whose data came from level
+// `srcLevel`, given the volume's own voxel size `h` in L0 cell units.
+//
+// WHY IT IS NOT ALWAYS 1. A level's volume is a dense grid over a BOUNDING
+// BOX and the refined set inside it is not box-shaped, so voxels inside the
+// box but outside the set are filled from a COARSER level -- 48-63% of the
+// structured voxels on the flagship card, measured by
+// tools/probe-d3-volume-crunch.js. The resample samples the tree NEAREST, so
+// every voxel landing in one source cell holds a BIT-IDENTICAL value.
+// Differencing those at the VOLUME's spacing gives exactly zero across the
+// plateau and the whole source-cell jump across one voxel at its edge, then
+// divides by a step h_src/h too small -- a staircase differentiated into
+// speckle. That is the stipple along the vortex tubes, and it is why the
+// artifact vanishes at ?volstack=0 (no refined box, no replicated voxels)
+// while every other knob only scales it.
+//
+// So the stencil spans ONE SOURCE CELL rather than one voxel. This is
+// common_d3_tree_sample.wgsl's own standing rule -- "any finite difference
+// taken from it must use the sampler's own h" -- applied one pass later,
+// where until 2026-09-12 the h was a pipeline constant and the same for
+// every voxel in the texture.
+//
+// A NO-OP WHERE THE VOLUME ALREADY HAS THE DATA: srcLevel equal to the
+// volume's level gives 2^-src / h = mult >= 1, and mult = 1 (the default and
+// every gate's setting) gives exactly 1. So the refined region renders
+// bit-identically and only the replicated population moves, which is what
+// `?volh=0` exists to demonstrate rather than assert.
+//
+// floor(x + 0.5) rather than Math.round, because the shader mirrors this and
+// WGSL's `round` is half-to-EVEN where JS's is half-UP. The ratio is an exact
+// integer for every box whose extent lands on the level's own grid, so the
+// two agree anyway -- but a rule stated twice should not differ on a case
+// merely because nobody reaches it.
+export function stencilStride(h, srcLevel) {
+  const hs = 2 ** -srcLevel;
+  return h.map((hk) => Math.max(1, Math.floor(hs / hk + 0.5)));
+}

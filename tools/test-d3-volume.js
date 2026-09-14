@@ -35,7 +35,7 @@ const assert = require('assert');
 const {
   levelVolume, volumeStack, boxLocal, innermostAt, rayBox, rayTouchesRefined,
   stackUnwrapped, orbitBasis, orbitEye, cameraBasis, cameraRay, boxRatio,
-  orthoScale,
+  orthoScale, stencilStride,
 } = await import('../d3-volume.mjs');
 
 let checks = 0;
@@ -247,6 +247,48 @@ const close = (a, b, tol, msg) => ok(Math.abs(a - b) <= tol, `${msg}: ${a} vs ${
   // input and the answer is negative, not merely wrong.
   ok(boxRatio({ lo: [46, 0, 0], hi: [5, 11, 11] }, 1280) === null,
     'a wrapped span with no extent is refused, not silently negated');
+}
+
+// --- M6.4d's stencil stride ------------------------------------------------
+//
+// The rule d3_volume_scalar.wgsl's `strideFor` mirrors. Checked on the shape
+// that produced the artifact -- a level-2 volume holding voxels the tree
+// answered at level 0 -- and on the property that makes the change safe,
+// which is that it is the IDENTITY wherever the volume already has the data.
+{
+  const l2 = levelVolume({ lo: [0, 0, 0], ext: [24, 24, 24], level: 2, mult: 1 });
+  close(l2.h[0], 0.25, 1e-12, 'a level-2 volume at mult 1 has 4 voxels per L0 cell');
+
+  // THE NO-OP, and it is the whole safety argument: a voxel the refined level
+  // actually covers is differenced exactly as before, so the sharp near-wall
+  // sheet M6.4b measured is untouched and only the replicated population
+  // moves. `?volh=0` measures this rather than trusting it.
+  ok(stencilStride(l2.h, 2).every((d) => d === 1), 'source at the volume level: stride 1');
+
+  // THE ARTIFACT'S OWN CASE. A voxel filled from L0 sits in a 4x4x4 block of
+  // bit-identical values; differenced at one voxel it reads zero inside the
+  // block and the whole jump at its face. One SOURCE cell is 4 voxels.
+  ok(stencilStride(l2.h, 0).every((d) => d === 4), 'source at L0 in an L2 volume: stride 4');
+  ok(stencilStride(l2.h, 1).every((d) => d === 2), 'and one rung up is stride 2');
+
+  // NEVER BELOW 1. The L0 volume's voxels can be answered by a FINER level,
+  // and there is no sub-voxel difference to take -- that is undersampling,
+  // which is a different problem and not this one's to invent a stencil for.
+  const l0 = levelVolume({ lo: [0, 0, 0], ext: [64, 64, 64], level: 0, mult: 1 });
+  ok(stencilStride(l0.h, 2).every((d) => d === 1), 'a finer source never shrinks the stencil');
+
+  // `mult` MULTIPLIES IT, because ?vol=N makes every voxel N times smaller
+  // while a source cell stays a source cell. The trap this guards is reading
+  // the stride off the LEVEL difference alone (2^(2-0) = 4) and being wrong
+  // by exactly ?vol= on every render that sets it.
+  const l2x2 = levelVolume({ lo: [0, 0, 0], ext: [24, 24, 24], level: 2, mult: 2 });
+  ok(stencilStride(l2x2.h, 0).every((d) => d === 8), 'at ?vol=2 an L0 source cell is 8 voxels');
+  ok(stencilStride(l2x2.h, 2).every((d) => d === 2), 'and the volume\'s own level is 2, not 1');
+
+  // ANISOTROPIC BOXES ARE THE NORM here -- a refined shell round a flat plate
+  // is a slab -- so the stride is per axis and not one number.
+  const slab = levelVolume({ lo: [0, 0, 0], ext: [32, 4, 32], level: 1, mult: 1 });
+  ok(stencilStride(slab.h, 0).join(',') === '2,2,2', 'an anisotropic box still has square voxels');
 }
 
 console.log(`test-d3-volume: ${checks} checks passed`);
