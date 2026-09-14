@@ -250,7 +250,7 @@ async function init() {
     'vol', 'volbox', 'volBudget', 'volstack', 'volMargin', 'volh', 'volsync',
     'volfallback',
     'view', 'volfield', 'volIso', 'volGain', 'volOpacity', 'volGamma', 'volStep', 'volSteps',
-    'azim', 'elev', 'dist', 'fov', 'camtarget', 'winbox', 'proj',
+    'azim', 'elev', 'dist', 'fov', 'camtarget', 'camoffset', 'winbox', 'proj',
     // M8.2a: the solid-interior reset, ?solideq=0 to disable for A/B.
     'solideq',
     // D1: the swept-cell force term, ?swept=0 to disable for A/B.
