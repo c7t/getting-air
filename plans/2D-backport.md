@@ -20,7 +20,7 @@ GPU) and that is what made M4/M5 survivable. Build the 2D equivalent first.
 
 | # | Finding (3D) | Applies to 2D? | Why it is worth it | Size |
 |---|---|---|---|---|
-| B0 | `d3-amr.mjs` + mutation-checked host tests | **yes, prerequisite** | nothing else here is safe without it | M |
+| B0 | `d3-amr.mjs` + mutation-checked host tests | **DONE** | `amr2d.mjs` + `amr2d-gpu.mjs`, 34 GPU-free checks; deleted 680 lines of five duplicated checkers | M |
 | B1 | Post-collision Dupuis-Chopard `fneq` factor | **yes, a live bug** | 2D uses the pre-collision form on post-collision populations | S (code) / L (re-baseline) |
 | B2 | `cascade21`: 2:1 as ONE closure on the WANT set | **yes** | replaces 3 live balance bugs, an unbounded fixed-point loop, and closes a measured refinement defect on the shipped page | M |
 | B3 | One kernel per stage + a `parent_{dense,pool}` accessor | **yes** | deletes ~1100 lines of near-duplicate WGSL across 6 kernel pairs | M |
@@ -146,6 +146,47 @@ against it.**
 Keep `debugCheck21Balance`'s two hard-won properties while moving it: every
 level read in ONE submit (the torn-snapshot bug, `main-amr.js:2964-2985`) and
 `borderMaxDepth` rather than whole-tile depth (`main-amr.js:2946-2960`).
+
+### B0 — DONE (2026-09-14)
+
+`amr2d.mjs` (pure, `make test`) + `amr2d-gpu.mjs` (the readback) + 34
+mutation-checked assertions in `tools/test-amr2d.js`. The wiring replaced all
+five pages' private `debugCheck21Balance`/`readAllBlockSlots` -- 680 lines
+deleted -- and was gated on real GPU state: the corner-violation sequence over
+8192 steps of live refinement on `index-amr.html?levels=3` is identical before
+and after, and reproducible on a same-build repeat first.
+
+**Three things the work changed about the rest of this plan.**
+
+1. **The suite had two holes and only a mutation sweep found them.** Eight
+   mutants of `amr2d.mjs`; two broke NOTHING on the first pass -- a
+   non-periodic block wrap, and a branch-and-bound that accepts on its own
+   bound instead of subdividing. Both were the same shape: every fixture sat
+   in the middle of the grid, and every geometry case had a body large enough
+   that subdivision never mattered, so the mutants came out merely
+   CONSERVATIVE rather than wrong. **Score every new checker here by mutation,
+   not by a green run**, and put a fixture at the seam and one with a small
+   body.
+
+2. **B4 is bigger than it looked, and it has a live-verified precedent.** The
+   kernels' geometry test is a SINGLE CENTRE SAMPLE (`amr_manage.wgsl`'s
+   `isNearBody`, `amr_manage_pool.wgsl`'s `isNearBodyAt`: one `get_phi` at the
+   block centre against `FORCE_REFINE_MARGIN`). The gap to "does any cell of
+   this block come within the margin" is the block circumradius -- 5.66 L0
+   cells at RB=8. `main-cylinder-amr.js:224-236` records that gap
+   live-verified, with the symptom "L1's own force pass sat at a
+   bit-identical fx~-0.19 for 20,000+ steps", and records the fix as
+   ENLARGING THE MARGIN (`paramsForChildLevel`'s `childLevel===2` special
+   case) rather than fixing the test. So B4 should replace the centre sample
+   with the Lipschitz branch and bound `amr2d.mjs` now carries, which makes
+   the margin mean what it says and lets that special case go.
+   **Until then the checker must keep asking the kernel's question**, which is
+   why `checkGeometryCoverage` TAKES the predicate and both are exported.
+
+3. **The five-copy problem is not confined to the shaders.** B3 counts six
+   duplicated WGSL kernel pairs; the same rule had five copies in JS, and two
+   had already drifted. Expect more of this in `main-*-amr.js` -- worth a
+   sweep of its own before B3 rather than during it.
 
 ### B0b — the interface instrument (prerequisite for B1 and B6)
 
