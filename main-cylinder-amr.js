@@ -25,7 +25,7 @@
 import { reportFatal, reportNoWebGPU, reportNoAdapter } from './error-overlay.mjs';
 import { loadShader } from './shader-loader.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
-import { check21BalanceOnGPU } from './amr2d-gpu.mjs';
+import { check21BalanceOnGPU, allocLevelPool } from './amr2d-gpu.mjs';
 import { EX, EY, WT } from './lattice-2d.mjs';
 import { makeCanvasFit } from './canvas-fit.mjs';
 
@@ -552,126 +552,6 @@ function b64ToFloat32(b64, floatCount) {
   return new Float32Array(bytes.buffer);
 }
 
-// ── Milestone 5 (plans/AMR-multilevel.md): level-generic pool allocation.
-// Same buffer set as today's flat fine-pool globals, one instance per
-// level, sized per plans/AMR-multilevel-M5.md's table. Level 1 is
-// footprint-preserving with L0 (today's exact scheme, unchanged shapes --
-// its "parent" is the dense L0 grid, addressed by blockID/cellIndex, not
-// by anything this function allocates). Levels >=2 are genuine quadtree
-// children of a level-(m-1) pool tile and carry two extra fields
-// (parentSlot/quadrant) that level 1 has no need for. Buffers for levels
-// >=2 are allocated eagerly (so ?levels=3 is a real allocation-only smoke
-// test, not a no-op) but not bound into a pipeline until Milestone 6/7
-// wires them up.
-//
-// Milestone 5's first draft also allocated ownBX/ownBY (a cached logical
-// position per slot) -- Milestone 6 dropped them: a slot's own (bx,by) is
-// always derivable from slotToBlock[slot] + this level's own NBX (one
-// mod/div), EXACTLY what amr_interp_dense_parent.wgsl's main() already
-// does every dispatch for level 1 today. Caching it would have been a
-// second, redundant source of truth for zero performance benefit (the
-// "expensive" derivation this would save is a single mod+div the project
-// already pays for elsewhere in the same hot path) -- see
-// shaders/amr_interp_pool_parent.wgsl's header for where the derivation
-// actually happens.
-function allocLevelPool(device, U, m, NBX_m, NBY_m, maxFineBlocks) {
-  const NBLOCKS_m = NBX_m * NBY_m;
-  const fSizePool_m = maxFineBlocks * NCELLS1 * 9 * 4;
-  const pool = {
-    level: m,
-    NBX: NBX_m, NBY: NBY_m, NBLOCKS: NBLOCKS_m,
-    MAX_FINE_BLOCKS: maxFineBlocks,
-    fSizePool: fSizePool_m,
-    finePoolF_a: device.createBuffer({ size: fSizePool_m, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC }),
-    finePoolF_b: device.createBuffer({ size: fSizePool_m, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC }),
-    // COPY_DST is load-bearing, not boilerplate: debugSnapshotLoad writes
-    // this buffer via queue.writeBuffer, which is a validation error --
-    // silently discarded -- without it. See velBuf's own note below.
-    finePoolVel: device.createBuffer({ size: maxFineBlocks * NCELLS1 * 2 * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC }),
-    blockSlotBuf: device.createBuffer({ size: NBLOCKS_m * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC }),
-    slotToBlockBuf: device.createBuffer({ size: maxFineBlocks * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC }),
-    blockCriterionBuf: device.createBuffer({ size: NBLOCKS_m * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC }),  // COPY_SRC so debugReadBlockCriterion can read it back; without it the
-    // copy is a validation error, the whole command buffer is dropped, and
-    // the staging buffer reads back as all zeros -- which looks exactly like
-    // "the criterion pass never ran" and cost a wrong diagnosis once.
-    freeCountBuf: device.createBuffer({ size: 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC }),
-    newlyActivatedBuf: device.createBuffer({ size: maxFineBlocks * 4, usage: U.STORAGE | U.COPY_DST }),
-  };
-  if (m === 1) {
-    // Per-block allocation, unchanged from today -- L0 isn't itself
-    // decomposed into quads, so there's no "quad" on this boundary.
-    pool.freeListBuf = device.createBuffer({ size: maxFineBlocks * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
-  } else {
-    // Quad-unit allocation (decision 3, plans/AMR-multilevel.md:10):
-    // refine/coarsen always grants or releases all 4 children of one
-    // parent tile together, so the free list is indexed in quads (stride
-    // 4), not individual slots.
-    if (maxFineBlocks % 4 !== 0) {
-      throw new Error(`level ${m}: MAX_FINE_BLOCKS (${maxFineBlocks}) must be a multiple of 4 (quad allocation)`);
-    }
-    pool.freeListBuf = device.createBuffer({ size: (maxFineBlocks / 4) * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
-    // BUGFIX: same "fix at the source, every level" gap as the blockSlot/
-    // slotToBlock -1 init below, but for the free-list/free-count pair --
-    // level 1 gets its eager freeListBuf/freeCountBuf write from an
-    // explicit caller-side write right after the pools loop, but that was
-    // never generalized to levels >=2 either. Left at WebGPU's zero-init
-    // default, freeCountBuf reads back 0 ("no free quads"), so refine()
-    // always takes the "pool exhausted" branch and NO level>=2 quad can
-    // ever be granted until something explicitly calls resetSim() --
-    // silently, with no GPU validation error, since this is application
-    // logic, not an API misuse. resetSim()/debugSnapshotLoad already write
-    // these correctly on their own paths; nothing wrote them at bare
-    // allocation time, and nothing calls resetSim() automatically on page
-    // load, so a fresh page (or any driver script that steps without
-    // calling reset() first) saw permanent level>=2 refinement failure.
-    const freeQuads_m = maxFineBlocks / 4;
-    device.queue.writeBuffer(pool.freeListBuf, 0, new Int32Array(freeQuads_m).map((_, i) => i));
-    device.queue.writeBuffer(pool.freeCountBuf, 0, new Int32Array([freeQuads_m]));
-    // New vs. level 1: a quadtree child needs its own parent lookup --
-    // which parent-level slot it was carved from (parentSlot) and which
-    // of the 4 quadrants it occupies (quadrant) -- see
-    // plans/AMR-multilevel-M5.md §2 and shaders/amr_interp_pool_parent.wgsl.
-    // COPY_SRC (not just STORAGE|COPY_DST): Milestone 10's debugSnapshotSave
-    // reads these back via copyBufferToBuffer -- without it, that copy is an
-    // invalid WebGPU command, which poisons the WHOLE shared command encoder
-    // (all commands in an invalid GPUCommandBuffer become no-ops on submit),
-    // silently zeroing out every OTHER staging buffer in the same save too.
-    pool.parentSlotBuf = device.createBuffer({ size: maxFineBlocks * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
-    pool.quadrantBuf   = device.createBuffer({ size: maxFineBlocks * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
-    // Milestone 7: a level>=2 tile's own physical (L0-buffer-space) origin,
-    // cached at quad-activation time -- unlike ownBX/ownBY (correctly
-    // dropped, see the amendment above), this is NOT cheaply re-derivable
-    // per-dispatch: it requires walking the parent chain (this tile's
-    // quadrant offset, scaled by the parent's own cell size in L0 units,
-    // plus the parent's own origin, recursively), a cross-BUFFER,
-    // cross-LEVEL computation, not a same-buffer mod/div. See
-    // shaders/amr_step1_pool.wgsl's header.
-    pool.originXBuf = device.createBuffer({ size: maxFineBlocks * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
-    pool.originYBuf = device.createBuffer({ size: maxFineBlocks * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
-    // parentSlot has no meaningful "unset" value read anywhere unless
-    // slotToBlock already says active (initialized below) -- 0 is harmless
-    // filler, not a correctness requirement, so left at WebGPU's own
-    // zero-initialized default.
-  }
-  // BUGFIX: WebGPU zero-initializes new buffers by default -- 0 is a VALID
-  // slot/blockID, not "unassigned" (that's -1, this pool's own convention
-  // throughout). Every debug/reset path (resetSim, debugSnapshotLoad) was
-  // careful to explicitly (re)write -1 before this milestone, but nothing
-  // wrote it at bare ALLOCATION time for levels >=2 -- level 1 got it from
-  // an explicit caller-side write (main-amr.js's init(), right after the
-  // pools loop), but that was never generalized to every level. Exposed by
-  // Milestone 8: with N_LEVELS>=3, a fresh page load (no explicit
-  // AMR.reset() call) left level 2's entire pool looking "active, slot 0"
-  // from frame 1 -- every slot's own force/step/average pass then ran for
-  // real, all racing to write the SAME parent location (parentSlot also
-  // defaulted to 0). Fixed at the source (every level, not just level 1)
-  // rather than special-cased, so this can't recur if a future level's
-  // caller-side init is ever forgotten again.
-  device.queue.writeBuffer(pool.blockSlotBuf, 0, new Int32Array(NBLOCKS_m).fill(-1));
-  device.queue.writeBuffer(pool.slotToBlockBuf, 0, new Int32Array(maxFineBlocks).fill(-1));
-  return pool;
-}
-
 // Milestone 7: level m's own cell size, in L0-buffer-space units. Level 1's
 // own cell is 0.5 L0 units (matches amr_step1.wgsl/amr_interp_dense_parent.
 // wgsl's `fineToCoarseUnit`'s 0.5 factor); it halves again each level down.
@@ -827,7 +707,7 @@ async function init() {
       const maxFineBlocks = m === 1
         ? MAX_FINE_BLOCKS // unchanged param/default -- level 1 is byte-identical to today
         : (urlParams.has(`maxFineBlocks${m}`) ? parseInt(urlParams.get(`maxFineBlocks${m}`)) : 128);
-      const pool = allocLevelPool(device, U, m, curNBX, curNBY, maxFineBlocks);
+      const pool = allocLevelPool(device, U, m, curNBX, curNBY, maxFineBlocks, NCELLS1);
       writeF(pool.finePoolF_a, initFPool(maxFineBlocks), maxFineBlocks * NCELLS1);
       pools.push(pool);
       curNBX *= 2; curNBY *= 2; // next level's logical grid extent (quadtree doubling per axis)

@@ -56,7 +56,7 @@
 import { reportFatal, reportNoWebGPU, reportNoAdapter } from './error-overlay.mjs';
 import { loadShader } from './shader-loader.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
-import { check21BalanceOnGPU, readConservedTotals } from './amr2d-gpu.mjs';
+import { check21BalanceOnGPU, readConservedTotals, allocLevelPool } from './amr2d-gpu.mjs';
 import { EX, EY, WT } from './lattice-2d.mjs';
 import { makeCanvasFit } from './canvas-fit.mjs';
 
@@ -291,54 +291,9 @@ function handleErr(e) {
   reportFatal(statusEl, e);
 }
 
-// Milestone 5 (plans/AMR-multilevel.md)-shaped level-generic pool
-// allocation -- verbatim from main-amr.js's allocLevelPool.
-function allocLevelPool(device, U, m, NBX_m, NBY_m, maxFineBlocks) {
-  const NBLOCKS_m = NBX_m * NBY_m;
-  const fSizePool_m = maxFineBlocks * NCELLS1 * 9 * 4;
-  const pool = {
-    level: m,
-    NBX: NBX_m, NBY: NBY_m, NBLOCKS: NBLOCKS_m,
-    MAX_FINE_BLOCKS: maxFineBlocks,
-    fSizePool: fSizePool_m,
-    finePoolF_a: device.createBuffer({ size: fSizePool_m, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC }),
-    finePoolF_b: device.createBuffer({ size: fSizePool_m, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC }),
-    // COPY_DST is load-bearing, not boilerplate: debugSnapshotLoad writes
-    // this buffer via queue.writeBuffer, which is a validation error --
-    // silently discarded -- without it. See velBuf's own note below.
-    finePoolVel: device.createBuffer({ size: maxFineBlocks * NCELLS1 * 2 * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC }),
-    blockSlotBuf: device.createBuffer({ size: NBLOCKS_m * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC }),
-    slotToBlockBuf: device.createBuffer({ size: maxFineBlocks * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC }),
-    blockCriterionBuf: device.createBuffer({ size: NBLOCKS_m * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC }),  // COPY_SRC so debugReadBlockCriterion can read it back; without it the
-    // copy is a validation error, the whole command buffer is dropped, and
-    // the staging buffer reads back as all zeros -- which looks exactly like
-    // "the criterion pass never ran" and cost a wrong diagnosis once.
-    freeCountBuf: device.createBuffer({ size: 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC }),
-    newlyActivatedBuf: device.createBuffer({ size: maxFineBlocks * 4, usage: U.STORAGE | U.COPY_DST }),
-  };
-  if (m === 1) {
-    pool.freeListBuf = device.createBuffer({ size: maxFineBlocks * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
-  } else {
-    if (maxFineBlocks % 4 !== 0) {
-      throw new Error(`level ${m}: MAX_FINE_BLOCKS (${maxFineBlocks}) must be a multiple of 4 (quad allocation)`);
-    }
-    pool.freeListBuf = device.createBuffer({ size: (maxFineBlocks / 4) * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
-    const freeQuads_m = maxFineBlocks / 4;
-    device.queue.writeBuffer(pool.freeListBuf, 0, new Int32Array(freeQuads_m).map((_, i) => i));
-    device.queue.writeBuffer(pool.freeCountBuf, 0, new Int32Array([freeQuads_m]));
-    pool.parentSlotBuf = device.createBuffer({ size: maxFineBlocks * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
-    pool.quadrantBuf   = device.createBuffer({ size: maxFineBlocks * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
-    pool.originXBuf = device.createBuffer({ size: maxFineBlocks * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
-    pool.originYBuf = device.createBuffer({ size: maxFineBlocks * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
-  }
-  device.queue.writeBuffer(pool.blockSlotBuf, 0, new Int32Array(NBLOCKS_m).fill(-1));
-  device.queue.writeBuffer(pool.slotToBlockBuf, 0, new Int32Array(maxFineBlocks).fill(-1));
-  return pool;
-}
-
-  // card-params.mjs owns this rule and tools/test-card-params.js tests it.
-  // Five pages inlined the same loop -- see plans/2D-backport.md B3a.
-  const tauAtLevel = (m) => tauAtLevelOf(TAU, m);
+// card-params.mjs owns this rule and tools/test-card-params.js tests it.
+// Five pages inlined the same loop -- see plans/2D-backport.md B3a.
+const tauAtLevel = (m) => tauAtLevelOf(TAU, m);
 // Block-major linear index for a cell at BUFFER coordinates (cx, cy) --
 // matches shaders/amr_step.wgsl's cellIndex() exactly.
 function cellIndexJS(cx, cy) {
@@ -425,7 +380,7 @@ async function init() {
       const maxFineBlocks = m === 1
         ? MAX_FINE_BLOCKS
         : (urlParams.has(`maxFineBlocks${m}`) ? parseInt(urlParams.get(`maxFineBlocks${m}`)) : 128);
-      const pool = allocLevelPool(device, U, m, curNBX, curNBY, maxFineBlocks);
+      const pool = allocLevelPool(device, U, m, curNBX, curNBY, maxFineBlocks, NCELLS1);
       writeF(pool.finePoolF_a, initFPool(maxFineBlocks), maxFineBlocks * NCELLS1);
       pools.push(pool);
       curNBX *= 2; curNBY *= 2;
