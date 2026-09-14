@@ -61,7 +61,7 @@
 import { reportFatal, reportNoWebGPU, reportNoAdapter } from './error-overlay.mjs';
 import { loadShader } from './shader-loader.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
-import { check21BalanceOnGPU, readConservedTotals, allocLevelPool, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks } from './amr2d-gpu.mjs';
+import { check21BalanceOnGPU, readConservedTotals, allocLevelPool, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState } from './amr2d-gpu.mjs';
 // tauAtLevel: extracted to card-params.mjs by B3a-1, which landed the CALL
 // in all five AMR pages and this IMPORT in only main-amr.js. The other four
 // threw `ReferenceError: tauAtLevelOf is not defined` at init -- but only at
@@ -1017,20 +1017,9 @@ async function init() {
     decode: readF, cellIndex: cellIndexJS,
   });
 
-  async function debugReadCardState() {
-    const stage = device.createBuffer({ size: 104, usage: U.MAP_READ | U.COPY_DST });
-    const enc = device.createCommandEncoder();
-    enc.copyBufferToBuffer(cardStateBuf, 0, stage, 0, 104);
-    device.queue.submit([enc.finish()]);
-    await stage.mapAsync(GPUMapMode.READ);
-    const d = Array.from(new Float32Array(stage.getMappedRange()));
-    stage.unmap();
-    stage.destroy();
-    const keys = ['cx','cy','theta','vx','vy','omega','fx','fy','tz','mass','i_body','g_eff','a','b','v_max','o_max','cx_old','cy_old','th_old','tau','y_total','x_total','off_x','off_y','off_x_old','off_y_old'];
-    const out = {};
-    keys.forEach((k,i) => out[k] = d[i]);
-    return out;
-  }
+  // The rigid body's own state, keyed by common_geometry.wgsl's CardState --
+  // amr2d-gpu.mjs, three byte-identical copies before B4.
+  const debugReadCardState = () => readCardState(device, cardStateBuf);
 
   async function debugStepSync(n) {
     liveMode = false;

@@ -22,7 +22,7 @@ import {
   tauAtLevel as tauAtLevelOf,
 } from './card-params.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
-import { check21BalanceOnGPU, allocLevelPool, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks } from './amr2d-gpu.mjs';
+import { check21BalanceOnGPU, allocLevelPool, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState, checkGeometryCoverageOnGPU } from './amr2d-gpu.mjs';
 import { EX, EY, WT } from './lattice-2d.mjs';
 import { makeCanvasFit } from './canvas-fit.mjs';
 
@@ -2753,6 +2753,31 @@ async function init() {
   // assertion mechanism this project does not have.
   const debugCheck21Balance = () => check21BalanceOnGPU(device, pools, N_LEVELS);
 
+  // The rigid body's own state, keyed by common_geometry.wgsl's CardState --
+  // amr2d-gpu.mjs. THIS PAGE HAD NONE, which is half of why it had no
+  // geometry-coverage check either (plans/2D-backport.md B4).
+  const debugReadCardState = () => readCardState(device, cardStateBuf);
+
+  // GEOMETRY-FORCED REFINEMENT, THE HARD CONSTRAINT: every LEAF tile whose
+  // footprint comes within that level's own FORCE_REFINE_MARGIN of the body
+  // -- now, or FORCE_REFINE_LOOKAHEAD macro-steps out -- must already have a
+  // child, unless it is already at the finest configured level. Read down the
+  // levels it says the body lives entirely on the finest one.
+  //
+  // THIS PAGE MOVED A BODY THROUGH A REFINED REGION WITH NO SUCH GATE AT ALL.
+  // main-cylinder-amr.js had the only implementation in the project, and
+  // B3a-4 found that what looked like two more copies were `{ok: true}` stubs
+  // on the two BODYLESS pages -- so the distribution was exactly backwards:
+  // the check existed only where the body is PINNED, and was absent on both
+  // pages where it moves. tools/lib/amr-invariants.js PROBES for this
+  // function and reports SKIPPED when it is missing, precisely so a missing
+  // check cannot look greener than a present one; this is that skip closed.
+  const debugCheckGeometryCoverage = async () => checkGeometryCoverageOnGPU(device, pools, {
+    nLevels: N_LEVELS, W, H, rb: RB, NBX, NBLOCKS,
+    cardState: await debugReadCardState(),
+    paramsForChildLevel,
+  });
+
   // Deterministic synchronous stepping, bypassing rAF entirely -- lets two
   // separate builds be driven to an EXACT matching step count for a fair
   // diff. Wall-clock polling of the normal rAF-driven `liveMode` loop can't
@@ -3265,6 +3290,8 @@ async function init() {
     debugDeactivateBlock,
     debugListActiveBlocks,
     debugCheck21Balance,
+    debugCheckGeometryCoverage,
+    debugReadCardState,
     debugProbeGhostFill,
     debugRunSteadyGhostFill,
     debugReadPool,

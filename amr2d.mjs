@@ -208,6 +208,99 @@ export function refineWhere(pool, predicate) {
   return { blockSlot, slotToBlock, activeSlots: n };
 }
 
+// --- the body, as the kernels see it ----------------------------------------
+//
+// THE HOST STATEMENT OF shaders/common_geometry.wgsl's `get_phi`, because a
+// coverage checker is only honest if it evaluates the SAME distance the
+// kernel refines on.
+//
+// main-cylinder-amr.js's own checker did NOT: it used the old ALGEBRAIC form
+// `(hypot(lx/a, ly/b) - 1) * b`, which is exact only where a == b. That is
+// why it worked there and why it could not simply be copied to the pages that
+// needed one. On the falling card's default 8:1 ellipse the algebraic form
+// UNDER-reports the true distance by up to a/b = 8x along the major axis, so
+// a checker using it would flag a ring of tiles the kernel never considered
+// near the body -- eight times the margin's worth of them.
+//
+// Method and every constant are common_geometry.wgsl's, deliberately: 3
+// Newton iterations on the closest-point parameter, seeded from the algebraic
+// direction, on |lx|,|ly| with the sign restored from the exact algebraic
+// test; the circle closed form; and the far-field early-out at SDF_FAR. See
+// that file for why each is what it is. The two are checked against a
+// brute-force closest point in tools/test-amr2d.js -- an independent route,
+// per this module's first rule.
+export const SDF_FAR_DEFAULT = 64;
+
+export function ellipsePhi(px, py, state, { W, H, sdfFar = SDF_FAR_DEFAULT }) {
+  const { cx, cy, theta, a, b } = state;
+  const ca = Math.cos(theta), sa = Math.sin(theta);
+  let dx = px - cx, dy = py - cy;
+  // NEAREST IMAGE. The domain is periodic, so the body's closest copy is the
+  // one that counts -- and this is what lets a caller pass a raw, unwrapped
+  // window coordinate.
+  dx -= W * Math.round(dx / W);
+  dy -= H * Math.round(dy / H);
+  const lx = dx * ca + dy * sa;
+  const ly = -dx * sa + dy * ca;
+
+  if (Math.abs(a - b) <= 1e-6 * Math.max(a, b)) return Math.hypot(lx, ly) - a;
+
+  const x = Math.abs(lx), y = Math.abs(ly);
+  const r = Math.sqrt((x * x) / (a * a) + (y * y) / (b * b));
+  const algebraic = (r - 1) * b;
+  if (algebraic > sdfFar) return algebraic;
+  const inside = r < 1;
+
+  let t = Math.atan2(y * a, x * b);
+  for (let i = 0; i < 3; i++) {
+    const ct = Math.cos(t), st = Math.sin(t);
+    const ex = x - a * ct, ey = y - b * st;
+    const F = ex * (-a * st) + ey * (b * ct);
+    const Fp = -(a * a * st * st + b * b * ct * ct) + ex * (-a * ct) + ey * (-b * st);
+    t -= F / (Math.abs(Fp) < 1e-9 ? -1e-9 : Fp);
+    t = Math.min(Math.max(t, 0), 1.5707963);
+  }
+  const d = Math.hypot(x - a * Math.cos(t), y - b * Math.sin(t));
+  return inside ? -d : d;
+}
+
+// The distance the REFINEMENT test actually uses: the smaller of the body's
+// distance now and FORCE_REFINE_LOOKAHEAD macro-steps from now.
+//
+// The "future" pose does NOT extrapolate the body's centre forward. The
+// moving window keeps (cx, cy) pinned near the domain centre by construction
+// -- bulk translation is absorbed into off_x/off_y -- so it is a fixed buffer
+// cell's WINDOW position that moves, at -v. Extrapolate the test point
+// backward instead of the ellipse forward; theta is the one quantity the
+// window does not absorb, so it still runs forward. This mirrors
+// shaders/amr_manage.wgsl's isNearBody, which carries the same argument at
+// length.
+export function bodyPhiL0(px, py, state, dims, lookahead) {
+  const now = ellipsePhi(px, py, state, dims);
+  if (!(lookahead > 0)) return now;
+  const future = ellipsePhi(
+    px - state.vx * lookahead, py - state.vy * lookahead,
+    { ...state, theta: state.theta + state.omega * lookahead }, dims);
+  return Math.min(now, future);
+}
+
+// Buffer (L0) coordinates -> window coordinates. Buffer blocks are fixed in
+// memory; the body is anchored in WINDOW space, which is what every kernel's
+// `(u32(c) + W - u32(state.off_x)) % W` is doing.
+//
+// TWO THINGS ARE MIRRORED RATHER THAN CLEANED UP. The modulo is dropped --
+// ellipsePhi already takes the nearest image, so reducing into [0, W) first
+// changes nothing. The TRUNCATIONS are not: `u32()` is applied to the centre
+// as well as to off_x, so a level-2 tile centre of 34.25 is tested at 34, and
+// a checker that silently used the exact centre would disagree with the
+// kernel on any block sitting within a cell of the margin. Both truncations
+// go away in plans/2D-backport.md B4 (get_phi wraps for itself, so neither
+// buys anything); until then this asks the kernel's question, not a tidier
+// one.
+export function bufferToWindow(px, py, state) {
+  return [Math.trunc(px) - Math.trunc(state.off_x), Math.trunc(py) - Math.trunc(state.off_y)];
+}
+
 // DOES ANY POINT OF THIS BLOCK COME WITHIN `margin` OF THE BODY?
 //
 // THE TWO PREDICATES BELOW ANSWER DIFFERENT QUESTIONS, AND THE DIFFERENCE IS

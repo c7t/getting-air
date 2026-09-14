@@ -433,6 +433,137 @@ const sorted = (s) => [...s].sort();
     }
   });
 
+  // ── the body's own distance, against a brute-force closest point ─────────
+
+  // THE INDEPENDENT ROUTE: sample the ellipse boundary densely and take the
+  // nearest sample. It shares nothing with the Newton iteration -- no seed,
+  // no derivative, no quadrant folding -- so agreement is evidence.
+  const bruteEllipsePhi = (px, py, { cx, cy, theta, a, b }, { W, H }, N = 200000) => {
+    const ca = Math.cos(theta), sa = Math.sin(theta);
+    let dx = px - cx, dy = py - cy;
+    dx -= W * Math.round(dx / W);
+    dy -= H * Math.round(dy / H);
+    const lx = dx * ca + dy * sa, ly = -dx * sa + dy * ca;
+    let best = Infinity;
+    for (let i = 0; i < N; i++) {
+      const t = 2 * Math.PI * i / N;
+      const ex = lx - a * Math.cos(t), ey = ly - b * Math.sin(t);
+      const d2 = ex * ex + ey * ey;
+      if (d2 < best) best = d2;
+    }
+    const inside = (lx * lx) / (a * a) + (ly * ly) / (b * b) < 1;
+    return inside ? -Math.sqrt(best) : Math.sqrt(best);
+  };
+
+  ok('ellipsePhi is a TRUE distance -- within 0.2% of a brute-force closest point', () => {
+    // The tolerance is common_geometry.wgsl's own measured claim for three
+    // Newton iterations ("0.15% worst-case relative error against a
+    // brute-force reference over the region that matters"), not a number
+    // chosen to make this pass. The falling card's default aspect is 8:1,
+    // which is exactly where the OLD algebraic form is worst.
+    const dims = { W: 256, H: 256 };
+    const card = { cx: 128, cy: 128, theta: 0.7, a: 24, b: 3, vx: 0, vy: 0, omega: 0 };
+    let worst = 0, worstAt = null, samples = 0;
+    for (let px = 96; px <= 160; px += 4) {
+      for (let py = 96; py <= 160; py += 4) {
+        const got = A.ellipsePhi(px, py, card, dims);
+        const want = bruteEllipsePhi(px, py, card, dims);
+        if (want < 0) continue;   // interior: only the SIGN is guaranteed there
+        if (want < 1e-6) continue;
+        samples++;
+        const rel = Math.abs(got - want) / Math.max(want, 1);
+        if (rel > worst) { worst = rel; worstAt = [px, py, got, want]; }
+      }
+    }
+    assert.ok(samples > 100, `only ${samples} exterior samples -- the fixture stopped testing anything`);
+    assert.ok(worst <= 2e-3, `worst relative error ${worst} at ${JSON.stringify(worstAt)}`);
+  });
+
+  ok('ellipsePhi\'s SIGN is exact everywhere, inside included', () => {
+    const dims = { W: 256, H: 256 };
+    const card = { cx: 128, cy: 128, theta: -1.1, a: 24, b: 3 };
+    for (let px = 100; px <= 156; px += 1) {
+      for (let py = 100; py <= 156; py += 1) {
+        const got = A.ellipsePhi(px, py, card, dims);
+        const want = bruteEllipsePhi(px, py, card, dims, 20000);
+        if (Math.abs(want) < 1e-3) continue;   // on the boundary, sign is moot
+        assert.strictEqual(Math.sign(got), Math.sign(want), `sign at ${px},${py}: ${got} vs ${want}`);
+      }
+    }
+  });
+
+  ok('the ALGEBRAIC shortcut is the one main-cylinder-amr.js could not share', () => {
+    // Not a check of amr2d.mjs but of WHY this function had to be written:
+    // the only existing 2D coverage checker used `(r - 1) * b`, which is
+    // exact for a circle and under-reports by up to a/b on an ellipse. On the
+    // card's 8:1 default that is the difference between a correct check and
+    // one that flags a ring of tiles the kernel never considered near.
+    const dims = { W: 256, H: 256 };
+    const disc = { cx: 128, cy: 128, theta: 0.3, a: 9, b: 9 };
+    const algebraic = (px, py, { cx, cy, theta, a, b }) => {
+      const ca = Math.cos(theta), sa = Math.sin(theta);
+      const dx = px - cx, dy = py - cy;
+      const lx = dx * ca + dy * sa, ly = -dx * sa + dy * ca;
+      return (Math.sqrt((lx * lx) / (a * a) + (ly * ly) / (b * b)) - 1) * b;
+    };
+    // A circle: the two agree, which is why the cylinder page never noticed.
+    for (const [px, py] of [[140, 128], [128, 150], [137, 141]]) {
+      close(A.ellipsePhi(px, py, disc, dims), algebraic(px, py, disc), 1e-9, `circle at ${px},${py}`);
+    }
+    // An 8:1 card on its major axis: the shortcut is short by ~8x.
+    const card = { cx: 128, cy: 128, theta: 0, a: 24, b: 3 };
+    const ratio = A.ellipsePhi(160, 128, card, dims) / algebraic(160, 128, card, dims);
+    assert.ok(ratio > 7 && ratio < 8.1, `major-axis ratio is ${ratio}, expected ~a/b = 8`);
+  });
+
+  ok('ellipsePhi takes the NEAREST PERIODIC IMAGE, so a body at the seam is not far away', () => {
+    // The fixture the mutation sweep found missing the first time: every
+    // earlier geometry case sat in the MIDDLE of the grid, where a wrap bug
+    // is invisible.
+    const dims = { W: 64, H: 64 };
+    const body = { cx: 1, cy: 32, theta: 0, a: 4, b: 4 };
+    // x = 63 is two cells from cx = 1 the short way round, 62 the long way.
+    close(A.ellipsePhi(63, 32, body, dims), -2, 1e-6, 'across the x seam');
+    close(A.ellipsePhi(5, 32, body, dims), 0, 1e-6, 'the same distance the other side');
+    const tall = { cx: 32, cy: 63, theta: 0, a: 4, b: 4 };
+    close(A.ellipsePhi(32, 1, tall, dims), -2, 1e-6, 'across the y seam');
+  });
+
+  ok('bodyPhiL0 takes the MINIMUM over the current and extrapolated poses', () => {
+    const dims = { W: 256, H: 256 };
+    // Moving in +x at 0.5 cells/macro-step. The kernel extrapolates the TEST
+    // POINT backward at -v rather than the body forward, because the moving
+    // window absorbs bulk translation into off_x/off_y -- so a point AHEAD of
+    // the body in x is the one the future pose brings closer.
+    const card = { cx: 128, cy: 128, theta: 0, a: 6, b: 6, vx: 0.5, vy: 0, omega: 0 };
+    const now = A.ellipsePhi(150, 128, card, dims);
+    const both = A.bodyPhiL0(150, 128, card, dims, 20);
+    close(now, 16, 1e-6, 'the current pose');
+    close(both, 6, 1e-6, 'the test point moved back by vx*lookahead = 10');
+    // Zero lookahead is the current pose alone, not a min against itself.
+    close(A.bodyPhiL0(150, 128, card, dims, 0), now, 0, 'lookahead 0');
+    // Rotation still runs FORWARD -- the window absorbs translation, not spin.
+    const spin = { cx: 128, cy: 128, theta: 0, a: 24, b: 3, vx: 0, vy: 0, omega: Math.PI / 2 / 10 };
+    const spun = A.bodyPhiL0(128, 145, spin, dims, 10);
+    assert.ok(spun < A.ellipsePhi(128, 145, spin, dims) - 10,
+      `a quarter turn should bring the major axis under the test point (got ${spun})`);
+  });
+
+  ok('bufferToWindow TRUNCATES both the point and the offset, exactly as the kernels do', () => {
+    // shaders/amr_manage_pool.wgsl's isNearBodyAt is
+    // `(u32(centerX_L0) + W - u32(state.off_x)) % W`, and a level-2 tile
+    // centre is fractional. A checker that used the exact centre would
+    // disagree with the kernel on any block within a cell of the margin --
+    // which is precisely the population a coverage check is about. The
+    // modulo is dropped because ellipsePhi wraps for itself.
+    const st = { off_x: 10.75, off_y: -3.25 };
+    assert.deepStrictEqual(A.bufferToWindow(34.25, 7.9, st), [24, 10]);
+    assert.deepStrictEqual(A.bufferToWindow(34, 8, { off_x: 0, off_y: 0 }), [34, 8]);
+    // trunc, not floor: a negative offset moves the window the other way and
+    // Math.floor(-3.25) = -4 would shift the body by a cell.
+    assert.strictEqual(A.bufferToWindow(0, 0, st)[1], 3);
+  });
+
   // ── the geometry predicate, and the gap the kernel still has ─────────────
 
   const circle = (cx, cy, r) => (x, y) => Math.hypot(x - cx, y - cy) - r;

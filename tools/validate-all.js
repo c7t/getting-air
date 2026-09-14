@@ -155,8 +155,11 @@ function defaultConfigs(baseUrl) {
     // the project SHIPS, it defaults to levels=3, and until now the sweep
     // only ever drove window.__CYL -- so the falling-card page's own 2:1
     // balance was never under test on any config, only boot-smoked above.
-    // It exposes no body-geometry coverage scan and no card-state readback,
-    // so those two report n/a rather than OK (see tools/lib/amr-invariants.js).
+    // It exposed no body-geometry coverage scan and no card-state readback
+    // until plans/2D-backport.md B4 -- so the SHIPPED page, whose body
+    // MOVES, was the one running geometry-forced refinement with nothing
+    // checking it, while the only implementation in the project sat on the
+    // pinned-cylinder page. Both now report OK rather than n/a.
     {
       name: 'amr-dev-invariants',
       url: `${baseUrl}/index-amr.html`,

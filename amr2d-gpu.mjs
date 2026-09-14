@@ -34,7 +34,10 @@
 // time. Reading every level in ONE submit makes the check sound in both
 // modes.
 
-import { check21Balance, nbAtLevel, makePool } from './amr2d.mjs';
+import {
+  check21Balance, nbAtLevel, makePool, cellSizeL0AtLevel,
+  nearBodyWantCentre, bodyPhiL0, bufferToWindow,
+} from './amr2d.mjs';
 
 // Every level's blockSlot, copied in one command encoder and one submit, so
 // all levels come from the SAME GPU state. Returns { [level]: Set("bx,by") }.
@@ -382,4 +385,173 @@ export function assertPoolExtents(pools, nLevels, { W, H, rb }) {
         + `but the quadtree rule says ${want[0]}x${want[1]}`);
     }
   }
+}
+
+// --- geometry-forced refinement, scored against real GPU state --------------
+//
+// THE HARD CONSTRAINT: every LEAF tile whose footprint comes within that
+// level's FORCE_REFINE_MARGIN of the body must already have children. Read
+// down the levels it says the body lives entirely on the finest level, which
+// is what plans/2D-backport.md B4 then lets three force kernels stop
+// defending against.
+//
+// THIS EXISTED ON ONE PAGE OUT OF THREE THAT HAVE A BODY. main-cylinder-amr.js
+// carried the only implementation; main-amr.js (the shipped falling card) and
+// main-reentry-amr.js move a body through a refined region with no coverage
+// gate at all, and main-tgv-amr.js/main-channel-amr.js carried `{ok: true}`
+// STUBS -- which defeated tools/lib/amr-invariants.js's deliberate design of
+// PROBING for the function and reporting SKIPPED when it is absent, so a
+// missing check could not quietly look greener than a present one. The stubs
+// are gone (B3a-4); this is the other half.
+//
+// THE PREDICATE IS AN ARGUMENT, and that is the point. Today's kernels ask
+// about a block's CENTRE (one get_phi against the margin); amr2d.mjs's
+// `nearBodyWant` asks about the whole BLOCK, via a Lipschitz branch and
+// bound. They differ by the block's circumradius -- 5.66 L0 cells at RB=8 --
+// and main-cylinder-amr.js:224 records what that cost live. A checker is only
+// honest if it asks the question the kernel answers, so the default is
+// `nearBodyWantCentre` and B4 flips both sides together.
+//
+// EVERY ORIGIN AND SLOT IS READ BACK FRESH, never taken from a CPU mirror:
+// under autoRefine the mirror is stale every REFINE_EVERY macro-steps, and a
+// stale answer here looks exactly like a correct one.
+export async function checkGeometryCoverageOnGPU(device, pools, opts) {
+  const {
+    nLevels, W, H, rb, NBX, NBLOCKS, cardState,
+    paramsForChildLevel, wantFactory = nearBodyWantCentre,
+  } = opts;
+  const state = cardState;
+  const violations = [];
+  if (nLevels < 2) return { ok: true, violations, checked: 0 };
+
+  // The body model every level shares: window conversion, because the body is
+  // window-anchored and the buffer is not.
+  //
+  // THE LOOKAHEAD IS DELIBERATELY NOT APPLIED, and getting this wrong is what
+  // made the check fire the first time it was pointed at a MOVING body.
+  // FORCE_REFINE_LOOKAHEAD is not part of the constraint -- it is the
+  // kernel's MECHANISM for meeting it. The constraint is "no leaf within the
+  // margin of the body, EVER", and the manager only gets to decide every
+  // REFINE_EVERY macro-steps, so at decision time t0 it refines everything
+  // within the margin over [t0, t0 + LOOKAHEAD] and thereby keeps the
+  // now-condition true until t0 + REFINE_EVERY.
+  //
+  // A checker that also applies the lookahead asks about [t, t + LOOKAHEAD]
+  // for a t that is up to REFINE_EVERY past t0 -- i.e. it demands coverage of
+  // a window the last decision was never responsible for, and reports the
+  // leading edge of a moving body as a violation on a perfectly correct run.
+  // main-cylinder-amr.js's original never noticed because its body is PINNED:
+  // with v = omega = 0 the future pose IS the current one.
+  const sdf = (x, y) => {
+    const [wx, wy] = bufferToWindow(x, y, state);
+    return bodyPhiL0(wx, wy, state, { W, H }, 0);
+  };
+
+  let checked = 0;
+
+  // A parent block's footprint in L0 units. Level 0's dense block is RB
+  // COARSE cells; a level-m tile's interior is 2*RB cells of size 2^-m --
+  // which for m = 1 is the same 8 L0 units, because level 1 is
+  // footprint-preserving 1:1 with L0's blocks.
+  const extentL0 = (m) => (m === 0 ? rb : 2 * rb * cellSizeL0AtLevel(m));
+
+  const record = (m, bx, by, lo, hi, slot) =>
+    violations.push({ level: m, bx, by, slot, wantsChildLevel: m + 1, lo, hi });
+
+  // L0 -> L1. The dense parent: blockID indexes L0's own coarse block and
+  // L1's pool block identically.
+  {
+    const want = wantFactory(sdf, paramsForChildLevel(1).FORCE_REFINE_MARGIN);
+    const { blockSlot } = await readPoolIndirection(device, pools, 1);
+    const e = extentL0(0);
+    for (let blockID = 0; blockID < NBLOCKS; blockID++) {
+      if (blockSlot[blockID] !== -1) continue; // has an L1 child -- not a leaf
+      const bx = blockID % NBX, by = Math.floor(blockID / NBX);
+      const lo = [bx * rb, by * rb], hi = [lo[0] + e, lo[1] + e];
+      checked++;
+      if (want({ lo, hi, mid: [lo[0] + e / 2, lo[1] + e / 2] })) record(0, bx, by, lo, hi, -1);
+    }
+  }
+
+  // L(m) -> L(m+1), m = 1 .. nLevels-2. Level 1 caches no origin at all (it
+  // is re-derivable from blockID, and allocLevelPool only allocates
+  // originX/YBuf for m >= 2) -- the same PARENT_HAS_CACHED_ORIGIN split
+  // shaders/amr_manage_pool.wgsl makes.
+  for (let m = 1; m < nLevels - 1; m++) {
+    const want = wantFactory(sdf, paramsForChildLevel(m + 1).FORCE_REFINE_MARGIN);
+    const pool = pools[m];
+    const { slotToBlock } = await readPoolIndirection(device, pools, m);
+    const { blockSlot: childBlockSlot } = await readPoolIndirection(device, pools, m + 1);
+    const nbxChild = pools[m + 1].NBX;
+    const origin = m >= 2 ? await readTileOrigins(device, pool) : null;
+    const e = extentL0(m);
+
+    for (let slot = 0; slot < pool.MAX_FINE_BLOCKS; slot++) {
+      const blockID = slotToBlock[slot];
+      if (blockID < 0) continue; // slot not active
+      const bx = blockID % pool.NBX, by = Math.floor(blockID / pool.NBX);
+      // Quadrant 0 stands for all four -- refinement is quad-complete from
+      // level 2 down, the same all-or-nothing invariant
+      // amr_manage_pool.wgsl's hasGrandchild leans on.
+      if (childBlockSlot[(by * 2) * nbxChild + (bx * 2)] >= 0) continue; // not a leaf
+      const lo = origin ? [origin.x[slot], origin.y[slot]] : [bx * rb, by * rb];
+      const hi = [lo[0] + e, lo[1] + e];
+      checked++;
+      if (want({ lo, hi, mid: [lo[0] + e / 2, lo[1] + e / 2] })) record(m, bx, by, lo, hi, slot);
+    }
+  }
+
+  return { ok: violations.length === 0, violations, checked };
+}
+
+// A level's cached per-slot tile origins, in L0 units. Only levels >= 2 have
+// them; level 1's is bx*RB by construction.
+async function readTileOrigins(device, pool) {
+  const U = GPUBufferUsage;
+  const bytes = pool.MAX_FINE_BLOCKS * 4;
+  const sx = device.createBuffer({ size: bytes, usage: U.MAP_READ | U.COPY_DST });
+  const sy = device.createBuffer({ size: bytes, usage: U.MAP_READ | U.COPY_DST });
+  const enc = device.createCommandEncoder();
+  enc.copyBufferToBuffer(pool.originXBuf, 0, sx, 0, bytes);
+  enc.copyBufferToBuffer(pool.originYBuf, 0, sy, 0, bytes);
+  device.queue.submit([enc.finish()]);
+  await Promise.all([sx.mapAsync(GPUMapMode.READ), sy.mapAsync(GPUMapMode.READ)]);
+  const x = new Float32Array(sx.getMappedRange()).slice();
+  const y = new Float32Array(sy.getMappedRange()).slice();
+  sx.unmap(); sy.unmap(); sx.destroy(); sy.destroy();
+  return { x, y };
+}
+
+// --- the rigid body's own state -------------------------------------------
+//
+// THREE BYTE-IDENTICAL COPIES before this (main-cylinder-amr.js,
+// main-tgv-amr.js, main-channel-amr.js) -- and, tellingly, NOT on the two
+// pages that actually move a body: main-amr.js and main-reentry-amr.js had
+// none, which is half of why neither had a geometry-coverage check either.
+//
+// THE KEY LIST IS shaders/common_geometry.wgsl's `CardState`, IN ORDER, and
+// it is the one thing here that can silently rot: the struct is f32-only and
+// tightly packed, so inserting a field in the WGSL and not here re-labels
+// every field after it rather than failing. 104 bytes = 26 f32s, asserted
+// below against the key list for exactly that reason.
+export const CARD_STATE_KEYS = [
+  'cx', 'cy', 'theta', 'vx', 'vy', 'omega', 'fx', 'fy', 'tz', 'mass',
+  'i_body', 'g_eff', 'a', 'b', 'v_max', 'o_max', 'cx_old', 'cy_old', 'th_old',
+  'tau', 'y_total', 'x_total', 'off_x', 'off_y', 'off_x_old', 'off_y_old',
+];
+export const CARD_STATE_BYTES = CARD_STATE_KEYS.length * 4;
+
+export async function readCardState(device, cardStateBuf) {
+  const U = GPUBufferUsage;
+  const stage = device.createBuffer({ size: CARD_STATE_BYTES, usage: U.MAP_READ | U.COPY_DST });
+  const enc = device.createCommandEncoder();
+  enc.copyBufferToBuffer(cardStateBuf, 0, stage, 0, CARD_STATE_BYTES);
+  device.queue.submit([enc.finish()]);
+  await stage.mapAsync(GPUMapMode.READ);
+  const d = new Float32Array(stage.getMappedRange());
+  const out = {};
+  CARD_STATE_KEYS.forEach((k, i) => { out[k] = d[i]; });
+  stage.unmap();
+  stage.destroy();
+  return out;
 }
