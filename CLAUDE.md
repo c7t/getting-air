@@ -1144,7 +1144,9 @@ What exists today:
     periodic-z box (`?wide=1&zsponge=0&zclear=1`). Domain width and the z
     boundary change nothing; only the infinite span goes over. Cards in air
     tumble because their I* is ~10x higher; a finite card at I* = 0.17 in
-    water is not expected to.
+    water is not expected to -- and **the same finite 2:1 plate at I* = 0.5
+    DOES tumble** (0.21 rev/1000 steps, the strip's rate), so the finite
+    boundary is between 0.17 and 0.5, where Field et al. put it.
   - **THE CARD FLUTTERS, IT DOES NOT TUMBLE**, and five configurations say
     so (n = 32, 26000 steps, chi). net/arc revolutions: 0.04/0.44 at the
     default, 0.12/0.76 at tilt 0.7, 0.10/1.03 at `?levels=2`, 0.09/0.91 at
