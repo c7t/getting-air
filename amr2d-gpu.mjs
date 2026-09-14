@@ -108,6 +108,55 @@ export async function check21BalanceOnGPU(device, pools, nLevels) {
   };
 }
 
+// --- pool indirection readbacks (plans/2D-backport.md B3a) ------------------
+//
+// FIVE COPIES EACH before this. `readPoolIndirection` differed only in line
+// wrapping; `debugListActiveBlocks` was byte-identical.
+//
+// ALWAYS READS GPU STATE, never a CPU mirror. The mirror goes stale the
+// instant automatic refinement mutates the pool without the host seeing it,
+// which is every REFINE_EVERY macro-steps on a live page -- and a stale
+// answer here looks exactly like a correct one.
+//
+// Per-call staging buffers rather than a shared pair: these are debug paths
+// called at checkpoints, and a shared buffer would need the `serializedOn`
+// treatment the 3D fork had to build after a second reader entering the gap
+// between a submit and its mapAsync took the whole device down.
+export async function readPoolIndirection(device, pools, level = 1) {
+  const U = GPUBufferUsage;
+  const pool = pools[level];
+  const stageBlockSlot = device.createBuffer({ size: pool.NBLOCKS * 4, usage: U.MAP_READ | U.COPY_DST });
+  const stageSlotToBlock = device.createBuffer({ size: pool.MAX_FINE_BLOCKS * 4, usage: U.MAP_READ | U.COPY_DST });
+  const enc = device.createCommandEncoder();
+  enc.copyBufferToBuffer(pool.blockSlotBuf, 0, stageBlockSlot, 0, pool.NBLOCKS * 4);
+  enc.copyBufferToBuffer(pool.slotToBlockBuf, 0, stageSlotToBlock, 0, pool.MAX_FINE_BLOCKS * 4);
+  device.queue.submit([enc.finish()]);
+  await Promise.all([
+    stageBlockSlot.mapAsync(GPUMapMode.READ),
+    stageSlotToBlock.mapAsync(GPUMapMode.READ),
+  ]);
+  const blockSlot = new Int32Array(stageBlockSlot.getMappedRange()).slice();
+  const slotToBlock = new Int32Array(stageSlotToBlock.getMappedRange()).slice();
+  stageBlockSlot.unmap();
+  stageSlotToBlock.unmap();
+  stageBlockSlot.destroy();
+  stageSlotToBlock.destroy();
+  return { blockSlot, slotToBlock };
+}
+
+// The active blocks of one level, as {bx, by, slot}.
+export async function listActiveBlocks(device, pools, level = 1) {
+  const pool = pools[level];
+  const { blockSlot } = await readPoolIndirection(device, pools, level);
+  const active = [];
+  for (let blockID = 0; blockID < pool.NBLOCKS; blockID++) {
+    if (blockSlot[blockID] !== -1) {
+      active.push({ bx: blockID % pool.NBX, by: Math.floor(blockID / pool.NBX), slot: blockSlot[blockID] });
+    }
+  }
+  return active;
+}
+
 // --- the pool allocator (plans/2D-backport.md B3a) --------------------------
 //
 // FIVE BYTE-IDENTICAL COPIES before this, one per AMR page, INCLUDING every

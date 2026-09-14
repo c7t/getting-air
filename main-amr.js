@@ -22,7 +22,7 @@ import {
   tauAtLevel as tauAtLevelOf,
 } from './card-params.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
-import { check21BalanceOnGPU, allocLevelPool } from './amr2d-gpu.mjs';
+import { check21BalanceOnGPU, allocLevelPool, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks } from './amr2d-gpu.mjs';
 import { EX, EY, WT } from './lattice-2d.mjs';
 import { makeCanvasFit } from './canvas-fit.mjs';
 
@@ -2387,40 +2387,8 @@ async function init() {
     pacer.reset();
   }
 
-  // Reads blockSlot/slotToBlock directly from GPU -- the authoritative
-  // source once Milestone 4b's automatic management can mutate pool state
-  // without going through the CPU mirror at all.
-  //
-  // Milestone 6: generalized to take a level, using ephemeral staging
-  // buffers sized to THAT level's own NBLOCKS/MAX_FINE_BLOCKS (levels
-  // differ in both, see plans/AMR-multilevel-M5.md's table) instead of
-  // the fixed-size `stagingBlockSlot`/`stagingSlotToBlock` globals (which
-  // stay level-1-sized and are still used, unchanged, by
-  // debugSnapshotSave's own level-1-only readback). Slightly more
-  // allocation per call, but this is a debug/console function, not a hot
-  // path, and it removes the old "not safe to call concurrently with
-  // another in-flight readback through those buffers" caveat for free.
-  async function readPoolIndirection(level = 1) {
-    const pool = pools[level];
-    const stageBlockSlot = device.createBuffer({ size: pool.NBLOCKS * 4, usage: U.MAP_READ | U.COPY_DST });
-    const stageSlotToBlock = device.createBuffer({ size: pool.MAX_FINE_BLOCKS * 4, usage: U.MAP_READ | U.COPY_DST });
-    const enc = device.createCommandEncoder();
-    enc.copyBufferToBuffer(pool.blockSlotBuf, 0, stageBlockSlot, 0, pool.NBLOCKS * 4);
-    enc.copyBufferToBuffer(pool.slotToBlockBuf, 0, stageSlotToBlock, 0, pool.MAX_FINE_BLOCKS * 4);
-    device.queue.submit([enc.finish()]);
-    await Promise.all([
-      stageBlockSlot.mapAsync(GPUMapMode.READ),
-      stageSlotToBlock.mapAsync(GPUMapMode.READ),
-    ]);
-    const blockSlot = new Int32Array(stageBlockSlot.getMappedRange()).slice();
-    const slotToBlock = new Int32Array(stageSlotToBlock.getMappedRange()).slice();
-    stageBlockSlot.unmap();
-    stageSlotToBlock.unmap();
-    stageBlockSlot.destroy();
-    stageSlotToBlock.destroy();
-    return { blockSlot, slotToBlock };
-  }
-
+  // Pool indirection readback -- amr2d-gpu.mjs, five copies before B3a.
+  const readPoolIndirection = (level = 1) => readPoolIndirectionOn(device, pools, level);
   // Milestone 4b: toggles automatic vorticity-driven refinement. Manual
   // debugActivateBlock/debugDeactivateBlock are guarded against running
   // while this is on (see below) -- both mutate blockSlotCPU/slotToBlockCPU/
@@ -2771,21 +2739,8 @@ async function init() {
     writeF(f_a, f, NCELLS);
   }
 
-  // Always reads GPU state directly (not the CPU mirror, which goes stale
-  // the instant autoRefine's automatic management mutates pool state
-  // without the CPU ever seeing it) -- see readPoolIndirection.
-  async function debugListActiveBlocks(level = 1) {
-    const pool = pools[level];
-    const { blockSlot } = await readPoolIndirection(level);
-    const active = [];
-    for (let blockID = 0; blockID < pool.NBLOCKS; blockID++) {
-      if (blockSlot[blockID] !== -1) {
-        active.push({ bx: blockID % pool.NBX, by: Math.floor(blockID / pool.NBX), slot: blockSlot[blockID] });
-      }
-    }
-    return active;
-  }
-
+  // Active blocks of one level -- amr2d-gpu.mjs, five copies before B3a.
+  const debugListActiveBlocks = (level = 1) => listActiveBlocks(device, pools, level);
   // 2:1 BALANCE. The rule, the multi-level readback and the corner-balance
   // decision all live in amr2d-gpu.mjs / amr2d.mjs now -- they were five
   // copies of one checker across the AMR pages, byte-identical in the
