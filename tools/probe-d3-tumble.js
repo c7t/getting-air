@@ -38,6 +38,7 @@ const {
   ensureServer, ensureChrome, openTab, firstTab, navigateTo, waitForGlobal,
   attachPageWatch, assertPageHealthy, teardown,
 } = require('./lib/browser-lifecycle');
+const { mergeQuery } = require('./lib/url-query');
 
 const REPO_ROOT = path.join(__dirname, '..');
 
@@ -91,22 +92,6 @@ async function ev(Runtime, expr, what, timeoutMs = 900000) {
   const r = await Runtime.evaluate({ expression: expr, awaitPromise: true, returnByValue: true, timeout: timeoutMs });
   if (r.exceptionDetails) throw new Error(`${what}: ${r.exceptionDetails.text}`);
   return r.result.value;
-}
-
-// LATER WINS, and it has to. A leg appended to BASE as `...&levels=2&...&levels=3`
-// is read by URLSearchParams.get as the FIRST occurrence, so the leg is
-// silently ignored and the run reports on the base configuration under the
-// leg's name. That happened: a `levels=3` leg came back BIT-IDENTICAL to the
-// `levels=2` run, which is the only reason it was caught. This codebase's own
-// rule is that a parameter silently DROPPED is worse than one rejected, and a
-// duplicated one is that failure wearing a hat.
-function mergeQuery(...parts) {
-  const q = new URLSearchParams();
-  for (const part of parts) {
-    if (!part) continue;
-    for (const [k, v] of new URLSearchParams(part)) q.set(k, v);
-  }
-  return q.toString();
 }
 
 // Least-squares slope of `y` against `x`, for "is net still growing at the end

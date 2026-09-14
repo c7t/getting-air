@@ -46,6 +46,7 @@ const {
   ensureServer, ensureChrome, openTab, firstTab, navigateTo, waitForGlobal,
   attachPageWatch, assertPageHealthy, teardown,
 } = require('./lib/browser-lifecycle');
+const { mergeQuery } = require('./lib/url-query');
 
 const REPO_ROOT = path.join(__dirname, '..');
 
@@ -198,9 +199,12 @@ async function main() {
   // ?live=0 because every step is driven from here. A page that also stepped
   // in its animation loop would put an unknown number of extra steps between
   // two frames, which is the exact property this tool exists to remove.
-  const qs = [preset.url, 'live=0', `view=${view}`,
-              view === 'volume' ? preset.vol : null, o.extra]
-    .filter(Boolean).join('&');
+  // MERGED, NOT APPENDED, so `--extra=` can OVERRIDE a preset rather than be
+  // silently dropped -- see tools/lib/url-query.js. Appending left the first
+  // occurrence winning, which means `--extra=span=2` on the card preset filmed
+  // the preset's span and reported the clip under the caller's parameters.
+  const qs = mergeQuery(preset.url, 'live=0', `view=${view}`,
+                        view === 'volume' ? preset.vol : null, o.extra);
   const url = `${o.baseUrl}/index-3d.html?${o.url || qs}`;
 
   console.log(`rendering ${frames} frames (${o.seconds}s at ${o.fps} fps), ${spf} steps/frame`

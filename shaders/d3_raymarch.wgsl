@@ -47,6 +47,21 @@ struct RayParams {
   // to ask "did this voxel come from MY level".
   boxLo : array<vec4<f32>, 4>,
   boxExt: array<vec4<f32>, 4>,
+  // WHAT THE CAMERA LOOKS AT, OFFSET. xyz is a world-space shift added to the
+  // target in BOTH branches below; w is unused. APPENDED rather than folded
+  // into `tgt`, whose xyz is dead while `tgt.w` says follow: a field that
+  // means two things depending on a flag beside it is the hazard
+  // common_d3_parentmac_*.wgsl exists to avoid, and 16 bytes is not worth it.
+  //
+  // IT EXISTS BECAUSE A FALLING PLATE'S SUBJECT IS NOT CENTRED ON THE PLATE.
+  // The wake trails entirely on one side -- upward, against the fall -- so a
+  // camera aimed at the body puts every interesting structure in the top half
+  // of the frame and dead space in the bottom. Measured on the card at 1080p:
+  // framed on the body, the wake is cut off at dist 1.35 and fills a fifth of
+  // the frame at the dist 2.1 that contains it. The host sets this along the
+  // orbit's own up axis, so it stays correct whichever axis the scenario
+  // calls down.
+  tgtOff: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> rm : RayParams;
@@ -132,9 +147,9 @@ fn orbitAxes() -> Orbit {
 // reason (M8.3) -- same binding, same argument.
 fn camTarget() -> vec3<f32> {
   if (rm.tgt.w > 0.5f && HAS_BODY == 1u) {
-    return vec3<f32>(body.cx, body.cy, body.cz);
+    return vec3<f32>(body.cx, body.cy, body.cz) + rm.tgtOff.xyz;
   }
-  return rm.tgt.xyz;
+  return rm.tgt.xyz + rm.tgtOff.xyz;
 }
 
 struct Cam { o : vec3<f32>, d : vec3<f32> }

@@ -2472,6 +2472,13 @@ async function init() {
   }
   const CAM_FOLLOW = camTargetMode === 'body' && HAS_BODY ? 1 : 0;
   const CAM_TARGET = [(NX - 1) / 2, (NY - 1) / 2, (NZ - 1) / 2];
+  // AIM ABOVE THE BODY, in L0 cells along the camera's own up axis. A falling
+  // plate's subject is the plate AND its wake, and the wake is entirely on one
+  // side of it, so the frame that contains both is not the frame centred on
+  // the body -- see d3_raymarch.wgsl's tgtOff. Signed, and 0 by default, which
+  // is what keeps every recorded camera number and validate-d3-raymarch.js's
+  // IoU gate on the frame they were measured in.
+  let camOffset = numParam('camoffset', 0);
   // EXTINCTION PER L0 CELL at the top of the tone curve. The curve is
   // asymptotic to 1 (see d3_raymarch.wgsl's volTone), so this is a real
   // maximum rather than a scale that a strong core runs away with: at 0.6 a
@@ -2510,7 +2517,7 @@ async function init() {
     return;
   }
   if (volStack.length) {
-    rayBuf = device.createBuffer({ size: 192, usage: U.UNIFORM | U.COPY_DST });
+    rayBuf = device.createBuffer({ size: 208, usage: U.UNIFORM | U.COPY_DST });
     // 1x1x1, sampled by the levels this run does not have. rm.ctl.z folds
     // them out of the walk, so it is never read -- but a bind group with a
     // null texture is not a thing, exactly as the tree sampler's 4-byte
@@ -2576,7 +2583,7 @@ async function init() {
   function writeRayParams(aspectOverride) {
     if (!rayBuf) return;
     const aspect = aspectOverride || (canvas.width / Math.max(1, canvas.height));
-    const b = new Float32Array(48);
+    const b = new Float32Array(52);
     // cam.w is tan(fov/2) under perspective and the HALF-HEIGHT IN L0 CELLS
     // under orthographic -- the same number scaled by the distance, so the two
     // projections frame identically at the target plane.
@@ -2597,6 +2604,11 @@ async function init() {
       // finest axis.
       b.set(v ? [v.ext[0], v.ext[1], v.ext[2], Math.min(...v.h)] : [1, 1, 1, 1], 32 + 4 * i);
     }
+    // Along the orbit's up axis, which is the scenario's own down negated --
+    // so "above the body" means the same thing whichever axis a scenario falls
+    // along, and the host is where that already lives.
+    b.set([0, 0, 0, 0], 48);
+    b[48 + CAM_UP_AXIS] = CAM_UP_SIGN * camOffset;
     device.queue.writeBuffer(rayBuf, 0, b);
   }
 
@@ -2717,11 +2729,12 @@ async function init() {
     if (opts.azim != null) camAzim = opts.azim * Math.PI / 180;
     if (opts.elev != null) camElev = Math.max(-83, Math.min(83, opts.elev)) * Math.PI / 180;
     if (opts.dist != null) camDist = Math.max(1e-3, opts.dist) * Math.max(NX, NY, NZ);
+    if (opts.offset != null) camOffset = opts.offset;
     if (opts.dAzim != null) camAzim += opts.dAzim * Math.PI / 180;
     if (opts.dElev != null) camElev = Math.max(-1.45, Math.min(1.45, camElev + opts.dElev * Math.PI / 180));
     writeRayParams();
     return { azim: camAzim * 180 / Math.PI, elev: camElev * 180 / Math.PI,
-             dist: camDist / Math.max(NX, NY, NZ) };
+             dist: camDist / Math.max(NX, NY, NZ), offset: camOffset };
   }
 
   // ONE FRAME, RENDERED OFFSCREEN at a size the caller chooses, into a FIXED
@@ -2946,6 +2959,7 @@ async function init() {
              camera: rayBuf ? { azim: camAzim, elev: camElev, dist: camDist, fov: CAM_FOV,
                                 upAxis: CAM_UP_AXIS, upSign: CAM_UP_SIGN,
                                 target: CAM_TARGET, follow: CAM_FOLLOW, aspect: w / h,
+                                offset: camOffset,
                                 // Under ?proj=ortho, the half-height in L0
                                 // CELLS -- so a caller converts pixels to
                                 // cells with no camera model at all.
@@ -4973,7 +4987,7 @@ async function init() {
                           // 2 * orthoHalf / imageHeight and no camera model.
                           proj: camProj, orthoHalf: camDist * Math.tan(CAM_FOV / 2),
                           upAxis: CAM_UP_AXIS, upSign: CAM_UP_SIGN, target: CAM_TARGET,
-                          follow: CAM_FOLLOW, field: VOL_FIELDS[volField],
+                          follow: CAM_FOLLOW, offset: camOffset, field: VOL_FIELDS[volField],
                           iso: volIso, gain: volGain } : null,
       ...(AMR ? {
         rb: RB, fb: pool.FB, ghost: GHOST,
