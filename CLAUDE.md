@@ -1137,7 +1137,14 @@ What exists today:
     18000 steps first, then tumbles at the same ~0.2 rev/1000). Not yet
     compared with the 2D page's period, and one seed.
     The finite plate's flutter below is real physics for a finite plate at
-    this I* (Field et al. 1997), not a solver defect.
+    this I* (Field et al. 1997), not a solver defect -- and it is the TIPS,
+    not the field: the finite 2:1 plate with the same edges and rung
+    flutters identically (net max 0.37, arc 5.1, to the third digit at
+    every checkpoint) in the old sponge-everywhere box and in the strip's
+    periodic-z box (`?wide=1&zsponge=0&zclear=1`). Domain width and the z
+    boundary change nothing; only the infinite span goes over. Cards in air
+    tumble because their I* is ~10x higher; a finite card at I* = 0.17 in
+    water is not expected to.
   - **THE CARD FLUTTERS, IT DOES NOT TUMBLE**, and five configurations say
     so (n = 32, 26000 steps, chi). net/arc revolutions: 0.04/0.44 at the
     default, 0.12/0.76 at tilt 0.7, 0.10/1.03 at `?levels=2`, 0.09/0.91 at

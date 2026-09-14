@@ -704,7 +704,7 @@ SCENARIOS.card = {
   name: 'card',
   defaults: { n: 32, aspect: 0.125, span: 1, re: 500, u_t: 0.05, i_star: 0.17,
               tilt: 0.15, perturb: 0, seed: 12345, tow: 0, stream: 0, spanfill: 0,
-              edge: 0 },
+              edge: 0, wide: 0, zsponge: 1, zclear: 2 },
   walls: [],
   // THE SPANWISE-PERIODIC PLATE (`spanfill=1`, plans/3D.md M6.5 avenue 2).
   // Pesavento & Wang's card is a SECTION of an infinite strip: no tips, no
@@ -750,6 +750,15 @@ SCENARIOS.card = {
     const { n, span } = p;
     const prescribed = (p.tow || 0) !== 0 || (p.stream || 0) !== 0;
     if (p.spanfill) return [Math.round(6 * n), Math.round(8 * n), SCENARIOS.card.spanfillZ(p)];
+    // The FINITE plate in the strip's box, for separating the strip's tips
+    // from its domain (M6.5c): `wide=1` gives the strip's 8n lateral width
+    // and `zclear` the clearance beyond each span end in chords (the default
+    // 2 is the rule below); `zsponge=0` (derive) leaves z periodic with no
+    // band, as the strip has it.
+    if (!prescribed && (p.wide || p.zclear !== 2)) {
+      return [Math.round(6 * n), Math.round((p.wide ? 8 : 5) * n),
+              Math.round(Math.max(3 * n, span * n + 2 * p.zclear * n))];
+    }
     return prescribed
       ? [Math.round(8 * n), Math.round(8 * n),
          Math.round(Math.max(8 * n, 2 * span * n + 6 * n))]
@@ -891,7 +900,7 @@ SCENARIOS.card = {
       // No band on the periodic span axis of the strip: there is no far
       // field there to relax toward (common_d3_step.wgsl SPONGE_AX).
       sponge: { width: Math.max(6, Math.round(n / 2)), u: [p.stream, 0, 0],
-                axes: spanfill ? [1, 1, 0] : [1, 1, 1] },
+                axes: (spanfill || !p.zsponge) ? [1, 1, 0] : [1, 1, 1] },
       force: [0, 0, 0],
       blockage: area / (d[1] * d[2]),
       tSettle: u_t / gEff,
