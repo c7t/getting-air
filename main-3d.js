@@ -4699,6 +4699,14 @@ async function init() {
     axisSel.disabled = vol;
     canvas.style.cursor = vol ? 'grab' : '';
   }
+  // No volumes, no volume view: the option is DISABLED and says why, rather
+  // than snapping back to `slice` with no explanation (which it used to do,
+  // and which reads as a broken dropdown). The volumes are ?vol= / ?view=
+  // at page load because they are the memory.
+  if (!rayPipe) {
+    const opt = viewSel.querySelector('option[value="volume"]');
+    if (opt) { opt.disabled = true; opt.textContent = 'volume (add ?vol=1 to the URL)'; }
+  }
   viewSel.onchange = () => {
     if (viewSel.value === 'volume' && !rayPipe) { viewSel.value = viewMode; return; }
     viewMode = viewSel.value;
