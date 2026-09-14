@@ -352,7 +352,18 @@ async function runChannelPhysics(Page, Runtime, opts, config) {
     await waitForGlobal(Runtime, 'window.__CYL', 15000);
     await evalExprChan(Runtime, `window.__CYL.setLive(false)`);
     for (const c of groupCases) {
-      results.push(await runChanCase(Runtime, { timeout: opts.physicsTimeout }, c, s => console.log('    ' + s)));
+      const r = await runChanCase(Runtime, { timeout: opts.physicsTimeout }, c, s => console.log('    ' + s));
+      // THE MARGIN, PRINTED ON PASS TOO. A gate that prints only a tick
+      // cannot answer "did this change help", which is the question every
+      // precision or storage change here has to answer -- and CLAUDE.md names
+      // these analytic checks, not Cd/St, as the gate for exactly those.
+      // Before this the numbers were computed and thrown away unless they
+      // failed, so a re-baseline meant driving the pages from a second,
+      // parallel harness that did not share this one's case filtering (and
+      // got different answers for that reason).
+      console.log(`      L2rel ${r.l2rel.toExponential(4)} / ${c.l2_tol.toExponential(1)}`
+        + `  maxErr ${r.maxErr.toExponential(3)}  ${r.converged ? `converged at ${r.step}` : `NOT CONVERGED (${r.step})`}`);
+      results.push(r);
     }
   }
   const ok = results.every(r => r.l2.pass && r.converged);
@@ -381,7 +392,13 @@ async function runTgvPhysics(Page, Runtime, opts, config) {
     await navigateTo(Page, url);
     await waitForGlobal(Runtime, 'window.__CYL', 15000);
     await evalExprTgv(Runtime, `window.__CYL.setLive(false)`);
-    results.push({ name: c.name, ...(await runTgvCase(Runtime, { timeout: opts.physicsTimeout }, c, s => console.log('    ' + s))) });
+    const r = await runTgvCase(Runtime, { timeout: opts.physicsTimeout }, c, s => console.log('    ' + s));
+    // The margin, on PASS too -- see runChannelPhysics' note.
+    const num = (v) => (typeof v === 'number' && isFinite(v) ? v.toExponential(4) : String(v));
+    console.log('      ' + Object.entries(r)
+      .filter(([k, v]) => typeof v === 'number' && k !== 'step')
+      .map(([k, v]) => `${k} ${num(v)}`).join('  '));
+    results.push({ name: c.name, ...r });
   }
   const ok = results.every(r => r.fieldCheck.pass && r.rateCheck.pass);
   return { ok, results };
