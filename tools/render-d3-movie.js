@@ -35,6 +35,7 @@
 //   node tools/render-d3-movie.js --view=slice --out=/tmp/card-slice.mp4
 //   node tools/render-d3-movie.js --scenario=sphere --extra=re=300 --spin=90
 //   node tools/render-d3-movie.js --gif --seconds=6 --size=480x360
+//   node tools/render-d3-movie.js --encode=rgba                # raw frames on the pipe
 
 const path = require('path');
 const fs = require('fs');
@@ -87,7 +88,7 @@ const DEFAULTS = {
   scenario: 'card', extra: '', url: null,
   seconds: 30, fps: 30, size: '800x600', view: null,
   steps: null, spf: null, warmup: 0, spin: 0,
-  out: null, crf: 18, gif: false, keepOpen: false, quiet: false,
+  out: null, crf: 18, gif: false, keepOpen: false, quiet: false, encode: 'png',
 };
 
 function parseArgs(argv) {
@@ -108,6 +109,7 @@ function parseArgs(argv) {
     else if (a.startsWith('--spin=')) o.spin = parseFloat(a.slice(7));
     else if (a.startsWith('--out=')) o.out = a.slice(6);
     else if (a.startsWith('--crf=')) o.crf = parseInt(a.slice(6));
+    else if (a.startsWith('--encode=')) o.encode = a.slice(9);
     else if (a === '--gif') o.gif = true;
     else if (a === '--quiet') o.quiet = true;
     else if (a === '--keepOpen') o.keepOpen = true;
@@ -135,9 +137,22 @@ function write(stream, buf) {
   return new Promise((resolve) => stream.once('drain', resolve));
 }
 
+// PNG FRAMES ON THE PIPE, NOT RAW RGBA. See main-3d.js's encodePNG: the page
+// produces a PNG in less time than it took to base64 the raw bytes, and ships
+// ~23x fewer of them. image2pipe reads one PNG after another off a single
+// stream and takes the size from the frames, so nothing here has to agree with
+// the page about the geometry any more -- which is one fewer way to get a torn
+// picture.
+//
+// `--encode=rgba` restores the RAW WIRE FORMAT and nothing else -- the faster
+// base64 underneath it is unconditional, so that leg is not the pre-M6.5d tool
+// and does not measure as one. Per frame, 800x600, a developed card wake:
+// 146 ms before, 49 ms with the base64 fix alone, 13 ms with PNG as well.
 function ffmpegArgs(o, w, h) {
-  const input = ['-y', '-f', 'rawvideo', '-pixel_format', 'rgba',
-                 '-video_size', `${w}x${h}`, '-framerate', String(o.fps), '-i', 'pipe:0'];
+  const input = o.encode === 'rgba'
+    ? ['-y', '-f', 'rawvideo', '-pixel_format', 'rgba',
+       '-video_size', `${w}x${h}`, '-framerate', String(o.fps), '-i', 'pipe:0']
+    : ['-y', '-f', 'image2pipe', '-c:v', 'png', '-framerate', String(o.fps), '-i', 'pipe:0'];
   if (o.gif) {
     // Two passes over one read: `split` duplicates the decoded stream inside
     // the filter graph, so palettegen sees every frame without the input
@@ -159,6 +174,7 @@ async function main() {
   const preset = PRESETS[o.scenario] || { url: `scenario=${o.scenario}`, steps: 20000, view: 'volume', vol: 'vol=1' };
   const view = o.view || preset.view || 'volume';
   if (!['slice', 'volume'].includes(view)) { console.error(`--view=${view}: expected slice or volume`); process.exit(2); }
+  if (!['png', 'rgba'].includes(o.encode)) { console.error(`--encode=${o.encode}: expected png or rgba`); process.exit(2); }
   const m = /^(\d+)x(\d+)$/.exec(o.size);
   if (!m) { console.error(`--size=${o.size}: expected WIDTHxHEIGHT`); process.exit(2); }
   // EVEN, because yuv420p subsamples chroma by two and an odd dimension is a
@@ -215,7 +231,7 @@ async function main() {
     // may choose its own height from the plane's aspect. Believe the page
     // rather than the request: an encoder fed a size the frames are not is a
     // torn picture, not an error.
-    const probe = await ev(Runtime, `window.__D3.debugRenderFrame({ w: ${W}, h: ${H}, view: '${view}' })`, 'debugRenderFrame');
+    const probe = await ev(Runtime, `window.__D3.debugRenderFrame({ w: ${W}, h: ${H}, view: '${view}', encode: '${o.encode}' })`, 'debugRenderFrame');
     if (probe.skipped || probe.error) throw new Error(probe.skipped || probe.error);
     if (probe.w !== W || probe.h !== H) {
       console.log(`  page chose ${probe.w}x${probe.h} (the slice keeps its plane's aspect)`);
@@ -260,9 +276,9 @@ async function main() {
         await ev(Runtime, `window.__D3.debugSetCamera({ dAzim: ${dAzim} })`, 'debugSetCamera');
       }
       const img = await ev(Runtime,
-        `window.__D3.debugRenderFrame({ w: ${W}, h: ${H}, view: '${view}' })`, 'debugRenderFrame');
+        `window.__D3.debugRenderFrame({ w: ${W}, h: ${H}, view: '${view}', encode: '${o.encode}' })`, 'debugRenderFrame');
       if (img.skipped || img.error) throw new Error(img.skipped || img.error);
-      await write(ff.stdin, Buffer.from(img.rgba, 'base64'));
+      await write(ff.stdin, Buffer.from(img.png || img.rgba, 'base64'));
       if (pipeBroke) throw new Error(`ffmpeg stopped reading (${pipeBroke.code}):\n${ffErr.split('\n').slice(-12).join('\n')}`);
       encoded++;
 

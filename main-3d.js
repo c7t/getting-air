@@ -2761,6 +2761,12 @@ async function init() {
   // and the CDP round trip that returns it. That tool exists to produce an
   // IMAGE; timing through it would report its own encoder.
   //
+  // M6.5d CUT THAT BY ~10x AND THE CONCLUSION IS UNCHANGED. 1024x1024 now
+  // costs 38 ms at ?levels=1 and 110 ms at ?levels=3 (was 90/483 with the raw
+  // wire format and the fast base64, and ~1200 with neither) -- still 25-70x
+  // a draw that measures 1.4-2.7 ms here, still dominated by an encoder and a
+  // round trip this has neither. The ratio narrowed; the argument did not.
+  //
   // AND IT REPORTS THE MINIMUM OF ITS BATCHES, which is bench-d3-interface.js's
   // rule on this desktop -- the median moves several percent between runs and
   // the minimum is the one that is reproducible.
@@ -2805,6 +2811,55 @@ async function init() {
     writeRayParams();
     return { w, h, reps, batches, msPerFrame: ms[0], median: ms[(ms.length - 1) >> 1],
              spread: (ms[ms.length - 1] - ms[0]) / ms[0], all: ms };
+  }
+
+  // BASE64 WITHOUT BUILDING THE STRING IN JAVASCRIPT, and PNG INSTEAD OF RAW
+  // RGBA ON THE WIRE. plans/3D.md M6.5d, measured 2026-09-13.
+  //
+  // The old encoder was `s += String.fromCharCode(...px.subarray(i, i+8192))`
+  // over the whole frame and then btoa. It is the single most expensive thing
+  // debugRenderFrame did -- measured at 800x600 on a developed card wake,
+  // **315-344 ms of a ~330 ms page-side call**, against 2.5 ms for the
+  // raymarch draw it exists to deliver. The spread operator is a call with one
+  // argument per byte and the concatenation walks a rope; neither is what the
+  // platform's own encoder does.
+  //
+  //   toBase64 (FileReader/Blob, native): 57-67 ms, and BYTE-IDENTICAL to the
+  //   old string -- asserted in the probe that measured it, not assumed.
+  //
+  //   encodePNG + toBase64: **33-56 ms and 110 KB instead of 2500 KB**, on the
+  //   same frame. Both halves matter: it is ~8x cheaper to produce AND ~23x
+  //   cheaper to ship, and CDP's returnByValue of the raw string was itself
+  //   65 ms at ?levels=1 and 225 ms at ?levels=3.
+  //
+  // PNG AND NOT JPEG, though JPEG measured 25 ms and 20 KB. A frame that goes
+  // into x264 at crf 18 should not have been through a lossy codec first, and
+  // the difference is 20 ms on a call that also steps the solver. The
+  // round-trip is EXACTLY lossless and was checked that way -- decode the PNG
+  // back through a canvas and diff every byte: 0 of 1920000 differ.
+  //
+  // WebP was also measured and is NOT the answer despite being 3.5 KB: 126 ms,
+  // four times PNG's encode, because the payload is not what costs here.
+  function toBase64(bytes) {
+    return new Promise((resolve, reject) => {
+      const f = new FileReader();
+      // readAsDataURL returns "data:...;base64,XXXX" -- the prefix is the only
+      // thing separating it from what btoa would have produced.
+      f.onload = () => resolve(f.result.slice(f.result.indexOf(',') + 1));
+      f.onerror = () => reject(f.error || new Error('FileReader failed'));
+      f.readAsDataURL(new Blob([bytes]));
+    });
+  }
+
+  // putImageData and NOT drawImage: the bytes are already straight-alpha
+  // rgba8unorm and putImageData is defined to store them unchanged, where
+  // drawImage would premultiply and the round-trip would stop being exact.
+  async function encodePNG(px, w, h) {
+    const cv = new OffscreenCanvas(w, h);
+    const cx = cv.getContext('2d');
+    cx.putImageData(new ImageData(new Uint8ClampedArray(px.buffer, px.byteOffset, px.length), w, h), 0, 0);
+    const blob = await cv.convertToBlob({ type: 'image/png' });
+    return new Uint8Array(await blob.arrayBuffer());
   }
 
   async function debugRenderFrame(opts = {}) {
@@ -2880,9 +2935,14 @@ async function init() {
     // without ceremony where an array of 147456 numbers would not.
     const px = new Uint8Array(w * h * 4);
     for (let y = 0; y < h; y++) px.set(raw.subarray(y * rowBytes, y * rowBytes + w * 4), y * w * 4);
-    let s = '';
-    for (let i = 0; i < px.length; i += 8192) s += String.fromCharCode(...px.subarray(i, i + 8192));
-    return { w, h, view, step, rgba: btoa(s),
+    // `encode: 'png'` FOR ANY CALLER THAT ONLY WANTS THE PICTURE. See toBase64
+    // and encodePNG below for the measurement; the pixel-math callers
+    // (validate-d3-raymarch, the volume probes) keep the raw default, because
+    // decoding a PNG back to bytes is work they would only have to undo.
+    const payload = o.encode === 'png'
+      ? { png: await toBase64(await encodePNG(px, w, h)) }
+      : { rgba: await toBase64(px) };
+    return { w, h, view, step, ...payload,
              camera: rayBuf ? { azim: camAzim, elev: camElev, dist: camDist, fov: CAM_FOV,
                                 upAxis: CAM_UP_AXIS, upSign: CAM_UP_SIGN,
                                 target: CAM_TARGET, follow: CAM_FOLLOW, aspect: w / h,

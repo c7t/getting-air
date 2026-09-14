@@ -1000,7 +1000,12 @@ What exists today:
     **`debugRenderFrame` IS ALSO OFF THE ANIMATION THREAD AND STILL CANNOT DO
     IT: 1181 ms per call at 1024^2 against a 4.7 ms draw** -- base64 of 4 MiB
     and the CDP round trip, 250x the thing being timed. Off-thread is
-    necessary and not sufficient.
+    necessary and not sufficient. **M6.5d cut that ~10x and the conclusion is
+    unchanged** (38 ms at `?levels=1`, 110 ms at `?levels=3`, against a draw of
+    1.4-2.7 ms): still an encoder and a round trip, still not a shader timer.
+    That 1181 was a HEAVY config, and quoting it as the flat cost of a movie
+    frame overstates it by ~4x -- the movie tool renders 800x600, which
+    measured 146 ms before the fix and 13 ms after.
     **AND THE COST IS BELOW THE FLOOR.** A same-build repeat differs by 6.2%,
     the A/B by 3.9% -- with the SIGN not even stable across instruments -- so
     the honest statement is |cost| < ~6% of a 1024^2 render, at four times the
@@ -1096,6 +1101,31 @@ What exists today:
   ffmpeg. A recorder would film the SOLVER'S frame rate, so an expensive
   configuration's clip runs slow and two builds are not comparable; here
   `--seconds`/`--fps` describe the FILM and `--steps` the FLOW.
+  - **A FRAME'S COST WAS ITS BASE64, NOT ITS RAYMARCH** (M6.5d, 2026-09-13,
+    `--encode=rgba` to A/B). `debugRenderFrame` built its base64 as
+    `s += String.fromCharCode(...px.subarray(i, i+8192))` over the whole frame
+    -- one call per byte down a rope -- and that ONE LINE was **315-344 ms of a
+    ~330 ms page-side call** at 800x600, against 2.5 ms for the draw it exists
+    to deliver. Two changes, both measured on a developed card wake:
+    `FileReader`/`Blob` produces a BYTE-IDENTICAL string in 57-67 ms, and an
+    `OffscreenCanvas` PNG produces **110 KB instead of 2500 KB in 33-56 ms** --
+    so it is cheaper to make AND ~23x cheaper to ship, and CDP's returnByValue
+    of the raw string was itself 65 ms at `?levels=1` and 225 ms at `?levels=3`.
+    **Per frame at 800x600: 146 ms -> 49 ms (base64 alone) -> 13 ms (with PNG).**
+    End to end a 90-frame clip went 91.6 s -> 66.8 s, and the two mp4s are
+    **byte-identical** -- PNG round-trips exactly (0 of 1920000 bytes differ
+    through a decode), which is why it is PNG and not the 25 ms / 20 KB JPEG.
+    The raw path keeps the fast base64, so `validate-d3-raymarch.js` and the
+    volume probes got the same 3x for free; all 7 of its gates are unmoved.
+    **WebP is the trap here**: 3.5 KB, and 126 ms, because the payload was
+    never the expensive half.
+  - **THE CLIP LENGTH DOES NOT SET THE SIMULATION COST.** A preset's `steps` is
+    fixed, so `--seconds` and `--fps` change only how finely the run is
+    SAMPLED -- a 3 s clip of the card still integrates all 26000 steps. What
+    `--seconds` buys is frames, and a frame is now ~13 ms against ~555 ms of
+    stepping at `?levels=1` and ~2500 ms at `?levels=3`. Shortening a clip to
+    save time is therefore nearly free of effect; shortening `--steps` is the
+    knob that actually costs flow.
   - **THE RAY'S MARCH INTERVAL IS IN WINDOW COORDINATES, NOT BUFFER ONES**
     (M6.5a, `?winbox=0` to A/B). The body wraps through the periodic buffer
     and its wake does not, so a march bounded by [0, N) stops at the seam and
