@@ -56,7 +56,7 @@
 import { reportFatal, reportNoWebGPU, reportNoAdapter } from './error-overlay.mjs';
 import { assembleShader } from './shader-loader.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
-import { check21BalanceOnGPU } from './amr2d-gpu.mjs';
+import { check21BalanceOnGPU, readConservedTotals } from './amr2d-gpu.mjs';
 
 const canvas   = document.getElementById('c');
 const statusEl = document.getElementById('status');
@@ -1089,6 +1089,23 @@ async function init() {
   // assertion mechanism this project does not have.
   const debugCheck21Balance = () => check21BalanceOnGPU(device, pools, N_LEVELS);
 
+  // CONSERVATION, for plans/2D-backport.md B0b's interface instrument.
+  // Amounts to one readback of the dense L0 grid; see readConservedTotals for
+  // why that is the WHOLE hybrid system's total and not just the coarse
+  // level's, and why TGV in particular is where the number means anything
+  // (periodic, no body, no sponge, no walls -- so each level alone conserves
+  // both exactly and any drift is the coarse/fine interface).
+  //
+  // THE CURRENT BUFFER IS READ FROM `useB`, NOT ASSUMED. debugSnapshotSave
+  // can hardcode f_a because STEPS_PER_FRAME is even and useB therefore
+  // returns to false at every frame boundary -- but that is an invariant of
+  // how it is called, and a diagnostic taking checkpoints at arbitrary step
+  // counts should not inherit it.
+  const debugConservedTotals = () => readConservedTotals(device, {
+    f: useB ? f_b : f_a, W, H, NCELLS, ex: EX, ey: EY,
+    decode: readF, cellIndex: cellIndexJS,
+  });
+
   // No body -- HAS_BODY=0 means isNearBody(At) is unconditionally false in
   // every manage shader, so there's nothing for a geometry-coverage check
   // to assert. Trivially passing.
@@ -1170,6 +1187,7 @@ async function init() {
     debugStepSync,
     debugReadCardState,
     debugCheck21Balance,
+    debugConservedTotals,
     debugCheckGeometryCoverage,
     debugListActiveBlocks,
     setAutoRefine,

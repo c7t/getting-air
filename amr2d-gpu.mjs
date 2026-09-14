@@ -108,6 +108,89 @@ export async function check21BalanceOnGPU(device, pools, nLevels) {
   };
 }
 
+// --- conservation (plans/2D-backport.md B0b) --------------------------------
+//
+// TOTAL MASS AND TOTAL MOMENTUM OF THE WHOLE HYBRID SYSTEM, read off the
+// DENSE L0 GRID ALONE. That sounds like it must be wrong and it is exactly
+// right, for one reason: `average` runs at the end of every macro-step, for
+// every level, and overwrites a refined block's L0 cells with the finer
+// level's RESTRICTED moments. The restriction is an arithmetic mean of rho
+// and a mass-weighted mean of u, and a coarse cell has four times a fine
+// cell's area -- so
+//
+//     rho_avg * A_coarse  =  (SUM_children rho_c) * A_coarse/4
+//
+// and likewise for rho*u. The coarse cell's contribution to the sum IS its
+// children's, exactly, not approximately. Summing the L0 grid therefore gives
+// the hybrid system's own totals with no reconstruction and no double count.
+// main-tgv-amr.js:1128-1134 already states the velocity half of this for
+// `readField`; this is the same argument carried to the moments.
+//
+// WHY IT IS WORTH MEASURING AT ALL. On a PERIODIC, FORCE-FREE case -- which
+// is what `?scenario=tgv` is: no body, no sponge, no walls -- each level
+// ALONE conserves mass and momentum exactly. Streaming permutes populations;
+// BGK collision preserves the first two moments by construction. So any drift
+// is the coarse/fine interface and nothing else. 2D's interface is interp
+// (ring ghosts) plus average (restriction) with NO flux correction, so coarse
+// cells at the seam stream from their own coarse neighbours while the fine
+// tile streams from its ring -- and nothing in the 2D suite has ever measured
+// what that costs.
+//
+// THE ASYMMETRY IS THE DISCRIMINATOR, and it is what found the equivalent 3D
+// bug. `fneq` has no zeroth or first moment, so a wrong Dupuis-Chopard rescale
+// cannot perturb mass at all while corrupting the viscous stress, which IS the
+// momentum flux: "mass at the readback floor while momentum leaks" says the
+// defect is in the non-equilibrium coupling, not in the addressing or the
+// flux scheme. 2D has that rescale bug today (plans/2D-backport.md B1), so
+// this is the instrument that should see it.
+//
+// THE SUM IS TAKEN IN f64 ON THE HOST, deliberately. The readback is an exact
+// copy of the f32 the solver stores, and JS numbers are doubles, so the
+// reduction contributes nothing of its own -- unlike an f32 GPU reduction,
+// whose own rounding would be indistinguishable from the drift being measured.
+// 262144 cells x 9 directions is ~9 MB and a few ms; this is a diagnostic
+// called at checkpoints, not per frame.
+//
+// `ex`/`ey` come from the caller because every page already has the D2Q9
+// basis typed out. That is its own duplication (ten-plus copies, see
+// plans/2D-backport.md B9, which derives the lattice once and generates the
+// WGSL); passing it in avoids adding an eleventh here.
+export async function readConservedTotals(device, opts) {
+  const { f, W, H, NCELLS, ex, ey, decode, cellIndex } = opts;
+  const U = GPUBufferUsage;
+  const bytes = f.size;
+  const stage = device.createBuffer({ size: bytes, usage: U.MAP_READ | U.COPY_DST });
+  const enc = device.createCommandEncoder();
+  enc.copyBufferToBuffer(f, 0, stage, 0, bytes);
+  device.queue.submit([enc.finish()]);
+  await stage.mapAsync(GPUMapMode.READ);
+  const fArr = decode(stage.getMappedRange(), NCELLS);
+  stage.unmap();
+  stage.destroy();
+
+  let mass = 0, momX = 0, momY = 0;
+  let rhoMin = Infinity, rhoMax = -Infinity, maxU2 = 0;
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const cell = cellIndex(x, y);
+      let rho = 0, mx = 0, my = 0;
+      for (let i = 0; i < 9; i++) {
+        const v = fArr[i * NCELLS + cell];
+        rho += v; mx += v * ex[i]; my += v * ey[i];
+      }
+      // rho - 1 rather than rho: the interesting quantity is the DRIFT, and
+      // summing 262144 values all near 1 buries it under the total.
+      mass += rho - 1;
+      momX += mx; momY += my;
+      if (rho < rhoMin) rhoMin = rho;
+      if (rho > rhoMax) rhoMax = rho;
+      const u2 = (mx * mx + my * my) / (rho * rho);
+      if (u2 > maxU2) maxU2 = u2;
+    }
+  }
+  return { mass, momX, momY, rhoMin, rhoMax, maxU: Math.sqrt(maxU2), cells: W * H };
+}
+
 // THE ALLOCATION'S OWN EXTENTS AGAINST THE RULE. A cheap assertion the pages
 // can make at init: pools[m].NBX/NBY must be what the uniform tile shape says
 // they are. If the allocation loop and amr2d.mjs ever disagree, every checker
