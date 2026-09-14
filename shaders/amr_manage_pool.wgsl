@@ -125,6 +125,9 @@ override HAS_GRANDCHILD : u32 = 0u;
 // When 0, isNearBodyAt is unconditionally false -- see amr_manage.wgsl's
 // identical override.
 override HAS_BODY : u32 = 1u;
+// When 0, isNearBodyAt reverts to the pre-B4 single sample at the tile CENTRE
+// (?boxrefine=0) -- see amr_manage.wgsl's identical override.
+override BOX_REFINE : u32 = 1u;
 override REFINE_THRESH : f32;
 override COARSEN_THRESH : f32;
 // Ladder parameters -- see common_refine.wgsl.
@@ -146,25 +149,32 @@ override FORCE_REFINE_LOOKAHEAD : f32;
 override SPONGE_EXCLUDE_W : f32 = 0.0f;
 const EPS_FLOOR = 1e-6f;
 
-// Same now/future test as amr_manage.wgsl's isNearBody, parametrized by an
-// already-computed L0-buffer-space center instead of deriving it from a
-// dense blockID -- see that file's header for the extrapolation rationale
-// (test point moves backward at -v, not the ellipse forward, since the
-// moving window absorbs bulk translation into off_x/off_y).
+// Same test as amr_manage.wgsl's isNearBody, parametrized by an
+// already-computed L0-buffer-space center instead of deriving it from a dense
+// blockID -- see that file for the box-vs-centre change and ?boxrefine=0, and
+// common_geometry.wgsl for the bound itself.
+//
+// THE HALF-EXTENT IS f32(RB) * PARENT_CELL_SIZE_L0, and it is not the same
+// expression as amr_manage.wgsl's BLOCK/2 even though at level 1 it is the
+// same NUMBER. A level-m tile's interior is 2*RB cells of size
+// PARENT_CELL_SIZE_L0, so its footprint is 2*RB*PARENT_CELL_SIZE_L0 L0 units
+// and its half-extent is half of that -- which is exactly the offset both
+// callers already add to the tile ORIGIN to get the centre they pass in here
+// (see refine()'s parentCenterX_L0 and its BUGFIX comment on why no further
+// *0.5 belongs there). Deriving it the same way as the centre is deliberate:
+// if one is ever wrong the other is wrong with it, rather than the box
+// silently straddling a tile it does not belong to.
 fn isNearBodyAt(centerX_L0: f32, centerY_L0: f32) -> bool {
   if (HAS_BODY == 0u) { return false; }
-  let wx = (u32(centerX_L0) + W - u32(state.off_x)) % W;
-  let wy = (u32(centerY_L0) + H - u32(state.off_y)) % H;
-  let p_now = vec2<f32>(f32(wx), f32(wy));
 
-  let phi_now = get_phi(p_now, state);
+  if (BOX_REFINE == 0u) {
+    let wx = (u32(centerX_L0) + W - u32(state.off_x)) % W;
+    let wy = (u32(centerY_L0) + H - u32(state.off_y)) % H;
+    return phiMinPose(vec2<f32>(f32(wx), f32(wy)), FORCE_REFINE_LOOKAHEAD, state) < FORCE_REFINE_MARGIN;
+  }
 
-  let p_future = p_now - vec2<f32>(state.vx, state.vy) * FORCE_REFINE_LOOKAHEAD;
-  var future = state;
-  future.theta += state.omega * FORCE_REFINE_LOOKAHEAD;
-  let phi_future = get_phi(p_future, future);
-
-  return min(phi_now, phi_future) < FORCE_REFINE_MARGIN;
+  let p = vec2<f32>(centerX_L0 - state.off_x, centerY_L0 - state.off_y);
+  return nearBodyBox(p, f32(RB) * PARENT_CELL_SIZE_L0, FORCE_REFINE_MARGIN, FORCE_REFINE_LOOKAHEAD, state);
 }
 
 // True if the given L0-buffer-space center lies within SPONGE_EXCLUDE_W of any

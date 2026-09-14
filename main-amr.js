@@ -418,6 +418,22 @@ if (FORCE_REFINE_MARGIN >= SDF_FAR) {
 }
 
 const FORCE_REFINE_LOOKAHEAD = urlParams.has('forceRefineLookahead') ? parseFloat(urlParams.get('forceRefineLookahead')) : REFINE_EVERY;
+
+// ?boxrefine=0 restores the pre-B4 geometry TEST: ONE get_phi at a block's
+// CENTRE against FORCE_REFINE_MARGIN, truncated window conversion included.
+// Default 1 asks about the whole block (a Lipschitz branch and bound --
+// shaders/common_geometry.wgsl's nearBodyBox), which is the question the
+// margin was always meant to answer; the centre sample under-reports by the
+// block's own circumradius, 5.66 L0 cells at RB=8. Both paths live in one
+// build so the difference can be measured: plans/2D-backport.md B4.
+//
+// THE TEST, NOT THE CONFIGURATION. B4-2 also retired the childLevel===2
+// margin special case that existed to compensate for the centre test (see
+// paramsForChildLevel), and this flag does not bring it back. The full
+// pre-B4 configuration is `?boxrefine=0&forceRefineMargin2=8`; ?boxrefine=0
+// alone isolates the predicate with the margin held at its honest scaled
+// default, which is usually the comparison you actually want.
+const BOX_REFINE = urlParams.has('boxrefine') ? (parseInt(urlParams.get('boxrefine')) ? 1 : 0) : 1;
 // L0 window-space edge band (coarse cells) excluded from vorticity-driven
 // refinement -- keeps fine blocks out of the ALBC sponge (amr_step.wgsl
 // SPONGE_W=4). A fixed L0-window strip, so the same value applies at every
@@ -1201,7 +1217,7 @@ async function init() {
   const step1Constants = { W, H, RB, SDF_FAR, F16, DIRECT_GHOST: GHOST_COPY ? 0 : 1 };
   const criterionConstants = { W, H };
   const manageConstants = { DIAG, W, H, SDF_FAR, REFINE_THRESH, COARSEN_THRESH, FORCE_REFINE_MARGIN, FORCE_REFINE_LOOKAHEAD, SPONGE_EXCLUDE_W, DEMAND_CASCADE, HAS_LEVEL2: N_LEVELS > 2 ? 1 : 0,
-    N_REFINE_INC, N_REFINE_MAX, MAX_LEVEL: N_LEVELS - 1 };
+    N_REFINE_INC, N_REFINE_MAX, MAX_LEVEL: N_LEVELS - 1, BOX_REFINE };
 
   const stepPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [stepBGL] }),
@@ -1396,6 +1412,7 @@ async function init() {
       ...childParams,
       N_REFINE_INC, N_REFINE_MAX, MAX_LEVEL: N_LEVELS - 1,
       HAS_GRANDCHILD: hasGrandchild ? 1 : 0,
+      BOX_REFINE,
     };
     criterionPoolPLs[m] = device.createComputePipeline({
       layout: device.createPipelineLayout({ bindGroupLayouts: [criterionPoolBGL] }),
@@ -2775,6 +2792,7 @@ async function init() {
   const debugCheckGeometryCoverage = async () => checkGeometryCoverageOnGPU(device, pools, {
     nLevels: N_LEVELS, W, H, rb: RB, NBX, NBLOCKS,
     cardState: await debugReadCardState(),
+    boxRefine: BOX_REFINE !== 0,
     paramsForChildLevel,
   });
 

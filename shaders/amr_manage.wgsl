@@ -137,6 +137,9 @@ override DEMAND_CASCADE : u32 = 0u;
 // force-refine toward (channel-flow/TGV scenarios), so refinement is
 // purely vorticity-driven. See shaders/lbm_step.wgsl's identical override.
 override HAS_BODY : u32 = 1u;
+// When 0, isNearBody reverts to the pre-B4 single sample at the block CENTRE
+// (?boxrefine=0). Default 1: the whole block is tested. See isNearBody.
+override BOX_REFINE : u32 = 1u;
 // L0 window-space edge band (coarse cells) excluded from vorticity-driven
 // refinement -- keeps fine blocks out of the ALBC sponge (amr_step.wgsl
 // SPONGE_W=4). Default 0 disables it; the JS default is 8. Preserves
@@ -150,40 +153,44 @@ fn epsFor(blockID: u32) -> f32 {
   return min(1.0f, log2(max(blockCriterion[blockID], EPS_FLOOR)));
 }
 
-// True if blockID's center is within FORCE_REFINE_MARGIN of the card's
-// surface either right now, or FORCE_REFINE_LOOKAHEAD macro-steps from now.
-// Window-space conversion mirrors amr_step.wgsl's wx/wy derivation exactly
-// (buffer blocks are fixed in memory; the card is anchored in window space).
+// True if ANY POINT OF blockID's L0 block comes within FORCE_REFINE_MARGIN of
+// the card's surface, either right now or FORCE_REFINE_LOOKAHEAD macro-steps
+// from now. common_geometry.wgsl's nearBodyBox is the test and phiMinPose is
+// the two-pose distance; see that file for the Lipschitz bound and for why
+// the future pose moves the TEST POINT backward rather than the ellipse
+// forward.
 //
-// The "future" test does NOT extrapolate cx/cy forward -- amr_physics.wgsl's
-// moving window keeps cx/cy pinned near (W/2,H/2) by construction (bulk
-// translation is absorbed into off_x/off_y, not cx/cy), so cx += vx*lookahead
-// would displace a phantom ellipse that doesn't correspond to where the card
-// (or this buffer block, relative to it) actually will be. What DOES move,
-// relative to the window-anchored card, is a fixed buffer cell's window-space
-// position: wx(t) = cx_buf - off_x(t), and off_x grows at rate vx (it tracks
-// the card's total world-frame displacement), so wx(t) = wx(now) - vx*t.
-// Extrapolate the TEST POINT backward instead of the ellipse forward. theta
-// is the one quantity the window doesn't absorb, so it still extrapolates
-// forward normally.
+// THE BOX, NOT THE CENTRE -- plans/2D-backport.md B4. This used to be one
+// get_phi at the block centre, which under-reports by the block's own
+// circumradius (5.66 L0 cells at BLOCK=8). ?boxrefine=0 restores that exactly,
+// truncated window conversion and all, so the two live in one build and the
+// difference can be measured rather than argued.
+//
+// The new path drops the `(c + W - u32(off_x)) % W` window reduction with it:
+// get_phi already takes the NEAREST PERIODIC IMAGE, so the modulo bought
+// nothing, and the u32() truncated a fractional offset (and, in the pool
+// version, a fractional tile centre) by up to a cell -- error of the same
+// order as the margin it is compared against.
 fn isNearBody(blockID: u32) -> bool {
   if (HAS_BODY == 0u) { return false; }
   let nbx = W / BLOCK;
   let bx = blockID % nbx; let by = blockID / nbx;
   let cx_buf = bx * BLOCK + BLOCK / 2u;
   let cy_buf = by * BLOCK + BLOCK / 2u;
-  let wx = (cx_buf + W - u32(state.off_x)) % W;
-  let wy = (cy_buf + H - u32(state.off_y)) % H;
-  let p_now = vec2<f32>(f32(wx), f32(wy));
 
-  let phi_now = get_phi(p_now, state);
+  if (BOX_REFINE == 0u) {
+    let wx = (cx_buf + W - u32(state.off_x)) % W;
+    let wy = (cy_buf + H - u32(state.off_y)) % H;
+    return phiMinPose(vec2<f32>(f32(wx), f32(wy)), FORCE_REFINE_LOOKAHEAD, state) < FORCE_REFINE_MARGIN;
+  }
 
-  let p_future = p_now - vec2<f32>(state.vx, state.vy) * FORCE_REFINE_LOOKAHEAD;
-  var future = state;
-  future.theta += state.omega * FORCE_REFINE_LOOKAHEAD;
-  let phi_future = get_phi(p_future, future);
-
-  return min(phi_now, phi_future) < FORCE_REFINE_MARGIN;
+  // An L0 block is BLOCK coarse cells across, so its half-extent is BLOCK/2
+  // L0 units. (A level-1 tile's interior is 2*RB cells at half the size --
+  // the same footprint, which is what "level 1 is footprint-preserving 1:1
+  // with L0's blocks" means, and why this one function serves both the L0->L1
+  // decision and the L1->L2 cascade's reuse of it.)
+  let p = vec2<f32>(f32(cx_buf) - state.off_x, f32(cy_buf) - state.off_y);
+  return nearBodyBox(p, f32(BLOCK) * 0.5f, FORCE_REFINE_MARGIN, FORCE_REFINE_LOOKAHEAD, state);
 }
 
 // True if blockID's center lies within SPONGE_EXCLUDE_W (coarse cells) of any

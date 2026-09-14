@@ -288,16 +288,22 @@ export function bodyPhiL0(px, py, state, dims, lookahead) {
 // memory; the body is anchored in WINDOW space, which is what every kernel's
 // `(u32(c) + W - u32(state.off_x)) % W` is doing.
 //
-// TWO THINGS ARE MIRRORED RATHER THAN CLEANED UP. The modulo is dropped --
-// ellipsePhi already takes the nearest image, so reducing into [0, W) first
-// changes nothing. The TRUNCATIONS are not: `u32()` is applied to the centre
-// as well as to off_x, so a level-2 tile centre of 34.25 is tested at 34, and
-// a checker that silently used the exact centre would disagree with the
-// kernel on any block sitting within a cell of the margin. Both truncations
-// go away in plans/2D-backport.md B4 (get_phi wraps for itself, so neither
-// buys anything); until then this asks the kernel's question, not a tidier
-// one.
+// THE EXACT FORM IS WHAT THE KERNELS DO NOW. The modulo is dropped because
+// ellipsePhi (like get_phi) already takes the nearest image, so reducing into
+// [0, W) first changes nothing.
+//
+// `bufferToWindowLegacy` is the pre-B4 form, kept because ?boxrefine=0 keeps
+// the kernel path it mirrors. It applied `u32()` to the centre as well as to
+// off_x, so a level-2 tile centre of 34.25 was tested at 34 -- a
+// sub-cell-to-one-cell error compared against a margin of a few cells, on
+// exactly the borderline blocks a coverage check is about. A checker that
+// silently used the exact centre would have disagreed with the kernel there,
+// which is why it was mirrored rather than hidden.
 export function bufferToWindow(px, py, state) {
+  return [px - state.off_x, py - state.off_y];
+}
+
+export function bufferToWindowLegacy(px, py, state) {
   return [Math.trunc(px) - Math.trunc(state.off_x), Math.trunc(py) - Math.trunc(state.off_y)];
 }
 
@@ -338,12 +344,18 @@ export function bufferToWindow(px, py, state) {
 // and that radius BOUNDS how far the SDF can fall inside the box -- rounding
 // it down would make the bound false by a hair. One literal, so a host and a
 // kernel cannot disagree about a borderline block.
-const SQRT2_UP = 1.4142136;
+//
+// BOTH CONSTANTS ARE EXPORTED because shaders/common_geometry.wgsl's
+// nearBodyBox now types the same two values, and tools/test-amr2d.js parses
+// them back out of that file and compares. A generator would be better still
+// (lattice-2d.mjs's shape); two numbers did not earn one, but they did earn
+// the check that fails when the two drift.
+export const SQRT2_UP = 1.4142136;
 
 // The depth of the branch-and-bound. 3 leaves a residual slack of
 // RB*sqrt(2)/16 = 0.71 L0 cells at RB=8 -- conservative, so it can
 // over-refine by that much and never miss.
-const BLOCK_BB_DEPTH = 3;
+export const BLOCK_BB_DEPTH = 3;
 
 // A signed distance is 1-Lipschitz, so ONE evaluation at a box centre
 // brackets the minimum over the whole box as phi(c) - R <= min <= phi(c).

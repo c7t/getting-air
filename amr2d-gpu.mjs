@@ -36,7 +36,7 @@
 
 import {
   check21Balance, nbAtLevel, makePool, cellSizeL0AtLevel,
-  nearBodyWantCentre, bodyPhiL0, bufferToWindow,
+  nearBodyWant, nearBodyWantCentre, bodyPhiL0, bufferToWindow, bufferToWindowLegacy,
 } from './amr2d.mjs';
 
 // Every level's blockSlot, copied in one command encoder and one submit, so
@@ -404,13 +404,13 @@ export function assertPoolExtents(pools, nLevels, { W, H, rb }) {
 // missing check could not quietly look greener than a present one. The stubs
 // are gone (B3a-4); this is the other half.
 //
-// THE PREDICATE IS AN ARGUMENT, and that is the point. Today's kernels ask
-// about a block's CENTRE (one get_phi against the margin); amr2d.mjs's
-// `nearBodyWant` asks about the whole BLOCK, via a Lipschitz branch and
-// bound. They differ by the block's circumradius -- 5.66 L0 cells at RB=8 --
-// and main-cylinder-amr.js:224 records what that cost live. A checker is only
-// honest if it asks the question the kernel answers, so the default is
-// `nearBodyWantCentre` and B4 flips both sides together.
+// THE PREDICATE FOLLOWS THE KERNEL, via `boxRefine`. Since B4-2 the managers
+// ask about the whole BLOCK (a Lipschitz branch and bound --
+// shaders/common_geometry.wgsl's nearBodyBox, amr2d.mjs's `nearBodyWant`);
+// `?boxrefine=0` restores the pre-B4 single sample at the block CENTRE, and
+// then so does this, truncated window conversion included. A checker is only
+// honest if it asks the question the kernel answers, so the flag selects BOTH
+// halves here and the page passes its own BOX_REFINE straight through.
 //
 // EVERY ORIGIN AND SLOT IS READ BACK FRESH, never taken from a CPU mirror:
 // under autoRefine the mirror is stale every REFINE_EVERY macro-steps, and a
@@ -418,8 +418,10 @@ export function assertPoolExtents(pools, nLevels, { W, H, rb }) {
 export async function checkGeometryCoverageOnGPU(device, pools, opts) {
   const {
     nLevels, W, H, rb, NBX, NBLOCKS, cardState,
-    paramsForChildLevel, wantFactory = nearBodyWantCentre,
+    paramsForChildLevel, boxRefine = true,
   } = opts;
+  const wantFactory = boxRefine ? nearBodyWant : nearBodyWantCentre;
+  const toWindow = boxRefine ? bufferToWindow : bufferToWindowLegacy;
   const state = cardState;
   const violations = [];
   if (nLevels < 2) return { ok: true, violations, checked: 0 };
@@ -443,7 +445,7 @@ export async function checkGeometryCoverageOnGPU(device, pools, opts) {
   // main-cylinder-amr.js's original never noticed because its body is PINNED:
   // with v = omega = 0 the future pose IS the current one.
   const sdf = (x, y) => {
-    const [wx, wy] = bufferToWindow(x, y, state);
+    const [wx, wy] = toWindow(x, y, state);
     return bodyPhiL0(wx, wy, state, { W, H }, 0);
   };
 

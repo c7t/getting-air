@@ -75,6 +75,7 @@ const sorted = (s) => [...s].sort();
     refineWhere, nearBodyWant, nearBodyWantCentre, refineNearBody,
     resolveSource, toGlobalFine, fromGlobalFine, storageRatio,
     check21Balance, checkRingParentCoverage, checkGeometryCoverage, cascade21,
+    SQRT2_UP, BLOCK_BB_DEPTH,
   } = A;
 
   // ── pool geometry ────────────────────────────────────────────────────────
@@ -549,19 +550,31 @@ const sorted = (s) => [...s].sort();
       `a quarter turn should bring the major axis under the test point (got ${spun})`);
   });
 
-  ok('bufferToWindow TRUNCATES both the point and the offset, exactly as the kernels do', () => {
-    // shaders/amr_manage_pool.wgsl's isNearBodyAt is
+  ok('bufferToWindow is EXACT, and its legacy form truncates like the old kernel', () => {
+    // The pre-B4 kernels computed
     // `(u32(centerX_L0) + W - u32(state.off_x)) % W`, and a level-2 tile
-    // centre is fractional. A checker that used the exact centre would
-    // disagree with the kernel on any block within a cell of the margin --
-    // which is precisely the population a coverage check is about. The
-    // modulo is dropped because ellipsePhi wraps for itself.
+    // centre is FRACTIONAL -- so the u32() cost up to a cell, compared
+    // against a margin of a few, on exactly the borderline blocks a coverage
+    // check is about. Both forms survive because ?boxrefine=0 keeps the
+    // kernel path the legacy one mirrors. The modulo is dropped from both:
+    // ellipsePhi takes the nearest image itself.
     const st = { off_x: 10.75, off_y: -3.25 };
-    assert.deepStrictEqual(A.bufferToWindow(34.25, 7.9, st), [24, 10]);
-    assert.deepStrictEqual(A.bufferToWindow(34, 8, { off_x: 0, off_y: 0 }), [34, 8]);
-    // trunc, not floor: a negative offset moves the window the other way and
-    // Math.floor(-3.25) = -4 would shift the body by a cell.
-    assert.strictEqual(A.bufferToWindow(0, 0, st)[1], 3);
+    const close2 = (got, want, what) => {
+      close(got[0], want[0], 1e-12, what + ' x');
+      close(got[1], want[1], 1e-12, what + ' y');
+    };
+    close2(A.bufferToWindow(34.25, 7.9, st), [23.5, 11.15], 'exact');
+    close2(A.bufferToWindowLegacy(34.25, 7.9, st), [24, 10], 'legacy');
+    close2(A.bufferToWindow(34, 8, { off_x: 0, off_y: 0 }), [34, 8], 'zero offset');
+    // trunc, not floor, in the legacy form: a negative offset moves the
+    // window the other way and Math.floor(-3.25) = -4 would shift the body by
+    // a whole cell relative to what the kernel did.
+    assert.strictEqual(A.bufferToWindowLegacy(0, 0, st)[1], 3);
+    // And the exact form is a pure translation -- differences are preserved,
+    // which is what lets a box be subdivided in window space at all.
+    const a = A.bufferToWindow(10, 20, st), b = A.bufferToWindow(14, 26, st);
+    close(b[0] - a[0], 4, 1e-12, 'dx preserved');
+    close(b[1] - a[1], 6, 1e-12, 'dy preserved');
   });
 
   // ── the geometry predicate, and the gap the kernel still has ─────────────
@@ -668,6 +681,44 @@ const sorted = (s) => [...s].sort();
     // The gap is bounded by the block circumradius: RB*sqrt(2)/2 = 5.66 L0
     // cells at RB=8, which is why a margin smaller than that is where it bites.
     assert.ok(missed.length >= 4, `expected the gap on several blocks, saw ${missed.length}`);
+  });
+
+  ok('the WGSL box test types the SAME two constants amr2d.mjs does', () => {
+    // The kernel and the host run different code for the same rule, so the
+    // rule's two magic numbers are the seam. Parsed back OUT of the checked-in
+    // WGSL, which is what fails when the two are edited apart -- the half of
+    // tools/test-lattice-2d.js's design that catches a generator and a file
+    // being wrong together.
+    const wgsl = require('fs').readFileSync(
+      path.join(__dirname, '..', 'shaders', 'common_geometry.wgsl'), 'utf8');
+    const num = (re, what) => {
+      const m = wgsl.match(re);
+      assert.ok(m, `${what} is not declared in common_geometry.wgsl any more`);
+      return parseFloat(m[1]);
+    };
+    assert.strictEqual(num(/const\s+SQRT2_UP\s*:\s*f32\s*=\s*([0-9.]+)/, 'SQRT2_UP'), SQRT2_UP);
+    assert.strictEqual(num(/const\s+BLOCK_BB_DEPTH\s*:\s*u32\s*=\s*([0-9]+)u/, 'BLOCK_BB_DEPTH'), BLOCK_BB_DEPTH);
+    // And SQRT2_UP must still be an OVER-estimate of sqrt(2): rounding it down
+    // makes the Lipschitz bound false by a hair, on exactly the borderline
+    // blocks the whole test exists to catch.
+    assert.ok(SQRT2_UP >= Math.SQRT2, `SQRT2_UP=${SQRT2_UP} is below sqrt(2)`);
+    assert.ok(SQRT2_UP < Math.SQRT2 + 1e-6, `SQRT2_UP=${SQRT2_UP} is slack, not rounded up`);
+  });
+
+  ok('the WGSL stack cannot overflow at BLOCK_BB_DEPTH', () => {
+    // nearBodyBox's explicit stack is a fixed-size WGSL array, and an
+    // overflowing index there is a clamp, not a crash -- it would silently
+    // re-test a stale box and report a wrong answer. Each pop reuses its own
+    // slot and pushes 4, and the deepest level pushes nothing, so the high
+    // water mark is 3*depth + 1.
+    const wgsl = require('fs').readFileSync(
+      path.join(__dirname, '..', 'shaders', 'common_geometry.wgsl'), 'utf8');
+    const sizes = [...wgsl.matchAll(/var\s+stack[CHD]\s*:\s*array<[^,]+,\s*(\d+)\s*>/g)].map(m => +m[1]);
+    assert.strictEqual(sizes.length, 3, 'expected exactly three stack arrays');
+    for (const n of sizes) {
+      assert.ok(n >= 3 * BLOCK_BB_DEPTH + 1,
+        `stack of ${n} is too small for depth ${BLOCK_BB_DEPTH} (needs ${3 * BLOCK_BB_DEPTH + 1})`);
+    }
   });
 
   ok('refineWhere assigns slots deterministically and refuses to overflow the pool', () => {

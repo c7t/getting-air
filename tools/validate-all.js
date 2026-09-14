@@ -347,7 +347,18 @@ async function runPhysics(Runtime, opts) {
   await evalExprCyl(Runtime, `window.__CYL.setLive(false)`);
   const results = [];
   for (const c of cases) {
-    results.push(await runCase(Runtime, { timeout: opts.physicsTimeout }, c, s => console.log('    ' + s)));
+    const r = await runCase(Runtime, { timeout: opts.physicsTimeout }, c, s => console.log('    ' + s));
+    // THE NUMBERS, PRINTED ON PASS TOO -- the same gap 46157cd closed for the
+    // analytic gates, still open here. Cd/St were computed and thrown away
+    // unless they FAILED, so "did this change move the cylinder?" could only
+    // be answered by a config that happened to be red. That is the wrong way
+    // round for the several stages of plans/2D-backport.md that deliberately
+    // change the refined region and must REPORT the move rather than absorb
+    // it -- and CLAUDE.md's own AMR-Cd reproducibility caveat (~1e-3, the
+    // atomicSub free list) is unusable without the digits it is about.
+    console.log(`      Cd ${r.cd.measured?.toFixed(3)} / ${r.cd.target}±${r.cd.tol} ${r.cd.pass ? 'ok' : 'FAIL'}`
+      + `   St ${r.st.measured?.toFixed(4)} / ${r.st.target}±${r.st.tol} ${r.st.pass ? 'ok' : 'FAIL'}`);
+    results.push(r);
   }
   const ok = results.every(r => r.cd.pass && r.st.pass);
   return { ok, results };

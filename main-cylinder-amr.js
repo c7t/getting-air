@@ -322,6 +322,22 @@ const COARSEN_THRESH = urlParams.has('coarsenThresh') ? parseFloat(urlParams.get
 const FORCE_REFINE_MARGIN = urlParams.has('forceRefineMargin') ? parseFloat(urlParams.get('forceRefineMargin')) : 8;
 const FORCE_REFINE_LOOKAHEAD = urlParams.has('forceRefineLookahead') ? parseFloat(urlParams.get('forceRefineLookahead')) : REFINE_EVERY;
 
+// ?boxrefine=0 restores the pre-B4 geometry TEST: ONE get_phi at a block's
+// CENTRE against FORCE_REFINE_MARGIN, truncated window conversion included.
+// Default 1 asks about the whole block (a Lipschitz branch and bound --
+// shaders/common_geometry.wgsl's nearBodyBox), which is the question the
+// margin was always meant to answer; the centre sample under-reports by the
+// block's own circumradius, 5.66 L0 cells at RB=8. Both paths live in one
+// build so the difference can be measured: plans/2D-backport.md B4.
+//
+// THE TEST, NOT THE CONFIGURATION. B4-2 also retired the childLevel===2
+// margin special case that existed to compensate for the centre test (see
+// paramsForChildLevel), and this flag does not bring it back. The full
+// pre-B4 configuration is `?boxrefine=0&forceRefineMargin2=8`; ?boxrefine=0
+// alone isolates the predicate with the margin held at its honest scaled
+// default, which is usually the comparison you actually want.
+const BOX_REFINE = urlParams.has('boxrefine') ? (parseInt(urlParams.get('boxrefine')) ? 1 : 0) : 1;
+
 // Milestone 10: per-CHILD-level threshold overrides. REFINE_THRESH/
 // COARSEN_THRESH/FORCE_REFINE_MARGIN/FORCE_REFINE_LOOKAHEAD above (unsuffixed
 // URL params, unchanged) govern the L0->L1 decision, same as every build
@@ -357,41 +373,56 @@ const FORCE_REFINE_LOOKAHEAD = urlParams.has('forceRefineLookahead') ? parseFloa
 // debugCheck21Balance, vs. saturated-and-still-passing-only-because-
 // clamped without it.
 //
-// BUGFIX (L2 bounce-back investigation, childLevel===2 special case): the
-// L1->L2 hop's own scaled default (8*0.5=4) is EXACTLY equal to an L1
-// tile's own half-width (RB*cellSizeL0AtLevel(1) = 8*0.5 = 4), not
-// comfortably larger than it the way L0->L1's own margin (8) is relative
-// to an L0 "tile" (BLOCK=8 dense cells, half-width 8*cellSizeL0AtLevel(0)
-// = 8) -- both nominally "one tile half-width", but a candidate whose
-// CENTER sits just outside a margin equal to its own half-width can still
-// have its NEAR edge (or a grazing corner, at shallow surface incidence)
-// touching the body, so isNearBodyAt's center-only test silently passed
-// some genuinely body-touching L1 tiles as "not near enough" -- a real,
-// live-verified coverage gap distinct from (and only exposed after fixing)
-// amr_manage_pool.wgsl's childOriginX/Y registration bug: at res=9's N=3
-// forced-bounceback, this alone left level 1's own force pass NOT fully
-// masked (a small number of body-adjacent L1 tiles permanently missing
-// their required L2 child, each contributing a small but nonzero,
-// non-decaying bounce-back force every step -- debugForceBreakdown's own
-// l1 total sat at a bit-identical fx~-0.19 for 20000+ steps regardless of
-// the wake's live vorticity-driven L1 churn elsewhere, the tell that it
-// was a permanently-stuck coarse patch rather than real unsteady flow).
-// Doubling margin2 back to the unscaled base (8) closed the gap (l1 force
-// pass fully masked to exactly 0 again) and the N=3 forced-bounceback Cd/St
-// both validated against tools/validate-cylinder.js's own literature
-// benchmarks (previously Cd=-10.07 vs 1.35 target; now within tolerance).
-// Scoped to childLevel===2 only -- childLevel>=3's own scaled defaults are
-// untouched, still whatever kept level 3 from saturating at N=4 above.
+// THE childLevel===2 SPECIAL CASE IS GONE (plans/2D-backport.md B4-2), and
+// what it was compensating for is worth keeping written down, because it was
+// never about the margin.
+//
+// It read `childLevel === 2 ? FORCE_REFINE_MARGIN : <scaled>`, i.e. it
+// DOUBLED the L1->L2 margin back to the unscaled base, 8 instead of 4. The
+// reasoning at the time: the scaled default 8*0.5=4 is exactly an L1 tile's
+// own half-width, so a tile whose CENTER just missed it could still have its
+// near edge, or a grazing corner at shallow incidence, touching the body --
+// and isNearBodyAt's center-only test passed those as "not near enough". Real
+// and live-verified: at res=9 N=3 forced-bounceback it left a handful of
+// body-adjacent L1 tiles permanently without their L2 child, each
+// contributing a small non-decaying bounce-back force, and
+// debugForceBreakdown's l1 total sat at a bit-identical fx~-0.19 for 20,000+
+// steps. Doubling the margin buried the gap under slack and the config went
+// green (from Cd=-10.07).
+//
+// B4-2 fixed the TEST instead: isNearBodyAt now asks whether any point of the
+// tile is within the margin (shaders/common_geometry.wgsl's nearBodyBox), so
+// "one tile half-width" means what it says and the slack is not needed.
+//
+// MEASURED, one build, ?levels=3&bounceback, 8192 steps, L0 and L1 force
+// passes read directly via debugForceBreakdown -- they must be EXACTLY zero,
+// which is the sharp form of "the body lives entirely on the finest level"
+// and a far better instrument than Cd:
+//
+//   predicate  margin2   L1 tiles  L2 tiles   L0 force   L1 force
+//   centre        8         51        64        0.0000    0.0000   (before)
+//   BOX           8         67       128 (!)    0.0000    0.0000
+//   BOX           4         51        64        0.0000    0.0000   (now)
+//
+// The box test at the HONEST margin reproduces the centre test at the
+// inflated one, tile for tile -- which is the whole claim, demonstrated
+// rather than argued. And the middle row is why this could not be left: 128
+// is MAX_FINE_BLOCKS. Keeping both the fixed test and the slack SATURATED
+// level 2's pool, so further geometry-forced refinement was being silently
+// REFUSED -- the failure mode B4 is about to latch as an error rather than
+// degrade through. Two safety factors for one hazard is not twice as safe.
+//
+// childLevel>=3's scaled default is untouched, still whatever kept level 3
+// from saturating at N=4 above -- and it is now the same rule at every hop.
 function paramsForChildLevel(childLevel) {
   if (childLevel === 1) {
     return { REFINE_THRESH, COARSEN_THRESH, FORCE_REFINE_MARGIN, FORCE_REFINE_LOOKAHEAD };
   }
   const get = (name, base) => urlParams.has(`${name}${childLevel}`) ? parseFloat(urlParams.get(`${name}${childLevel}`)) : base;
-  const scaledMargin = childLevel === 2 ? FORCE_REFINE_MARGIN : FORCE_REFINE_MARGIN * cellSizeL0AtLevel(childLevel - 1);
   return {
     REFINE_THRESH: get('refineThresh', REFINE_THRESH),
     COARSEN_THRESH: get('coarsenThresh', COARSEN_THRESH),
-    FORCE_REFINE_MARGIN: get('forceRefineMargin', scaledMargin),
+    FORCE_REFINE_MARGIN: get('forceRefineMargin', FORCE_REFINE_MARGIN * cellSizeL0AtLevel(childLevel - 1)),
     FORCE_REFINE_LOOKAHEAD: get('forceRefineLookahead', FORCE_REFINE_LOOKAHEAD),
   };
 }
@@ -1052,7 +1083,7 @@ async function init() {
   // their own copy of the sponge, not shared with the coarse kernel).
   const step1Constants = { W, H, RB, SPONGE_UX: U0, SPONGE_UY: 0, USE_BOUNCEBACK, F16, DIRECT_GHOST: GHOST_COPY ? 0 : 1 };
   const criterionConstants = { W, H };
-  const manageConstants = { DIAG, W, H, REFINE_THRESH, COARSEN_THRESH, FORCE_REFINE_MARGIN, FORCE_REFINE_LOOKAHEAD, DEMAND_CASCADE, HAS_LEVEL2: N_LEVELS > 2 ? 1 : 0 };
+  const manageConstants = { DIAG, W, H, REFINE_THRESH, COARSEN_THRESH, FORCE_REFINE_MARGIN, FORCE_REFINE_LOOKAHEAD, DEMAND_CASCADE, HAS_LEVEL2: N_LEVELS > 2 ? 1 : 0, BOX_REFINE };
 
   const stepPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [stepBGL] }),
@@ -1195,6 +1226,7 @@ async function init() {
       PARENT_HAS_CACHED_ORIGIN: parentIsDense ? 0 : 1,
       ...childParams,
       HAS_GRANDCHILD: hasGrandchild ? 1 : 0,
+      BOX_REFINE,
     };
     criterionPoolPLs[m] = device.createComputePipeline({
       layout: device.createPipelineLayout({ bindGroupLayouts: [criterionPoolBGL] }),
@@ -2396,6 +2428,7 @@ async function init() {
   const debugCheckGeometryCoverage = async () => checkGeometryCoverageOnGPU(device, pools, {
     nLevels: N_LEVELS, W, H, rb: RB, NBX, NBLOCKS,
     cardState: await debugReadCardState(),
+    boxRefine: BOX_REFINE !== 0,
     // paramsForChildLevel(m+1), not the window.__CYL.getRefineParams()
     // wrapper (that's an inline arrow property, not a name in scope here) --
     // same per-child-level FORCE_REFINE_MARGIN/FORCE_REFINE_LOOKAHEAD
