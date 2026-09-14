@@ -3352,7 +3352,33 @@ async function init() {
   // Chunked so a long run is not one enormous command buffer (the duct
   // needs O(10^4) steps to settle), and awaited per chunk so the queue
   // cannot run arbitrarily far ahead of the page.
-  const SYNC_CHUNK = 500;
+  //
+  // THE CHUNK IS A TIME BUDGET, NOT A STEP COUNT, and it has to be
+  // (plans/3D.md M6.5e, 2026-09-13). It was a flat 500 steps, which is a
+  // command buffer whose DURATION is whatever the configuration costs: 1.0 s
+  // on the n = 32 card at ?levels=1, and **14 s** on the span-2 plate at
+  // ?levels=3 and Re = 1100, where a step is 27.8 ms. A submit that long is
+  // killed by the GPU watchdog -- `GPU device lost (unknown): A valid
+  // external Instance reference no longer exists` -- and it takes the run
+  // with it.
+  //
+  // IT LOOKS LIKE A MEMORY OR CONTENTION FAULT AND IS NEITHER. Measured on
+  // that config: 4000 steps clean at 250 steps per submit, dead inside 1000
+  // at 500. Nothing about the pool, the volume budget or the free VRAM
+  // changes between those two; only the submit's wall time does. This is the
+  // most likely reading of the truncated I* = 0.5 and I* = 0.3 runs recorded
+  // in M6.5c as cut "by a memory watchdog" at 24000 and 20000 steps -- they
+  // ran at this cost, through this path.
+  //
+  // SO THE FIRST CHUNK IS A PROBE. Nothing here knows the per-step cost in
+  // advance -- it depends on scenario, depth, refined fraction and device --
+  // and a config where 500 steps is fatal cannot afford to measure with 500.
+  // It starts small, times every chunk, and converges on SYNC_TARGET_MS; the
+  // extra submits cost a queue drain each, which is noise beside the steps.
+  const SYNC_CHUNK_MAX = 500;
+  const SYNC_CHUNK_PROBE = 16;
+  const SYNC_TARGET_MS = numParam('syncms', 1000);
+  let syncChunk = SYNC_CHUNK_PROBE;
   // Reads the manager's refusal counter, latches it, and turns it into a
   // stop. One 16-byte readback per chunk, on a path that already waits for
   // the queue -- so it costs a copy, not a sync. Only meaningful with the
@@ -3469,11 +3495,19 @@ async function init() {
     if (await checkPoolExhausted()) return { step, exhausted: poolExhausted };
     let done = 0;
     while (done < n) {
-      const k = Math.min(SYNC_CHUNK, n - done);
+      const k = Math.min(syncChunk, n - done);
+      const t0 = performance.now();
       const enc = device.createCommandEncoder();
       encodeSteps(enc, k);
       device.queue.submit([enc.finish()]);
       await device.queue.onSubmittedWorkDone();
+      // Retimed EVERY chunk, not once: the per-step cost moves with the
+      // refined set, and on a tumbling plate that is not a small drift.
+      // Halving-at-most per update keeps one slow chunk (a manager event, a
+      // volume refresh landing in the same frame) from collapsing it to 1.
+      const perStep = (performance.now() - t0) / k;
+      syncChunk = Math.max(1, Math.min(SYNC_CHUNK_MAX,
+        Math.max(Math.ceil(k / 2), Math.round(SYNC_TARGET_MS / Math.max(perStep, 1e-3)))));
       done += k;
       // STOPS ADVANCING rather than throwing: a tool that reads the returned
       // step count or debugPoolState sees it immediately, and one that does

@@ -36,6 +36,7 @@
 //   node tools/render-d3-movie.js --scenario=sphere --extra=re=300 --spin=90
 //   node tools/render-d3-movie.js --gif --seconds=6 --size=480x360
 //   node tools/render-d3-movie.js --encode=rgba                # raw frames on the pipe
+//   node tools/render-d3-movie.js --trackOut=/tmp/card.csv    # the series, not just the end
 
 const path = require('path');
 const fs = require('fs');
@@ -89,6 +90,7 @@ const DEFAULTS = {
   seconds: 30, fps: 30, size: '800x600', view: null,
   steps: null, spf: null, warmup: 0, spin: 0,
   out: null, crf: 18, gif: false, keepOpen: false, quiet: false, encode: 'png',
+  trackOut: null,
 };
 
 function parseArgs(argv) {
@@ -110,6 +112,7 @@ function parseArgs(argv) {
     else if (a.startsWith('--out=')) o.out = a.slice(6);
     else if (a.startsWith('--crf=')) o.crf = parseInt(a.slice(6));
     else if (a.startsWith('--encode=')) o.encode = a.slice(9);
+    else if (a.startsWith('--trackOut=')) o.trackOut = a.slice(11);
     else if (a === '--gif') o.gif = true;
     else if (a === '--quiet') o.quiet = true;
     else if (a === '--keepOpen') o.keepOpen = true;
@@ -343,25 +346,44 @@ async function main() {
     // Tumbling is net ~ arc and both above one. Fluttering is arc >> net.
     // Neither number is read from the QUATERNION, which says only where the
     // plate ended up and reads zero for one that made exactly one turn.
+    //
+    // THE RUNNING PAIR IS KEPT, NOT JUST THE FINAL ONE, for probe-d3-tumble's
+    // reason: `net` WANDERS under flutter -- 0.120 at the end of a run whose
+    // maximum was 0.306 -- so its last value is a sample of a moving quantity
+    // and `netMax` is the number that separates a bounded rock from a turn.
+    // A clip long enough to ask whether the motion is CHAOTIC is asking about
+    // the series, and this run is too expensive to have to repeat under a
+    // different tool to get it. `--trackOut=` writes it.
     const O = [0, 0, 0];
-    let arc = 0;
+    let arc = 0, netMax = 0;
+    const series = [];
     for (let i = 1; i < track.length; i++) {
       const p = track[i - 1], c = track[i], dt = c.step - p.step;
       O[0] += 0.5 * (p.wx + c.wx) * dt;
       O[1] += 0.5 * (p.wy + c.wy) * dt;
       O[2] += 0.5 * (p.wz + c.wz) * dt;
       arc += 0.5 * (Math.hypot(p.wx, p.wy, p.wz) + Math.hypot(c.wx, c.wy, c.wz)) * dt;
+      const n = Math.hypot(...O) / (2 * Math.PI);
+      if (n > netMax) netMax = n;
+      series.push({ ...c, net: n, arc: arc / (2 * Math.PI) });
     }
     const net = Math.hypot(...O) / (2 * Math.PI);
     arc /= 2 * Math.PI;
+    if (o.trackOut) {
+      const cols = ['step', 'net', 'arc', 'cx', 'cy', 'cz', 'dx', 'dy', 'dz',
+                    'vx', 'vy', 'vz', 'wx', 'wy', 'wz', 'qw', 'qx', 'qy', 'qz'];
+      fs.writeFileSync(o.trackOut, cols.join(',') + '\n'
+        + series.map(r => cols.map(k => (Number.isFinite(r[k]) ? r[k] : '')).join(',')).join('\n') + '\n');
+      console.log(`track: ${series.length} rows -> ${o.trackOut}`);
+    }
     console.log(`body: fell ${fell.toFixed(1)} cells, drifted ${across.toFixed(1)} across`);
-    console.log(`      rotation: ${net.toFixed(2)} net revolutions, ${arc.toFixed(2)} of arc`
-      + `  (net/arc ${(net / Math.max(arc, 1e-12)).toFixed(2)})`);
+    console.log(`      rotation: ${net.toFixed(2)} net revolutions (max ${netMax.toFixed(2)}),`
+      + ` ${arc.toFixed(2)} of arc  (net/arc ${(net / Math.max(arc, 1e-12)).toFixed(2)})`);
     console.log(`      v = (${q(z.vx)}, ${q(z.vy)}, ${q(z.vz)})`
       + `  |omega| = ${Math.hypot(z.wx, z.wy, z.wz).toExponential(2)}  step ${z.step}`);
     // "It tumbled" is a claim with a threshold, so it is stated with both
     // numbers beside it rather than asserted.
-    if (net > 0.75 && net / Math.max(arc, 1e-12) > 0.6) {
+    if (netMax > 0.75 && netMax / Math.max(arc, 1e-12) > 0.6) {
       console.log('      TUMBLING: it turned through more than three quarters of a revolution,');
       console.log('      and most of its rotation went one way.');
     } else if (arc > 0.25) {
