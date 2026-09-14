@@ -21,6 +21,7 @@ GPU) and that is what made M4/M5 survivable. Build the 2D equivalent first.
 | # | Finding (3D) | Applies to 2D? | Why it is worth it | Size |
 |---|---|---|---|---|
 | B0 | `d3-amr.mjs` + mutation-checked host tests | **DONE** | `amr2d.mjs` + `amr2d-gpu.mjs`, 34 GPU-free checks; deleted 680 lines of five duplicated checkers | M |
+| B0b | The interface instrument (mass/momentum drift) | **DONE** | `tools/analyze-amr-interface.js`; measured B9 as 93% of the mass channel and the seam at 9.6x the no-interface floor in momentum | M |
 | B1 | Post-collision Dupuis-Chopard `fneq` factor | **yes, a live bug** | 2D uses the pre-collision form on post-collision populations | S (code) / L (re-baseline) |
 | B2 | `cascade21`: 2:1 as ONE closure on the WANT set | **yes** | replaces 3 live balance bugs, an unbounded fixed-point loop, and closes a measured refinement defect on the shipped page | M |
 | B3 | One kernel per stage + a `parent_{dense,pool}` accessor | **yes** | deletes ~1100 lines of near-duplicate WGSL across 6 kernel pairs | M |
@@ -30,7 +31,7 @@ GPU) and that is what made M4/M5 survivable. Build the 2D equivalent first.
 | B6 | Explode/coalesce at the coarse/fine interface | **yes, but measure first** | 2D's interface is not conservative, and nothing in 2D measures that | L |
 | B7 | The diffuse band converges at 2nd order; Richardson it | **yes** | may close the standing `dense-reference`/`amr-N2-diffuse` Cd=1.95-vs-1.35 red cells | S |
 | B8 | `SOLID_EQ` on the bounce-back path | **latent only** | free on every 2D gate (all bounce-back bodies are pinned); disarms a landmine | S |
-| B9 | f32 lattice weights do not sum to 1 | **yes, and 2x worse than recorded** | measured 1 + 1.49e-8, not the 7.45e-9 CLAUDE.md states; a gate whose error grows with run length is measuring a drift | S (code) / L (re-baseline) |
+| B9 | f32 lattice weights do not sum to 1 | **yes, MEASURED in the running solver** | 1 + 1.49e-8, not CLAUDE.md's 7.45e-9; it is 93% of the interface instrument's mass channel, so it BLOCKS any interface mass claim | S (code) / L (re-baseline) |
 
 Sizes are of the *change*, not of the validation. B1, B6 and B9 each move the
 published benchmark surface and `main` **is** the site, so each needs its own
@@ -214,6 +215,67 @@ fast two discretizations diverge. It exists so B1 and B6 have a number.
 
 Each stage is independently mergeable and has its own gate. Stages B1/B6/B9
 move published numbers; B2/B3/B4/B5 must not.
+
+### B0b — DONE (2026-09-14)
+
+`tools/analyze-amr-interface.js`, plus `readConservedTotals` in
+`amr2d-gpu.mjs` and `debugConservedTotals` on `main-tgv-amr.js`. Three rungs
+in one invocation -- none / half / all -- reporting mass and momentum drift
+against the two no-interface controls. Reports; does not PASS/FAIL.
+
+**It changed the ordering of the rest of this plan, on its first run.**
+
+1. **THE MASS CHANNEL IS THE LATTICE, NOT THE INTERFACE. B9 now blocks B6's
+   mass half.** Measured N=128, tau=0.8, 512 steps:
+
+   ```
+   rung  refined   d mass    per cell/step   predicted (B9)   ratio
+   none       0%   1.561e-1     1.861e-8        1.863e-8      0.999
+   half      50%   2.057e-1     2.452e-8        2.286e-8      1.073
+   all      100%   2.271e-1     2.707e-8        2.709e-8      0.999
+   ```
+
+   B9's weight excess, predicted statically, measured directly. `all` costs
+   1.4545x `none` because a refined cell collides TWICE per macro-step at
+   `tau_1 = 2*tau_0 - 1/2` rather than once at `tau_0` -- `(2/1.1)/(1/0.8)`;
+   measured 1.4557. The prediction therefore holds on BOTH paths to 0.1%,
+   which confirms the mechanism, `tauAtLevel` and the substep count at once.
+   The seam's own mass contribution is the **7.3% on the `half` rung, and only
+   there** -- real, but sitting on a floor 13x its size. **Fix B9 before
+   making any interface mass claim.**
+
+2. **The momentum channel is clean and the seam is loud in it.** none
+   5.73e-6, `half` **1.157e-3 = 9.6x the no-interface floor**, all 1.20e-4 --
+   and growing as `step^0.79` rather than settling, which is what says it is a
+   per-step source at the seam rather than a transient from the freeze. So
+   **B1 does not have to wait for B9**: the weight excess is isotropic and
+   cannot move momentum, and `fneq` has no zeroth or first moment so B1's
+   rescale cannot move mass. The two are separable by which channel moves.
+
+3. **A declared `?refine=` ladder is needed after all, and it is B6's.** The
+   `half` rung's 128-of-256 blocks is the POOL CAP, not an answer the
+   criterion gave: slots are granted in blockID order, the free list dries up
+   part-way, and the denied blocks form a band. Reproducible and usable, but
+   emergent and jagged rather than declared -- and B6 needs a FLAT seam
+   (3D's `?refine=slab`) as the control that separates a correction bug from a
+   convex corner. The tool flags a rung sitting at its cap rather than
+   reporting the count as geometry.
+
+**One trap worth carrying, because any tool here can hit it.**
+`debugStepSync(n)` runs in `STEPS_PER_FRAME = 64` batches and **rounds up**,
+so asking for 16 runs 64. A first version normalized by the REQUEST, and a
+ladder of deltas 16/16/32/64/128 actually ran 384 steps while being labelled
+256 -- the mass channel then read exactly **1.500x** its predicted floor on
+every rung, which looks like a real 50% excess and is entirely the ladder.
+Normalize by the step count the PAGE reports, never by the request.
+
+**And one pre-existing defect found in passing, not fixed here:**
+`index-tgv-amr.html?levels=1` never finishes init -- `#status` sits at
+"initializing...". `resetSim` dereferences `pools[1]` unconditionally while
+the allocation loop runs zero times at `N_LEVELS = 1`. It fails silently
+rather than with `error:`, so `validate-all.js`'s boot smoke would not catch
+it even if a levels=1 config existed. Belongs with B4's "refuse rather than
+degrade" work.
 
 ### B1 — the post-collision Dupuis-Chopard factor
 
@@ -719,8 +781,8 @@ current).
 ## 5. Ordering
 
 ```
-B0   host module + mutation-checked tests        ──┐
-B0b  interface instrument (mass/momentum drift)  ──┤ prerequisites
+B0   host module + mutation-checked tests        ──┐ DONE
+B0b  interface instrument (mass/momentum drift)  ──┤ DONE
                                                    │
 B3a  JS duplication sweep                        ──┤ (blocks B3 and B4)
                                                    │
@@ -729,13 +791,18 @@ B4   finest-level-only + hard failure            ◄──┘  (smallest, proves
                                                       coverage extraction first)
 B7   chi band ladder                                  (independent, cheap)
 B8   SOLID_EQ                                         (independent, free)
-B2   cascade21                                    ◄── needs B0
-B3   kernel unification, manage LAST               ◄── needs B2 and B3a
-B5   window = sponge translation                   ◄── independent of B2/B3,
-                                                       but smaller after B3
-B1   post-collision rescale                        ◄── needs B0b
-B9   lattice weights                                   (independent; re-baseline)
-B6   explode/coalesce                              ◄── needs B0b, B1, B3, B4
+B9   lattice weights                               ◄── MOVED UP: B0b measured it
+                                                       as 93% of the interface
+                                                       instrument's mass channel
+B2   cascade21                                     ◄── needs B0
+B3   kernel unification, manage LAST                ◄── needs B2 and B3a
+B5   window = sponge translation                    ◄── independent of B2/B3,
+                                                        but smaller after B3
+B1   post-collision rescale                         ◄── needs B0b only; its
+                                                        channel is MOMENTUM, so
+                                                        it does not wait for B9
+B6   explode/coalesce                               ◄── needs B0b, B1, B3, B4,
+                                                        and B9 for its mass half
 ```
 
 B4, B7 and B8 are deliberately first among the real changes: each is small,
