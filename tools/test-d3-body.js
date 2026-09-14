@@ -342,6 +342,28 @@ const close = (a, b, tol, what) =>
     close(s.v[0] / s.v[1], 0.3 / 0.4, 1e-12, 'direction unchanged by the clamp');
   });
 
+  ok('planar: v_z and the cross-span angular momentum stay exactly zero under any load', () => {
+    // The spanwise-periodic strip's symmetry (d3-scenarios.mjs `spanfill`).
+    // A projection, so the in-plane dynamics are untouched: the x, y and L_z
+    // components must equal the unconstrained step's, exactly.
+    const shape = { kind: SHAPE.ROUNDBOX, a: 16, b: 40, c: 2, r: 0 };
+    let s = makeBodyState({ shape, x: [0, 0, 0], q: qFromAxisAngle([1, 1, 1], 2 * Math.PI / 3), density: 2.7 });
+    let u = s;
+    for (let i = 0; i < 50; i++) {
+      const force = [Math.sin(i), Math.cos(2 * i), 0.7 * Math.sin(3 * i)];
+      const torque = [0.2 * Math.cos(i), 0.1 * Math.sin(i), 0.05 * Math.cos(4 * i)];
+      s = stepFreeBody(s, { force, torque, gravity: [1e-3, 0, 0], planar: true });
+      u = stepFreeBody(u, { force: [force[0], force[1], 0], torque: [0, 0, torque[2]], gravity: [1e-3, 0, 0] });
+      assert.strictEqual(s.v[2], 0, 'v_z');
+      assert.strictEqual(s.L[0], 0, 'L_x'); assert.strictEqual(s.L[1], 0, 'L_y');
+      assert.strictEqual(s.omega[0], 0, 'omega_x'); assert.strictEqual(s.omega[1], 0, 'omega_y');
+    }
+    // Same as a body that was only ever loaded in the plane.
+    close(s.v[0], u.v[0], 1e-15, 'v_x'); close(s.v[1], u.v[1], 1e-15, 'v_y');
+    close(s.L[2], u.L[2], 1e-15, 'L_z');
+    for (let k = 0; k < 4; k++) close(s.q[k], u.q[k], 1e-12, `q[${k}]`);
+  });
+
   if (!process.exitCode) console.log(`\n${pass} check(s) passed`);
   else console.log('\nFAILED');
 })();

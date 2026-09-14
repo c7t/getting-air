@@ -144,6 +144,15 @@ fn coveredByChild(g: vec3<i32>) -> bool {
 }
 
 override SPONGE_W : f32 = 0.0f;
+// Per-axis mask on the band: 0 turns the sponge OFF on that axis's two
+// faces. The spanwise-periodic strip (d3-scenarios.mjs card `spanfill`)
+// needs it, because a strip filling a periodic z has no far field in z at
+// all -- a band there relaxes the strip's OWN near fluid to rest and the
+// plate stops falling (measured: v_x pinned at 0.001 against 0.03). Default
+// 1 on every axis, which is what every scenario before it ran.
+override SPONGE_AX : u32 = 1u;
+override SPONGE_AY : u32 = 1u;
+override SPONGE_AZ : u32 = 1u;
 override SPONGE_UX : f32 = 0.0f;
 override SPONGE_UY : f32 = 0.0f;
 override SPONGE_UZ : f32 = 0.0f;
@@ -352,9 +361,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   // winCoord is the identity without a window.
   let wp = winCoord(p, winOffset(vec3<f32>(body.cx, body.cy, body.cz)));
   let spongeW = spongeWeight3(
-    min(wp.x, f32(NX - 1u) - wp.x),
-    min(wp.y, f32(NY - 1u) - wp.y),
-    min(wp.z, f32(NZ - 1u) - wp.z), SPONGE_W);
+    select(1e30f, min(wp.x, f32(NX - 1u) - wp.x), SPONGE_AX != 0u),
+    select(1e30f, min(wp.y, f32(NY - 1u) - wp.y), SPONGE_AY != 0u),
+    select(1e30f, min(wp.z, f32(NZ - 1u) - wp.z), SPONGE_AZ != 0u), SPONGE_W);
 
   // A ring cell advects and stores; see COLLIDE_RING.
   if (COLLIDE_RING == 0u && !isInterior3(fi)) {

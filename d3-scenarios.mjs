@@ -703,8 +703,33 @@ SCENARIOS.fall = {
 SCENARIOS.card = {
   name: 'card',
   defaults: { n: 32, aspect: 0.125, span: 1, re: 500, u_t: 0.05, i_star: 0.17,
-              tilt: 0.15, perturb: 0, seed: 12345, tow: 0, stream: 0 },
+              tilt: 0.15, perturb: 0, seed: 12345, tow: 0, stream: 0, spanfill: 0 },
   walls: [],
+  // THE SPANWISE-PERIODIC PLATE (`spanfill=1`, plans/3D.md M6.5 avenue 2).
+  // Pesavento & Wang's card is a SECTION of an infinite strip: no tips, no
+  // tip vortices, and a dimensionless moment of inertia defined per unit
+  // span. A finite plate is a different body -- Field et al. (1997) put a 3D
+  // disk of this project's I* (0.17 in the paper's units is ~0.017 in the
+  // disk definition) in the fluttering/chaotic band, not the tumbling one,
+  // and the six-lever sweep of M6.5 measured exactly that (flutter, glide,
+  // never a turn). The domain is already periodic on every axis, so the
+  // infinite strip costs nothing: the plate's span is made to FILL z, with a
+  // pad past the periodic seam so an unwrapped neighbour position (the step
+  // kernel evaluates `get_phi3` at `z - ez` BEFORE wrapping) reads inside
+  // exactly when its wrapped cell does. `span` then sets the z extent in
+  // chords -- the spanwise room the wake has to develop a 3D mode in -- and
+  // the lateral width is 8n, the 2D card's own BLOCKAGE = 8 (12.5%), because
+  // this leg exists to be compared with the 2D result and not with the
+  // free-fall box's 5%. The body is PLANAR by symmetry: an infinite strip
+  // cannot translate along its span or turn about a cross-span axis, so the
+  // integrator is told to forbid both (d3-body.mjs `planar`), which is also
+  // what keeps the pad from ever leaving the seam.
+  //
+  // This is the decisive test of the fork against the paper: a strip at
+  // I* = 0.17, Re = 1100 that does not tumble says the solver is wrong; one
+  // that does, while the finite plate flutters, says the finite plate's
+  // fluttering is physics.
+  spanfillZ: (p) => Math.round(Math.max(1, p.span) * p.n),
   // Long in the fall direction, and WIDE ACROSS IT, which is where this
   // differs from `fall`. A tumbling plate does not fall straight: it
   // translates along the direction it is turning, at a speed comparable to
@@ -723,6 +748,7 @@ SCENARIOS.card = {
   dims: (p) => {
     const { n, span } = p;
     const prescribed = (p.tow || 0) !== 0 || (p.stream || 0) !== 0;
+    if (p.spanfill) return [Math.round(6 * n), Math.round(8 * n), SCENARIOS.card.spanfillZ(p)];
     return prescribed
       ? [Math.round(8 * n), Math.round(8 * n),
          Math.round(Math.max(8 * n, 2 * span * n + 6 * n))]
@@ -735,8 +761,14 @@ SCENARIOS.card = {
     // (x, y, z) -- principalInertia's ROUNDBOX case is stated in exactly
     // those axes, so naming them any other way would put the plate's large
     // moment on the wrong axis and the tumble would be about the wrong one.
+    const spanfill = !!p.spanfill;
+    // The pad: 2 cells past the seam on each side. Any value > 0.5 makes the
+    // unwrapped-neighbour test agree with the wrapped cell; 2 leaves a cell
+    // of slack for the chi band's own reach.
+    const SPANFILL_PAD = 2;
     const a = n / 2;                       // semi-chord
-    const b = span * n / 2;                // semi-span
+    const b = spanfill ? SCENARIOS.card.spanfillZ(p) / 2 + SPANFILL_PAD
+                       : span * n / 2;    // semi-span
     const c = aspect * n / 2;              // semi-thickness
     // Re on the CHORD, the paper's convention: Re = 2 u_t a / nu.
     const nu = 2 * u_t * a / re;
@@ -759,8 +791,12 @@ SCENARIOS.card = {
     // balance written two ways: card-params.mjs ends at G_EFF = U_T^2/(pi t rho_b)
     // and this is U_T^2 Cd/(4 t rho_b), i.e. 1.1/4 = 0.275 against 1/pi = 0.318.
     const cd = 1.1;
-    const area = 4 * a * b;
-    const gEff = u_t * u_t * cd * area / (2 * rho_b * V);
+    // The frontal area INSIDE the domain: for the periodic strip that is the
+    // z extent, not the padded half-extent, and it is what blockage and any
+    // Cd are normalized by. gEff is unchanged by the pad because area and V
+    // scale together in b -- it is u_t^2 cd / (4 c rho_b) either way.
+    const area = spanfill ? 4 * a * (SCENARIOS.card.spanfillZ(p) / 2) : 4 * a * b;
+    const gEff = u_t * u_t * cd * (4 * a * b) / (2 * rho_b * V);
     const d = SCENARIOS.card.dims(p);
     // ORIENTATION, and it is the only fiddly part.
     //
@@ -839,8 +875,15 @@ SCENARIOS.card = {
       // down it, so an x-only window loses it sideways. A PINNED plate has
       // nothing for a window to follow; a towed one travels on x alone,
       // because it is on rails and cannot turn.
-      window: prescribed ? (towed ? [1, 0, 0] : [0, 0, 0]) : [1, 1, 1],
-      sponge: { width: Math.max(6, Math.round(n / 2)), u: [p.stream, 0, 0] },
+      window: prescribed ? (towed ? [1, 0, 0] : [0, 0, 0]) : (spanfill ? [1, 1, 0] : [1, 1, 1]),
+      // The integrator's symmetry constraint for the periodic strip; see the
+      // spanfill note above. Inert for every other leg.
+      planar: spanfill,
+      spanfill,
+      // No band on the periodic span axis of the strip: there is no far
+      // field there to relax toward (common_d3_step.wgsl SPONGE_AX).
+      sponge: { width: Math.max(6, Math.round(n / 2)), u: [p.stream, 0, 0],
+                axes: spanfill ? [1, 1, 0] : [1, 1, 1] },
       force: [0, 0, 0],
       blockage: area / (d[1] * d[2]),
       tSettle: u_t / gEff,

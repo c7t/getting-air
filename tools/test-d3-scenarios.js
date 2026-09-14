@@ -77,6 +77,7 @@ const close = (a, b, tol, what) =>
 (async () => {
   const root = path.join(__dirname, '..');
   const S = await import(path.join(root, 'd3-scenarios.mjs'));
+  const B = await import(path.join(root, 'd3-body.mjs'));
   const {
     CS2, nuFromTau, tauFromNu, ductCoord, ductVelocityAt, ductPeakCoeff, ductForceForPeak,
     ductProfile, ductSettleTime, beltramiK, beltramiDecayTime, beltramiVelocityAt,
@@ -531,6 +532,26 @@ const close = (a, b, tol, what) =>
     close(leg.aspect * leg.n / 2, 1.5, 1e-12, 'this case exists for the half-integer');
     assert.strictEqual(solidSpan(leg.body.x[0], 1.5, leg.dims[0]), 3, 'thickness must be 2c = 3 cells');
     assert.strictEqual(solidSpan(leg.body.x[1], 12, leg.dims[1]), 24, 'chord must be 2a = 24 cells');
+  });
+
+  ok('card spanfill: the strip fills z, reads inside past the seam, and is planar', () => {
+    const leg = resolveScenario('card', { n: 16, span: 2, spanfill: 1 });
+    assert.deepStrictEqual(leg.dims, [96, 128, 32], 'dims [6n, 8n, span n]');
+    assert.strictEqual(leg.planar, true, 'planar');
+    assert.deepStrictEqual(leg.window, [1, 1, 0], 'no window on the periodic span axis');
+    close(leg.blockage, 1 / 8, 1e-12, 'the 2D card\'s BLOCKAGE = 8');
+    // Every cell along z on the plate's mid-line is solid, and so is the
+    // UNWRAPPED neighbour one past either seam -- which is what the step
+    // kernel's `get_phi3(z - ez)` sees before the index wraps.
+    const q = leg.body.q, x = leg.body.x;
+    const phiAt = (z) => B.sdfBody(B.qRotateInv(q, [0, 0, z - x[2]]), leg.body.shape);
+    for (let z = -1; z <= leg.dims[2]; z++) assert.ok(phiAt(z) < 0, `z = ${z} must be inside, phi = ${phiAt(z)}`);
+    // And the same n at span 1 is the unfilled plate's chord-square, so the
+    // knob changes nothing but the span.
+    const plain = resolveScenario('card', { n: 16, span: 2 });
+    close(leg.body.shape.a, plain.body.shape.a, 0, 'chord'); close(leg.body.shape.c, plain.body.shape.c, 0, 'thickness');
+    close(leg.gEff, plain.gEff, 1e-15, 'g_eff is span-independent, pad included');
+    assert.ok(!plain.planar && plain.window[2] === 1, 'the unfilled card is unchanged');
   });
 
   ok('card: a free fall and a tilted leg are NOT snapped', () => {

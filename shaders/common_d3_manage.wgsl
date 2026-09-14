@@ -142,6 +142,8 @@ override MARGIN : f32 = 2.0f;
 // manager refines AHEAD by however far the body can travel in that time --
 // see blockWanted. 1 makes the lead term vanish.
 override MANAGE_EVERY : f32 = 1.0f;
+// The strip's planar symmetry, for the lead below; see d3_physics.wgsl.
+override PLANAR : u32 = 0u;
 // The body's own radius is baked into get_phi3, so the criterion needs
 // nothing else about the shape.
 override HAS_BODY : u32 = 0u;
@@ -286,9 +288,13 @@ fn blockWanted(b: vec3<u32>) -> bool {
   // It costs nothing where it did not apply: |omega| ~ 1e-4 on the falling
   // sphere at R = 6 makes the term 0.01 cells against a margin of 2-3, so
   // every existing sphere case is unmoved.
+  // Under PLANAR (the spanwise-periodic strip) the body turns about its
+  // span only, so the surface speed bound is |omega| times the IN-PLANE
+  // radius sqrt(a^2 + c^2); the full circumradius would be half the domain
+  // and would refine the whole slab the moment the plate began to turn.
+  let radius = select(bodyCircumradius3(body), length(vec2<f32>(body.a, body.c)), PLANAR != 0u);
   let lead = MANAGE_EVERY * (length(vec3<f32>(body.vx, body.vy, body.vz))
-                             + length(vec3<f32>(body.wx, body.wy, body.wz))
-                               * bodyCircumradius3(body));
+                             + length(vec3<f32>(body.wx, body.wy, body.wz)) * radius);
   let reach = MARGIN + lead;
   let lo = vec3<f32>(b * RB) * BOX_SCALE;
   let half = 0.5f * f32(RB) * BOX_SCALE;

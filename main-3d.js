@@ -1025,6 +1025,10 @@ async function init() {
   const RHO_W_LOCAL = urlParams.get('rhow') === '0' ? 0 : 1;
   const CHI_EPS = numParam('chiEps', 1.5);
   const sponge = params.sponge || { width: 0, u: [0, 0, 0] };
+  // Per-axis sponge mask (see common_d3_step.wgsl's SPONGE_AX). A scenario
+  // that says nothing gets the band on every face, as before.
+  const spongeAxes = sponge.axes || [1, 1, 1];
+  const SPONGE_AXES = { SPONGE_AX: spongeAxes[0] ? 1 : 0, SPONGE_AY: spongeAxes[1] ? 1 : 0, SPONGE_AZ: spongeAxes[2] ? 1 : 0 };
   const stepConstants = {
     ...dims, WGX: WG[0], WGY: WG[1], WGZ: WG[2],
     OMEGA: 1 / params.tau,
@@ -1033,7 +1037,7 @@ async function init() {
     WALL_Y: params.walls.includes('y') ? 1 : 0,
     WALL_Z: params.walls.includes('z') ? 1 : 0,
     HAS_BODY, USE_BOUNCEBACK, CHI_EPS, SOLID_EQ, RHO_W_LOCAL, ...WINC,
-    SPONGE_W: sponge.width, SPONGE_UX: sponge.u[0], SPONGE_UY: sponge.u[1], SPONGE_UZ: sponge.u[2],
+    SPONGE_W: sponge.width, SPONGE_UX: sponge.u[0], SPONGE_UY: sponge.u[1], SPONGE_UZ: sponge.u[2], ...SPONGE_AXES,
     // M4.1a: skip cells a refined block covers. Folds out entirely when
     // there is no pool.
     HAS_POOL: AMR ? 1 : 0,
@@ -1062,6 +1066,7 @@ async function init() {
       GY: (params.gravity || [0, 0, 0])[1],
       GZ: (params.gravity || [0, 0, 0])[2],
       NO_FLUID_FORCE: params.noFluidForce ? 1 : 0,
+      PLANAR: params.planar ? 1 : 0,
       ...WINC,
     } },
   }) : null;
@@ -1392,7 +1397,7 @@ async function init() {
       OMEGA_FINE: 1 / TAU_FINE,
       FORCE_X: params.force[0], FORCE_Y: params.force[1], FORCE_Z: params.force[2],
       HAS_BODY, USE_BOUNCEBACK, CHI_EPS, SOLID_EQ, RHO_W_LOCAL, ...WINC,
-      SPONGE_W: sponge.width, SPONGE_UX: sponge.u[0], SPONGE_UY: sponge.u[1], SPONGE_UZ: sponge.u[2],
+      SPONGE_W: sponge.width, SPONGE_UX: sponge.u[0], SPONGE_UY: sponge.u[1], SPONGE_UZ: sponge.u[2], ...SPONGE_AXES,
     });
     avgPipe = await mk(avgBGL, avgModule, { ...poolConst, TAU_COARSE, DC_PRE });
     // A level's `mac` from its own `f`. ONE pipeline for every level: the
@@ -1453,7 +1458,7 @@ async function init() {
       // static set, not from a second read of ?margin=: the bit-identical
       // gate needs the two criteria to agree exactly, and two independent
       // parses of one parameter is how they would silently stop agreeing.
-      const manageConst = { ...poolConst, HAS_BODY, ...WINC,
+      const manageConst = { ...poolConst, HAS_BODY, ...WINC, PLANAR: params.planar ? 1 : 0,
         // OFF unless ?qthresh= was given, at which point Q_ABS folds the
         // whole field test out at pipeline-creation time and every scenario
         // that predates M8.4 is bit-identical.
@@ -1714,7 +1719,7 @@ async function init() {
           OMEGA_FINE: 1 / tauAtLevel(m),
           FORCE_X: params.force[0], FORCE_Y: params.force[1], FORCE_Z: params.force[2],
           HAS_BODY, USE_BOUNCEBACK, CHI_EPS, SOLID_EQ, RHO_W_LOCAL, ...WINC,
-          SPONGE_W: sponge.width, SPONGE_UX: sponge.u[0], SPONGE_UY: sponge.u[1], SPONGE_UZ: sponge.u[2],
+          SPONGE_W: sponge.width, SPONGE_UX: sponge.u[0], SPONGE_UY: sponge.u[1], SPONGE_UZ: sponge.u[2], ...SPONGE_AXES,
         });
         // Explode reads the parent buffer holding time t -- the one the
         // parent's own upcoming substep will READ -- and writes the ring of
@@ -4367,8 +4372,11 @@ async function init() {
     // Translation AND rotation, the same bound common_d3_manage.wgsl's
     // blockWanted applies -- see its comment for why |omega| * circumradius is
     // the right term and why it is a bound rather than 2D's extrapolated pose.
+    // In-plane radius under `planar`, as common_d3_manage.wgsl's lead.
+    const radius = params.planar ? Math.hypot(params.body.shape.a, params.body.shape.c)
+                                 : bodyCircumradius(params.body.shape);
     const lead = MANAGE_EVERY * (Math.hypot(b.vx, b.vy, b.vz)
-      + Math.hypot(b.wx, b.wy, b.wz) * bodyCircumradius(params.body.shape));
+      + Math.hypot(b.wx, b.wy, b.wz) * radius);
     const host = refineHierarchy(pool, {
       levels: LEVELS,
       want: nearBodyWant(geomForced.sdfAt([b.cx, b.cy, b.cz], [b.qw, b.qx, b.qy, b.qz]), margin + lead) });

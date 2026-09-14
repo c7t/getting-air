@@ -236,12 +236,17 @@ export function rotationalEnergy(q, ibody, L) {
 // `wrap` is the moving window's per-axis domain size, 0 on an axis with no
 // window -- see d3-window.mjs. Default [0,0,0], so this is the unwindowed
 // integrator it always was, bit for bit.
-export function stepFreeBody(s, { force = [0, 0, 0], torque = [0, 0, 0], gravity = [0, 0, 0], dt = 1, vMax = Infinity, oMax = Infinity, wrap = [0, 0, 0] } = {}) {
+// `planar` (d3-scenarios.mjs's spanwise-periodic card) is a SYMMETRY
+// constraint, not a limiter: an infinite strip along z cannot translate along
+// z or turn about a cross-span axis, so v_z and L_x, L_y are held at zero
+// AFTER the force is applied. Not a clamp on magnitude -- a projection onto
+// the plane -- and mirrored in shaders/d3_physics.wgsl (PLANAR).
+export function stepFreeBody(s, { force = [0, 0, 0], torque = [0, 0, 0], gravity = [0, 0, 0], dt = 1, vMax = Infinity, oMax = Infinity, wrap = [0, 0, 0], planar = false } = {}) {
   const m = s.mass;
   let v = [
     s.v[0] + dt * (force[0] / m + gravity[0]),
     s.v[1] + dt * (force[1] / m + gravity[1]),
-    s.v[2] + dt * (force[2] / m + gravity[2]),
+    planar ? 0 : s.v[2] + dt * (force[2] / m + gravity[2]),
   ];
   // MAGNITUDE clamps, matching d3_physics.wgsl -- clamping components
   // independently would change the vector's direction, which is a limiter
@@ -249,7 +254,8 @@ export function stepFreeBody(s, { force = [0, 0, 0], torque = [0, 0, 0], gravity
   // blowup. Both are no-ops at the default Infinity.
   const vmag = Math.hypot(...v);
   if (vmag > vMax) v = v.map(c => c * (vMax / vmag));
-  let L = [s.L[0] + dt * torque[0], s.L[1] + dt * torque[1], s.L[2] + dt * torque[2]];
+  let L = planar ? [0, 0, s.L[2] + dt * torque[2]]
+                 : [s.L[0] + dt * torque[0], s.L[1] + dt * torque[1], s.L[2] + dt * torque[2]];
   // Position, wrapped into the buffer on every windowed axis (M8.3), with
   // the running DISPLACEMENT accumulated before the wrap -- it is the one
   // consumer that wants the unwrapped answer, and it is reporting only.
@@ -280,10 +286,17 @@ export function stepFreeBody(s, { force = [0, 0, 0], torque = [0, 0, 0], gravity
   // `q + (dt/2) w_quat q`) is used for each partial rotation: unit-norm by
   // construction, and exact for a constant omega over its interval.
   let w = omegaFromL(s.q, s.ibody, L);
+  // Under `planar` the strip's span axis is world z, so I_world^-1 maps a
+  // z-only L to a z-only omega only if the span is a principal axis in
+  // world coordinates -- true by construction for a plate whose span stays
+  // along z, which the constraint itself guarantees. Project anyway, so a
+  // round-off tilt of the span cannot feed a cross-span rotation back in.
+  if (planar) w = [0, 0, w[2]];
   const wmag = Math.hypot(...w);
   if (wmag > oMax) { const k = oMax / wmag; w = w.map(c => c * k); L = L.map(c => c * k); }
   const qHalf = qNormalize(qMul(expMap(w, dt / 2), s.q));
-  const wHalf = omegaFromL(qHalf, s.ibody, L);
+  let wHalf = omegaFromL(qHalf, s.ibody, L);
+  if (planar) wHalf = [0, 0, wHalf[2]];
   const q = qNormalize(qMul(expMap(wHalf, dt), s.q));
   return { ...s, x, v, q, L, d, omega: wHalf };
 }

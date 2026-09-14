@@ -48,6 +48,11 @@ override GZ : f32 = 0.0f;
 // fluid coupling in the way. Default 0 = normal coupled operation.
 override NO_FLUID_FORCE : u32 = 0u;
 
+// The spanwise-periodic strip's symmetry (d3-scenarios.mjs card `spanfill`,
+// d3-body.mjs `planar`): no translation along z, rotation about z only.
+// A projection applied after the force, not a magnitude clamp. Default 0.
+override PLANAR : u32 = 0u;
+
 @compute @workgroup_size(1)
 fn main() {
   // Drain the accumulated impulse regardless of what is done with it --
@@ -82,6 +87,7 @@ fn main() {
   // 2D was a limiter on a runaway and in 3D would silently steer a tumbling
   // body. These limiters exist to contain a blowup, not to shape the
   // trajectory, so they must not rotate anything.
+  if (PLANAR != 0u) { v.z = 0f; }
   let vmag = length(v);
   if (vmag > body.v_max) { v = v * (body.v_max / vmag); }
 
@@ -92,7 +98,9 @@ fn main() {
   // ill-conditioned inverse for a very anisotropic plate (Iz/Ix is large at
   // the falling card's aspect ratio).
   var Ln = vec3<f32>(body.Lx, body.Ly, body.Lz) + torque;
+  if (PLANAR != 0u) { Ln.x = 0f; Ln.y = 0f; }
   var w = omegaFromL(q, body, Ln);
+  if (PLANAR != 0u) { w.x = 0f; w.y = 0f; }
   // Magnitude clamp again, and applied to L as well as omega -- L is the
   // integrated state here, so clamping only the derived omega would leave
   // the two inconsistent and the limiter would do nothing that persists.
@@ -122,7 +130,8 @@ fn main() {
   // first-order tangent step `q + (dt/2) w_quat q` -- unit-norm by
   // construction and exact for a constant omega over its interval.
   let qHalf = normalize(qMul(expMapQ(w, 0.5f), q));
-  let wHalf = omegaFromL(qHalf, body, Ln);
+  var wHalf = omegaFromL(qHalf, body, Ln);
+  if (PLANAR != 0u) { wHalf.x = 0f; wHalf.y = 0f; }
   let qn = normalize(qMul(expMapQ(wHalf, 1.0f), q));
 
   // 4. Position, WRAPPED INTO THE BUFFER on every axis the moving window is
