@@ -26,7 +26,7 @@ GPU) and that is what made M4/M5 survivable. Build the 2D equivalent first.
 | B2 | `cascade21`: 2:1 as ONE closure on the WANT set | **yes** | replaces 3 live balance bugs, an unbounded fixed-point loop, and closes a measured refinement defect on the shipped page | M |
 | B3 | One kernel per stage + a `parent_{dense,pool}` accessor | **yes** | deletes ~1100 lines of near-duplicate WGSL across 6 kernel pairs | M |
 | B3a | The same sweep in JS: the AMR pages duplicate each other | **largely DONE** | duplication outside `init`/`frame` 3,319 → 2,419 lines; byte-identical 1,129 → 613. Found a stranded comment and two always-true gates on the way | M |
-| B4 | The body lives entirely on the finest level | **yes, already true** | makes finest-wins masking in 3 force kernels provably dead code | S |
+| B4 | The body lives entirely on the finest level | **in progress** | B4-1 (the coverage gate) and B4-2 (the box predicate) DONE; the masking deletion and the refusals remain | S |
 | B5 | The window is a translation of the SPONGE | **half already true in 2D AMR, not in `main.js`** | removes window bookkeeping from 5 hot kernels; retires `card-total.mjs`'s problem | M |
 | B6 | Explode/coalesce at the coarse/fine interface | **yes, but measure first** | 2D's interface is not conservative, and nothing in 2D measures that | L |
 | B7 | The diffuse band converges at 2nd order; Richardson it | **yes** | may close the standing `dense-reference`/`amr-N2-diffuse` Cd=1.95-vs-1.35 red cells | S |
@@ -637,6 +637,66 @@ refusals (margin vs. stencil reach; a body with AMR and no geometry-forced
 refinement), and pool exhaustion latched as `error:` instead of degrading
 silently.
 
+### B4-2 — the box predicate — DONE (2026-09-14)
+
+Both managers' geometry test is now `nearBodyBox` (`shaders/common_geometry.wgsl`,
+the WGSL twin of `amr2d.mjs`'s `nearBodyWant`), the `u32()` window truncation
+is gone, `paramsForChildLevel`'s `childLevel===2` margin special case is
+retired, and `?boxrefine=0` keeps the old test in the same build.
+
+**The two halves are ONE change, and trying to stage them proved it.** Fixing
+the test while keeping the margin slack that existed to compensate for the
+broken test SATURATED level 2's pool — 128/128, `MAX_FINE_BLOCKS` — so
+geometry-forced refinement was being silently refused. Two safety factors for
+one hazard is worse than either. Measured at `?levels=3&bounceback`, 8192
+steps, with `debugForceBreakdown` reading the coarser levels' own force passes
+(they must be **exactly zero**, which is the sharp form of "the body lives
+entirely on the finest level"):
+
+```
+predicate  margin2   L1 tiles  L2 tiles   L0 force   L1 force
+centre        8         51        64        0.0000    0.0000     before
+BOX           8         67       128 (!)    0.0000    0.0000
+BOX           4         52        64        0.0000    0.0000     now
+```
+
+The box test at the honest margin reproduces the centre test at the inflated
+one, tile for tile. That is B4's claim demonstrated rather than argued.
+
+**Three things worth carrying forward.**
+
+1. **`debugForceBreakdown` is the instrument for B4's remaining work, not
+   Cd.** "Every coarser level's force pass integrates to exactly zero" is a
+   direct, unambiguous statement of the premise the masking deletion rests on;
+   Cd is a time-averaged surface integral that would absorb a small violation
+   without comment. Same lesson CLAUDE.md already records for precision work
+   (the analytic gates, not Cd/St) — it generalizes.
+
+2. **`?levels=4` IS BROKEN, and this is the first thing to say so
+   concretely.** At `levels=4&bounceback`: coverage reports 20 violations,
+   level 3 sits at 128/128, and `debugForceBreakdown` reads L2 fx=-2.33
+   against L3 fx=+2.26 — large cancelling contributions, i.e. exactly the
+   "body-adjacent block computing its force at a coarser level than the build
+   is configured for" pathology the coverage check exists to catch.
+   Consistent with `main-cylinder-amr.js`'s own "N_LEVELS>=4 is untested"
+   note. **B4's refuse-rather-than-degrade item now has a live reproducer**,
+   which is worth more than the refusal itself: it means the latch can be
+   tested by something other than a deliberately under-provisioned pool.
+
+3. **A `?flag=0` control restores a TEST, not a CONFIGURATION, and the
+   difference has to be written on the flag.** `?boxrefine=0` alone leaves the
+   retired margin special case retired, so the full pre-B4 leg is
+   `?boxrefine=0&forceRefineMargin2=8`. Every remaining stage here ships this
+   shape of control (`?dcpre=1`, `?window=`, `?solideq=0`); each should say
+   what its `0` does and does not restore, or an A/B measured a year from now
+   will quietly compare two things that differ in three ways.
+
+**And `validate-all` now prints Cd/St on PASS** — the gap 46157cd closed for
+the analytic gates was still open on the cylinder path, so the numbers were
+computed and discarded unless a config was already red. None of the table
+above would have been visible otherwise, and every remaining stage that moves
+the refined region needs it.
+
 ### B4 — the body lives entirely on the finest level
 
 **2D already asserts this** — `debugCheckGeometryCoverage`: every leaf tile
@@ -965,8 +1025,13 @@ B3a  JS duplication sweep                        ──┤ LARGELY DONE
 B4-1 the coverage gate itself                    ──┤ DONE (it was never
                                                    │  three copies -- it had
                                                    │  to be WRITTEN)
+B4-2 the box predicate + the margin slack         ──┤ DONE (one change, not
+                                                   │  two -- see B4-2)
                                                    │
-B4   finest-level-only + hard failure            ◄──┘  (smallest, proves B0)
+B4   finest-level-only + hard failure            ◄──┘  (smallest, proves B0;
+                                                      ?levels=4 is now a live
+                                                      reproducer for the
+                                                      refusal half)
 B7   chi band ladder                                  (independent, cheap)
 B8   SOLID_EQ                                         (independent, free)
 B9   lattice weights                                   DONE -- unblocked B6's
