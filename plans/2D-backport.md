@@ -575,6 +575,68 @@ B3a-4  two always-true geometry-coverage stubs   -15
 `debugReadPool`, `debugReadDiag`. `debugSnapshotSave` is 3 copies in 3
 variants and should wait for B2/B3, which move the snapshot's shape anyway.
 
+### B4-1 — the coverage gate — DONE (2026-09-14)
+
+B3a's finding #3 said B4 had to WRITE a geometry-coverage check for the two
+pages that move a body, not just change the predicate in an existing one.
+Done: `ellipsePhi`/`bodyPhiL0`/`bufferToWindow` in `amr2d.mjs`,
+`checkGeometryCoverageOnGPU` + `readCardState` in `amr2d-gpu.mjs`, six more
+mutation-scored checks in `tools/test-amr2d.js`, and the check now live on
+`main-amr.js`, `main-reentry-amr.js` and `main-cylinder-amr.js`. The
+predicate is an ARGUMENT and still defaults to the kernel's centre sample, so
+B4-2 flips both sides together.
+
+**Three things it changed about the rest of B4.**
+
+1. **THE LOOKAHEAD IS NOT PART OF THE CONSTRAINT.** The check fired on the
+   first moving body it saw — 2 violations at step 1024 of `index-amr.html` —
+   and it was the checker that was wrong. `FORCE_REFINE_LOOKAHEAD` is the
+   kernel's MECHANISM, not the requirement: the manager decides every
+   `REFINE_EVERY` steps, so at t0 it covers `[t0, t0+LOOKAHEAD]` and thereby
+   keeps the *now*-condition true until `t0 + REFINE_EVERY`. A checker that
+   also applies the lookahead asks about a window the last decision was never
+   responsible for, and reports the leading edge of a moving body as a
+   violation on a correct run. **A pinned body cannot show this** (v = omega =
+   0 makes the future pose the current one), which is why the only existing
+   implementation had it backwards and nothing noticed. B4's own text already
+   says the refine-ahead framing is the criterion's job — this is the other
+   half of that sentence, and it belongs in the checker's header, not in a
+   commit message.
+
+2. **THE OLD CHECK HAD ALREADY DRIFTED, in the direction its own header
+   denied.** It was defended as "an INDEPENDENT re-derivation to catch drift
+   in the shader's version". Its `get_phi` computed the superseded ALGEBRAIC
+   distance `(hypot(lx/a, ly/b) - 1) * b`, which `common_geometry.wgsl`
+   replaced with a true Newton distance — exact for a CIRCLE, and short by up
+   to a/b (8x on the card's default aspect) for an ellipse. It was never a
+   second opinion; it was the only one, on the only page where the error is
+   invisible, and copying it to the card page would have flagged a ring of
+   tiles the kernel never considered near the body. **Duplication defended as
+   independence is the specific thing to distrust here** — the independent
+   route has to be a different DERIVATION (here: a brute-force closest point
+   on the boundary), not a second transcription.
+
+3. **`?levels>=3` HAD A FATAL INIT ERROR ON FOUR OF THE FIVE AMR PAGES, and
+   the suite could not see it.** B3a-1's `tauAtLevel` extraction landed the
+   CALL in all five pages and the IMPORT in one, so the other four threw
+   `ReferenceError: tauAtLevelOf is not defined` at init. Invisible at every
+   page's own `levels=2` default, because `updateLevelParams`'s
+   `for (c = 2; c < N_LEVELS; c++)` loop is VACUOUS there — the same shape as
+   B3a-4's always-true gates and the `?levels=1` tgv defect, which is now
+   three instances of one class. `make check` was green throughout (B3a's
+   finding #1 again: it is a PARSE check). Fixed, and gated by three new
+   `checkBoots` configs at `?levels=3` — `cylinder-amr-boot-N3`,
+   `tgv-amr-boot-N3`, `channel-amr-boot-N3`. **Any new URL-selected mode
+   wants a boot config at the setting where its loop is not vacuous.**
+
+**What is left in B4**, unchanged in substance by the above: the box
+predicate in both managers (and `paramsForChildLevel`'s `childLevel===2`
+margin special case retired with it), the finest-wins masking and
+`childBlockSlot` bindings deleted from the three force kernels, the init-time
+refusals (margin vs. stencil reach; a body with AMR and no geometry-forced
+refinement), and pool exhaustion latched as `error:` instead of degrading
+silently.
+
 ### B4 — the body lives entirely on the finest level
 
 **2D already asserts this** — `debugCheckGeometryCoverage`: every leaf tile
@@ -900,9 +962,11 @@ B0b  interface instrument (mass/momentum drift)  ──┤ DONE
                                                    │
 B3a  JS duplication sweep                        ──┤ LARGELY DONE
                                                    │
-B4   finest-level-only + hard failure            ◄──┘  (smallest, proves B0;
-                                                      take B3a's geometry-
-                                                      coverage extraction first)
+B4-1 the coverage gate itself                    ──┤ DONE (it was never
+                                                   │  three copies -- it had
+                                                   │  to be WRITTEN)
+                                                   │
+B4   finest-level-only + hard failure            ◄──┘  (smallest, proves B0)
 B7   chi band ladder                                  (independent, cheap)
 B8   SOLID_EQ                                         (independent, free)
 B9   lattice weights                                   DONE -- unblocked B6's
