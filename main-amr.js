@@ -2387,14 +2387,6 @@ async function init() {
     pacer.reset();
   }
 
-  // Activates coarse block (bx,by) [0<=bx<NBX, 0<=by<NBY, buffer-space --
-  // see plans/AMR.md's Milestone 4 design note on why block IDs are
-  // buffer-space-native] against a free pool slot, filling the whole new
-  // slot from the CURRENT coarse state (GHOST_ONLY=0 pipeline) since there
-  // is no prior fine-level state for it to evolve from. Only valid while
-  // liveMode is false, matching the debugSnapshotSave/Load convention --
-  // dispatchMacroStep's useB toggling and this function's direct queue
-  // writes would otherwise race the frame() loop's own encoder.
   // Reads blockSlot/slotToBlock directly from GPU -- the authoritative
   // source once Milestone 4b's automatic management can mutate pool state
   // without going through the CPU mirror at all.
@@ -2451,6 +2443,14 @@ async function init() {
     }
   }
 
+  // Activates coarse block (bx,by) [0<=bx<NBX, 0<=by<NBY, buffer-space --
+  // see plans/AMR.md's Milestone 4 design note on why block IDs are
+  // buffer-space-native] against a free pool slot, filling the whole new
+  // slot from the CURRENT coarse state (GHOST_ONLY=0 pipeline) since there
+  // is no prior fine-level state for it to evolve from. Only valid while
+  // liveMode is false, matching the debugSnapshotSave/Load convention --
+  // dispatchMacroStep's useB toggling and this function's direct queue
+  // writes would otherwise race the frame() loop's own encoder.
   // Milestone 6: `level` defaults to 1 (today's exact behavior, unchanged
   // code path below). Levels >=2 activate at QUAD granularity (decision 3)
   // -- (bx,by) identifies ONE child in this level's own coordinate space,
