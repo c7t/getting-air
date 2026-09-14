@@ -1177,7 +1177,11 @@ What exists today:
     water is not expected to -- and **the same finite 2:1 plate at I* = 0.5
     DOES tumble** (0.21 rev/1000 steps, the strip's rate), and so does
     I* = 0.3 (0.19 rev/1000), so the finite boundary is between 0.17 and
-    0.3, the lower edge of Field et al.'s chaotic band. Sharp edges at
+    0.3, the lower edge of Field et al.'s chaotic band. **Both of those runs
+    were truncated by M6.5e's submit watchdog** (recorded at the time as a
+    memory limit), so neither rate was measured on a run allowed to finish --
+    they bracket the 0.202 the I* = 0.34 run held for 46000 steps, so they are
+    probably right, and re-running them is now cheap. Sharp edges at
     I* = 0.5 tumble as well (0.17 rev/1000, later onset): the stadium is a
     ~20% margin, not the mechanism.
   - **THE CARD FLUTTERS, IT DOES NOT TUMBLE**, and five configurations say
