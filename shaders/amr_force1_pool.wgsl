@@ -20,16 +20,17 @@
 // @include "common_fpack.wgsl"
 // @include "common_reduce.wgsl"
 
+// The same 4-field PREFIX of the shared 32-byte per-level uniform every other
+// pool shader declares. It used to be the odd one out -- the full 8 fields,
+// because it was the only reader of nbx/nby (for the finest-wins masking) and
+// the only reader of hasChild at all. With the masking gone (see header) all
+// three go with it, and the last 16 bytes of that buffer are now padding on
+// every reader.
 struct LevelParams {
-  nbx: u32,        // THIS level's own NBX -- needed here (unlike the other
-  nby: u32,        // pool-parent shaders) for the finest-wins masking
-                   // check below; nby itself is still unused.
+  nbx: u32,        // unused here.
+  nby: u32,        // unused here.
   parentTau: f32,  // unused here (force doesn't touch tau at all).
   dxL: f32,        // this level's own grid spacing in L0-buffer-space units.
-  hasChild: u32,   // does THIS level itself have an active child level?
-  _pad1: u32,
-  _pad2: u32,
-  _pad3: u32,
 }
 
 @group(0) @binding(0) var<storage, read>       state          : CardState;
@@ -39,7 +40,10 @@ struct LevelParams {
 @group(0) @binding(4) var<storage, read>       originX        : array<f32>;
 @group(0) @binding(5) var<storage, read>       originY        : array<f32>;
 @group(0) @binding(6) var<uniform>             levelParams    : LevelParams;
-@group(0) @binding(7) var<storage, read>       childBlockSlot : array<i32>; // level+1's blockSlot, or a harmless dummy if hasChild==0
+// binding 7 was level+1's blockSlot, for the finest-wins masking (see
+// header). Gone with it; 8 is left where it is rather than renumbered,
+// because a renumber is three separate pages' bind groups to land in
+// lockstep and this project has shipped that bug before (238e48c).
 // TEMPORARY diagnostic (level-2 bounce-back sign investigation): per-slot
 // (fx,fy) written unconditionally by every dispatch -- lets the JS side
 // correlate sign against each tile's own position instead of only ever
@@ -118,23 +122,7 @@ fn main(
     let isInterior = fx >= GHOST && fx < GHOST + RB * 2u && fy >= GHOST && fy < GHOST + RB * 2u;
 
     if (blockID >= 0 && isInterior) {
-      // This level's own logical (bx,by), derived from blockID exactly like
-      // amr_interp_pool_parent.wgsl/amr_step1_pool.wgsl do (levelParams.nbx
-      // is THIS level's own NBX here -- unlike those files, this shader
-      // does need it, for the masking check below).
-      let bxOwn = u32(blockID) % levelParams.nbx;
-      let byOwn = u32(blockID) / levelParams.nbx;
-
-      var maskedByFiner = false;
-      if (levelParams.hasChild != 0u) {
-        let nbxChild = levelParams.nbx * 2u; // child level's own NBX = this level's NBX * 2
-        // Quadrant 0's own child block ID -- if it's active, all 4 are
-        // (quad allocation is all-or-nothing, see amr_force1.wgsl's header).
-        let childBlockID = (byOwn * 2u) * nbxChild + (bxOwn * 2u);
-        maskedByFiner = childBlockSlot[childBlockID] >= 0;
-      }
-
-      if (!maskedByFiner) {
+      {
         let originX_L0 = originX[slot];
         let originY_L0 = originY[slot];
         let bufX = fineToCoarseUnit(fx, originX_L0);

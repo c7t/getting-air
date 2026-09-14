@@ -83,6 +83,12 @@ invariants the AMR machinery depends on:
   a build-vs-build claim there needs a same-build repeat, not a comparison
   against a number recorded in another session. The dense configs remain
   deterministic and usable as a strict check.
+  **AND THE SPREAD WIDENS WITH DEPTH -- ~+/-0.002 at N=3, not +/-0.001.**
+  The figure above is `amr-N2-diffuse`'s. Measured 2026-09-14, three runs of
+  one build: `amr-N3-diffuse` gave Cd 1.411 / 1.408 / 1.407. Same mechanism,
+  more of it -- a third pool level is a third free list regrouping a third set
+  of truncated partials. Calibrate against the config you are actually
+  comparing, and take the repeat on THAT config; N=2's floor is not N=3's.
 - **`tools/validate-cylinder.js`** — physics: pinned cylinder in uniform
   crossflow, time-averaged Cd/Strouhal vs. literature values in
   `benchmarks/cylinder.json`. Assumes a Chrome + page are already up (see

@@ -4,16 +4,35 @@
 // derivation as amr_step.wgsl's file header -- dispatch over buffer-space
 // coordinates, derive window coordinates per-thread for the card SDF.
 //
-// Milestone 8 (plans/AMR-multilevel.md): finest-wins masking. `average`
-// keeps a parent's cells populated (if coarser) under an active child, so
+// Milestone 8 (plans/AMR-multilevel.md) added FINEST-WINS MASKING here:
+// `average` keeps a parent's cells populated under an active child, so
 // summing every level's force pass unconditionally would double-count the
-// same physical drag -- once crudely here at L0, once accurately at L1's
-// own force pass (amr_force1.wgsl). Refinement is always whole-block
-// (never partial -- decision 3's quad granularity, and L0->L1's own
-// footprint-preserving 1:1 relationship), so the skip is a per-BLOCK
-// check, not per-cell: if blockSlot1[this cell's block] is active, an L1
-// tile already covers this block's ENTIRE footprint more accurately, so
-// this pass contributes nothing for any cell in it.
+// same physical drag -- once crudely at L0, once accurately at L1's own pass
+// (amr_force1.wgsl). It skipped any block whose L1 tile was active.//
+// Milestone 8's FINEST-WINS MASKING IS GONE (plans/2D-backport.md B4-3).
+// Only the FINEST level's force pass is dispatched now, so no coarser pass
+// can double-count a body cell and there is nothing to mask against. The
+// premise is the geometry-forced-refinement hard constraint -- every leaf
+// within FORCE_REFINE_MARGIN of the body is already at the finest level --
+// which amr2d-gpu.mjs's checkGeometryCoverageOnGPU asserts on every AMR page
+// and tools/validate-amr-invariants.js gates periodically through a run.
+//
+// MEASURED BEFORE DELETING, not argued. debugForceBreakdown runs each
+// level's pass in isolation; with the masking still in place the coarser
+// levels' raw i32 accumulators (FSCALE = 1e7) read, at 8192 steps:
+//
+//   levels=2            L0 0            L1 237344  (finest)
+//   levels=3            L0 0    L1 1    L2 214591  (finest)
+//   levels=2 bounceback L0 0            L1 201702  (finest)
+//   levels=3 bounceback L0 0    L1 0    L2 207126  (finest)
+//
+// EXACTLY zero, bar a single 1e-7 unit on one config -- one workgroup's
+// truncated partial (see amr_force1_pool.wgsl's FSCALE header), 5e-6 of the
+// total and ~100x below the ~1e-3 reproducibility floor AMR Cd already has.
+// Dead code, demonstrated.
+//
+// This pass therefore only runs at all when L0 IS the finest level, i.e. a
+// build with no pool at all.
 
 // @include "common_geometry.wgsl"
 // @include "common_lattice.wgsl"
@@ -23,7 +42,6 @@
 @group(0) @binding(0) var<storage, read>       state      : CardState;
 @group(0) @binding(1) var<storage, read>       f_in       : array<u32>;
 @group(0) @binding(2) var<storage, read_write> forces     : array<atomic<i32>, 4>;
-@group(0) @binding(3) var<storage, read>       blockSlot1 : array<i32>; // level 1's own blockSlot -- see header
 
 override W : u32;
 override H : u32;
@@ -77,13 +95,7 @@ fn main(
   var tz_body = 0.0f;
 
   if (cx < W && cy < H) {
-    // Finest-wins masking (see header): skip this cell's whole block if L1
-    // already covers it.
-    let nbx1 = W / BLOCK;
-    let blockID1 = (cy / BLOCK) * nbx1 + (cx / BLOCK);
-    let coveredByFiner = blockSlot1[blockID1] >= 0;
-
-    if (!coveredByFiner) {
+    {
       let wx   = (cx + W - u32(state.off_x)) % W;
       let wy   = (cy + H - u32(state.off_y)) % H;
       let cell = cellIndex(cx, cy);

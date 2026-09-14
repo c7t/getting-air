@@ -45,14 +45,11 @@
 //    a runtime lookup (contrast amr_force1_pool.wgsl, whose shared
 //    pipeline serves multiple levels and needs it from levelParams.dxL).
 //
-// Finest-wins masking (see amr_force.wgsl's header for the general
-// rationale): whether THIS tile is superseded by an active level-2 child
-// is uniform across its whole interior (quad allocation is all-or-nothing,
-// decision 3), so it's one lookup per invocation, not per-cell. HAS_CHILD
-// is a compile-time override, not a runtime uniform like
-// amr_force1_pool.wgsl's -- level 1 has exactly ONE dedicated pipeline (not
-// shared across levels), so whether level 2 exists at all is fixed for the
-// whole session, known at pipeline-creation time.
+// FINEST-WINS MASKING IS GONE (plans/2D-backport.md B4-3), along with its
+// HAS_CHILD override and the binding-4 childBlockSlot it read. Only the
+// finest level's force pass is dispatched now, so this one runs only when
+// level 1 IS the finest -- see amr_force.wgsl's header for the measurement
+// that showed every coarser pass already contributing exactly zero.
 
 // @include "common_geometry.wgsl"
 // @include "common_lattice.wgsl"
@@ -63,12 +60,10 @@
 @group(0) @binding(1) var<storage, read>       f_in           : array<u32>;
 @group(0) @binding(2) var<storage, read_write> forces         : array<atomic<i32>, 4>;
 @group(0) @binding(3) var<storage, read>       slotToBlock    : array<i32>;
-@group(0) @binding(4) var<storage, read>       childBlockSlot : array<i32>; // level 2's blockSlot, or a harmless dummy if HAS_CHILD=0 -- see header
 
 override W : u32;
 override H : u32;
 override RB : u32;
-override HAS_CHILD : u32 = 0u;
 // Optional sharp momentum-exchange bounce-back force -- see amr_step1.wgsl's
 // USE_BOUNCEBACK header for the unclamped-source rationale this shares.
 override USE_BOUNCEBACK : u32 = 0u;
@@ -136,19 +131,7 @@ fn main(
     let isInterior = fx >= GHOST && fx < GHOST + RB * 2u && fy >= GHOST && fy < GHOST + RB * 2u;
 
     if (blockID >= 0 && isInterior) {
-      var maskedByFiner = false;
-      if (HAS_CHILD != 0u) {
-        let nbx1 = W / BLOCK;
-        let bx1 = u32(blockID) % nbx1;
-        let by1 = u32(blockID) / nbx1;
-        let nbx2 = nbx1 * 2u;
-        // Quadrant 0's own child block ID -- if it's active, all 4 are
-        // (quad allocation is all-or-nothing, see header).
-        let childBlockID = (by1 * 2u) * nbx2 + (bx1 * 2u);
-        maskedByFiner = childBlockSlot[childBlockID] >= 0;
-      }
-
-      if (!maskedByFiner) {
+      {
         let nbx = W / BLOCK;
         let originX = (u32(blockID) % nbx) * RB;
         let originY = (u32(blockID) / nbx) * RB;
