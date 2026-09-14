@@ -1132,8 +1132,10 @@ What exists today:
     0.22 rev per 1000 steps from step 14000 -- 4.1 net revolutions in
     30000 against the finite plate's all-time 0.31. Each of the three was
     necessary: sharp strip at L2 flutters (0.44), stadium at L2 drifts
-    through one turn intermittently (1.03), stadium at L3 tumbles. One run
-    per row; not yet repeated, not yet compared with the 2D page's period.
+    through one turn intermittently (1.03), stadium at L3 tumbles -- from
+    BOTH release angles (tilt 1.047 and 0.15; the shallow one flutters for
+    18000 steps first, then tumbles at the same ~0.2 rev/1000). Not yet
+    compared with the 2D page's period, and one seed.
     The finite plate's flutter below is real physics for a finite plate at
     this I* (Field et al. 1997), not a solver defect.
   - **THE CARD FLUTTERS, IT DOES NOT TUMBLE**, and five configurations say
