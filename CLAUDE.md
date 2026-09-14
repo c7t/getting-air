@@ -1123,6 +1123,19 @@ What exists today:
     default card "0.44 revolutions". It now reports `net = |INT omega dt|`
     beside `arc = INT |omega| dt`: tumbling is net ~ arc, fluttering is
     arc >> net.
+  - **THE STRIP TUMBLES (M6.5c, 2026-09-13).** `?spanfill=1&edge=1&levels=3`:
+    the card as a SPANWISE-PERIODIC strip (the domain is periodic, so the
+    span fills z with a pad past the seam; the body is planar by symmetry;
+    the sponge is off on the span axis, without which the strip is glued),
+    with STADIUM edges (the 2D card is an ellipse, the 3D plate was a sharp
+    rectangle) and one more rung of refinement, autorotates at a steady
+    0.22 rev per 1000 steps from step 14000 -- 4.1 net revolutions in
+    30000 against the finite plate's all-time 0.31. Each of the three was
+    necessary: sharp strip at L2 flutters (0.44), stadium at L2 drifts
+    through one turn intermittently (1.03), stadium at L3 tumbles. One run
+    per row; not yet repeated, not yet compared with the 2D page's period.
+    The finite plate's flutter below is real physics for a finite plate at
+    this I* (Field et al. 1997), not a solver defect.
   - **THE CARD FLUTTERS, IT DOES NOT TUMBLE**, and five configurations say
     so (n = 32, 26000 steps, chi). net/arc revolutions: 0.04/0.44 at the
     default, 0.12/0.76 at tilt 0.7, 0.10/1.03 at `?levels=2`, 0.09/0.91 at

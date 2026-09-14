@@ -703,7 +703,8 @@ SCENARIOS.fall = {
 SCENARIOS.card = {
   name: 'card',
   defaults: { n: 32, aspect: 0.125, span: 1, re: 500, u_t: 0.05, i_star: 0.17,
-              tilt: 0.15, perturb: 0, seed: 12345, tow: 0, stream: 0, spanfill: 0 },
+              tilt: 0.15, perturb: 0, seed: 12345, tow: 0, stream: 0, spanfill: 0,
+              edge: 0 },
   walls: [],
   // THE SPANWISE-PERIODIC PLATE (`spanfill=1`, plans/3D.md M6.5 avenue 2).
   // Pesavento & Wang's card is a SECTION of an infinite strip: no tips, no
@@ -779,7 +780,14 @@ SCENARIOS.card = {
     // it transfers to a 3D plate at all. Clamped above 1 for that module's
     // reason: a card lighter than the fluid is not this regime.
     const rho_b = Math.max(1.05, i_star * 2 * a ** 3 / (c * (a * a + c * c)));
-    const shape = { kind: SHAPE.ROUNDBOX, a, b, c, r: 0 };
+    // `edge` rounds the plate's edges: r = edge * c, so 1 is a STADIUM
+    // section (a full semicircle of radius c on each chord edge), the
+    // nearest the ROUNDBOX comes to the 2D card, which is an ELLIPSE
+    // (card-params.mjs). Volume and inertia keep the box formulas -- at
+    // c/a = 1/8 the stadium is 2.7% lighter than the box, inside the I*
+    // clamp's own slack -- so rho_b and g_eff are the box's. A true elliptic
+    // cylinder is the next body if this one matters.
+    const shape = { kind: SHAPE.ROUNDBOX, a, b, c, r: Math.max(0, Math.min(1, p.edge || 0)) * c };
     const V = 8 * a * b * c;
     // BROADSIDE drag balance, as in `fall`: the plate is dropped flat, and
     // the frontal area is then the whole face. Cd = 1.1 is the textbook flat
