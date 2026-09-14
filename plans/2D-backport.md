@@ -31,7 +31,7 @@ GPU) and that is what made M4/M5 survivable. Build the 2D equivalent first.
 | B6 | Explode/coalesce at the coarse/fine interface | **yes, but measure first** | 2D's interface is not conservative, and nothing in 2D measures that | L |
 | B7 | The diffuse band converges at 2nd order; Richardson it | **yes** | may close the standing `dense-reference`/`amr-N2-diffuse` Cd=1.95-vs-1.35 red cells | S |
 | B8 | `SOLID_EQ` on the bounce-back path | **latent only** | free on every 2D gate (all bounce-back bodies are pinned); disarms a landmine | S |
-| B9 | f32 lattice weights do not sum to 1 | **yes, MEASURED in the running solver** | 1 + 1.49e-8, not CLAUDE.md's 7.45e-9; it is 93% of the interface instrument's mass channel, so it BLOCKS any interface mass claim | S (code) / L (re-baseline) |
+| B9 | f32 lattice weights do not sum to 1 | **DONE** | `lattice-2d.mjs` derives the basis once (was eleven copies); mass injection halved, velocity drift removed; couette gates improved 26-53% | S (code) / L (re-baseline) |
 
 Sizes are of the *change*, not of the validation. B1, B6 and B9 each move the
 published benchmark surface and `main` **is** the site, so each needs its own
@@ -612,6 +612,59 @@ dispatch is a separate, smaller commit and should go first — it makes the
 base page consistent with the AMR pages and is gated by `index-boot` plus a
 dense snapshot diff.
 
+### B9 — DONE (2026-09-14)
+
+`lattice-2d.mjs` + `tools/gen-lattice-2d.js` + `tools/test-lattice-2d.js`, and
+the eleven hand-typed copies of the D2Q9 basis are now one derivation.
+
+**THE 3D FIX DOES NOT TRANSFER, AND THAT IS THE FINDING.** `lattice-3d.mjs`
+nudges the weights by whole ulps so they sum to exactly 1, on the argument
+that the resulting moment error is harmless because it does not compound. For
+D2Q9 that argument is false: the moment error compounds too, in the
+**velocity**. Through one BGK collision,
+
+```
+rho -> rho (1 + omega (S - 1))                 S    = sum_i w_i
+M   -> M   (1 + omega (3 Sig2 - 1))            Sig2 = sum_i w_i e_ix^2
+u   -> u   (1 + omega (3 Sig2 - S))            <- what every gate measures
+```
+
+and `3 Sig2 - S` is `2 w1 + 8 w2 - w0` for D2Q9. Per step, in units of omega:
+
+```
+shipped (0.02777778f)         mass  1.490e-8    velocity  1.490e-8
+correctly rounded fractions   mass  7.451e-9    velocity  0 EXACTLY
+the 3D-style tweak [0,0,-1]   mass  0           velocity -1.490e-8
+```
+
+The plain fractions satisfy the velocity identity **to the bit**, and no tweak
+in `|k| <= 4` zeroes both. So 2D ships the plain fractions at full precision:
+half the mass injection AND no velocity drift. Mass drift with exact velocity
+is the benign half — a uniform rho rise in a periodic box has zero gradient
+and so no dynamics.
+
+**Measured, before and after, on the channel gates** (every case improved or
+held; none worsened): couette −26% to −53%, poiseuille −0.5% to −10%, and the
+worst case converged in **13312 steps against 27648** — a drift growing with
+run length had been defeating the steady-state detector. TGV is mixed and
+reported as such: the two longest dense cases improve 17% and 21%, shorter
+ones move within noise. Cylinder `dense-reference` Cd 1.950 → 1.951, St 0.1258
+→ 0.1260, both already outside their bands and still are — which is
+CLAUDE.md's own point about Cd/St being the wrong instrument here, confirmed.
+
+**The interface instrument now reads what it should:** its mass floor halved
+(1.861e-8 → 9.377e-9 per cell per step, predicted 9.313e-9) while the seam's
+ABSOLUTE contribution is unchanged (1.66e-9 → 1.64e-9). The interface stands
+at 14.4% of a floor half the size, instead of 7.3%. **B6's mass half is
+unblocked.**
+
+**For the 3D side, not acted on here:** the same arithmetic says D3Q27's tweak
+`[-1,1,-1,0]` trades an exactly zero velocity drift for an exactly zero mass
+drift (plain: mass 7.451e-9, velocity 0; tweaked: mass 0, velocity 7.451e-9).
+D3Q19's `[1,-4,2]` is a genuine improvement — mass 1.490e-8 → 0 with the
+velocity drift unchanged in magnitude — so the decision there was right for
+the default velocity set and questionable for the `?q=27` variant.
+
 ### B6 — the coarse/fine interface
 
 **Do not start here.** Start at B0b. 2D's interface today is interp (ring
@@ -791,9 +844,8 @@ B4   finest-level-only + hard failure            ◄──┘  (smallest, proves
                                                       coverage extraction first)
 B7   chi band ladder                                  (independent, cheap)
 B8   SOLID_EQ                                         (independent, free)
-B9   lattice weights                               ◄── MOVED UP: B0b measured it
-                                                       as 93% of the interface
-                                                       instrument's mass channel
+B9   lattice weights                                   DONE -- unblocked B6's
+                                                       mass half
 B2   cascade21                                     ◄── needs B0
 B3   kernel unification, manage LAST                ◄── needs B2 and B3a
 B5   window = sponge translation                    ◄── independent of B2/B3,
@@ -801,8 +853,7 @@ B5   window = sponge translation                    ◄── independent of B2/
 B1   post-collision rescale                         ◄── needs B0b only; its
                                                         channel is MOMENTUM, so
                                                         it does not wait for B9
-B6   explode/coalesce                               ◄── needs B0b, B1, B3, B4,
-                                                        and B9 for its mass half
+B6   explode/coalesce                               ◄── needs B0b, B1, B3, B4
 ```
 
 B4, B7 and B8 are deliberately first among the real changes: each is small,
