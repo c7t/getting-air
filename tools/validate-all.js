@@ -120,6 +120,37 @@ function defaultConfigs(baseUrl) {
       url: `${baseUrl}/index-reentry-amr.html`,
       checkBoots: true,
     },
+    // THE OTHER THREE AMR PAGES, AT ?levels=3 -- and the level is the point.
+    //
+    // Four of the five AMR pages default to levels=2, and at levels=2
+    // updateLevelParams's `for (c = 2; c < N_LEVELS; c++)` loop runs ZERO
+    // times. A whole init path therefore exists that nothing in this suite
+    // reached cheaply: the cylinder page's levels=3 configs did reach it, but
+    // only via the most expensive runs here, and the two bodyless AMR pages
+    // had no boot coverage at all.
+    //
+    // That is not hypothetical. B3a-1 extracted `tauAtLevel` into
+    // card-params.mjs, landed the CALL in all five pages and the IMPORT in
+    // one, and the other four threw `ReferenceError: tauAtLevelOf is not
+    // defined` at init -- invisible at every page's own default, fatal at
+    // levels=3, and `make check` green throughout (it is a PARSE check; the
+    // name is perfectly good syntax). Exactly the shape CLAUDE.md records
+    // checkBoots being added for after 238e48c, one octave deeper.
+    {
+      name: 'cylinder-amr-boot-N3',
+      url: `${baseUrl}/index-cylinder-amr.html?levels=3`,
+      checkBoots: true,
+    },
+    {
+      name: 'tgv-amr-boot-N3',
+      url: `${baseUrl}/index-tgv-amr.html?levels=3`,
+      checkBoots: true,
+    },
+    {
+      name: 'channel-amr-boot-N3',
+      url: `${baseUrl}/index-channel-amr.html?levels=3`,
+      checkBoots: true,
+    },
     // index-amr.html under the structural-invariant sweep. This is the page
     // the project SHIPS, it defaults to levels=3, and until now the sweep
     // only ever drove window.__CYL -- so the falling-card page's own 2:1

@@ -62,6 +62,13 @@ import { reportFatal, reportNoWebGPU, reportNoAdapter } from './error-overlay.mj
 import { loadShader } from './shader-loader.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
 import { check21BalanceOnGPU, readConservedTotals, allocLevelPool, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks } from './amr2d-gpu.mjs';
+// tauAtLevel: extracted to card-params.mjs by B3a-1, which landed the CALL
+// in all five AMR pages and this IMPORT in only main-amr.js. The other four
+// threw `ReferenceError: tauAtLevelOf is not defined` at init -- but only at
+// ?levels>=3, because updateLevelParams's `for (c = 2; c < N_LEVELS; c++)`
+// loop is VACUOUS at the levels=2 default every one of them ships. See
+// plans/2D-backport.md B4.
+import { tauAtLevel as tauAtLevelOf } from './card-params.mjs';
 import { EX, EY, WT } from './lattice-2d.mjs';
 import { makeCanvasFit } from './canvas-fit.mjs';
 
