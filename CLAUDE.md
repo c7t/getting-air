@@ -993,7 +993,10 @@ What exists today:
     `d3-volume.mjs`'s `boxRatio` prefers it; feeding it a wrapped span with no
     `ext` is REFUSED rather than silently negated, and `make test` gates that.
     Same class as M6.5a: a quantity that is fine in buffer coordinates and
-    meaningless in window ones.
+    meaningless in window ones. **`debugCriterion` had the SAME min..max and
+    now uses `axisSpan` too** (2026-09-13) -- that was the third instance in
+    one file. M8.4's `boxRatio` 4.6 stands: it was measured on a pinned sphere
+    with no window, where min..max and the periodic span agree.
   - **THE VOLUME'S EXTENT IS FIXED AT CREATION AND A ROTATING BODY OUTGROWS
     IT** -- `?volMargin=` is slack added ONCE, to the step-0 box, and only the
     ORIGIN moves thereafter (a texture has a size). A plate turning edge-on to

@@ -3587,19 +3587,37 @@ async function init() {
     // The ladder's base is the ACTIVE threshold's own rotation rate, matching
     // what the manager is running (main-3d.js's REFINE_THRESH derivation).
     const cutBase = Q_THRESH * qr;
+    // PERIODIC, VIA `axisSpan`, for `poolStateAt`'s reason and the third time
+    // in this file (M6.4c fixed two). A plain min..max in BUFFER coordinates
+    // reads the seam crossing as geometry: with a moving window the flagged
+    // set travels through a periodic buffer and straddles the seam twice a
+    // lap, and min..max is then nearly the whole axis. The M8.4 number this
+    // path produced (boxRatio 4.6 on a wake criterion) SURVIVES -- it was
+    // measured on a pinned sphere with no window, where the two agree -- but
+    // the first wake number on the card would not have.
+    const CRIT_NB_A = [nx, ny, nz];
     const rows = ths.map((t) => {
       const cut = t * qr;
       let n = 0;
-      const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+      const used = CRIT_NB_A.map((m) => new Uint8Array(m));
       for (let i = 0; i < total; i++) {
         if (!(q[i] > cut)) continue;
         n++;
         const b = [i % nx, Math.floor(i / nx) % ny, Math.floor(i / (nx * ny))];
-        for (let k = 0; k < 3; k++) { lo[k] = Math.min(lo[k], b[k]); hi[k] = Math.max(hi[k], b[k]); }
+        for (let k = 0; k < 3; k++) used[k][b[k]] = 1;
       }
-      const boxVol = n ? (hi[0] - lo[0] + 1) * (hi[1] - lo[1] + 1) * (hi[2] - lo[2] + 1) : 0;
-      return { thresh: t, count: n, frac: n / total,
-               bbox: n ? { lo, hi } : null, boxVol, boxRatio: n ? boxVol / n : null };
+      const spans = used.map((u, k) => axisSpan(u, CRIT_NB_A[k]));
+      // `hi` can sit BELOW `lo` on a wrapped span, so the extent is carried
+      // rather than left to be recovered as hi - lo by every reader --
+      // d3-volume.mjs's boxRatio refuses the latter instead of negating.
+      const lo = spans.map((sp) => (sp ? sp.lo : 0));
+      const hi = spans.map((sp, k) => (sp ? (sp.lo + sp.len - 1) % CRIT_NB_A[k] : -1));
+      const ext = spans.map((sp) => (sp ? sp.len : 0));
+      const bbox = n ? { lo, hi, ext,
+        wraps: spans.map((sp, k) => !!sp && sp.lo + sp.len > CRIT_NB_A[k]) } : null;
+      const eff = volBoxRatio(bbox, n);
+      return { thresh: t, count: n, frac: n / total, bbox,
+               boxVol: eff ? eff.boxBlocks : 0, boxRatio: eff ? eff.ratio : null };
     });
     // THE LADDER'S DEMAND, per level, WITHOUT ALLOCATING IT. Measuring demand
     // by refining it cannot see past the slot budget -- which is exactly
