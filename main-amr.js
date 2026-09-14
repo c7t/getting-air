@@ -22,6 +22,7 @@ import {
   tauAtLevel as tauAtLevelOf,
 } from './card-params.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
+import { check21BalanceOnGPU } from './amr2d-gpu.mjs';
 
 const canvas   = document.getElementById('c');
 let deviceLost = false;
@@ -2935,171 +2936,17 @@ async function init() {
     return active;
   }
 
-  // Milestone 9's own validation ask: walk all active tiles, confirm no
-  // same-level-neighbor pair differs by more than 1 level -- cheap enough
-  // to call periodically during development/validation, not wired into
-  // the live per-macro-step path (that would need a GPU-side assertion
-  // mechanism this project doesn't have; a readback-based debug function
-  // is enough to catch a real violation during testing).
+  // 2:1 BALANCE. The rule, the multi-level readback and the corner-balance
+  // decision all live in amr2d-gpu.mjs / amr2d.mjs now -- they were five
+  // copies of one checker across the AMR pages, byte-identical in the
+  // readback and already drifted in the checker. amr2d.mjs's pure half is
+  // exercised by `make test` on inputs that VIOLATE the invariant, which an
+  // in-page copy could never be.
   //
-  // Generalized to N_LEVELS>=2 (was hardcoded to compare level 1 against
-  // level 2 only, silently ignoring level 3+). Border-aware, not whole-
-  // tile-max: a first version of this compared each tile's DEEPEST
-  // descendant ANYWHERE in its footprint against its neighbor's deepest
-  // descendant anywhere in ITS footprint -- wrong, and produced false-
-  // positive "violations" live (e.g. a level-1 tile A next to a level-1
-  // tile B where B's level-3 descendant sat on B's FAR side, away from A
-  // -- the actual A/B shared edge only ever touched B's level-2 quadrants,
-  // which IS balanced; B's unrelated far-side depth doesn't matter to
-  // that boundary). True 2:1 balance is a property of ADJACENT CELLS, not
-  // adjacent TILES-as-a-whole: only check LEAF tiles (active, no children
-  // -- a non-leaf tile's own boundary correctness is already checked one
-  // level deeper, at its children's own same-level neighbor checks, so
-  // checking it again here would be redundant AND use the wrong
-  // granularity), and for each neighbor, walk toward the SHARED edge
-  // specifically (borderMaxDepth), not the neighbor's tile as a whole.
-  // Every level's blockSlot copied in ONE command encoder and ONE submit, so
-  // all levels come from the SAME GPU state.
-  //
-  // BUGFIX: debugCheck21Balance used to call debugListActiveBlocks(m) in a
-  // loop, and each of those does its own submit + mapAsync round trip. While
-  // the sim is RUNNING (liveMode, i.e. any ordinary browser session) the
-  // render loop keeps submitting macro-steps between those round trips, so
-  // level 1 was read at one instant and level 2 at a later one -- across, in
-  // general, one or more REFINE_EVERY refinement rounds. A tile coarsened out
-  // of level 1 after the level-1 read, or refined into level 2 before the
-  // level-2 read, then reads back as a depth-2-next-to-depth-0 pair that
-  // never existed at any single instant: a torn snapshot reported as a 2:1
-  // violation.
-  //
-  // This is why the artifact only ever showed up at levels>=3: at levels=2
-  // the loop runs exactly once, so there is only one readback and nothing to
-  // tear against. That made it look like "the second refinement octave breaks
-  // 2:1 balance" when what actually changed was the number of readbacks.
-  // Live-verified on index-amr.html?levels=3 by alternating protocols on one
-  // page: sampling while live reported violations in 2 of 8 samples, while
-  // the paused read taken immediately after each of those was clean every
-  // time (0 of 8). Reading every level in one submit makes the check sound in
-  // both modes; tools/lib/amr-invariants.js pauses first and so was never
-  // affected either way.
-  async function readAllBlockSlots() {
-    const stages = [];
-    const enc = device.createCommandEncoder();
-    for (let m = 1; m < N_LEVELS; m++) {
-      const pool = pools[m];
-      const stage = device.createBuffer({ size: pool.NBLOCKS * 4, usage: U.MAP_READ | U.COPY_DST });
-      enc.copyBufferToBuffer(pool.blockSlotBuf, 0, stage, 0, pool.NBLOCKS * 4);
-      stages.push({ m, stage, pool });
-    }
-    device.queue.submit([enc.finish()]);
-    await Promise.all(stages.map(s => s.stage.mapAsync(GPUMapMode.READ)));
-    const sets = {};
-    for (const { m, stage, pool } of stages) {
-      const blockSlot = new Int32Array(stage.getMappedRange()).slice();
-      stage.unmap();
-      stage.destroy();
-      const active = new Set();
-      for (let blockID = 0; blockID < pool.NBLOCKS; blockID++) {
-        if (blockSlot[blockID] !== -1) active.add(`${blockID % pool.NBX},${Math.floor(blockID / pool.NBX)}`);
-      }
-      sets[m] = active;
-    }
-    return sets;
-  }
-
-  async function debugCheck21Balance() {
-    const NBX_ = {}, NBY_ = {}, counts = {};
-    // One coherent multi-level snapshot -- see readAllBlockSlots.
-    const activeSets = await readAllBlockSlots();
-    for (let m = 1; m < N_LEVELS; m++) {
-      NBX_[m] = pools[m].NBX; NBY_[m] = pools[m].NBY;
-      counts[m] = activeSets[m].size;
-    }
-    function hasChild(m, bx, by) {
-      return m + 1 < N_LEVELS && activeSets[m + 1].has(`${bx * 2},${by * 2}`);
-    }
-    function ancestorDepth(m, bx, by) {
-      let level = m, x = bx, y = by;
-      while (level >= 1) {
-        if (activeSets[level].has(`${x},${y}`)) return level;
-        x = Math.floor(x / 2); y = Math.floor(y / 2);
-        level--;
-      }
-      return 0;
-    }
-    // The 2 (of 4) quadrant children that lie along a given edge of their
-    // parent -- e.g. a parent's SOUTH edge is covered by its qy=1 children
-    // (both qx). Recursing with the SAME edge picks the correct
-    // ever-deeper sliver along that edge, not the tile's max depth.
-    const EDGE_CHILDREN = { N: [[0, 0], [1, 0]], S: [[0, 1], [1, 1]], E: [[1, 0], [1, 1]], W: [[0, 0], [0, 1]] };
-    const OPPOSITE = { N: 'S', S: 'N', E: 'W', W: 'E' };
-    function borderMaxDepth(m, bx, by, edge) {
-      if (!hasChild(m, bx, by)) return m;
-      let maxD = m;
-      for (const [dx, dy] of EDGE_CHILDREN[edge]) {
-        maxD = Math.max(maxD, borderMaxDepth(m + 1, bx * 2 + dx, by * 2 + dy, edge));
-      }
-      return maxD;
-    }
-    const violations = [];
-    const NEIGHBOR_OFFSETS = [['N', 0, -1], ['S', 0, 1], ['E', 1, 0], ['W', -1, 0]];
-    for (let m = 1; m < N_LEVELS; m++) {
-      for (const key of activeSets[m]) {
-        const [bx, by] = key.split(',').map(Number);
-        if (hasChild(m, bx, by)) continue; // not a leaf -- checked one level deeper instead
-        for (const [edge, dx, dy] of NEIGHBOR_OFFSETS) {
-          const nbx = (bx + dx + NBX_[m]) % NBX_[m];
-          const nby = (by + dy + NBY_[m]) % NBY_[m];
-          const nDepth = activeSets[m].has(`${nbx},${nby}`)
-            ? borderMaxDepth(m, nbx, nby, OPPOSITE[edge])
-            : ancestorDepth(m, nbx, nby);
-          if (Math.abs(m - nDepth) > 1) violations.push({ level: m, bx, by, myDepth: m, neighbor: [nbx, nby], nDepth, edge });
-        }
-      }
-    }
-
-    // ── Corner balance, reported SEPARATELY ──────────────────────────────
-    // The check above is edge-only ([N,S,E,W]) and always was, so nothing has
-    // ever asserted that a tile's DIAGONAL neighbour sits within one level.
-    // That is fine for the ring path -- interp fills a corner ghost from the
-    // parent when the corner tile is absent -- and NOT fine for ?ghostfree=1,
-    // whose bilinear parent stencil reads the parent's corner cell directly.
-    // Measured: before CORNER_BALANCE, 100% of the ghost-free clamp fallbacks
-    // were diagonal (?diag=1).
-    //
-    // Kept as its own list rather than folded into `violations`, and `ok` is
-    // deliberately NOT gated on it: corner balance is a REQUIREMENT of the
-    // ghost-free path, not of the default one, so failing every default run on
-    // it would be wrong. Callers that need it assert cornerOk themselves --
-    // see tools/lib/amr-invariants.js's requireCornerBalance.
-    const cornerViolations = [];
-    const CORNER_OFFSETS = [['NW', -1, -1], ['NE', 1, -1], ['SW', -1, 1], ['SE', 1, 1]];
-    for (let m = 1; m < N_LEVELS; m++) {
-      for (const key of activeSets[m]) {
-        const [bx, by] = key.split(',').map(Number);
-        if (hasChild(m, bx, by)) continue;
-        for (const [corner, dx, dy] of CORNER_OFFSETS) {
-          const nbx = (bx + dx + NBX_[m]) % NBX_[m];
-          const nby = (by + dy + NBY_[m]) % NBY_[m];
-          // No borderMaxDepth analogue for a corner: a diagonal neighbour
-          // touches at a single point, so the deepest tile along a shared EDGE
-          // is not the right quantity. Ancestor depth is, and it is what the
-          // ghost-free stencil actually cares about (does a tile exist at my
-          // level there).
-          const nDepth = activeSets[m].has(`${nbx},${nby}`) ? m : ancestorDepth(m, nbx, nby);
-          if (Math.abs(m - nDepth) > 1) cornerViolations.push({ level: m, bx, by, neighbor: [nbx, nby], nDepth, corner });
-        }
-      }
-    }
-
-    return {
-      ok: violations.length === 0,
-      violations,
-      counts,
-      cornerOk: cornerViolations.length === 0,
-      cornerViolations,
-    };
-  }
+  // Cheap enough to call periodically during development and validation; not
+  // wired into the live per-macro-step path, which would need a GPU-side
+  // assertion mechanism this project does not have.
+  const debugCheck21Balance = () => check21BalanceOnGPU(device, pools, N_LEVELS);
 
   // Deterministic synchronous stepping, bypassing rAF entirely -- lets two
   // separate builds be driven to an EXACT matching step count for a fair

@@ -26,7 +26,7 @@
 //      ever run on valid input is indistinguishable from one that returns
 //      nothing.
 //
-// AND THE SUITE ITSELF WAS SCORED THE SAME WAY, because "35 checks pass" says
+// AND THE SUITE ITSELF WAS SCORED THE SAME WAY, because a green run says
 // nothing about what they would catch. amr2d.mjs was mutated one edit at a
 // time and this suite re-run; every mutant below must break at least one
 // check, and two of them did NOT until the checks named beside them were
@@ -70,7 +70,7 @@ const sorted = (s) => [...s].sort();
   const A = await import(path.join(__dirname, '..', 'amr2d.mjs'));
   const {
     GHOST, RB_DEFAULT, fineToCoarseUnit, coarseUnitToFine, cellSizeL0AtLevel,
-    tauAtLevel, makePool, poolAtLevel, nbAtLevel, parentOfBlock,
+    makePool, poolAtLevel, nbAtLevel, parentOfBlock,
     quadrantOfBlock, quadrantOrigin, tileOriginL0, tileOriginL0Recursive,
     refineWhere, nearBodyWant, nearBodyWantCentre, refineNearBody,
     resolveSource, toGlobalFine, fromGlobalFine, storageRatio,
@@ -163,17 +163,6 @@ const sorted = (s) => [...s].sort();
         }
       }
       assert.ok(differs, `mutant "${name}" was not caught -- the check cannot see it`);
-    }
-  });
-
-  ok('tau doubles (tau - 1/2) per rung, which is what makes AMR a stability mechanism', () => {
-    close(tauAtLevel(0.8, 0), 0.8, 1e-12, 'level 0');
-    close(tauAtLevel(0.8, 1), 1.1, 1e-12, 'level 1');
-    close(tauAtLevel(0.8, 2), 1.7, 1e-12, 'level 2');
-    for (const tau0 of [0.51, 0.6, 0.8]) {
-      for (let m = 0; m < 4; m++) {
-        close(tauAtLevel(tau0, m) - 0.5, (tau0 - 0.5) * 2 ** m, 1e-12, `tau-1/2 at level ${m}`);
-      }
     }
   });
 

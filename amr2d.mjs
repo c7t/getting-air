@@ -72,18 +72,10 @@ export function coarseUnitToFine(p, origin, dx = 0.5) {
 }
 
 // Level m's own cell size in L0 units -- main-amr.js:749's cellSizeL0AtLevel.
+// (tau at level m is card-params.mjs's tauAtLevel, already shared and already
+// tested there. It is not restated here: one rule, one home.)
 export function cellSizeL0AtLevel(m) {
   return 2 ** -m;
-}
-
-// tau at level m, applied recursively: tau_fine = 2*tau_coarse - 0.5.
-// main-amr.js:528. Here because the grid-transfer rescale is stated in terms
-// of it and plans/2D-backport.md B1 has to reason about tau = 1 at EVERY
-// level, not just L0.
-export function tauAtLevel(tau0, m) {
-  let t = tau0;
-  for (let i = 0; i < m; i++) t = 2 * t - 0.5;
-  return t;
 }
 
 // --- the pool, and why one pool description serves every level -------------

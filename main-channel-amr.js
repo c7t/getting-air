@@ -48,6 +48,7 @@
 import { reportFatal, reportNoWebGPU, reportNoAdapter } from './error-overlay.mjs';
 import { assembleShader } from './shader-loader.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
+import { check21BalanceOnGPU } from './amr2d-gpu.mjs';
 
 const canvas   = document.getElementById('c');
 const statusEl = document.getElementById('status');
@@ -1092,105 +1093,17 @@ async function init() {
     return active;
   }
 
-  // Same border-aware 2:1-balance check as main-cylinder-amr.js's own
-  // debugCheck21Balance (verbatim -- purely structural, no scenario
-  // dependence at all).
-  // Every level's blockSlot copied in ONE command encoder and ONE submit, so
-  // all levels come from the SAME GPU state.
+  // 2:1 BALANCE. The rule, the multi-level readback and the corner-balance
+  // decision all live in amr2d-gpu.mjs / amr2d.mjs now -- they were five
+  // copies of one checker across the AMR pages, byte-identical in the
+  // readback and already drifted in the checker. amr2d.mjs's pure half is
+  // exercised by `make test` on inputs that VIOLATE the invariant, which an
+  // in-page copy could never be.
   //
-  // BUGFIX: debugCheck21Balance used to call debugListActiveBlocks(m) in a
-  // loop, and each of those does its own submit + mapAsync round trip. While
-  // the sim is RUNNING (liveMode, i.e. any ordinary browser session) the
-  // render loop keeps submitting macro-steps between those round trips, so
-  // level 1 was read at one instant and level 2 at a later one -- across, in
-  // general, one or more REFINE_EVERY refinement rounds. A tile coarsened out
-  // of level 1 after the level-1 read, or refined into level 2 before the
-  // level-2 read, then reads back as a depth-2-next-to-depth-0 pair that
-  // never existed at any single instant: a torn snapshot reported as a 2:1
-  // violation.
-  //
-  // This is why the artifact only ever showed up at levels>=3: at levels=2
-  // the loop runs exactly once, so there is only one readback and nothing to
-  // tear against. That made it look like "the second refinement octave breaks
-  // 2:1 balance" when what actually changed was the number of readbacks.
-  // Live-verified on index-amr.html?levels=3 by alternating protocols on one
-  // page: sampling while live reported violations in 2 of 8 samples, while
-  // the paused read taken immediately after each of those was clean every
-  // time (0 of 8). Reading every level in one submit makes the check sound in
-  // both modes; tools/lib/amr-invariants.js pauses first and so was never
-  // affected either way.
-  async function readAllBlockSlots() {
-    const stages = [];
-    const enc = device.createCommandEncoder();
-    for (let m = 1; m < N_LEVELS; m++) {
-      const pool = pools[m];
-      const stage = device.createBuffer({ size: pool.NBLOCKS * 4, usage: U.MAP_READ | U.COPY_DST });
-      enc.copyBufferToBuffer(pool.blockSlotBuf, 0, stage, 0, pool.NBLOCKS * 4);
-      stages.push({ m, stage, pool });
-    }
-    device.queue.submit([enc.finish()]);
-    await Promise.all(stages.map(s => s.stage.mapAsync(GPUMapMode.READ)));
-    const sets = {};
-    for (const { m, stage, pool } of stages) {
-      const blockSlot = new Int32Array(stage.getMappedRange()).slice();
-      stage.unmap();
-      stage.destroy();
-      const active = new Set();
-      for (let blockID = 0; blockID < pool.NBLOCKS; blockID++) {
-        if (blockSlot[blockID] !== -1) active.add(`${blockID % pool.NBX},${Math.floor(blockID / pool.NBX)}`);
-      }
-      sets[m] = active;
-    }
-    return sets;
-  }
-
-  async function debugCheck21Balance() {
-    const NBX_ = {}, NBY_ = {};
-    // One coherent multi-level snapshot -- see readAllBlockSlots.
-    const activeSets = await readAllBlockSlots();
-    for (let m = 1; m < N_LEVELS; m++) {
-      NBX_[m] = pools[m].NBX; NBY_[m] = pools[m].NBY;
-    }
-    function hasChild(m, bx, by) {
-      return m + 1 < N_LEVELS && activeSets[m + 1].has(`${bx * 2},${by * 2}`);
-    }
-    function ancestorDepth(m, bx, by) {
-      let level = m, x = bx, y = by;
-      while (level >= 1) {
-        if (activeSets[level].has(`${x},${y}`)) return level;
-        x = Math.floor(x / 2); y = Math.floor(y / 2);
-        level--;
-      }
-      return 0;
-    }
-    const EDGE_CHILDREN = { N: [[0, 0], [1, 0]], S: [[0, 1], [1, 1]], E: [[1, 0], [1, 1]], W: [[0, 0], [0, 1]] };
-    const OPPOSITE = { N: 'S', S: 'N', E: 'W', W: 'E' };
-    function borderMaxDepth(m, bx, by, edge) {
-      if (!hasChild(m, bx, by)) return m;
-      let maxD = m;
-      for (const [dx, dy] of EDGE_CHILDREN[edge]) {
-        maxD = Math.max(maxD, borderMaxDepth(m + 1, bx * 2 + dx, by * 2 + dy, edge));
-      }
-      return maxD;
-    }
-    const violations = [];
-    const NEIGHBOR_OFFSETS = [['N', 0, -1], ['S', 0, 1], ['E', 1, 0], ['W', -1, 0]];
-    for (let m = 1; m < N_LEVELS; m++) {
-      for (const key of activeSets[m]) {
-        const [bx, by] = key.split(',').map(Number);
-        if (hasChild(m, bx, by)) continue;
-        for (const [edge, dx, dy] of NEIGHBOR_OFFSETS) {
-          const nbx = (bx + dx + NBX_[m]) % NBX_[m];
-          const nby = (by + dy + NBY_[m]) % NBY_[m];
-          const nDepth = activeSets[m].has(`${nbx},${nby}`)
-            ? borderMaxDepth(m, nbx, nby, OPPOSITE[edge])
-            : ancestorDepth(m, nbx, nby);
-          if (Math.abs(m - nDepth) > 1) violations.push({ level: m, bx, by, myDepth: m, neighbor: [nbx, nby], nDepth, edge });
-        }
-      }
-    }
-    return { ok: violations.length === 0, violations };
-  }
+  // Cheap enough to call periodically during development and validation; not
+  // wired into the live per-macro-step path, which would need a GPU-side
+  // assertion mechanism this project does not have.
+  const debugCheck21Balance = () => check21BalanceOnGPU(device, pools, N_LEVELS);
 
   // No body -- HAS_BODY=0 means isNearBody(At) is unconditionally false in
   // every manage shader, so there's nothing for a geometry-coverage check
