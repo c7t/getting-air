@@ -36,10 +36,11 @@
 
 import { reportFatal, reportNoWebGPU, reportNoAdapter } from './error-overlay.mjs';
 import { createTotalUnwrapper } from './card-total.mjs';
-import { assembleShader } from './shader-loader.mjs';
+import { loadShader } from './shader-loader.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
 import { check21BalanceOnGPU } from './amr2d-gpu.mjs';
 import { EX, EY, WT } from './lattice-2d.mjs';
+import { makeCanvasFit } from './canvas-fit.mjs';
 
 const canvas   = document.getElementById('c');
 const statusEl = document.getElementById('status');
@@ -261,12 +262,9 @@ recalculate();
 // `parentTau` when interpolating L1->L2), etc. Plain JS, not a GPU
 // readback -- TAU is already a live JS variable the slider mutates
 // directly, so this needs no round-trip.
-function tauAtLevel(m) {
-  let t = TAU;
-  for (let i = 0; i < m; i++) t = 2 * t - 0.5;
-  return t;
-}
-
+  // card-params.mjs owns this rule and tools/test-card-params.js tests it.
+  // Five pages inlined the same loop -- see plans/2D-backport.md B3a.
+  const tauAtLevel = (m) => tauAtLevelOf(TAU, m);
 const FSCALE  = 1e7;
 
 // The D2Q9 basis, from the ONE place it is derived -- lattice-2d.mjs, which
@@ -330,15 +328,6 @@ function initCardState() {
     0, 0,            // y_total, x_total
     0, 0, 0, 0       // off_x, off_y, off_x_old, off_y_old
   ]);
-}
-
-async function loadShader(device, path) {
-  const code = await assembleShader(path, async (p) => {
-    const r = await fetch(p + '?v=' + Date.now());
-    if (!r.ok) throw new Error(`failed to load ${p} (HTTP ${r.status} ${r.statusText})`);
-    return r.text();
-  });
-  return device.createShaderModule({ code });
 }
 
 function handleErr(e) {
@@ -566,35 +555,10 @@ async function init() {
   const ctx = canvas.getContext('webgpu');
   const fmt = navigator.gpu.getPreferredCanvasFormat();
 
-  // Reconfigure ONLY on a real size change. This used to run unconditionally
-  // on every `resize` event, and both halves of it are destructive:
-  // assigning canvas.width/height resets the drawing buffer even when the
-  // value is unchanged, and ctx.configure() replaces the swapchain,
-  // invalidating textures that in-flight command buffers still reference
-  // (this page keeps up to STAGES frames in flight).
-  //
-  // On desktop `resize` fires when you resize the window, so the cost was
-  // invisible. On a PHONE it fires constantly -- the URL bar hides and shows
-  // on any scroll or drag, which includes touching the control sliders --
-  // so the swapchain was being torn down and rebuilt underneath frames that
-  // were already submitted. Reported symptom: the view "twitches back" a few
-  // frames, correlated with moving sliders or switching away and back.
-  //
-  // Also guards the degenerate case: clientWidth/Height read 0 during some
-  // layout transitions (and while hidden), and a 0-sized canvas is not a
-  // valid configuration.
-  let cfgW = 0, cfgH = 0;
-  function resize() {
-    const dpr = window.devicePixelRatio || 1;
-    const w = Math.round(canvas.clientWidth * dpr);
-    const h = Math.round(canvas.clientHeight * dpr);
-    if (w <= 0 || h <= 0) return;      // mid-layout / hidden: nothing to configure
-    if (w === cfgW && h === cfgH) return; // same size: reconfiguring is pure damage
-    cfgW = w; cfgH = h;
-    canvas.width = w;
-    canvas.height = h;
-    ctx.configure({ device, format: fmt, alphaMode: 'opaque' });
-  }
+  // Canvas sizing and swapchain reconfiguration -- see canvas-fit.mjs,
+  // which carries the reasoning for the changed-size guard (it was ten
+  // identical copies of it).
+  const resize = makeCanvasFit({ canvas, ctx, device, format: fmt });
   window.addEventListener('resize', resize);
   resize();
 
