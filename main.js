@@ -5,6 +5,7 @@ import { createTotalUnwrapper } from './card-total.mjs';
 import { createSimPacer, parseSimRate, DEFAULT_TU_PER_SEC } from './sim-rate.mjs';
 import { assembleShader } from './shader-loader.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
+import { EX, EY, WT } from './lattice-2d.mjs';
 import {
   deriveCardParams, parseCardParams, parseResLog2, reynoldsFromTau,
   DENSE_DEFAULT_RES_LOG2,
@@ -84,9 +85,12 @@ recalculate();
 // to avoid 32-bit integer overflow when summing 1000s of cells.
 const FSCALE  = 1e7;
 
-const EX = [0, 1, 0,-1, 0, 1,-1,-1, 1];
-const EY = [0, 0, 1, 0,-1, 1, 1,-1,-1];
-const WT = [4/9, 1/9, 1/9, 1/9, 1/9, 1/36, 1/36, 1/36, 1/36];
+// The D2Q9 basis, from the ONE place it is derived -- lattice-2d.mjs, which
+// also generates shaders/common_lattice.wgsl. Typed out here (and in nine
+// sibling pages) until 2026-09-14, in f64 EXACT FRACTIONS while the shader
+// held eight-digit f32 decimals: the host built its initial condition from
+// weights the GPU did not have. WT is now the shader's own f32 values.
+// EX/EY were already identical everywhere and are unchanged.
 
 function feq(rho, ux, uy, i) {
   const eu = EX[i]*ux + EY[i]*uy;
