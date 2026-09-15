@@ -710,7 +710,9 @@ has**. Give level 1 an `originX/originY` pair at allocation and
    `parentIndex`/`parentPresent` pair does not have, because the two parents
    are different BUFFERS and WGSL cannot pass one to a function.**
 3. `interp` — `common_interp.wgsl` already holds the shared half; move the
-   fetch behind `parentIndex` and collapse the two entry files.
+   fetch behind `parentIndex` and collapse the two entry files. **DONE — see
+   B3-3 below. The fetch could not move behind an index alone: the origin has
+   to move with it, because the two halves work in different FRAMES.**
 4. `force1` — same, and it shrinks again under B4.
 5. `criterion` — smallest, do it for uniformity.
 6. `manage` — **last**, and only after B2 has already deleted the per-pass
@@ -842,6 +844,54 @@ two standing red cells.
 measured (1 run in 7), and the repeat came back IDENTICAL -- the first live
 use of the rule B3-1 wrote down, on the first opportunity to get it wrong.
 Take the repeat.
+
+### B3-3 — DONE (2026-09-14). Interp, and what the accessor is really for.
+
+`amr_interp_dense_parent.wgsl` (308) and `amr_interp_pool_parent.wgsl` (269)
+are 39 lines each -- bindings and two `@include`s. 577 lines become 504, and
+the ~120-line `main()` they each carried becomes one.
+
+    shaders/common_interp_kernel.wgsl          the kernel, once
+    shaders/common_interp_parent_dense.wgsl    parent = L0's dense grid
+    shaders/common_interp_parent_pool.wgsl     parent = another pool tile
+
+`common_interp.wgsl` -- the BLEND -- is untouched and keeps its name: it is
+shared more widely than this pair (plans/ghost-free.md needs the STEP kernels
+to run the same reconstruction inline), which is why the new file is
+`common_interp_kernel.wgsl` rather than folded into it. One is the math inside
+the kernel; the other is the kernel around it.
+
+**The accessor grew by two functions and, more usefully, by a CONSTRAINT.**
+
+    fn parentTau() -> f32
+    fn levelNbx() -> u32
+    fn levelNby() -> u32
+    fn parentOrigin(slot, bx, by) -> vec2<u32>
+    fn sampleParent(slot, ix, iy) -> CoarseSample
+
+`parentOrigin` and `sampleParent` are a PAIR and must agree on a FRAME. The
+dense half works in coarse BUFFER coordinates over the whole periodic domain
+(origin `bx*RB`, sample wraps and goes through `cellIndex()`); the pool half
+works in PARENT-LOCAL INTERIOR coordinates inside one tile (origin the
+quadrant's own 0-or-RB offset, sample a bare `+GHOST` shift, no wrap and no
+second slot lookup). Neither is meaningful without the other, which is the
+argument for one fragment per parent kind rather than a set of independent
+knobs -- and it is the thing a "just parameterize the differences" refactor
+would have got wrong by exposing origin and fetch as separate overrides.
+
+**What this bought that the line count does not show.** The dense half's
+KNOWN GAP -- `wrapCoord` assumes the coarse level is periodic in BOTH axes, so
+a block refined against a real WALL_Y wall would sample the periodic image
+instead of reflecting -- was documented in the entry file's header, where it
+read as a property of "the interp shader". It is a property of the DENSE
+FETCH, and it now sits in the file that contains that fetch, next to it. The
+pool half never had the gap and no longer carries the warning.
+
+**Measured inert**, `index-cylinder-amr.html?levels=3`, 4096 steps from reset:
+bit-IDENTICAL to the pre-B3 baseline, first run. Boot smoke PASS on all seven
+pages; invariants PASS (all eight gates) on amr-dev and both N2/N3 x
+diffuse/bounceback; analytic channel/TGV PASS; Cd/St unchanged apart from the
+two standing red cells.
 
 ### B3a — the same sweep, in JS
 
@@ -1610,8 +1660,8 @@ B2-2d delete the ?cascade=0 path (16 -> 14),       ◄── DONE; corner balanc
 B2   cascade21                                     ◄── needs B0
 B3-1 step1: one kernel, every level               ◄── DONE, bit-identical
 B3-2 average: one body, two parent fragments      ◄── DONE, bit-identical
-B3   the rest (interp, force1, criterion,          ◄── needs B2 and B3a
-     manage LAST)
+B3-3 interp: kernel + two parent fragments        ◄── DONE, bit-identical
+B3   the rest (force1, criterion, manage LAST)     ◄── needs B2 and B3a
 B5   window = sponge translation                    ◄── independent of B2/B3,
                                                         but smaller after B3
 B1   post-collision rescale                         ◄── needs B0b only; its
