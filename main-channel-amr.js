@@ -52,7 +52,7 @@
 import { reportFatal, refuseConfig, reportNoWebGPU, reportNoAdapter } from './error-overlay.mjs';
 import { loadShader } from './shader-loader.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
-import { check21BalanceOnGPU, allocLevelPool, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState } from './amr2d-gpu.mjs';
+import { check21BalanceOnGPU, allocLevelPool, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState , checkRefinementClosureOnGPU } from './amr2d-gpu.mjs';
 // tauAtLevel: extracted to card-params.mjs by B3a-1, which landed the CALL
 // in all five AMR pages and this IMPORT in only main-amr.js. The other four
 // threw `ReferenceError: tauAtLevelOf is not defined` at init -- but only at
@@ -1014,6 +1014,11 @@ async function init() {
   // wired into the live per-macro-step path, which would need a GPU-side
   // assertion mechanism this project does not have.
   const debugCheck21Balance = () => check21BalanceOnGPU(device, pools, N_LEVELS);
+  // How far this topology is from the 2:1 closure -- amr2d-gpu.mjs.
+  // Reports, does not gate: the shipped manager implements the rule as
+  // per-pass tests and only the VETO half of the refine cascade exists,
+  // so this is expected to be nonzero until plans/2D-backport.md B2.
+  const debugCheckRefinementClosure = () => checkRefinementClosureOnGPU(device, pools, N_LEVELS);
 
   // The rigid body's own state, keyed by common_geometry.wgsl's CardState --
   // amr2d-gpu.mjs, three byte-identical copies before B4.
@@ -1117,6 +1122,7 @@ async function init() {
     debugRunToSteady,
     debugReadCardState,
     debugCheck21Balance,
+    debugCheckRefinementClosure,
     debugListActiveBlocks,
     setAutoRefine,
     isAutoRefine: () => autoRefine,

@@ -515,7 +515,7 @@ async function runInvariants(Runtime, opts, global) {
     global,
     // cov/bad come back null (not empty) on a page that exposes no
     // geometry-coverage scan or card-state readback -- print n/a, never OK.
-    onCheckpoint: (stepsDone, { diag, bal, cov, bad }) => {
+    onCheckpoint: (stepsDone, { diag, bal, cov, closure, bad }) => {
       const corner = bal.cornerOk === undefined ? ''
         : `, corner ${bal.cornerOk ? 'OK' : `${bal.cornerViolations.length}`}`;
       // `n/a` is printed, never nothing: an invariant that silently is not
@@ -524,7 +524,9 @@ async function runInvariants(Runtime, opts, global) {
         : `, converged ${diag.converged ? 'OK' : `NO (${diag.refineByCascadeLastIter} cascade grants outstanding, ${diag.refinePoolExhausted} starved)`}`);
       console.log(`    step ${stepsDone}: 2:1-balance ${bal.ok ? 'OK' : `FAIL (${bal.violations.length})`}${corner}, ` +
         `coverage ${cov === null ? 'n/a' : cov.ok ? 'OK' : `FAIL (${cov.violations.length})`}, ` +
-        `field ${bad === null ? 'n/a' : bad.length ? `FAIL (${bad.join(',')})` : 'OK'}${conv}`);
+        `field ${bad === null ? 'n/a' : bad.length ? `FAIL (${bad.join(',')})` : 'OK'}${conv}` +
+        // Reported, not gated -- see tools/lib/amr-invariants.js on why.
+        `${closure === null ? '' : `, closure ${closure.ok ? 'OK' : `${closure.missing} missing`}`}`);
     },
   });
 }

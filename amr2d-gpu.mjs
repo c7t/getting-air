@@ -37,6 +37,7 @@
 import {
   check21Balance, nbAtLevel, makePool, cellSizeL0AtLevel,
   nearBodyWant, nearBodyWantCentre, bodyPhiL0, bufferToWindow, bufferToWindowLegacy,
+  cascade21,
 } from './amr2d.mjs';
 
 // Every level's blockSlot, copied in one command encoder and one submit, so
@@ -649,4 +650,61 @@ export function makeRefusalWatch({ device, pools, nLevels, checkCoverage, minInt
   };
 
   return watch;
+}
+
+// --- how far the SHIPPED topology is from closed ---------------------------
+//
+// THE CLOSURE, RUN ON WHAT ACTUALLY EXISTS. amr2d.mjs's `cascade21` is the
+// 2:1 rule as ONE function -- present(m, b) => present(m-1, parent(n)) for
+// every neighbour n of b at level m, and for b itself. Run it on the live
+// present set and everything it ADDS is a block the rule says must exist and
+// does not. `forced` records WHY each one was added, and the four reasons are
+// four different defects:
+//
+//   parentOf      the tree property: a block whose own parent tile is absent.
+//   siblingOf     quad incompleteness: a level>=2 block without its three
+//                 siblings, which the pool cannot actually represent.
+//   neighbourOf   with an EDGE offset: plain 2:1 balance.
+//     "  "        with a DIAGONAL offset: the RING. amr_step1.wgsl reads the
+//                 corner cell whenever the diagonal same-level neighbour is
+//                 absent, and its parent tile has to exist for that read to
+//                 land. This is the half debugCheck21Balance reports and
+//                 deliberately does not gate.
+//
+// WHY THIS IS A MEASUREMENT AND NOT YET A GATE. The shipped manager
+// implements the rule as per-pass tests inside coarsen and refine, wrapped in
+// a fixed-point loop -- and only the VETO half of the refine cascade was ever
+// written (main-amr.js:112-131), so a criterion-driven refine can be blocked
+// forever by a neighbour that would only ever have been created BY that
+// refine. plans/2D-backport.md B2 replaces the whole arrangement with this
+// closure applied to the WANT set between decide and coarsen/refine. This
+// exists so that change has a before-number instead of an argument.
+export async function checkRefinementClosureOnGPU(device, pools, nLevels) {
+  const activeSets = await readAllBlockSlots(device, pools, nLevels);
+  const levelSets = [null];
+  for (let m = 1; m < nLevels; m++) levelSets[m] = activeSets[m];
+  const nbAt = (m) => [pools[m].NBX, pools[m].NBY];
+
+  const present = levelSets.map((s, m) => (m === 0 ? null : s.size));
+  const r = cascade21(levelSets, nbAt, { levels: nLevels });
+
+  // Classify by the reason cascade21 recorded, which is the whole point of it
+  // recording one.
+  const byReason = { parentOf: 0, siblingOf: 0, edge: 0, diagonal: 0 };
+  const byLevel = {};
+  for (const f of r.forced) {
+    const b = f.because;
+    if (b.siblingOf !== undefined) byReason.siblingOf++;
+    else if (b.parentOf !== undefined) byReason.parentOf++;
+    else if (b.offset) (b.offset[0] !== 0 && b.offset[1] !== 0 ? byReason.diagonal++ : byReason.edge++);
+    byLevel[f.level] = (byLevel[f.level] || 0) + 1;
+  }
+  return {
+    ok: r.forced.length === 0,
+    missing: r.forced.length,
+    present, byReason, byLevel,
+    // Capped: a badly-unbalanced tree can force thousands, and the first
+    // handful is what anyone actually reads.
+    sample: r.forced.slice(0, 8),
+  };
 }

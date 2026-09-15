@@ -47,6 +47,14 @@ async function runInvariantSweep(Runtime, opts) {
     throw new Error(`${G}.debugCheck21Balance is not available -- wrong page, or it failed to initialize`);
   }
   const hasCoverage = await has('debugCheckGeometryCoverage');
+  // REPORTED, NEVER GATED (plans/2D-backport.md B2). This runs amr2d.mjs's
+  // `cascade21` -- the 2:1 rule as one closure -- on the live PRESENT set, and
+  // counts what the rule says must exist and does not. The shipped manager
+  // implements that rule as per-pass tests inside coarsen and refine, so a
+  // nonzero count here is the CURRENT state of the code, not a regression; B2
+  // is where it is expected to reach zero. Gating it now would paint the whole
+  // suite red for a defect that is already written down.
+  const hasClosure = await has('debugCheckRefinementClosure');
   // Refinement convergence. Only meaningful with ?diag=1: at DIAG=0 every
   // counter stays 0 and `converged` reads TRUE VACUOUSLY, so asserting it
   // without the flag would be a silent false pass -- exactly the failure mode
@@ -77,6 +85,7 @@ async function runInvariantSweep(Runtime, opts) {
   // debugReadDiag()'s own comment on why gating on `granted` was wrong.
   const convergenceViolations = [];
   let diagEnabled = false;
+  const closureViolations = [];
   const coverageViolations = [];
   const fieldViolations = [];
   let stepsDone = 0;
@@ -114,6 +123,14 @@ async function runInvariantSweep(Runtime, opts) {
       if (!cov.ok) coverageViolations.push({ step: stepsDone, violations: cov.violations });
     }
 
+    let closure = null;
+    if (hasClosure) {
+      const r = await evalExpr(Runtime, `${G}.debugCheckRefinementClosure()`, 30000);
+      if (r.exceptionDetails) throw new Error(`debugCheckRefinementClosure failed at step ${stepsDone}: ${r.exceptionDetails.text}`);
+      closure = r.result.value;
+      if (!closure.ok) closureViolations.push({ step: stepsDone, missing: closure.missing, byReason: closure.byReason });
+    }
+
     let bad = [];
     if (hasCardState) {
       const state = await evalExpr(Runtime, `${G}.debugReadCardState()`, 30000);
@@ -125,7 +142,7 @@ async function runInvariantSweep(Runtime, opts) {
     // cov/bad are null (not empty) when this page doesn't expose that check,
     // so a caller renders "n/a" rather than the "OK" an empty result would
     // otherwise read as.
-    if (onCheckpoint) onCheckpoint(stepsDone, { diag, bal: bal.result.value, cov, bad: hasCardState ? bad : null });
+    if (onCheckpoint) onCheckpoint(stepsDone, { diag, bal: bal.result.value, cov, closure, bad: hasCardState ? bad : null });
 
     if (bad.length) break;
   }
@@ -138,7 +155,8 @@ async function runInvariantSweep(Runtime, opts) {
     && fieldViolations.length === 0 && !cornerFails && convergenceViolations.length === 0;
   return { ok, stepsDone, balanceViolations, cornerViolations, requireCornerBalance,
     convergenceViolations, convergenceChecked: hasDiag && diagEnabled,
-    coverageViolations, fieldViolations, hasCoverage, hasCardState };
+    coverageViolations,
+    closureViolations, fieldViolations, hasCoverage, hasCardState };
 }
 
 module.exports = { evalExpr, checkFinite, runInvariantSweep };
