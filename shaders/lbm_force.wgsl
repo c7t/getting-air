@@ -79,7 +79,19 @@ fn main(
     let by   = (y + u32(state.off_y)) % H;
     let cell = by * W + bx;
     let base = cell * 9u;
-    let p    = vec2<f32>(f32(x), f32(y));
+    // THE BODY'S FRAME, not the window's. This was `vec2<f32>(f32(x), f32(y))`
+    // -- the WINDOW position, built straight from the thread index -- which
+    // silently pinned this kernel to the shipped convention no matter what
+    // WINDOW_BODY said. It @includes common_geometry.wgsl, so it DECLARED the
+    // override and every page duly supplied it; it just never read it. An
+    // override a shader does not declare is a hard pipeline error, but one it
+    // declares and ignores is invisible, which is why this survived B5-2 and
+    // B5-3. Under ?window=0 `state.cx` is a BUFFER coordinate while `p` stayed
+    // a window position, so the force integral swept a body displaced by
+    // exactly (off_x, off_y): measured 226x wrong in fy at off_y=75, and
+    // exactly right at off_y=0 -- which is every pinned-cylinder config, and
+    // therefore every config that had ever been pointed at ?window=0.
+    let p    = bodyFrameCell(vec2<u32>(bx, by), state);
 
     let phi = get_phi(p, state);
     let chi = get_chi(phi);
@@ -99,7 +111,9 @@ fn main(
         for (var i = 0u; i < 9u; i++) {
           let wx_src = (x + W - u32(ex[i])) % W;
           let wy_src = (y + H - u32(ey[i])) % H;
-          if (get_phi(vec2<f32>(f32(wx_src), f32(wy_src)), state) < 0f) {
+          let bx_nb  = (wx_src + u32(state.off_x)) % W;
+          let by_nb  = (wy_src + u32(state.off_y)) % H;
+          if (get_phi(bodyFrameCell(vec2<u32>(bx_nb, by_nb), state), state) < 0f) {
             let f_opp = fUnpack(f_in[fIdx(opp[i], (W * H), cell)], opp[i]);
             let corr = 2f * wt[i] * (f32(ex[i]) * usx + f32(ey[i]) * usy) / CS2;
             fx_body += -f32(ex[i]) * (2f * f_opp + corr);
