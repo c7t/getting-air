@@ -214,6 +214,14 @@ export function allocLevelPool(device, U, m, NBX_m, NBY_m, maxFineBlocks, NCELLS
     // "the criterion pass never ran" and cost a wrong diagnosis once.
     freeCountBuf: device.createBuffer({ size: 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC }),
     newlyActivatedBuf: device.createBuffer({ size: maxFineBlocks * 4, usage: U.STORAGE | U.COPY_DST }),
+    // THE WANT SET at this level, one u32 per BLOCK (not per slot): does a
+    // level-m tile want to exist here, before any allocation has happened?
+    // plans/2D-backport.md B2 -- the 2:1 closure runs on this between the
+    // criterion and coarsen/refine, which is what lets the per-pass balance
+    // tests and the fixed-point loop go away. COPY_DST so a test can SEED it
+    // (including with sets that violate the invariant), COPY_SRC so the
+    // result can be scored against amr2d.mjs's host twin.
+    wantBuf: device.createBuffer({ size: NBLOCKS_m * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC }),
   };
   if (m === 1) {
     // Per-block allocation, unchanged from today -- L0 isn't itself
@@ -707,4 +715,240 @@ export async function checkRefinementClosureOnGPU(device, pools, nLevels) {
     // handful is what anyone actually reads.
     sample: r.forced.slice(0, 8),
   };
+}
+
+// --- the GPU cascade, and scoring it against the host twin -----------------
+//
+// shaders/amr_cascade.wgsl is the 2:1 closure as two entry points on the want
+// arrays. This builds its pipelines and drives it, and -- the part that
+// matters -- scores it against amr2d.mjs's `cascade21` on SEEDED want sets.
+//
+// WHY SEEDED AND NOT LIVE. A closure only ever run on valid input is
+// indistinguishable from one that returns its input unchanged (B0's third
+// rule). The live criterion produces whatever it produces; a seed can be an
+// arbitrary set, including ones that violate 2:1 balance by three levels, sit
+// on the periodic seam, or want one child of a quad with no siblings. Those
+// are the inputs that tell the two implementations apart.
+//
+// SHARED, not per-page: five AMR pages would otherwise carry five copies of a
+// pipeline set and a bind group, which is the shape CLAUDE.md records
+// producing 238e48c.
+export function makeCascadePipelines(device, loadedModule, pools, nLevels) {
+  const bgl = device.createBindGroupLayout({
+    label: 'cascadeBGL',
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+      { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    ],
+  });
+  const layout = device.createPipelineLayout({ bindGroupLayouts: [bgl] });
+  const byLevel = {};
+  // Levels >= 2 only: level 1's parent is the dense L0 grid, which is present
+  // everywhere, so nothing cascades OUT of level 1 -- the same reason
+  // cascade21's own loop stops at 2.
+  for (let m = nLevels - 1; m >= 2; m--) {
+    const pool = pools[m];
+    const constants = { NBX: pool.NBX, NBY: pool.NBY, QUAD_COMPLETE: 1 };
+    byLevel[m] = {
+      completeQuads: device.createComputePipeline({
+        layout, compute: { module: loadedModule, entryPoint: 'completeQuads', constants },
+      }),
+      balance: device.createComputePipeline({
+        layout, compute: { module: loadedModule, entryPoint: 'balance', constants },
+      }),
+      bg: device.createBindGroup({
+        layout: bgl,
+        entries: [
+          { binding: 0, resource: { buffer: pool.wantBuf } },
+          { binding: 1, resource: { buffer: pools[m - 1].wantBuf } },
+        ],
+      }),
+      workgroups: Math.ceil((pool.NBX * pool.NBY) / 64),
+    };
+  }
+  return { bgl, byLevel };
+}
+
+// ONE SWEEP, DEEPEST FIRST. See the shader's header on why this reaches the
+// fixed point without iterating: a want at level m forces wants at level m-1
+// only, so the propagation is one-directional down the levels.
+export function encodeCascade(enc, cascade, nLevels) {
+  for (let m = nLevels - 1; m >= 2; m--) {
+    const c = cascade.byLevel[m];
+    for (const entry of ['completeQuads', 'balance']) {
+      const p = enc.beginComputePass();
+      p.setPipeline(c[entry]);
+      p.setBindGroup(0, c.bg);
+      p.dispatchWorkgroups(c.workgroups);
+      p.end();
+    }
+  }
+}
+
+// Every level's want array, as the "bx,by" Sets amr2d.mjs works in, read in
+// ONE submit so all levels come from the same GPU state (the torn-snapshot
+// discipline readAllBlockSlots' header explains at length).
+export async function readWantSets(device, pools, nLevels) {
+  const U = GPUBufferUsage;
+  const stages = [];
+  const enc = device.createCommandEncoder();
+  for (let m = 1; m < nLevels; m++) {
+    const pool = pools[m];
+    const stage = device.createBuffer({ size: pool.NBLOCKS * 4, usage: U.MAP_READ | U.COPY_DST });
+    enc.copyBufferToBuffer(pool.wantBuf, 0, stage, 0, pool.NBLOCKS * 4);
+    stages.push({ m, stage, pool });
+  }
+  device.queue.submit([enc.finish()]);
+  await Promise.all(stages.map(s => s.stage.mapAsync(GPUMapMode.READ)));
+  const sets = [null];
+  for (const { m, stage, pool } of stages) {
+    const w = new Uint32Array(stage.getMappedRange());
+    const set = new Set();
+    for (let b = 0; b < pool.NBLOCKS; b++) {
+      if (w[b] !== 0) set.add(`${b % pool.NBX},${Math.floor(b / pool.NBX)}`);
+    }
+    stage.unmap();
+    stage.destroy();
+    sets[m] = set;
+  }
+  return sets;
+}
+
+export function writeWantSets(device, pools, nLevels, sets) {
+  for (let m = 1; m < nLevels; m++) {
+    const pool = pools[m];
+    const w = new Uint32Array(pool.NBLOCKS);
+    for (const key of (sets[m] || [])) {
+      const [bx, by] = key.split(',').map(Number);
+      w[by * pool.NBX + bx] = 1;
+    }
+    device.queue.writeBuffer(pool.wantBuf, 0, w);
+  }
+}
+
+// THE GATE: seed both implementations with the same want set, close it on the
+// GPU and on the host, and require the two to agree EXACTLY -- not to a
+// tolerance, and not merely in size. Returns the disagreement both ways round,
+// because "the GPU forced something the host did not" and "the host forced
+// something the GPU did not" are different bugs.
+export async function cascadeRoundTrip(device, pools, nLevels, cascade, seedSets) {
+  writeWantSets(device, pools, nLevels, seedSets);
+  const enc = device.createCommandEncoder();
+  encodeCascade(enc, cascade, nLevels);
+  device.queue.submit([enc.finish()]);
+  await device.queue.onSubmittedWorkDone();
+  const gpu = await readWantSets(device, pools, nLevels);
+
+  const nbAt = (m) => [pools[m].NBX, pools[m].NBY];
+  const host = cascade21(seedSets, nbAt, { levels: nLevels }).sets;
+
+  const perLevel = [];
+  let ok = true;
+  for (let m = 1; m < nLevels; m++) {
+    const g = gpu[m], h = host[m];
+    const gpuOnly = [...g].filter(k => !h.has(k));
+    const hostOnly = [...h].filter(k => !g.has(k));
+    if (gpuOnly.length || hostOnly.length) ok = false;
+    perLevel.push({
+      level: m, gpu: g.size, host: h.size,
+      gpuOnly: gpuOnly.slice(0, 6), hostOnly: hostOnly.slice(0, 6),
+      gpuOnlyCount: gpuOnly.length, hostOnlyCount: hostOnly.length,
+    });
+  }
+  return { ok, perLevel, seeded: seedSets.map((s, m) => (m === 0 ? null : s.size)) };
+}
+
+// THE SEED BATTERY, and it is the part that does the work.
+//
+// A closure only ever run on VALID input is indistinguishable from one that
+// returns its input unchanged -- B0's third rule, and the reason
+// tools/test-amr2d.js runs its checkers on inputs that violate the invariant.
+// The same applies to a GPU closure, with one extra hazard the host twin does
+// not have: a data race would show up only where two threads touch the same
+// slot, which needs a seed DENSE enough to produce collisions.
+//
+// So the battery is built from the failure modes, not from typical states:
+//
+//   deep-single      one block at the finest level and nothing else. Forces a
+//                    chain all the way up -- the transitivity the shipped
+//                    fixed-point loop needed iterations for.
+//   quad-partial     ONE child of a quad, no siblings. The criterion really
+//                    can produce this (it is evaluated per block and nothing
+//                    in it looks sideways), and it is a state the POOL cannot
+//                    represent. 3D's first cascade rejected it instead of
+//                    completing it and its checker was right.
+//   seam             a block at (0,0), so every parent it forces is across
+//                    the periodic wrap. Every earlier geometry fixture in this
+//                    project sat in the MIDDLE of the grid, and a mutant that
+//                    dropped the wrap broke nothing until a seam fixture was
+//                    added.
+//   seam-corner      (0,0) AND (NBX-1, NBY-1) -- diagonal neighbours across
+//                    both wraps at once, which is the ring case in the one
+//                    place the arithmetic can go wrong in both axes.
+//   dense-band       a full row of the finest level. Thousands of threads
+//                    writing overlapping parents in one dispatch: the seed
+//                    that would expose a non-monotone write.
+//   already-closed   the output of the host closure fed back in. Must come
+//                    back UNCHANGED -- idempotence, which is what makes "one
+//                    deepest-first sweep is the fixed point" checkable rather
+//                    than asserted.
+//   empty            nothing wanted. Must stay empty; a closure that forces
+//                    anything from nothing is forcing it from a bug.
+export function makeCascadeSeeds(pools, nLevels) {
+  const finest = nLevels - 1;
+  if (finest < 2) {
+    // With one pool level there is nothing to cascade -- level 1's parent is
+    // the dense grid. Say so rather than returning a battery that passes
+    // vacuously.
+    return [{ name: 'levels<3: nothing to cascade', sets: [null, new Set()] }];
+  }
+  const nb = (m) => [pools[m].NBX, pools[m].NBY];
+  const blank = () => { const s = [null]; for (let m = 1; m < nLevels; m++) s[m] = new Set(); return s; };
+  const at = (m, ...keys) => { const s = blank(); for (const k of keys) s[m].add(k); return s; };
+
+  const [fx, fy] = nb(finest);
+  const seeds = [
+    { name: 'empty', sets: blank() },
+    { name: 'deep-single', sets: at(finest, `${fx >> 1},${fy >> 1}`) },
+    // (7,5) is deliberately odd in both axes: the quad's other three members
+    // are (6,4), (7,4), (6,5), so a completion that rounded the wrong way
+    // would land on a different quad entirely.
+    { name: 'quad-partial', sets: at(finest, '7,5') },
+    { name: 'seam', sets: at(finest, '0,0') },
+    { name: 'seam-corner', sets: at(finest, '0,0', `${fx - 1},${fy - 1}`) },
+  ];
+
+  {
+    const s = blank();
+    for (let bx = 0; bx < fx; bx++) s[finest].add(`${bx},${fy >> 1}`);
+    seeds.push({ name: 'dense-band', sets: s });
+  }
+  {
+    // A mixed set with wants at EVERY level, so the sweep has to compose its
+    // own output with the caller's input at each rung rather than only ever
+    // seeing one of the two.
+    const s = blank();
+    for (let m = 1; m < nLevels; m++) {
+      const [x, y] = nb(m);
+      s[m].add(`${(x >> 1) + m},${(y >> 1) - m}`);
+    }
+    seeds.push({ name: 'mixed-levels', sets: s });
+  }
+  // IDEMPOTENCE. Feed the host closure's own output back in; it must come
+  // back unchanged. That is what makes "one deepest-first sweep IS the fixed
+  // point" a checked property rather than an assertion -- and it is the
+  // property the shipped FIXED_POINT_ITERS loop exists because nobody had.
+  for (const base of ['deep-single', 'dense-band', 'mixed-levels']) {
+    const src = seeds.find(x => x.name === base);
+    seeds.push({ name: `already-closed:${base}`, sets: closeSeed(pools, nLevels, src.sets) });
+  }
+  return seeds;
+}
+
+// Idempotence needs the host closure's own output as a seed, which the caller
+// cannot build without cascade21 -- so it is derived here rather than asking
+// every page to import the pure module too.
+export function closeSeed(pools, nLevels, sets) {
+  const nbAt = (m) => [pools[m].NBX, pools[m].NBY];
+  return cascade21(sets, nbAt, { levels: nLevels }).sets;
 }

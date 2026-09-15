@@ -52,7 +52,7 @@
 import { reportFatal, refuseConfig, reportNoWebGPU, reportNoAdapter } from './error-overlay.mjs';
 import { loadShader } from './shader-loader.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
-import { check21BalanceOnGPU, allocLevelPool, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState , checkRefinementClosureOnGPU } from './amr2d-gpu.mjs';
+import { check21BalanceOnGPU, allocLevelPool, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState , checkRefinementClosureOnGPU , makeCascadePipelines, cascadeRoundTrip, makeCascadeSeeds } from './amr2d-gpu.mjs';
 // tauAtLevel: extracted to card-params.mjs by B3a-1, which landed the CALL
 // in all five AMR pages and this IMPORT in only main-amr.js. The other four
 // threw `ReferenceError: tauAtLevelOf is not defined` at init -- but only at
@@ -617,6 +617,11 @@ async function init() {
     layout: device.createPipelineLayout({ bindGroupLayouts: [criterionBGL] }),
     compute: { module: criterionSM, entryPoint: 'main', constants: criterionConstants }
   });
+  // plans/2D-backport.md B2: the 2:1 closure's own pipelines. Built but
+  // NOT yet in dispatchMacroStep -- see debugCascadeRoundTrip.
+  const cascadeSM = await loadShader(device, 'shaders/amr_cascade.wgsl');
+  const cascade = makeCascadePipelines(device, cascadeSM, pools, N_LEVELS);
+
   const manageCoarsenPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [manageBGL] }),
     compute: { module: manageSM, entryPoint: 'coarsen', constants: manageConstants }
@@ -1020,6 +1025,30 @@ async function init() {
   // so this is expected to be nonzero until plans/2D-backport.md B2.
   const debugCheckRefinementClosure = () => checkRefinementClosureOnGPU(device, pools, N_LEVELS);
 
+  // THE GPU CASCADE, SCORED AGAINST THE HOST TWIN (plans/2D-backport.md B2-2).
+  //
+  // Nothing in the simulation consumes the want arrays yet -- this is the
+  // closure built and proved correct BEFORE anything depends on it, the same
+  // order B4-1 took before B4-2. `seeds` is a list of want sets in
+  // amr2d.mjs's "bx,by" form; each is written to the GPU, closed by
+  // shaders/amr_cascade.wgsl, and required to match cascade21's result
+  // EXACTLY. Omit it and a default battery runs -- see makeCascadeSeeds.
+  //
+  // The seeds matter more than the driver: a closure only ever run on valid
+  // input is indistinguishable from one that returns its input unchanged, so
+  // the battery deliberately includes sets that VIOLATE 2:1 balance, sit on
+  // the periodic seam, and want one child of a quad with no siblings.
+  async function debugCascadeRoundTrip(seeds) {
+    const battery = seeds || makeCascadeSeeds(pools, N_LEVELS);
+    const results = [];
+    for (const { name, sets } of battery) {
+      const r = await cascadeRoundTrip(device, pools, N_LEVELS, cascade, sets);
+      results.push({ name, ...r });
+    }
+    return { ok: results.every(r => r.ok), results };
+  }
+
+
   // The rigid body's own state, keyed by common_geometry.wgsl's CardState --
   // amr2d-gpu.mjs, three byte-identical copies before B4.
   const debugReadCardState = () => readCardState(device, cardStateBuf);
@@ -1123,6 +1152,7 @@ async function init() {
     debugReadCardState,
     debugCheck21Balance,
     debugCheckRefinementClosure,
+    debugCascadeRoundTrip,
     debugListActiveBlocks,
     setAutoRefine,
     isAutoRefine: () => autoRefine,

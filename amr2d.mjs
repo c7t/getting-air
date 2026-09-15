@@ -685,7 +685,25 @@ export function checkGeometryCoverage(pool, levelSets, want, { levels }) {
 // ALL 9 OFFSETS, NOT THE FOUR EDGES. d = (0,0) is the tree property (a block
 // with no parent is not a refinement of anything), the edges are 2:1 balance,
 // and the four DIAGONALS are the RING -- see checkRingParentCoverage for the
-// concrete cell that goes unreadable without them.
+// concrete cell that goes unreadable without them.//
+// AND d = (0,0) IS REDUNDANT -- MEASURED, NOT ASSUMED. The three-jobs reading
+// above ("tree property, faces, ring") is how this rule is usually written
+// down, and it overstates the case: the own-parent offset is IMPLIED by the
+// four faces. A quad's members are adjacent and share a parent, so for any
+// block at least one x-face neighbour has the same parent -- bx even gives
+// (bx+1)>>1 == bx>>1, bx odd gives (bx-1)>>1 == bx>>1, and NBX is a power of
+// two so the wrap has no edge case. Dropping (0,0) therefore changes nothing,
+// and it is the one mutant of this closure that breaks NOTHING: 0 of 42 host
+// checks and 0 of 10 GPU seeds, against 5-9 failures for every other mutant
+// tried (face-only, no quad completion, non-periodic wrap, one-axis parent
+// shift, transposed parent, quad completion rounding up).
+//
+// KEEP IT ANYWAY. It costs one ninth of a cheap pass, it makes the rule
+// self-evident rather than a consequence, and the redundancy depends on the
+// face offsets being present -- so a future change that narrowed the offset
+// set would silently take the tree property with it. What is NOT ok is
+// deleting it as an optimization on the strength of a green suite, which is
+// exactly what a green suite would support here.
 export function cascade21(wantSets, nbAt, { levels }) {
   const sets = [null];
   for (let m = 1; m < levels; m++) sets[m] = new Set(wantSets[m] || []);
