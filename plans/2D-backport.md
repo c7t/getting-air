@@ -515,12 +515,40 @@ code could not satisfy it can now become a gate.**
    is blocked by a hard limit, the unblocking step is its own stage** — it is
    cheaper, it is bit-identical, and it converts a leap back into a step.
 
-**Left for B2-2d:** delete the `?cascade=0` path — the per-pass tests,
-`FIXED_POINT_ITERS`, `?demandCascade`, `?refineIters`, and the two bindings
-that go dead with them (`parentBlockSlot`, `grandchildBlockSlot`, taking the
-pool manager 16 → 14). Then `requireCornerBalance` can become the default in
-`tools/lib/amr-invariants.js`, and B3's `manage` pair becomes a refactor
-instead of a rewrite — which is what B3 sequenced it last for.
+### B2-2d — DONE (2026-09-14). The per-pass path is gone.
+
+-766/+294. `amr_manage.wgsl` 11 -> 9 bindings, `amr_manage_pool.wgsl` 16 -> 14,
+and with them `hasLevel2Child`, `level2Wanted`, `edgeNeighbors`,
+`hasGrandchild`, `childEdgeNeighbors`, the 8-cell grandchild ring walk, the
+`isHardRequired` split, the neighbour-active veto, `FIXED_POINT_ITERS`,
+`?demandCascade`, `?refineIters`, `HAS_LEVEL2`, `HAS_GRANDCHILD`,
+`dummyCriterionBuf`. Inert against B2-2c: `amr-N3-diffuse` 1.425 / 0.1551 is
+exact, the bounce-back pair within 0.001.
+
+**CORNER 2:1 BALANCE IS NOW A GATE** (`requireCornerBalance` defaults true,
+and `validate-all`'s `?ghostfree=1` special case is gone -- that path alone
+used to need it, now everything does). It was reported-and-not-gated from B0
+until now *for a good reason*: the ring path tolerates a missing diagonal
+parent, the per-pass cascade covered only the faces, so the count was reliably
+13 on the shipped page and gating it would have failed every run for a defect
+already written down. **A check that had to be non-gating because the code
+could not satisfy it becomes a gate the moment the code can -- and leaving it
+reporting-only after that is how a fixed invariant silently regresses.** Worth
+scanning the rest of this project's checkers for the same shape.
+
+**And a process note that nearly cost the tree.** The first attempt at
+collapsing the dispatch brace-matched across template literals and truncated
+`main-amr.js` from 3833 lines to 152 -- and **`make js` PASSED**, because a
+truncated file is still valid JavaScript. It was caught by reading
+`git diff --stat` (11,544 deletions), not by any check. That is B3a's finding
+#1 for the third time, now with a positive rule attached: **for scripted
+surgery in these files, the diff stat is part of the gate**, and a diff an
+order of magnitude larger than the change described is a failure regardless of
+what `node --check` says.
+
+**B3's `manage` pair is now a refactor rather than a rewrite**, which is what
+B3 sequenced it last for: the two files no longer contain two different
+implementations of a balance rule, because they no longer contain one at all.
 
 ### B2 — 2:1 balance as one closure
 
@@ -1417,8 +1445,10 @@ B2-2b0 get the pool manager off the 16-buffer      ◄── DONE, 16 -> 15
                                                         slot % 4)
 B2-2b the switch-over, measured, default off      ◄── DONE
 B2-2c default flipped                             ◄── DONE
-B2-2d delete the ?cascade=0 path (16 -> 14),       ◄── next; unblocks B3's
-      then corner balance can GATE                      manage pair
+B2-2d delete the ?cascade=0 path (16 -> 14),       ◄── DONE; corner balance
+      corner balance GATES                              now gates, and B3's
+                                                        manage pair is a
+                                                        refactor not a rewrite
 B2   cascade21                                     ◄── needs B0
 B3   kernel unification, manage LAST                ◄── needs B2 and B3a
 B5   window = sponge translation                    ◄── independent of B2/B3,
