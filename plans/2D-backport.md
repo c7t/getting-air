@@ -579,7 +579,9 @@ of them is the shape B2-2d described:
    Now gated at every checkpoint.
 
 The sweep is seven gates, all gating: `2:1-balance, corner, coverage, field,
-pool, closure, quadrants`.
+pool, closure, quadrants`. **Eight since B3-1's prerequisite** -- `origins`,
+the same shape as `quadrants` and added for the same reason (a per-slot buffer
+whose content is a function of cheaper data, scored before that is relied on).
 
 **And they were checked for being vacuous**, which is the point of the whole
 exercise. Under `?maxFineBlocks=16`: six fire (2:1-balance 28, corner 55,

@@ -22,7 +22,7 @@ import {
   tauAtLevel as tauAtLevelOf,
 } from './card-params.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
-import { check21BalanceOnGPU, allocLevelPool, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState, checkGeometryCoverageOnGPU, makeRefusalWatch , checkRefinementClosureOnGPU , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU } from './amr2d-gpu.mjs';
+import { check21BalanceOnGPU, allocLevelPool, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState, checkGeometryCoverageOnGPU, makeRefusalWatch , checkRefinementClosureOnGPU , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU, checkTileOriginsOnGPU } from './amr2d-gpu.mjs';
 import { EX, EY, WT } from './lattice-2d.mjs';
 import { makeCanvasFit } from './canvas-fit.mjs';
 
@@ -2881,6 +2881,7 @@ async function init() {
   // quadrantOfSlot. This scores the stored buffer against that rule over
   // live ACTIVE slots, which is what lets the pool manager stop writing it.
   const debugCheckSlotQuadrants = () => checkSlotQuadrantsOnGPU(device, pools, N_LEVELS);
+  const debugCheckTileOrigins = () => checkTileOriginsOnGPU(device, pools, N_LEVELS, RB);
 
   // THE GPU CASCADE, SCORED AGAINST THE HOST TWIN (plans/2D-backport.md B2-2).
   //
@@ -3451,6 +3452,7 @@ async function init() {
     debugCheck21Balance,
     debugCheckRefinementClosure,
     debugCheckSlotQuadrants,
+    debugCheckTileOrigins,
     debugCascadeRoundTrip,
     debugCheckGeometryCoverage,
     debugReadCardState,

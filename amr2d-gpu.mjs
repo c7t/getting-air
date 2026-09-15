@@ -37,7 +37,7 @@
 import {
   check21Balance, nbAtLevel, makePool, cellSizeL0AtLevel,
   nearBodyWant, nearBodyWantCentre, bodyPhiL0, bufferToWindow, bufferToWindowLegacy,
-  cascade21, quadrantOfSlot,
+  cascade21, quadrantOfSlot, tileOriginL0, RB_DEFAULT,
 } from './amr2d.mjs';
 
 // Every level's blockSlot, copied in one command encoder and one submit, so
@@ -988,6 +988,68 @@ export function closeSeed(pools, nLevels, sets) {
 // value there" -- including debugSnapshotLoad, which writes whatever a
 // snapshot recorded. That is an empirical claim about live state, and this is
 // how it gets checked rather than asserted.
+// A TILE'S CACHED ORIGIN AGAINST THE CLOSED FORM, ON THE LIVE POOL.
+//
+// shaders/amr_manage_pool.wgsl builds originX/originY RECURSIVELY at refine
+// time (parent origin + quadrant offset * the PARENT's cell size), which is
+// the transposable computation amr2d.mjs's tileOriginL0/tileOriginL0Recursive
+// pair exists to pin down -- but that pair is a HOST twin, and nothing scored
+// the live buffer the kernels actually read.
+//
+// This scores it, against the closed form `block * RB * 2^-(m-1)`. The two
+// routes agree exactly in f32 (every term is a power of two times an integer),
+// so any mismatch is a real defect, not rounding. Same shape and same purpose
+// as checkSlotQuadrantsOnGPU: a per-slot buffer whose content is a function of
+// cheaper data, checked so that reading it that way is a measured fact rather
+// than an argument.
+export async function checkTileOriginsOnGPU(device, pools, nLevels, rb = RB_DEFAULT) {
+  const U = GPUBufferUsage;
+  const stages = [];
+  const enc = device.createCommandEncoder();
+  // Levels >= 2 only: level 1 caches no origin (allocLevelPool allocates
+  // originX/YBuf for m >= 2), it derives `bx * RB` -- which IS the closed
+  // form at m = 1, so there is nothing there to disagree.
+  for (let m = 2; m < nLevels; m++) {
+    const pool = pools[m];
+    const bytes = pool.MAX_FINE_BLOCKS * 4;
+    const ox = device.createBuffer({ size: bytes, usage: U.MAP_READ | U.COPY_DST });
+    const oy = device.createBuffer({ size: bytes, usage: U.MAP_READ | U.COPY_DST });
+    const s2b = device.createBuffer({ size: bytes, usage: U.MAP_READ | U.COPY_DST });
+    enc.copyBufferToBuffer(pool.originXBuf, 0, ox, 0, bytes);
+    enc.copyBufferToBuffer(pool.originYBuf, 0, oy, 0, bytes);
+    enc.copyBufferToBuffer(pool.slotToBlockBuf, 0, s2b, 0, bytes);
+    stages.push({ m, ox, oy, s2b, pool });
+  }
+  if (!stages.length) return { ok: true, checked: 0, violations: [] };
+  device.queue.submit([enc.finish()]);
+  await Promise.all(stages.flatMap(s => [
+    s.ox.mapAsync(GPUMapMode.READ), s.oy.mapAsync(GPUMapMode.READ), s.s2b.mapAsync(GPUMapMode.READ),
+  ]));
+
+  const violations = [];
+  let checked = 0;
+  for (const { m, ox, oy, s2b, pool } of stages) {
+    const x = new Float32Array(ox.getMappedRange());
+    const y = new Float32Array(oy.getMappedRange());
+    const slotToBlock = new Int32Array(s2b.getMappedRange());
+    for (let slot = 0; slot < pool.MAX_FINE_BLOCKS; slot++) {
+      const blockID = slotToBlock[slot];
+      if (blockID < 0) continue;   // never allocated -- never written
+      checked++;
+      const block = [blockID % pool.NBX, Math.floor(blockID / pool.NBX)];
+      const [wx, wy] = tileOriginL0(block, m, rb);
+      if (x[slot] !== wx || y[slot] !== wy) {
+        if (violations.length < 8) {
+          violations.push({ level: m, slot, blockID, stored: [x[slot], y[slot]], rule: [wx, wy] });
+        }
+      }
+    }
+    ox.unmap(); oy.unmap(); s2b.unmap();
+    ox.destroy(); oy.destroy(); s2b.destroy();
+  }
+  return { ok: violations.length === 0, checked, violations };
+}
+
 export async function checkSlotQuadrantsOnGPU(device, pools, nLevels) {
   const U = GPUBufferUsage;
   const stages = [];

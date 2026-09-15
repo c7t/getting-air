@@ -115,18 +115,22 @@ invariants the AMR machinery depends on:
   `webgpu-verify`) — `validate-all.js` is the one-command version.
 - **`tools/validate-amr-invariants.js`** — AMR structural invariants,
   asserted periodically through a run (not just at the end, so a transient
-  violation can't slip past). **Seven gates as of 2026-09-14, all gating:**
+  violation can't slip past). **Eight gates as of 2026-09-14, all gating:**
   2:1 balance (`debugCheck21Balance`), CORNER 2:1 balance (same call — gating
   only since the closure made it satisfiable), geometry-forced refinement
   (`debugCheckGeometryCoverage` — every leaf near the body already at the
   finest level), field-finite (NaN/blowup), pool starvation (refines refused
   for want of a slot; needs `?diag=1` or it reads vacuously true), the 2:1
   CLOSURE (`debugCheckRefinementClosure` — what the rule requires but the
-  allocator did not deliver), and the slot-quadrant rule
-  (`debugCheckSlotQuadrants`).
+  allocator did not deliver), the slot-quadrant rule
+  (`debugCheckSlotQuadrants`), and the TILE-ORIGIN rule
+  (`debugCheckTileOrigins` — a tile's cached origin against the closed form
+  `block * RB * 2^-(m-1)`, exact in f32; the pool manager builds it by a
+  parent-chain recursion instead, and that recursion is what got transposed
+  once and cost a wrong level-2 force).
   **Sanity-check the sweep against a starved pool** (`--extra=maxFineBlocks=16`)
-  after touching it: six of the seven go red there and `quadrants` does NOT,
-  which is what shows they are reading seven different things rather than one.
+  after touching it: six go red there and `quadrants`/`origins` do NOT,
+  which is what shows they are reading different things rather than one.
 - **`tools/validate-amr-vs-dense.js`** — standalone/opt-in, **not** part of
   `validate-all.js`'s default sweep (a high-resolution dense run is far more
   expensive than that suite's default configs). Runs the dense reference at
