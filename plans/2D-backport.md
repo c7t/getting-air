@@ -23,7 +23,7 @@ GPU) and that is what made M4/M5 survivable. Build the 2D equivalent first.
 | B0 | `d3-amr.mjs` + mutation-checked host tests | **DONE** | `amr2d.mjs` + `amr2d-gpu.mjs`, 34 GPU-free checks; deleted 680 lines of five duplicated checkers | M |
 | B0b | The interface instrument (mass/momentum drift) | **DONE** | `tools/analyze-amr-interface.js`; measured B9 as 93% of the mass channel and the seam at 9.6x the no-interface floor in momentum | M |
 | B1 | Post-collision Dupuis-Chopard `fneq` factor | **yes, a live bug** | 2D uses the pre-collision form on post-collision populations | S (code) / L (re-baseline) |
-| B2 | `cascade21`: 2:1 as ONE closure on the WANT set | **B2-1 DONE** | the 3 balance bugs measure as already fixed; what is left is the RING (14 blocks) and the veto half (L2's extent, 80 vs 176 L0 units) | M |
+| B2 | `cascade21`: 2:1 as ONE closure on the WANT set | **B2-1/2a DONE** | the 3 balance bugs measure as already fixed; what is left is the RING (14 blocks) and the veto half (L2's extent, 80 vs 176 L0 units) | M |
 | B3 | One kernel per stage + a `parent_{dense,pool}` accessor | **yes** | deletes ~1100 lines of near-duplicate WGSL across 6 kernel pairs | M |
 | B3a | The same sweep in JS: the AMR pages duplicate each other | **largely DONE** | duplication outside `init`/`frame` 3,319 → 2,419 lines; byte-identical 1,129 → 613. Found a stranded comment and two always-true gates on the way | M |
 | B4 | The body lives entirely on the finest level | **DONE** | coverage gate written for the two moving-body pages, the block predicate fixed, ~120 lines of masking + 3 bindings + an override deleted, and 3 refusals now under test | S |
@@ -359,6 +359,46 @@ directional. `closure -> 0` (the ring half) and `L2 extent -> ~176 without
 not the thing being checked — which matters because the AMR configs' own
 reproducibility floor (+/-0.002 at N=3, CLAUDE.md) is wide enough to hide a
 real regression underneath a change this size.
+
+### B2-2a — the GPU closure, proved before it is used — DONE (2026-09-14)
+
+`shaders/amr_cascade.wgsl`: `completeQuads` + `balance`, no includes at all
+(the rule is about the TREE, so it needs no SDF, lattice or populations).
+Want buffers in `allocLevelPool`; pipelines built; `dispatchMacroStep`
+untouched, so the physics is inert. `cascadeRoundTrip` seeds both
+implementations and requires an EXACT match.
+
+**One sweep, deepest first — the fixed-point loop is not needed and that is
+now checked**, via three already-closed seeds, rather than argued.
+
+**Two things worth carrying.**
+
+1. **The seeds are the work, not the driver.** All 10 agree on all four AMR
+   pages, but agreement on valid input is worth nothing on its own, so the
+   battery is built from failure modes: quad-partial (odd in both axes),
+   seam (0,0), seam-corner (both wraps at once), and `dense-band` — a full
+   finest-level row, which is the only seed dense enough that two threads
+   write the same parent slot in one dispatch, i.e. the only one that could
+   expose a non-monotone write. Mutation-scored: 7 mutants of the shader,
+   5–9 seed failures each.
+
+2. **`d = (0,0)` IS REDUNDANT, measured.** It is the one mutant that breaks
+   nothing — 0 of 10 GPU seeds, and 0 of 42 host checks with the same mutant
+   applied to `cascade21`. A quad's members are adjacent and share a parent,
+   so for any block at least one x-face neighbour has the same parent
+   (`bx` even → `(bx+1)>>1 == bx>>1`; odd → `(bx-1)>>1`; NBX is a power of
+   two so the wrap has no edge case). **So this plan's own "d = (0,0) is the
+   tree property, the edges are 2:1 balance, the diagonals are the ring"
+   overstates it: the tree property is implied by the edges.** Keep the
+   offset — it costs a ninth of a cheap pass, it makes the rule self-evident,
+   and the redundancy depends on the faces being present — but a green suite
+   would support deleting it, which is why it is written into both files.
+
+**Left for B2-2b:** the `decide` entry points (criterion + geometry → want,
+with the balance vetoes removed), switching coarsen/refine to consume the want
+set, and deleting the per-pass tests, `FIXED_POINT_ITERS`, and
+`?demandCascade`. Gate is B2-1's two directional numbers: `closure -> 0` and
+L2's extent `80 -> ~176` L0 units without the flag.
 
 ### B2 — 2:1 balance as one closure
 
@@ -1249,6 +1289,7 @@ B8   SOLID_EQ                                          DONE -- exact on the
 B9   lattice weights                                   DONE -- unblocked B6's
                                                        mass half
 B2-1 the before-number                             ◄── DONE
+B2-2a the GPU closure, proved, unused             ◄── DONE
 B2   cascade21                                     ◄── needs B0
 B3   kernel unification, manage LAST                ◄── needs B2 and B3a
 B5   window = sponge translation                    ◄── independent of B2/B3,
