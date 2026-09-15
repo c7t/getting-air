@@ -1,5 +1,27 @@
 // Fused LBM Kernel: Pull-Streaming + Collision + Source Term
 // This kernel performs a full LBM step in one pass over memory.
+//
+// BUFFER-COORDINATE DISPATCH (plans/2D-backport.md B5, first step). A thread
+// owns a BUFFER cell and converts to window coordinates only where something
+// is physically anchored -- the body SDF, the ALBC sponge, and the WALL_Y
+// channel walls. It used to be the other way round: a thread owned a WINDOW
+// cell and converted at every load and store, which meant streaming computed
+// a window source and then mapped it straight back to a buffer source --
+// composing a shift with its own inverse, once per direction per cell.
+//
+// This is the shape shaders/amr_step.wgsl has always had, and the shape 3D
+// settled on. The dense path was the last window-dispatch kernel in the tree.
+//
+// PROVABLY INERT, not merely believed so: the two readings visit the same
+// cells and compute the same per-cell arithmetic, with no reduction anywhere
+// in this kernel, so the only question is the index algebra --
+//
+//     window:  wsrc = (x - e) mod W,  bsrc = (wsrc + off) mod W
+//     buffer:  bsrc = (bx - e) mod W                 with x = (bx - off) mod W
+//
+// -- and those compose to the same integer. B5's own gate (unshift the field
+// and compare bit-for-bit) is the general form of that; here the shift is the
+// identity, because the cell each thread WRITES has not moved at all.
 
 // @include "common_geometry.wgsl"
 // @include "common_lattice.wgsl"
@@ -114,8 +136,16 @@ fn get_chi(phi: f32) -> f32 {
 
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let x = gid.x; let y = gid.y;
-  if (x >= W || y >= H) { return; }
+  // THE BUFFER CELL THIS THREAD OWNS. Everything it writes is indexed by
+  // this, with no conversion (see file header).
+  let bx = gid.x; let by = gid.y;
+  if (bx >= W || by >= H) { return; }
+  let cell = by * W + bx;
+
+  // ... and its WINDOW position, needed only by the three physically-anchored
+  // things below: the body SDF, the sponge band, and the WALL_Y walls.
+  let x = (bx + W - u32(state.off_x)) % W;
+  let y = (by + H - u32(state.off_y)) % H;
 
   // Position/solid-velocity/own-cell-index terms, hoisted ABOVE the gather
   // loop (unchanged math, just moved earlier from where section "3" used
@@ -132,14 +162,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   let phi = get_phi(p, state);
 
-  let bx = (x + u32(state.off_x)) % W;
-  let by = (y + u32(state.off_y)) % H;
-  let cell = by * W + bx;
-
-  // 1. Pull Streaming: Read populations from neighbors that will arrive at (x,y)
+  // 1. Pull Streaming: the neighbours that arrive at this cell.
   var f: array<f32,9>;
   for (var i = 0u; i < 9u; i++) {
-    // Window coordinates of source neighbor
+    // The source cell, in BUFFER coordinates -- one wrap, no round trip.
+    let bx_src = (bx + W - u32(ex[i])) % W;
+    let by_src = (by + H - u32(ey[i])) % H;
+    // Its WINDOW position, for the two physically-anchored source tests
+    // below. Same shift as this cell's own, so it stays exact.
     let wx_src = (x + W - u32(ex[i])) % W;
     let wy_src = (y + H - u32(ey[i])) % H;
 
@@ -166,9 +196,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       let corr = 2f * wt[i] * f32(ex[i]) * wallUx / CS2;
       f[i] = fUnpack(f_in[fIdx(opp[i], (W * H), cell)], opp[i]) + corr;
     } else {
-      // Map window source to buffer source
-      let bx_src = (wx_src + u32(state.off_x)) % W;
-      let by_src = (wy_src + u32(state.off_y)) % H;
       f[i] = fUnpack(f_in[fIdx(i, (W * H), (by_src * W + bx_src))], i);
     }
   }
@@ -201,7 +228,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let uy = uy_star + Fy / (2.0f * rhoDen);
   let u_sq = ux*ux + uy*uy;
 
-  // Store velocity for rendering (buffer cell index)
+  // Store velocity for rendering (the buffer cell this thread owns)
   vel[cell * 2u] = ux; vel[cell * 2u + 1u] = uy;
 
   // 4. Collision and ALBC Sponge

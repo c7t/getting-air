@@ -1537,6 +1537,60 @@ dispatch is a separate, smaller commit and should go first — it makes the
 base page consistent with the AMR pages and is gated by `index-boot` plus a
 dense snapshot diff.
 
+### B5-0 — DONE (2026-09-14). The dense step is buffer-dispatched.
+
+`shaders/lbm_step.wgsl` now owns a BUFFER cell per thread and converts to
+window coordinates only for the three physically-anchored things: the body
+SDF, the ALBC sponge band, and the WALL_Y channel walls. It was the last
+window-dispatch kernel in the tree.
+
+**The round trip it removes is the point.** Streaming used to compute a window
+source and then map it straight back to a buffer source -- composing a shift
+with its own inverse, once per direction per cell:
+
+    window:  wsrc = (x - e) mod W,  bsrc = (wsrc + off) mod W
+    buffer:  bsrc = (bx - e) mod W            with x = (bx - off) mod W
+
+Provably the same integer, no reduction anywhere in the kernel, and the cell
+each thread WRITES has not moved -- so B5's "unshift and compare bit-for-bit"
+gate degenerates here to a plain comparison.
+
+**AND THE GATE HAD TO BE CHOSEN CAREFULLY, which is worth recording.**
+`dense-reference` is the obvious dense config and it is the WRONG ONE: a
+PINNED cylinder never moves the window, so `off` stays 0, the shift is the
+identity, and the config cannot tell the two readings apart at all. The page
+that can is `index-reentry.html` -- dense, a MOVING body, and (unlike
+`index.html`) it exposes `window.__CYL` with `debugSnapshotSave`. Measured
+there, 4096 steps from reset:
+
+    same build, twice   IDENTICAL   (the dense pages are exactly
+                                     deterministic -- no pool free list)
+    pre vs post         IDENTICAL
+
+Plus `dense-reference` Cd 1.951 / St 0.1260 exactly (CLAUDE.md's recorded
+bit-exact value), `index-boot`/`reentry-boot` PASS, and
+channel-poiseuille/couette-dense + tgv-dense PASS.
+
+**`lbm_stream.wgsl` and `lbm_collide.wgsl` are DELETED.** The plan cited them
+as evidence that the dense path was window-dispatched; they are in fact DEAD
+-- unreferenced by any page, tool or Makefile target since the fused
+`lbm_step.wgsl` replaced them, and only kept green by `make wgsl` compiling
+every file in the directory. They were also **the last two copies of `struct
+CardState` outside `common_geometry.wgsl`** (checked: not yet drifted), which
+is the struct amr2d-gpu.mjs's `CARD_STATE_KEYS` warns can rot silently because
+inserting a field re-labels every field after it rather than failing. A dead
+file that still compiles is a rot surface `make check` actively protects.
+
+**What is left of B5** is the real change: the BODY moves into buffer
+coordinates, the SDF takes the nearest image, and the conversion survives only
+in the sponge -- with `?window=` selecting old/new, and a refusal (not a
+degradation) when there is no body, a walled axis, or no sponge. Note that
+`lbm_force.wgsl` is deliberately NOT converted here: its atomicAdd reduction
+is per-WORKGROUP, so re-tiling the dispatch regroups the truncated partials
+and the total moves in the last fixed-point digit whenever `off` != 0 -- the
+same class as the AMR free-list note in CLAUDE.md. That is a re-baselining
+change and belongs with B5 proper, not bundled into an inert one.
+
 ### B9 — DONE (2026-09-14)
 
 `lattice-2d.mjs` + `tools/gen-lattice-2d.js` + `tools/test-lattice-2d.js`, and
