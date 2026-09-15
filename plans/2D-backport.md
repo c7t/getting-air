@@ -400,6 +400,63 @@ set, and deleting the per-pass tests, `FIXED_POINT_ITERS`, and
 `?demandCascade`. Gate is B2-1's two directional numbers: `closure -> 0` and
 L2's extent `80 -> ~176` L0 units without the flag.
 
+### B2-2b — BLOCKED ON THE BINDING CEILING, and that decides its shape
+
+**Attempted and reverted, 2026-09-14.** The intent was the house pattern every
+other stage here used: land the switch-over behind `?cascade=1` with the
+default byte-identical, measure the A/B in one build, flip the default in a
+later commit. **That is impossible for the pool manager**, and the reason is a
+hard limit rather than a design preference:
+
+```
+error: The number of storage buffers (17) in the Compute stage
+       exceeds the maximum per-stage limit (16).
+       While validating [BindGroupLayoutDescriptor "managePoolBGL"]
+```
+
+`shaders/amr_manage_pool.wgsl` already declares **16 storage buffers — exactly
+the per-stage maximum**, which every AMR page already knows it is sitting on
+(`NEEDED_STORAGE_BUFFERS_PER_STAGE = 16`, checked against the adapter at init).
+Adding the child level's want array is a 17th, and no grouping avoids it: the
+limit is per STAGE, not per bind group. Caught on the first boot-smoke run,
+before any of it could be believed.
+
+**So the switch-over cannot be staged behind a flag — it has to be the
+replacement, in one commit.** That is not a loss: two of the pool manager's
+bindings become dead under the closure, and they are exactly the two the
+legacy tests read — `parentBlockSlot` (the neighbour-active veto) and
+`grandchildBlockSlot` (the grandchild guard). Delete those and add `childWant`
+and the count goes 16 → 15, with room. But the deletions and the switch are
+one atomic change, and the A/B has to be done ACROSS commits (against B2-1's
+recorded numbers) rather than within one build.
+
+**Two ways forward, and the first is probably worth doing on its own.**
+
+1. **B2-2b0: get the pool manager off the ceiling first.** Sitting exactly at
+   a hard device limit means *any* future change to that kernel has this same
+   conversation, and the suite reports it as a page that will not boot. There
+   is slack available without touching the decision logic: `parentOriginX` and
+   `parentOriginY` are two buffers holding one vec2 per slot, and
+   `childParentSlot`/`childQuadrant` are two more that a single packed u32
+   would carry. Either pairing buys a slot and makes the flagged
+   switch-over possible after all. **Independently valuable, gated
+   bit-identical, and it is the difference between B2-2b being stageable and
+   being a leap.**
+
+2. **B2-2b as one replacement**, accepting that the default moves in the same
+   commit that adds the closure. Gated by B2-1's directional numbers rather
+   than by a same-build A/B: `closure -> 0`, L2's x-extent `80 -> ~176` L0
+   units with no flag set, plus the AMR Cd/St reported as a change.
+
+**What was already written and works, for whoever picks this up:** the
+`decide` entry points for both managers (the criterion/geometry half of
+coarsen-refine with the neighbour tests removed), the `select`-based rewiring
+of coarsen/refine onto the want array, and the one-sweep dispatch
+(decide → `encodeCascade` → coarsen finest-first → refine coarsest-first).
+All of it passed `make check` and `naga`; only the pool manager's bind group
+could not be created. The dense manager (`amr_manage.wgsl`, 11 buffers) has
+ample room and its half of the change is unaffected by any of this.
+
 ### B2 — 2:1 balance as one closure
 
 **What 2D has.** The rule is spread across `amr_manage.wgsl` and
@@ -1290,6 +1347,10 @@ B9   lattice weights                                   DONE -- unblocked B6's
                                                        mass half
 B2-1 the before-number                             ◄── DONE
 B2-2a the GPU closure, proved, unused             ◄── DONE
+B2-2b0 get the pool manager off the 16-buffer      ◄── NEW, and it is what
+       ceiling                                          makes B2-2b stageable
+B2-2b the switch-over                             ◄── cannot be flagged; see
+                                                        B2-2b's own section
 B2   cascade21                                     ◄── needs B0
 B3   kernel unification, manage LAST                ◄── needs B2 and B3a
 B5   window = sponge translation                    ◄── independent of B2/B3,

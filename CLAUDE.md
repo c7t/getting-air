@@ -168,6 +168,21 @@ invariants the AMR machinery depends on:
   recursion — which is what lets `tools/test-dense-to-amr.js` validate the
   injector by round-trip instead of by eye.
 
+## The 16-storage-buffer ceiling
+`shaders/amr_manage_pool.wgsl` declares **exactly 16 storage buffers**, which
+IS `maxStorageBuffersPerShaderStage` on the target hardware — every AMR page
+checks for it at init (`NEEDED_STORAGE_BUFFERS_PER_STAGE = 16`) and refuses
+loudly if the adapter offers fewer. So that kernel has **no free binding**:
+adding one is a hard `CreateBindGroupLayout` failure, the page does not boot,
+and no bind-group regrouping helps because the limit is per STAGE. Measured
+2026-09-14 while trying to add one array (plans/2D-backport.md B2-2b, which
+that discovery re-shaped).
+
+Anything that needs new per-level state there has to free a binding first --
+`parentOriginX`/`parentOriginY` are two buffers holding one vec2 per slot, and
+`childParentSlot`/`childQuadrant` are two more that one packed u32 would
+carry. Check the count before designing around a new buffer, not after.
+
 ## Performance work
 Read `plans/perf-characterization.md` BEFORE optimizing anything here. The
 two target devices have **opposite** bottlenecks — the desktop is
