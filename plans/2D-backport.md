@@ -713,7 +713,9 @@ has**. Give level 1 an `originX/originY` pair at allocation and
    fetch behind `parentIndex` and collapse the two entry files. **DONE — see
    B3-3 below. The fetch could not move behind an index alone: the origin has
    to move with it, because the two halves work in different FRAMES.**
-4. `force1` — same, and it shrinks again under B4.
+4. `force1` — same, and it shrinks again under B4. **DONE — see B3-4 below.
+   It collapsed to ONE kernel like step1, not to a kernel-plus-accessor like
+   average/interp, and it leaves `originX`/`originY` with no reader.**
 5. `criterion` — smallest, do it for uniformity.
 6. `manage` — **last**, and only after B2 has already deleted the per-pass
    balance tests. Unifying 364+492 lines of two different balance
@@ -892,6 +894,60 @@ bit-IDENTICAL to the pre-B3 baseline, first run. Boot smoke PASS on all seven
 pages; invariants PASS (all eight gates) on amr-dev and both N2/N3 x
 diffuse/bounceback; analytic channel/TGV PASS; Cd/St unchanged apart from the
 two standing red cells.
+
+### B3-4 — DONE (2026-09-14). force1, and the origin buffers are now dead.
+
+`amr_force1.wgsl` (231, level 1) and `amr_force1_pool.wgsl` (224, level>=2)
+are one file under the first name. It collapsed for exactly B3-1's reasons and
+had exactly B3-1's four differences -- origin, dxL, the diffuse band, and the
+area/line weight, which IS dxL. So this stage was cheap; what it sets up is
+not.
+
+**`originX`/`originY` HAVE NO READER LEFT.** B3-1a took the fine step off them;
+this takes the force pass off them, and those were the only two. What still
+touches them is `shaders/amr_manage_pool.wgsl`, which WRITES `childOriginX/Y`
+at refine time and READS `parentOriginX/Y` to do it -- four of that kernel's
+bindings, on the kernel CLAUDE.md records as having sat at the exact
+16-storage-buffer per-stage ceiling. The parent origin it reads has the same
+closed form (`f32(bxP*RB) * 2 * PARENT_CELL_SIZE_L0`), so the whole cycle is
+removable and `PARENT_HAS_CACHED_ORIGIN` with it. **That also retires the
+eighth gate**: `debugCheckTileOrigins` scores a buffer that would no longer
+exist, and leaving a checker pointed at deleted state is how this project got
+its three vacuous gates (B2-2d). Delete it in the same commit, deliberately --
+the rule stops needing a checker because it stops being stored.
+
+**The binding layout was RENUMBERED CONTIGUOUS**, which the old file
+explicitly declined to do ("a renumber is three separate pages' bind groups to
+land in lockstep and this project has shipped that bug before"). It had two
+holes by then -- 4/5 from the origin buffers, 7 from B4-3's masking. Done here
+because it is now ONE layout instead of two, the edit is scripted with an
+assert per site, and boot smoke on every page is the gate. Which earned its
+keep immediately: the first attempt shipped a surviving `K_EPS` in the
+pipeline constants that the shader no longer declares, and boot smoke caught
+it as `Pipeline overridable constant "K_EPS" not found` rather than anything
+subtler.
+
+**Measured inert.** The bit-identity gate does NOT reach level 1's force at
+`?levels=3` -- only the finest level's force pass is dispatched (B4-3), so
+that run exercises level 3. The configs that exercise level 1's force are the
+N=2 ones, and they are exact to the digit across builds:
+
+    amr-N2-diffuse      Cd 1.642  St 0.1477     (unchanged, 3 builds)
+    amr-N2-bounceback   Cd 1.322  St 0.1617     (unchanged; level 1 bounce-back)
+    amr-N3-diffuse      Cd 1.425  St 0.1551
+    amr-N3-bounceback   Cd 1.351  St 0.1616
+
+plus bit-IDENTICAL at `?levels=3` in TWO different modes (see below), boot
+smoke on all five AMR pages, and invariants PASS on all eight gates.
+
+**AND THE GATE'S MODEL GOT CORRECTED TWICE, which is the durable output of
+this whole stage.** B3-1b called a stray DIFFERS a "rare excursion". The kEps
+commit found it was not noise but a second EXACTLY-reproducible attractor.
+This stage found a third. Sixteen runs over six builds: 9 in mode A, 4 in B, 2
+in C, every run bit-exact within its mode and the modes stable ACROSS BUILDS.
+So a DIFFERS carries no information beyond "different mode", an IDENTICAL is
+conclusive, and the strong form -- used here -- is to match the baseline in
+two different modes, which no race can forge. Written into CLAUDE.md.
 
 ### B3a — the same sweep, in JS
 
@@ -1661,7 +1717,9 @@ B2   cascade21                                     ◄── needs B0
 B3-1 step1: one kernel, every level               ◄── DONE, bit-identical
 B3-2 average: one body, two parent fragments      ◄── DONE, bit-identical
 B3-3 interp: kernel + two parent fragments        ◄── DONE, bit-identical
-B3   the rest (force1, criterion, manage LAST)     ◄── needs B2 and B3a
+B3-4 force1: one kernel, every level              ◄── DONE, bit-identical
+B3-5 retire originX/originY + the 8th gate         ◄── unblocked by B3-4
+B3   the rest (criterion, manage LAST)             ◄── needs B2 and B3a
 B5   window = sponge translation                    ◄── independent of B2/B3,
                                                         but smaller after B3
 B1   post-collision rescale                         ◄── needs B0b only; its

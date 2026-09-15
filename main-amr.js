@@ -914,7 +914,7 @@ async function init() {
   // nby:u32, parentTau:f32, dxL:f32, hasChild:u32, _pad1:u32, _pad2:u32,
   // _pad3:u32} = 32 bytes -- interp/average/step1_pool only declare the
   // first 4 fields (16 bytes) in their own WGSL struct, which is a valid
-  // prefix of this same buffer; amr_force1_pool.wgsl (Milestone 8) is the
+  // prefix of this same buffer; amr_force1.wgsl (Milestone 8) is the
   // only reader of hasChild, so it declares the full 8-field struct. Only
   // levels >=2 need one -- level 1's parent is the dense L0 grid, addressed
   // via the dense shader's own CardState.tau read, not this uniform (its
@@ -1033,7 +1033,7 @@ async function init() {
     };
   }
 
-  const [stepSM, frcSM, phySM, renSM, digestSM, interpDenseSM, interpPoolSM, step1SM, avgSM, avgPoolSM, criterionSM, manageSM, force1SM, force1PoolSM, criterionPoolSM, managePoolSM] = await Promise.all([
+  const [stepSM, frcSM, phySM, renSM, digestSM, interpDenseSM, interpPoolSM, step1SM, avgSM, avgPoolSM, criterionSM, manageSM, force1SM, criterionPoolSM, managePoolSM] = await Promise.all([
     loadShader(device, 'shaders/amr_step.wgsl'),
     loadShader(device, 'shaders/amr_force.wgsl'),
     loadShader(device, 'shaders/amr_physics.wgsl'),
@@ -1056,7 +1056,6 @@ async function init() {
     // Milestone 8: per-level force/torque integration, same dense/pool
     // addressing split as everything else -- see amr_force1.wgsl's header.
     loadShader(device, 'shaders/amr_force1.wgsl'),
-    loadShader(device, 'shaders/amr_force1_pool.wgsl'),
     // Milestone 9: per-level criterion + quad allocator/2:1-balance,
     // parent=level>=1 -- see amr_criterion_pool.wgsl/amr_manage_pool.wgsl.
     loadShader(device, 'shaders/amr_criterion_pool.wgsl'),
@@ -1228,29 +1227,20 @@ async function init() {
   // Milestone 8: level 1's own force pass. Binding 4 (childBlockSlot) is
   // level 2's blockSlot when HAS_CHILD=1, or a harmless dummy buffer when
   // HAS_CHILD=0 (N_LEVELS==2) -- see amr_force1.wgsl's header.
+  // Milestone 8: level>=2's own force pass, one pipeline shared across every
+  // such level (hasChild is a runtime LevelParams field here, not a
+  // compile-time override -- see amr_force1.wgsl's header).
+  // THE force pass, one layout for every pool level since B3-4 (there was a
+  // second, level-1-only force1BGL here until then), and renumbered
+  // contiguous now that the origin buffers and the masking's childBlockSlot
+  // are both gone -- see shaders/amr_force1.wgsl's binding block.
   const force1BGL = device.createBindGroupLayout({ label: 'force1BGL', entries: [
     { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-    { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }
-  ]});
-  // Milestone 8: level>=2's own force pass, one pipeline shared across every
-  // such level (hasChild is a runtime LevelParams field here, not a
-  // compile-time override -- see amr_force1_pool.wgsl's header).
-  const force1PoolBGL = device.createBindGroupLayout({ label: 'force1PoolBGL', entries: [
-    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
     { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
-    // binding 7 (the child level's blockSlot) is gone with the
-    // finest-wins masking -- see amr_force1_pool.wgsl on why 8 is not
-    // renumbered down into the hole.
-    // TEMPORARY diagnostic (level-2 bounce-back sign investigation) -- see
-    // amr_force1_pool.wgsl's own debugSlotForce header.
-    { binding: 8, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }
+    { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+    { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }
   ]});
 
   const constants = { W, H, SDF_FAR };
@@ -1411,16 +1401,12 @@ async function init() {
   // pipeline-creation time -- level 1 has exactly one dedicated pipeline
   // (not shared across levels), so whether level 2 exists is fixed for the
   // whole session (see amr_force1.wgsl's header).
-  const force1PL = device.createComputePipeline({
-    layout: device.createPipelineLayout({ bindGroupLayouts: [force1BGL] }),
-    compute: { module: force1SM, entryPoint: 'main', constants: { W, H, RB, F16, K_EPS } }
-  });
   // Milestone 8: level>=2's own force pass, one pipeline reused across
   // every such level (no per-level overrides -- hasChild/dxL are runtime
-  // LevelParams reads, see amr_force1_pool.wgsl's header).
-  const force1PoolPL = device.createComputePipeline({
-    layout: device.createPipelineLayout({ bindGroupLayouts: [force1PoolBGL] }),
-    compute: { module: force1PoolSM, entryPoint: 'main', constants: { W, H, RB, F16, K_EPS } }
+  // LevelParams reads, see amr_force1.wgsl's header).
+  const force1PL = device.createComputePipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [force1BGL] }),
+    compute: { module: force1SM, entryPoint: 'main', constants: { W, H, RB, F16 } }
   });
   const criterionPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [criterionBGL] }),
@@ -1719,17 +1705,15 @@ async function init() {
     // blockSlot if it exists in this configuration, else the dummy --
     // matches this level's own levelParams.hasChild value written above.
     // TEMPORARY diagnostic (level-2 bounce-back sign investigation) -- see
-    // amr_force1_pool.wgsl's own debugSlotForce header.
+    // amr_force1.wgsl's own debugSlotForce header.
     childPool.debugSlotForceBuf = device.createBuffer({ size: childPool.MAX_FINE_BLOCKS * 8, usage: U.STORAGE | U.COPY_SRC });
-    childPool.force1PoolBG = device.createBindGroup({ layout: force1PoolBGL, entries: [
+    childPool.force1BG = device.createBindGroup({ layout: force1BGL, entries: [
       { binding: 0, resource: { buffer: cardStateBuf } },
       { binding: 1, resource: { buffer: childPool.finePoolF_a } },
       { binding: 2, resource: { buffer: forceBuf } },
       { binding: 3, resource: { buffer: childPool.slotToBlockBuf } },
-      { binding: 4, resource: { buffer: childPool.originXBuf } },
-      { binding: 5, resource: { buffer: childPool.originYBuf } },
-      { binding: 6, resource: { buffer: childPool.levelParamsBuf } },
-      { binding: 8, resource: { buffer: childPool.debugSlotForceBuf } },
+      { binding: 4, resource: { buffer: childPool.levelParamsBuf } },
+      { binding: 5, resource: { buffer: childPool.debugSlotForceBuf } },
     ]});
   }
 
@@ -1739,11 +1723,14 @@ async function init() {
   // no ping-pong variant is needed here (unlike frcBG_a/frcBG_b, which DOES
   // depend on the persistent, cross-macro-step `useB` flag for L0's OWN
   // buffer choice).
-  const force1BG = device.createBindGroup({ layout: force1BGL, entries: [
+  pools[1].debugSlotForceBuf = device.createBuffer({ size: pools[1].MAX_FINE_BLOCKS * 8, usage: U.STORAGE | U.COPY_SRC });
+  pools[1].force1BG = device.createBindGroup({ layout: force1BGL, entries: [
     { binding: 0, resource: { buffer: cardStateBuf } },
     { binding: 1, resource: { buffer: pools[1].finePoolF_a } },
     { binding: 2, resource: { buffer: forceBuf } },
     { binding: 3, resource: { buffer: pools[1].slotToBlockBuf } },
+    { binding: 4, resource: { buffer: pools[1].levelParamsBuf } },
+    { binding: 5, resource: { buffer: pools[1].debugSlotForceBuf } },
   ]});
 
   const error = await device.popErrorScope();
@@ -2402,11 +2389,10 @@ async function init() {
     if (!skipGroup('force')) {
       if (finestLevel === 0) {
         const frc = beginPass(enc, 'force L0'); frc.setPipeline(frcPL); frc.setBindGroup(0, frcBG); frc.dispatchWorkgroups(WGX, WGY); frc.end();
-      } else if (finestLevel === 1) {
-        const f1frc = beginPass(enc, 'force L1'); f1frc.setPipeline(force1PL); f1frc.setBindGroup(0, force1BG); f1frc.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); f1frc.end();
       } else {
+        // NO LEVEL SPLIT SINCE B3-4: one kernel, one pipeline, every level.
         const pool = pools[finestLevel];
-        const p = beginPass(enc, `force L${finestLevel}`); p.setPipeline(force1PoolPL); p.setBindGroup(0, pool.force1PoolBG); p.dispatchWorkgroups(WGX1, WGY1, pool.MAX_FINE_BLOCKS); p.end();
+        const p = beginPass(enc, `force L${finestLevel}`); p.setPipeline(force1PL); p.setBindGroup(0, pool.force1BG); p.dispatchWorkgroups(WGX1, WGY1, pool.MAX_FINE_BLOCKS); p.end();
       }
     }
     if (!skipGroup('phy')) { const phy = beginPass(enc, 'body dynamics'); phy.setPipeline(phyPL); phy.setBindGroup(0, phyBG); phy.dispatchWorkgroups(1); phy.end(); }

@@ -6,7 +6,7 @@
 // below, same convention as main-cylinder-amr.js's own header). Unlike the
 // cylinder harness, there is no body at all (HAS_BODY=0 everywhere) and no
 // force/torque to integrate, so amr_force.wgsl/amr_force1.wgsl/
-// amr_force1_pool.wgsl/amr_physics.wgsl are never dispatched -- matching
+// amr_physics.wgsl are never dispatched -- matching
 // main-channel.js's identical decision for the dense solver.
 //
 // Domain: square (W=H=2^resLog2), matching every other AMR page's shape

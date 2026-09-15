@@ -1,14 +1,28 @@
-// Milestone 8 (plans/AMR-multilevel.md): level 1's own force/torque
-// integration -- generalizes amr_force.wgsl the same way amr_step1.wgsl
-// generalized amr_step.wgsl: same momentum-exchange math, dispatched over
-// this level's own pool tiles (full FB*FB shape, Z=slot -- same dispatch
-// shape as amr_step1.wgsl, NOT amr_average_f2c.wgsl's RB-granularity one,
-// since MORE sample points per unit area is the entire point of this
-// milestone: a fixed physical epsilon under-sampled the chi transition
-// band at coarse resolution, aliasing the force/torque that drives the
-// body's own trajectory).
+// THE force/torque integration over a level's own pool tiles -- ONE kernel,
+// every pool level (plans/2D-backport.md B3-4). Until then this was the
+// level>=2 half of a pair, with a separate amr_force1.wgsl compiled and
+// dispatched for level 1 alone.
 //
-// Two things a naive per-level copy of amr_force.wgsl would get wrong:
+// It collapsed for exactly the reasons B3-1 collapsed the fine-step pair, and
+// the two files had exactly the same four differences -- origin, dxL, the
+// diffuse band, and (here) the area/line weight, which IS dxL. The origin was
+// the only structural one, and it was a wrong claim: a tile's physical origin
+// is `block * RB * 2^-(m-1)` in closed form, i.e. `f32(bx*RB) * 2 *
+// levelParams.dxL`, so the per-slot originX/originY buffers this used to read
+// are gone from it -- and with the fine step off them since B3-1a, THIS WAS
+// THEIR LAST READER. See plans/2D-backport.md B3-4 for what that retires.
+//
+// Generalizes amr_force.wgsl (L0's own, which stays: L0 is a dense,
+// ghost-free grid) the same way amr_step1.wgsl generalizes amr_step.wgsl --
+// same momentum-exchange math, dispatched over pool tiles (full FB*FB shape,
+// Z=slot, same as amr_step1.wgsl and NOT amr_average_f2c.wgsl's
+// RB-granularity one, since MORE sample points per unit area is the entire
+// point of Milestone 8: a fixed physical epsilon under-sampled the chi
+// transition band at coarse resolution, aliasing the force/torque that drives
+// the body's own trajectory).
+//
+// TWO THINGS A NAIVE PER-LEVEL COPY OF amr_force.wgsl WOULD GET WRONG, and
+// they are why this is not simply amr_force.wgsl with a different binding:
 //
 // 1. GHOST cells must NOT contribute. Unlike amr_step1.wgsl (which
 //    legitimately collides/streams every cell, ghost included, since ghost
@@ -18,83 +32,110 @@
 //    force there would double-count against whichever cell actually OWNS
 //    that physical point. Only isInterior cells contribute.
 //
-// 2. Cross-level weighting. Fx/Fy here are a per-CELL momentum exchange,
-//    not normalized by cell size or by this level's own timestep, so a
-//    raw unweighted sum would not integrate to the same total regardless
-//    of which level owns a region (the exact invariance Milestone 8's own
-//    validation checks). The weight is dx_L^1, and BOTH factors matter:
+// 2. Cross-level weighting. Fx/Fy here are a per-CELL momentum exchange, not
+//    normalized by cell size or by this level's own timestep, so a raw
+//    unweighted sum would not integrate to the same total regardless of which
+//    level owns a region (the exact invariance Milestone 8's own validation
+//    checks). The weight is dx_L^1, and BOTH factors matter:
 //
 //      cell mass  ~ rho * dx_L^2   (2D volume measure)
 //      timestep     dt_L = dx_L    (acoustic scaling: dx and dt halve together)
 //      force = mass * du / dt   ->  dx_L^2 / dx_L  =  dx_L
 //
 //    An earlier version used dx_L^2, applying only the volume measure and
-//    silently dropping the 1/dt_L factor -- level L runs 2^L substeps per
-//    L0 macro-step, but this pass runs ONCE per macro-step and reads one
+//    silently dropping the 1/dt_L factor -- level L runs 2^L substeps per L0
+//    macro-step, but this pass runs ONCE per macro-step and reads one
 //    substep's momentum exchange, so the missing factor is exactly 2^L =
-//    1/dx_L. Measured on the cylinder harness at Re=100: that bug cost 2x
-//    at L1 and 4x at L2 (Cd 0.943 -> 1.430 at N=2, and the N=3 case went
-//    from unusable to inside the literature band). This is the same dx^1
-//    the bounce-back branch below already used -- for the same reason, not
-//    (as its old comment claimed) because one is a perimeter integral and
-//    the other a volume integral: the mass and timestep factors combine to
-//    dx^1 either way.
-//
-//    L1's dx is a fixed 0.5 (footprint-preserving with L0, same reasoning
-//    as amr_step1.wgsl's literal epsilon), so this is a literal here, not
-//    a runtime lookup (contrast amr_force1_pool.wgsl, whose shared
-//    pipeline serves multiple levels and needs it from levelParams.dxL).
+//    1/dx_L. Measured on the cylinder harness at Re=100: that bug cost 2x at
+//    L1 and 4x at L2 (Cd 0.943 -> 1.430 at N=2, and the N=3 case went from
+//    unusable to inside the literature band). The bounce-back branch uses the
+//    SAME dx^1 -- not (as its old comment claimed) because one is a perimeter
+//    integral and the other a volume integral, but because the mass and
+//    timestep factors combine to dx^1 either way. Live-verified there too:
+//    dx^2 gave Cd=0.631 (target 1.35) on the N=2 cylinder case, dx^1 gives
+//    1.262.
 //
 // FINEST-WINS MASKING IS GONE (plans/2D-backport.md B4-3), along with its
-// HAS_CHILD override and the binding-4 childBlockSlot it read. Only the
-// finest level's force pass is dispatched now, so this one runs only when
-// level 1 IS the finest -- see amr_force.wgsl's header for the measurement
-// that showed every coarser pass already contributing exactly zero.
+// HAS_CHILD override, the childBlockSlot binding it read, and the levelParams
+// nbx/nby/hasChild reads that served it. Only the finest level's force pass is
+// dispatched now -- see amr_force.wgsl's header for the measurement that
+// showed every coarser pass already contributing exactly zero.
 
 // @include "common_geometry.wgsl"
 // @include "common_lattice.wgsl"
 // @include "common_fpack.wgsl"
 // @include "common_reduce.wgsl"
 
+// The shared 32-byte per-level uniform, same buffer every pool shader reads.
+// This declares through kEps at offset 20; the fields before it that this
+// kernel does not use are declared because WGSL has no way to skip them.
+struct LevelParams {
+  nbx: u32,        // this level's own block-grid extent -- used to derive the
+                   // tile's own (bx,by), and with dxL its physical origin.
+  nby: u32,        // unused here.
+  parentTau: f32,  // unused here (force doesn't touch tau at all).
+  dxL: f32,        // this level's own grid spacing in L0-buffer-space units:
+                   // the diffuse band, the area/line weight, and half the
+                   // origin derivation all scale with it.
+  hasChild: u32,   // unused since the finest-wins masking went (see header);
+                   // declared only to reach kEps.
+  kEps: f32,       // the diffuse band in units of this level's dx. A per-level
+                   // uniform, not an override -- one pipeline serves every
+                   // level, so a compile-time constant could not say anything
+                   // per-level. See shaders/amr_step1.wgsl's get_chi.
+}
+
 @group(0) @binding(0) var<storage, read>       state          : CardState;
 @group(0) @binding(1) var<storage, read>       f_in           : array<u32>;
 @group(0) @binding(2) var<storage, read_write> forces         : array<atomic<i32>, 4>;
 @group(0) @binding(3) var<storage, read>       slotToBlock    : array<i32>;
+@group(0) @binding(4) var<uniform>             levelParams    : LevelParams;
+// Diagnostic (level-2 bounce-back sign investigation): per-slot (fx,fy)
+// written unconditionally by every dispatch -- lets the JS side correlate
+// sign against each tile's own position instead of only ever seeing the
+// grand total (debugReadSlotForces).
+@group(0) @binding(5) var<storage, read_write> debugSlotForce : array<vec2<f32>>;
+// RENUMBERED CONTIGUOUS by B3-4. The layout had holes: 4/5 were
+// originX/originY (gone -- the origin is derived, see header), 7 was the
+// masking's childBlockSlot (gone in B4-3) and 8 sat past the hole because
+// renumbering meant landing three pages' bind groups in lockstep. It is five
+// pages now and one layout instead of two, so it is done once, here, with
+// boot smoke on every page as the gate.
 
 override W : u32;
 override H : u32;
 override RB : u32;
-// Optional sharp momentum-exchange bounce-back force -- see amr_step1.wgsl's
-// USE_BOUNCEBACK header for the unclamped-source rationale this shares.
-override USE_BOUNCEBACK : u32 = 0u;
 const GHOST = 2u;
-const BLOCK = 8u;
-// FSCALE: see shaders/amr_force1_pool.wgsl's FSCALE comment for why this
-// is 1e7 and not 1e4 (per-workgroup truncation in the atomic reduction).
+// FSCALE: fixed-point scale for the atomic force accumulation. Raised from
+// 1e4 to 1e7 because the reduction below atomicAdds ONE TRUNCATED i32 PER
+// WORKGROUP (safeFixed's i32() cast truncates toward zero), so any workgroup
+// whose partial sum falls below one fixed-point unit contributes exactly
+// zero -- a systematic, one-directional loss, not rounding noise. Per-cell
+// contributions shrink with the level's own dx weight, so deeper levels hit
+// that floor hardest: measured on the cylinder harness at Re=100, at 1e4 the
+// truncation cost ~10% of the force at L1 and ~32% at L2 (Cd 1.430 -> 1.593
+// at N=2, 0.943 -> 1.390 at N=3). i32 max ~2.1e9 against the +/-2e9 clamp
+// still bounds |force| < 200, ~1000x the largest force either scenario
+// produces. A deeper hierarchy would eventually need a real fix (float
+// atomics via CAS, or a two-stage reduction) rather than more scale.
 const FSCALE = 10000000f;
-// An OVERRIDE since B7, not a const -- ?kEps= sweeps the diffuse band
-// across every level at once. Default unchanged, so this build is
-// byte-identical to the previous one.
-override K_EPS : f32 = 1.5f;
-const AREA_WEIGHT = 0.5f; // dx_L1^1 -- see header point 2
-// Bounce-back's MEM sum is a PERIMETER (line) integral over boundary
-// links, not the diffuse method's VOLUME integral over penalized cells --
-// a finer grid has MORE boundary links along the SAME physical perimeter
-// (density ~ 1/dx), but each link's own population-based contribution
-// doesn't shrink with dx the way a volume-density penalty force does, so
-// dx^1, the same weight AREA_WEIGHT now carries -- see header point 2.
-// Live-verified: dx^2 gave Cd=0.631 (target 1.35) on the N=2 (L1-only)
-// cylinder case; dx^1 gives Cd=1.262, matching within tolerance.
-const LINE_WEIGHT = 0.5f; // dx_L1 -- see above
+// Optional sharp momentum-exchange bounce-back force -- see
+// amr_step1.wgsl's USE_BOUNCEBACK header for the shared rationale.
+override USE_BOUNCEBACK : u32 = 0u;
 
-fn fineToCoarseUnit(fCoord: u32, origin: u32) -> f32 {
+// Cell-centred refinement, shared with amr_step1.wgsl: the two children of
+// parent cell c sit at c -/+ dx/2, so tile-local fine index j maps to
+// origin - dx/2 + dx*(j - GHOST). amr2d.mjs's fineToCoarseUnit is the host
+// twin. (Both files once hardcoded level 1's own dx=0.5 here, which was a
+// real bug for every deeper level -- see amr_step1.wgsl.)
+fn fineToCoarseUnit(fCoord: u32, origin: f32) -> f32 {
   let j = f32(i32(fCoord) - i32(GHOST));
-  return f32(origin) - 0.25 + 0.5 * j;
+  return origin - 0.5 * levelParams.dxL + levelParams.dxL * j;
 }
 
-fn fineToCoarseUnitI(fCoordI: i32, origin: u32) -> f32 {
+fn fineToCoarseUnitI(fCoordI: i32, origin: f32) -> f32 {
   let j = f32(fCoordI - i32(GHOST));
-  return f32(origin) - 0.25 + 0.5 * j;
+  return origin - 0.5 * levelParams.dxL + levelParams.dxL * j;
 }
 
 fn wrapf(v: f32, n: f32) -> f32 {
@@ -104,7 +145,7 @@ fn wrapf(v: f32, n: f32) -> f32 {
 }
 
 fn get_chi(phi: f32) -> f32 {
-    return chiFromPhiEps(phi, K_EPS * 0.5f); // see header -- L1's own dx is a fixed literal
+    return chiFromPhiEps(phi, levelParams.kEps * levelParams.dxL);
 }
 
 fn safeFixed(x: f32) -> i32 {
@@ -135,11 +176,16 @@ fn main(
 
     if (blockID >= 0 && isInterior) {
       {
-        let nbx = W / BLOCK;
-        let originX = (u32(blockID) % nbx) * RB;
-        let originY = (u32(blockID) / nbx) * RB;
-        let bufX = fineToCoarseUnit(fx, originX);
-        let bufY = fineToCoarseUnit(fy, originY);
+        // This tile's physical origin in L0 units, as one multiply --
+        // `block * RB * 2^-(m-1)`, and `2^-(m-1)` is `2 * dxL`. It used to
+        // be a per-slot buffer read; see the header, and amr2d.mjs's
+        // tileOriginL0 for the host statement of the same closed form.
+        let bx = u32(blockID) % levelParams.nbx;
+        let by = u32(blockID) / levelParams.nbx;
+        let originX_L0 = f32(bx * RB) * 2.0f * levelParams.dxL;
+        let originY_L0 = f32(by * RB) * 2.0f * levelParams.dxL;
+        let bufX = fineToCoarseUnit(fx, originX_L0);
+        let bufY = fineToCoarseUnit(fy, originY_L0);
         let wx = wrapf(bufX - state.off_x, f32(W));
         let wy = wrapf(bufY - state.off_y, f32(H));
         let p = vec2<f32>(wx, wy);
@@ -147,6 +193,14 @@ fn main(
         let phi = get_phi(p, state);
         let poolPlaneStride = arrayLength(&f_in) / 9u;
         let cell = slot * (FB * FB) + fy * FB + fx;
+        // dx_L^1 for BOTH branches: a cell's mass scales as dx_L^2 but this
+        // level's timestep is dt_L = dx_L (acoustic scaling), and force is
+        // mass*du/dt, so the two factors combine to dx_L^1. See
+        // amr_force1.wgsl's header point 2 -- the diffuse branch previously
+        // used dx_L^2, applying the volume measure but dropping 1/dt_L,
+        // which cost a factor of 2^L (4x at level 2).
+        let areaWeight = levelParams.dxL;
+        let lineWeight = levelParams.dxL;
 
         if (USE_BOUNCEBACK != 0u) {
           // See lbm_force.wgsl's identical branch for the MEM formula;
@@ -161,15 +215,15 @@ fn main(
             let usy = state.vy + state.omega * rx;
 
             for (var i = 0u; i < 9u; i++) {
-              let srcBufX = fineToCoarseUnitI(i32(fx) - ex[i], originX);
-              let srcBufY = fineToCoarseUnitI(i32(fy) - ey[i], originY);
+              let srcBufX = fineToCoarseUnitI(i32(fx) - ex[i], originX_L0);
+              let srcBufY = fineToCoarseUnitI(i32(fy) - ey[i], originY_L0);
               let srcWx = wrapf(srcBufX - state.off_x, f32(W));
               let srcWy = wrapf(srcBufY - state.off_y, f32(H));
               if (get_phi(vec2<f32>(srcWx, srcWy), state) < 0f) {
                 let f_opp = fUnpack(f_in[fIdx(opp[i], poolPlaneStride, cell)], opp[i]);
                 let corr = 2f * wt[i] * (f32(ex[i]) * usx + f32(ey[i]) * usy) / CS2;
-                fx_body += -f32(ex[i]) * (2f * f_opp + corr) * LINE_WEIGHT;
-                fy_body += -f32(ey[i]) * (2f * f_opp + corr) * LINE_WEIGHT;
+                fx_body += -f32(ex[i]) * (2f * f_opp + corr) * lineWeight;
+                fy_body += -f32(ey[i]) * (2f * f_opp + corr) * lineWeight;
               }
             }
             tz_body = rx * fy_body - ry * fx_body;
@@ -177,9 +231,6 @@ fn main(
         } else {
           let chi = get_chi(phi);
           if (chi >= 1e-6) {
-            // Pull-gather within this slot's own buffer, clamped at its edge
-            // (matching amr_step1.wgsl's streaming -- this is a pool tile,
-            // not the periodic dense grid amr_force.wgsl reads).
             var rho = 0f; var ux_star = 0f; var uy_star = 0f;
             for (var i = 0u; i < 9u; i++) {
               let srcX = clamp(i32(fx) - ex[i], 0, i32(FB) - 1);
@@ -202,8 +253,8 @@ fn main(
             let Fx = rho * chi * (usx - ux_star);
             let Fy = rho * chi * (usy - uy_star);
 
-            fx_body = -Fx * AREA_WEIGHT;
-            fy_body = -Fy * AREA_WEIGHT;
+            fx_body = -Fx * areaWeight;
+            fy_body = -Fy * areaWeight;
             tz_body = rx * fy_body - ry * fx_body;
           }
         }
@@ -227,5 +278,6 @@ fn main(
     atomicAdd(&forces[0], safeFixed(sum_fx * FSCALE));
     atomicAdd(&forces[1], safeFixed(sum_fy * FSCALE));
     atomicAdd(&forces[2], safeFixed(sum_tz * FSCALE));
+    debugSlotForce[slot] = vec2<f32>(sum_fx, sum_fy);
   }
 }

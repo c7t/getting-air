@@ -110,22 +110,29 @@ invariants the AMR machinery depends on:
   force does not feed back into the flow -- unlike the falling card, whose
   field cannot be compared this way at all):
 
-      ?levels=3   TWO modes, each EXACTLY reproducible. 9 of 12 runs land on
-                  one, 3 on the other; the two differ by ux relL2 2.6e-5,
-                  vorticity 5.8e-4, and every run reproduces its mode
-                  bit-for-bit -- including across different builds.
-      ?levels=2   every one of 4 runs DIFFERS, at ux relL2 2-4e-5 (more than
-                  two modes, or none)
+      ?levels=3   at least THREE modes, each EXACTLY reproducible. Over 16
+                  runs and 6 builds: mode A 9 runs, mode B 4, mode C 2. Modes
+                  differ from each other by ux relL2 1.6-2.6e-5, vorticity
+                  3.4-5.8e-4 -- and every run reproduces its mode BIT-FOR-BIT,
+                  including across different builds.
+      ?levels=2   every one of 4 runs DIFFERS, at ux relL2 2-4e-5 (more modes,
+                  or none)
 
   **It is NOT noise and NOT an excursion** -- that was the first reading and it
   was wrong. A run lands in one of a small number of attractors (the atomicSub
-  free list resolving one way or the other at some early refine), and each
-  attractor is bit-exact. So the way to gate a code motion at N=3 is: run until
-  you match the baseline's mode, and an IDENTICAL is then conclusive; a DIFFERS
-  only tells you which mode you are in. Better, cross-check BOTH modes -- two
-  builds that agree bit-for-bit in each of two modes is much stronger than one
-  IDENTICAL. N=2 has no reproducible baseline at all and `amr-diff` cannot gate
-  there.
+  free list resolving a race one way or another at some early refine), and each
+  attractor is bit-exact and build-independent. So:
+
+  - a DIFFERS tells you only WHICH MODE you are in. It is never, on its own,
+    evidence that a change moved anything.
+  - an IDENTICAL against a baseline run is conclusive -- no race can forge a
+    bit-exact match.
+  - the strong form is to match the baseline in TWO DIFFERENT MODES. Two
+    builds agreeing bit-for-bit in each of two attractors is far better
+    evidence than one IDENTICAL, and it costs one extra run.
+
+  N=2 has no reproducible baseline at all and `amr-diff` cannot gate there;
+  use the Cd/St numbers, which ARE stable there to the digit across builds.
 
   Note this inverts the Cd picture, where N=3 is the WIDER spread: do not
   assume one config's reproducibility from another's, in either direction.
