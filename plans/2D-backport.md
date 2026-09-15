@@ -1695,6 +1695,92 @@ and the total moves in the last fixed-point digit whenever `off` != 0 -- the
 same class as the AMR free-list note in CLAUDE.md. That is a re-baselining
 change and belongs with B5 proper, not bundled into an inert one.
 
+### B5-3 — DONE (2026-09-15). The placement is honoured, and `?window=0` validates.
+
+B5-2 ended on a decision, not a fix: the window convention threw the body's
+initial placement away and the buffer convention kept it, so the two could not
+agree on the pinned cylinder. **The decision taken was the third option B5-2
+did not see** -- honour the placement AND move `?upstream=`'s default to the
+value that was actually running, so the knob becomes real without moving a
+single baseline.
+
+**The arithmetic that makes it free.** `CX0 = UPSTREAM * 2 * R` and
+`R = W / (2 * BLOCKAGE)`, so `CX0 = UPSTREAM * W / BLOCKAGE`. At the default
+BLOCKAGE = 24, **UPSTREAM = 12 IS exactly W/2** -- for any W and any `res`.
+The shipped cylinder has therefore been running at 12 diameters all along
+while its own parameter said 8. Setting the default to 12 is documentation
+catching up with reality, and it is why nothing re-baselines.
+
+`physics.wgsl`/`amr_physics.wgsl` gain `INITIAL_CX`/`INITIAL_CY` overrides
+replacing the hardcoded `f32(W)/2.0`. **They have NO DEFAULT on purpose.** A
+sentinel default would let a page that forgets to supply one degrade quietly
+back to W/2 -- the exact bug being fixed -- whereas a missing override is a
+`CreateComputePipeline` error, which every page turns into `error:` in
+`#status` and the boot smoke catches. All six pages that dispatch a physics
+kernel supply them: `W/2, H/2` for `main.js`, `main-amr.js` and both reentry
+pages (bit-identical to the old constant), `CX0, CY0` for the two cylinder
+pages.
+
+**WHAT THE OLD BUILD ACTUALLY DID ON STEP 0, which is the part worth keeping.**
+`dispatchMacroStep` runs force BEFORE physics. `cardInit()` seeded cx = CX0 =
+170.67 and physics overwrote it with 256 on that same step -- so step 0 applied
+the body's solid coupling at a position the rest of the run never used. Seed and
+pin now agree. That inconsistency was invisible to every gate because it lasted
+one step.
+
+**MEASURED -- `?upstream=` IS LIVE, and its old value was a bad configuration.**
+`dense-reference`, Re=100:
+
+    upstream    Cd       St         cx (probed live)
+    8          2.028    0.1277     170.667
+    12         1.951    0.1260     256.0       <- the shipped default
+    20         2.209    2.0328     426.667
+
+St 2.03 at upstream=20 is not a bug: 426 of 512 puts the cylinder ~4D from the
+outlet, the wake is destroyed, and the shedding peak is meaningless. The knob
+now reports that instead of hiding it. Compare B5-2's table, where 4, 8 and 20
+all gave 1.951 bit-identically.
+
+**AND `?window=0` NOW REPRODUCES THE PINNED CYLINDER -- AT TWO PLACEMENTS.**
+
+    default (upstream=12)   window=1  1.951/0.1260   window=0  1.951/0.1260
+    upstream=8              window=1  2.028/0.1277   window=0  2.028/0.1277
+
+Agreeing at ONE placement could be coincidence of a shared default; agreeing at
+two, including the one that used to read 2.028 against 1.951, is the
+conventions genuinely meeting. B5-2's blocker is closed and B5 proper is
+unblocked.
+
+**INERT WHERE IT MUST BE, proved rather than argued.** `index-reentry.html`
+(dense, MOVING window) at 4096 steps from `reset()`, via `debugSnapshotSave` +
+`tools/amr-diff.js`: same build twice IDENTICAL (relL2 0 on ux/uy/rho/omega,
+which is what makes the comparison meaningful), and **pristine HEAD vs this
+build IDENTICAL**. `dense-reference` 1.951/0.1260 on both trees -- and dense is
+bit-exact deterministic, so identical there is conclusive, not indicative.
+Boot smoke PASS on all seven pages, all three refusal configs PASS, all seven
+invariant gates PASS on every AMR config, every channel/TGV analytic gate PASS.
+
+**CLAUDE.md's `amr-N2-diffuse` Cd 1.620 IS STALE, and that is not this
+change.** Measured on a pristine HEAD checkout, properly served: 1.642, 1.642.
+This build: 1.643, 1.643. Both stable to four digits, 0.001 apart -- the
+documented floor. The recorded 1.619/1.620 predates some earlier stage; do not
+read a 0.02 gap against it as a regression.
+
+**THE MEASUREMENT HAZARD THAT NEARLY SANK THIS STAGE.** `ensureServer` only
+checks that *something* answers on the baseUrl port and reuses it, whatever
+tree that server's cwd is. With several worktrees live, the default
+`https://localhost:4444` belonged to the MAIN checkout and 4445 to the 3d-trt
+worktree -- so a full sweep and its "pristine A/B" both ran, agreed with each
+other, looked entirely clean, and measured neither this branch nor its
+baseline. Every number had to be thrown away. Two runs agreeing is not evidence
+they ran your code; `curl` the served file for a token you added, and pass both
+`--baseUrl=` and a private `--port=`.
+
+**Still open, unchanged from B5-2:** `lbm_force.wgsl` is the last
+window-DISPATCHED kernel, and converting it re-groups its per-workgroup
+truncated atomicAdds, so it is a re-baselining change that belongs with B5
+proper rather than an inert stage.
+
 ### B9 — DONE (2026-09-14)
 
 `lattice-2d.mjs` + `tools/gen-lattice-2d.js` + `tools/test-lattice-2d.js`, and

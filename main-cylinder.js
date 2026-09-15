@@ -106,7 +106,18 @@ let NCELLS = W * H;
 // a valid resolution sweep: blockage and fetch length in D-units stay
 // fixed, only the diffuse-interface width relative to D shrinks.
 let BLOCKAGE = parseFloat(urlParams.get('blockage')) || 24;
-let UPSTREAM = parseFloat(urlParams.get('upstream')) || 8;
+// UPSTREAM's default is 12, NOT the 8 this used to say, and the difference
+// is documentation catching up with reality rather than a change of
+// configuration. physics.wgsl step 5 overwrote cx with W/2 every step, so
+// CX0 was discarded and the cylinder ran at W/2 whatever this said --
+// ?upstream=4, 8 and 20 all measured Cd 1.951 / St 0.1260, bit-identical
+// (plans/2D-backport.md B5-2/B5-3). At the default BLOCKAGE = 24,
+// CX0 = UPSTREAM * 2 * R = UPSTREAM * W / BLOCKAGE, so UPSTREAM = 12 IS
+// exactly W/2, for any W and any `res`. Setting the default to 12 therefore
+// keeps every recorded baseline bit-identical while the knob becomes real.
+// It is real relative to the CYLINDER's diameter, so at a non-default
+// ?blockage= the body no longer lands at W/2 -- which is the knob working.
+let UPSTREAM = parseFloat(urlParams.get('upstream')) || 12;
 let R = W / (2 * BLOCKAGE);
 
 // U0: freestream speed in lattice units/step (kept small so Ma = U0/cs
@@ -352,7 +363,7 @@ async function init() {
   });
   const phyPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [phyBGL] }),
-    compute: { module: phySM, entryPoint: 'main', constants }
+    compute: { module: phySM, entryPoint: 'main', constants: { ...constants, INITIAL_CX: CX0, INITIAL_CY: CY0 } }
   });
   const renPL = device.createRenderPipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [renBGL] }),

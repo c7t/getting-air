@@ -291,7 +291,7 @@ async function init() {
   // main-reentry-amr.js's identical phyPL construction.
   const phyPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [phyBGL] }),
-    compute: { module: phySM, entryPoint: 'main', constants: { W, H, WINDOW_BODY, KINEMATIC: 1, VY_FIXED: VY, OMEGA_FIXED: OMEGA } }
+    compute: { module: phySM, entryPoint: 'main', constants: { W, H, WINDOW_BODY, KINEMATIC: 1, VY_FIXED: VY, OMEGA_FIXED: OMEGA, INITIAL_CX: W / 2, INITIAL_CY: H / 2 } }
   });
   const renPL = device.createRenderPipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [renBGL] }),

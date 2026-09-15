@@ -968,7 +968,7 @@ async function init() {
   function makePhyPipeline() {
     phyPL = device.createComputePipeline({
       layout: device.createPipelineLayout({ bindGroupLayouts: [phyBGL] }),
-      compute: { module: phySM, entryPoint: 'main', constants: { W, H, KINEMATIC: 1, VY_FIXED: VY, OMEGA_FIXED: OMEGA } }
+      compute: { module: phySM, entryPoint: 'main', constants: { W, H, KINEMATIC: 1, VY_FIXED: VY, OMEGA_FIXED: OMEGA, INITIAL_CX: W / 2, INITIAL_CY: H / 2 } }
     });
   }
   makePhyPipeline();

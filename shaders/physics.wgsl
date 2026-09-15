@@ -24,6 +24,29 @@ override KINEMATIC : u32 = 0u;
 override VY_FIXED : f32 = 0.0f;
 override OMEGA_FIXED : f32 = 0.0f;
 
+// THE WINDOW POSITION THE BODY IS PINNED TO under WINDOW_BODY = 1. This used
+// to be hardcoded `W/2, H/2`, which silently OVERWROTE the position the page
+// seeded into CardState -- every step, so it was not a one-off initialization
+// difference but a standing correction. That made
+// main-cylinder*.js's documented `?upstream=` knob completely inert: the page
+// computes CX0 = UPSTREAM * 2 * R and this kernel discarded it, running the
+// cylinder at W/2 no matter what. Measured directly on the shipped path:
+// ?upstream=4, 8 and 20 all gave Cd 1.951 / St 0.1260, bit-identical across a
+// 5x change (plans/2D-backport.md B5-2).
+//
+// It also made the two window conventions disagree by construction, since
+// WINDOW_BODY = 0 INTEGRATES the body's position and therefore honours the
+// seed. B5's whole gate is that the two readings are a permutation of each
+// other; they cannot be while one of them throws the placement away.
+//
+// NO DEFAULT, deliberately. A sentinel default would let a page that forgets
+// to supply this degrade quietly back to W/2 -- the exact failure being fixed.
+// Without one, a missing value is a pipeline-creation error at init, which
+// every AMR/dense page turns into an `error:` in #status and the boot smoke
+// check catches.
+override INITIAL_CX : f32;
+override INITIAL_CY : f32;
+
 @compute @workgroup_size(1)
 fn main() {
   // 0. Save current as old for the next step
@@ -84,9 +107,10 @@ fn main() {
   else if (state.y_total <= -wrap_y) { state.y_total += wrap_y; }
 
   // 5. Moving Window Panning
-  // We want to keep (cx, cy) near (W/2, H*2/3)
-  let initial_cx = f32(W) / 2.0f;
-  let initial_cy = f32(H) / 2.0f;
+  // The body is held at the window position the PAGE placed it at -- see
+  // INITIAL_CX/INITIAL_CY above for why that is not `W/2, H/2`.
+  let initial_cx = INITIAL_CX;
+  let initial_cy = INITIAL_CY;
 
   if (WINDOW_BODY != 0u) {
     // THE SHIPPED CONVENTION. The body is pinned to a fixed WINDOW position;

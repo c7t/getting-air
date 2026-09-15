@@ -125,7 +125,7 @@ function parseArgs(argv) {
     // default) -- see this file's own header, "KNOWN ISSUE" -- diffuse
     // coupling is currently failing its own Cd/St check independent of
     // this tool. Pass --diffuse to override.
-    blockage: 24, upstream: 8, u0: 0.04, seed: 12345, bounceback: true, perturb: 0,
+    blockage: 24, upstream: 12, u0: 0.04, seed: 12345, bounceback: true, perturb: 0,
     mode: 'both',
     maxFineBlocksByLevel: {},
     tol: 0.05, tolOmega: 0.15, tolFullrefine: 0.01,

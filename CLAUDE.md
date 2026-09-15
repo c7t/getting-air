@@ -64,10 +64,15 @@ invariants the AMR machinery depends on:
   can be swept across the whole suite without a second copy of the table.
 
   **The default sweep is not currently all-green on `main`.**
-  `dense-reference` and `amr-N2-diffuse` fail at Re=100 (Cd 1.950 and 1.620
+  `dense-reference` and `amr-N2-diffuse` fail at Re=100 (Cd 1.951 and 1.642
   against 1.35±0.15). That is the diffuse-interface-width issue, not a
   regression. Re-baseline against these numbers rather than assuming a red
   cell is yours.
+  **`amr-N2-diffuse` READ 1.620 HERE UNTIL 2026-09-15 AND THAT NUMBER WAS
+  STALE.** Measured that day on a pristine checkout of the then-HEAD, twice:
+  1.642, 1.642 (stable to four digits). Some earlier stage moved it and did
+  not re-record it here, so a ~0.02 gap against the old figure is not a
+  regression -- take a pristine-tree reading before believing one.
   **AND IT IS NO LONGER OPEN — IT IS MEASURED (2026-09-14, `?kEps=`).** The
   band is `K_EPS * dx_level` and `?kEps=` now sweeps every level at once
   (plans/2D-backport.md B7); the instrument is a BAND ladder at fixed
@@ -145,6 +150,24 @@ invariants the AMR machinery depends on:
   more of it -- a third pool level is a third free list regrouping a third set
   of truncated partials. Calibrate against the config you are actually
   comparing, and take the repeat on THAT config; N=2's floor is not N=3's.
+  **VERIFY WHICH TREE THE DEV SERVER IS SERVING BEFORE BELIEVING A RUN.**
+  `ensureServer` only checks that *something* answers on the baseUrl port; if
+  it finds one it prints "HTTPS dev server already up" and reuses it, whatever
+  that server's cwd is. With more than one worktree live, the default
+  `https://localhost:4444` is routinely the MAIN checkout's server, not yours.
+  Measured 2026-09-15: a full sweep and a "pristine A/B" both ran green and
+  agreed with each other while serving the main checkout and the `3d-trt`
+  worktree respectively -- neither was the branch under test, and every number
+  had to be discarded. Two runs agreeing is NOT evidence they ran your code.
+  Prove the tree, then pin both ports:
+
+      ss -lptn | grep -oE 'pid=[0-9]+'      # then readlink /proc/<pid>/cwd
+      curl -sk https://localhost:<port>/shaders/physics.wgsl | grep -c <TOKEN-YOU-ADDED>
+      node tools/validate-all.js --baseUrl=https://localhost:<yours> --port=<your chrome>
+
+  `https.py` takes `GA_PORT=`; it is UNTRACKED, so an archived checkout used
+  as a baseline will not have it.
+
 - **`tools/validate-cylinder.js`** — physics: pinned cylinder in uniform
   crossflow, time-averaged Cd/Strouhal vs. literature values in
   `benchmarks/cylinder.json`. Assumes a Chrome + page are already up (see
