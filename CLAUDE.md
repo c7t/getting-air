@@ -178,10 +178,17 @@ and no bind-group regrouping helps because the limit is per STAGE. Measured
 2026-09-14 while trying to add one array (plans/2D-backport.md B2-2b, which
 that discovery re-shaped).
 
-Anything that needs new per-level state there has to free a binding first --
-`parentOriginX`/`parentOriginY` are two buffers holding one vec2 per slot, and
-`childParentSlot`/`childQuadrant` are two more that one packed u32 would
-carry. Check the count before designing around a new buffer, not after.
+**One was recovered on 2026-09-14 and the count is now 15** (B2-2b0):
+`childQuadrant` held `slot % 4` -- both allocators compose a slot as
+`quadIdx*4 + quadrant`, so it was a buffer storing a constant. The buffer
+itself stays (five other shaders read it) and `allocLevelPool` now writes it
+once; only this kernel's binding went. `amr2d.mjs`'s `quadrantOfSlot` is the
+rule and `checkSlotQuadrantsOnGPU` scores the live buffer against it.
+
+If more room is needed: `parentOriginX`/`parentOriginY` are two buffers
+holding one vec2 per slot. And check the count BEFORE designing around a new
+buffer -- the failure mode is a `CreateBindGroupLayout` error at init, i.e. a
+page that does not boot, not a warning.
 
 ## Performance work
 Read `plans/perf-characterization.md` BEFORE optimizing anything here. The

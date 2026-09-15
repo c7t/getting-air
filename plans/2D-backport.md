@@ -432,16 +432,25 @@ recorded numbers) rather than within one build.
 
 **Two ways forward, and the first is probably worth doing on its own.**
 
-1. **B2-2b0: get the pool manager off the ceiling first.** Sitting exactly at
-   a hard device limit means *any* future change to that kernel has this same
-   conversation, and the suite reports it as a page that will not boot. There
-   is slack available without touching the decision logic: `parentOriginX` and
-   `parentOriginY` are two buffers holding one vec2 per slot, and
-   `childParentSlot`/`childQuadrant` are two more that a single packed u32
-   would carry. Either pairing buys a slot and makes the flagged
-   switch-over possible after all. **Independently valuable, gated
-   bit-identical, and it is the difference between B2-2b being stageable and
-   being a leap.**
+1. **B2-2b0: get the pool manager off the ceiling first — DONE
+   (2026-09-14).** 16 → 15. `childQuadrant` held `slot % 4`: both allocators
+   compose a slot as `quadIdx*4 + quadrant`, so a whole binding was spent on a
+   constant. The buffer stays (five other shaders read it) and
+   `allocLevelPool` writes it once instead of refine() rewriting it per
+   allocation.
+
+   **The measurement is the transferable part.** The claim being relied on was
+   not "the arithmetic is right" — that is two lines — but "nothing on any
+   path has ever put a different value there", including `debugSnapshotLoad`,
+   which writes whatever a snapshot recorded. So `quadrantOfSlot` went into
+   `amr2d.mjs` as the rule, `checkSlotQuadrantsOnGPU` into `amr2d-gpu.mjs`,
+   and the rule was scored against live state on the UNCHANGED build first:
+   holds over 352 active slots at `?levels=3` and 212 at `?levels=4` after
+   8000+ steps of real refinement. **A derivable-looking field is a claim
+   about every writer, not about the formula.**
+
+   Binding 8 is left as a HOLE rather than renumbered — a renumber is five
+   pages' bind groups in lockstep, the 238e48c shape.
 
 2. **B2-2b as one replacement**, accepting that the default moves in the same
    commit that adds the closure. Gated by B2-1's directional numbers rather
@@ -1347,10 +1356,12 @@ B9   lattice weights                                   DONE -- unblocked B6's
                                                        mass half
 B2-1 the before-number                             ◄── DONE
 B2-2a the GPU closure, proved, unused             ◄── DONE
-B2-2b0 get the pool manager off the 16-buffer      ◄── NEW, and it is what
-       ceiling                                          makes B2-2b stageable
-B2-2b the switch-over                             ◄── cannot be flagged; see
-                                                        B2-2b's own section
+B2-2b0 get the pool manager off the 16-buffer      ◄── DONE, 16 -> 15
+       ceiling                                          (childQuadrant held
+                                                        slot % 4)
+B2-2b the switch-over                             ◄── stageable again: there
+                                                        is now room for the want
+                                                        array behind ?cascade=1
 B2   cascade21                                     ◄── needs B0
 B3   kernel unification, manage LAST                ◄── needs B2 and B3a
 B5   window = sponge translation                    ◄── independent of B2/B3,
