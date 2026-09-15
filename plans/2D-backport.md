@@ -1581,6 +1581,46 @@ is the struct amr2d-gpu.mjs's `CARD_STATE_KEYS` warns can rot silently because
 inserting a field re-labels every field after it rather than failing. A dead
 file that still compiles is a rot surface `make check` actively protects.
 
+### B5-1 — DONE (2026-09-14). Nine conversions become two functions.
+
+Every buffer->window conversion in the solver now goes through
+`bufferToWindowCell` or `bufferToWindowPos` in `common_geometry.wgsl`. There
+were NINE hand-written sites across six files, and **they were not all the
+same conversion** -- which is the reason to count them before changing them:
+
+    cells      (c + N - u32(off)) % N      integer; TRUNCATES off
+    positions  wrapf(p - off, N)           continuous; keeps off's fraction
+
+Five sites used the first (`amr_step`, `amr_force`, `lbm_step`,
+`common_refine`'s legacy `?boxrefine=0` path and `inSpongeBandAt`), four the
+second (`amr_step1` x2, `amr_force1` x2). The second family is exactly what B5
+exists to remove -- `off` is a float carrying the body's fractional travel, and
+the fine levels evaluate at fractional L0 positions -- so they had to be
+distinguishable, not merged.
+
+**This is where the `?window=` switch goes.** B5 proper changes what "convert"
+means; doing it across nine sites in six files is the shape that ships a
+half-converted build. It is now one function.
+
+**`wrapf` HAD THREE COPIES** -- `amr_step1.wgsl`, `amr_force1.wgsl` and
+`amr_render.wgsl`, byte-identical. Found because moving it to
+`common_geometry.wgsl` made `make wgsl` refuse the render page with
+`redefinition of wrapf`; the other two were deleted deliberately, the third
+was found by the compiler. Worth noting which gate catches which: `make check`
+cannot see a code motion (B3a finding #1) but it does see a name collision.
+
+**And the host already disagrees with all nine.** `amr2d.mjs`'s
+`bufferToWindow` is a BARE SUBTRACTION with no wrap, because `get_phi` already
+takes the nearest periodic image -- so every kernel's wrap is work `get_phi`
+immediately redoes. The kernels keep it for now: this commit is inert by
+construction and dropping the wrap is a real (if tiny) numerical change. It
+belongs with B5 proper, where it is one line instead of nine.
+
+**Measured inert.** Bit-IDENTICAL on `index-reentry.html` (dense, moving
+window) AND on `index-cylinder-amr.html?levels=3`; boot smoke PASS on all
+seven pages; invariants PASS on all seven gates; every dense and AMR
+analytic/physics config unchanged to the digit.
+
 **What is left of B5** is the real change: the BODY moves into buffer
 coordinates, the SDF takes the nearest image, and the conversion survives only
 in the sponge -- with `?window=` selecting old/new, and a refusal (not a

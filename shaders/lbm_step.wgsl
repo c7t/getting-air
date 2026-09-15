@@ -144,8 +144,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   // ... and its WINDOW position, needed only by the three physically-anchored
   // things below: the body SDF, the sponge band, and the WALL_Y walls.
-  let x = (bx + W - u32(state.off_x)) % W;
-  let y = (by + H - u32(state.off_y)) % H;
+  let w = bufferToWindowCell(vec2<u32>(bx, by), state);
+  let x = w.x; let y = w.y;
 
   // Position/solid-velocity/own-cell-index terms, hoisted ABOVE the gather
   // loop (unchanged math, just moved earlier from where section "3" used

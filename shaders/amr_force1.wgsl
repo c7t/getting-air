@@ -138,12 +138,6 @@ fn fineToCoarseUnitI(fCoordI: i32, origin: f32) -> f32 {
   return origin - 0.5 * levelParams.dxL + levelParams.dxL * j;
 }
 
-fn wrapf(v: f32, n: f32) -> f32 {
-  var r = v % n;
-  if (r < 0.0) { r += n; }
-  return r;
-}
-
 fn get_chi(phi: f32) -> f32 {
     return chiFromPhiEps(phi, levelParams.kEps * levelParams.dxL);
 }
@@ -186,9 +180,7 @@ fn main(
         let originY_L0 = f32(by * RB) * 2.0f * levelParams.dxL;
         let bufX = fineToCoarseUnit(fx, originX_L0);
         let bufY = fineToCoarseUnit(fy, originY_L0);
-        let wx = wrapf(bufX - state.off_x, f32(W));
-        let wy = wrapf(bufY - state.off_y, f32(H));
-        let p = vec2<f32>(wx, wy);
+        let p = bufferToWindowPos(vec2<f32>(bufX, bufY), state);
 
         let phi = get_phi(p, state);
         let poolPlaneStride = arrayLength(&f_in) / 9u;
@@ -217,9 +209,8 @@ fn main(
             for (var i = 0u; i < 9u; i++) {
               let srcBufX = fineToCoarseUnitI(i32(fx) - ex[i], originX_L0);
               let srcBufY = fineToCoarseUnitI(i32(fy) - ey[i], originY_L0);
-              let srcWx = wrapf(srcBufX - state.off_x, f32(W));
-              let srcWy = wrapf(srcBufY - state.off_y, f32(H));
-              if (get_phi(vec2<f32>(srcWx, srcWy), state) < 0f) {
+              let srcW = bufferToWindowPos(vec2<f32>(srcBufX, srcBufY), state);
+              if (get_phi(srcW, state) < 0f) {
                 let f_opp = fUnpack(f_in[fIdx(opp[i], poolPlaneStride, cell)], opp[i]);
                 let corr = 2f * wt[i] * (f32(ex[i]) * usx + f32(ey[i]) * usy) / CS2;
                 fx_body += -f32(ex[i]) * (2f * f_opp + corr) * lineWeight;

@@ -233,12 +233,6 @@ fn fineToCoarseUnitI(fCoordI: i32, origin: f32) -> f32 {
   return origin - 0.5 * levelParams.dxL + levelParams.dxL * j;
 }
 
-fn wrapf(v: f32, n: f32) -> f32 {
-  var r = v % n;
-  if (r < 0.0) { r += n; }
-  return r;
-}
-
 fn get_chi(phi: f32) -> f32 {
     return chiFromPhiEps(phi, levelParams.kEps * levelParams.dxL);
 }
@@ -321,9 +315,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   // (see file header).
   let bufX = fineToCoarseUnit(fx, originX_L0);
   let bufY = fineToCoarseUnit(fy, originY_L0);
-  let wx = wrapf(bufX - state.off_x, f32(W));
-  let wy = wrapf(bufY - state.off_y, f32(H));
-  let p = vec2<f32>(wx, wy);
+  let p = bufferToWindowPos(vec2<f32>(bufX, bufY), state);
+  let wx = p.x; let wy = p.y;
   // Periodic minimum-image lever arm, matching amr_step.wgsl / amr_force.wgsl
   // (the coarse step and force pass wrap rx/ry; the fine step previously did
   // not, so a cell reached across a seam got the wrong rotational velocity).
@@ -344,9 +337,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (USE_BOUNCEBACK != 0u && HAS_BODY != 0u) {
       let srcBufX = fineToCoarseUnitI(i32(fx) - ex[i], originX_L0);
       let srcBufY = fineToCoarseUnitI(i32(fy) - ey[i], originY_L0);
-      let srcWx = wrapf(srcBufX - state.off_x, f32(W));
-      let srcWy = wrapf(srcBufY - state.off_y, f32(H));
-      if (get_phi(vec2<f32>(srcWx, srcWy), state) < 0f) {
+      let srcW = bufferToWindowPos(vec2<f32>(srcBufX, srcBufY), state);
+      if (get_phi(srcW, state) < 0f) {
         let corr = 2f * wt[i] * (f32(ex[i]) * usx + f32(ey[i]) * usy) / CS2;
         f[i] = fUnpack(f_in[fIdx(opp[i], poolPlaneStride, cell)], opp[i]) + corr;
         continue;

@@ -129,8 +129,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (cx >= W || cy >= H) { return; }
 
   // Window/physical coordinates: invert the moving-window shift.
-  let wx = (cx + W - u32(state.off_x)) % W;
-  let wy = (cy + H - u32(state.off_y)) % H;
+  let w = bufferToWindowCell(vec2<u32>(cx, cy), state);
+  let wx = w.x; let wy = w.y;
 
   // Position/solid-velocity/own-cell-index terms, hoisted ABOVE the gather
   // loop -- see lbm_step.wgsl's identical hoist for why USE_BOUNCEBACK

@@ -262,3 +262,52 @@ fn nearBodyBox(center: vec2<f32>, half: f32, margin: f32, lookahead: f32, state:
     }
     return false;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BUFFER -> WINDOW, THE ONLY TWO PLACES IT HAPPENS (plans/2D-backport.md B5-1)
+//
+// The solver is buffer-coordinate native: a thread owns a buffer cell and
+// everything it indexes is a buffer index. Three things are anchored to the
+// WINDOW instead and have to convert -- the body SDF, the ALBC sponge band,
+// and the refinement geometry predicates -- and until B5-1 each of the nine
+// call sites spelled the conversion out for itself, in one of two idioms that
+// are NOT interchangeable:
+//
+//   cells      (c + N - u32(off)) % N       integer, truncates off
+//   positions  wrapf(p - off, N)            continuous, keeps off's fraction
+//
+// The second is the one B5 exists to remove: it is the sub-cell precision
+// exposure, because `off` is a float carrying the body's fractional travel
+// and the fine levels evaluate at fractional L0 positions. Naming both here
+// does not change either -- the arithmetic below is verbatim what every site
+// had -- but it makes them countable, keeps a site from picking the wrong one
+// by copy-paste, and puts the B5 switch in ONE function instead of nine.
+//
+// amr2d.mjs's `bufferToWindow` is the host twin, and it is the BARE
+// SUBTRACTION with no wrap at all: get_phi already takes the nearest periodic
+// image, so wrapping first is work whose result get_phi immediately redoes.
+// The kernels keep their wrap here only because this commit is inert by
+// construction; dropping it is a real (if tiny) numerical change and belongs
+// with B5 proper.
+//
+// DEPENDS ON THE INCLUDER declaring `override W` / `override H`, like get_phi
+// above.
+
+fn wrapf(v: f32, n: f32) -> f32 {
+  var r = v % n;
+  if (r < 0.0) { r += n; }
+  return r;
+}
+
+// Integer buffer CELL -> integer window cell.
+fn bufferToWindowCell(c: vec2<u32>, state: CardState) -> vec2<u32> {
+  return vec2<u32>((c.x + W - u32(state.off_x)) % W,
+                   (c.y + H - u32(state.off_y)) % H);
+}
+
+// Continuous buffer POSITION -> continuous window position, keeping the
+// sub-cell part of both the position and the offset.
+fn bufferToWindowPos(p: vec2<f32>, state: CardState) -> vec2<f32> {
+  return vec2<f32>(wrapf(p.x - state.off_x, f32(W)),
+                   wrapf(p.y - state.off_y, f32(H)));
+}

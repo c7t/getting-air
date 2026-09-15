@@ -129,8 +129,8 @@ fn nearBodyAt(centre: vec2<f32>, halfExtent: f32) -> bool {
   if (HAS_BODY == 0u) { return false; }
 
   if (BOX_REFINE == 0u) {
-    let wx = (u32(centre.x) + W - u32(state.off_x)) % W;
-    let wy = (u32(centre.y) + H - u32(state.off_y)) % H;
+    let w = bufferToWindowCell(vec2<u32>(u32(centre.x), u32(centre.y)), state);
+    let wx = w.x; let wy = w.y;
     return phiMinPose(vec2<f32>(f32(wx), f32(wy)), FORCE_REFINE_LOOKAHEAD, state) < FORCE_REFINE_MARGIN;
   }
 
@@ -145,8 +145,8 @@ fn nearBodyAt(centre: vec2<f32>, halfExtent: f32) -> bool {
 // (the JS default is 8; ?spongeExclude=0 disables it).
 fn inSpongeBandAt(centre: vec2<f32>) -> bool {
   if (SPONGE_EXCLUDE_W <= 0.0f) { return false; }
-  let wx = (u32(centre.x) + W - u32(state.off_x)) % W;
-  let wy = (u32(centre.y) + H - u32(state.off_y)) % H;
+  let w = bufferToWindowCell(vec2<u32>(u32(centre.x), u32(centre.y)), state);
+  let wx = w.x; let wy = w.y;
   let distX = min(f32(wx), f32(W - wx));
   let distY = min(f32(wy), f32(H - wy));
   return min(distX, distY) < SPONGE_EXCLUDE_W;

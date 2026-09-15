@@ -112,8 +112,8 @@ fn main(
 
   if (cx < W && cy < H) {
     {
-      let wx   = (cx + W - u32(state.off_x)) % W;
-      let wy   = (cy + H - u32(state.off_y)) % H;
+      let w    = bufferToWindowCell(vec2<u32>(cx, cy), state);
+      let wx   = w.x; let wy = w.y;
       let cell = cellIndex(cx, cy);
       let p    = vec2<f32>(f32(wx), f32(wy));
 

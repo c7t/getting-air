@@ -110,11 +110,7 @@ fn get_ux(x: i32, y: i32) -> f32 {
     return vel[cellIndex(bx, by) * 2u];
 }
 
-fn wrapf(v: f32, n: f32) -> f32 {
-    var r = v % n;
-    if (r < 0.0) { r += n; }
-    return r;
-}
+// wrapf lives in common_geometry.wgsl (B5-1), included above.
 
 // Coarse-grid vorticity at integer-centred cell (cx, cy) in WINDOW coords
 // (get_ux/get_uy add the window offset and wrap). Central difference, per
