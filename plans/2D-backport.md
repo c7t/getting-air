@@ -30,7 +30,7 @@ GPU) and that is what made M4/M5 survivable. Build the 2D equivalent first.
 | B5 | The window is a translation of the SPONGE | **half already true in 2D AMR, not in `main.js`** | removes window bookkeeping from 5 hot kernels; retires `card-total.mjs`'s problem | M |
 | B6 | Explode/coalesce at the coarse/fine interface | **yes, but measure first** | 2D's interface is not conservative, and nothing in 2D measures that | L |
 | B7 | The diffuse band ladder | **DONE** | `?kEps=` sweeps all nine chi sites; the band is FIRST order in 2D (3D's 2nd does not transfer) and both red cells are quantified band error, closing at `?kEps=0.375` | S |
-| B8 | `SOLID_EQ` on the bounce-back path | **latent only** | free on every 2D gate (all bounce-back bodies are pinned); disarms a landmine | S |
+| B8 | `SOLID_EQ` on the bounce-back path | **DONE** | exact on the deterministic leg; the interior it fixes is at 78% of free-stream today, so the landmine was armed | S |
 | B9 | f32 lattice weights do not sum to 1 | **DONE** | `lattice-2d.mjs` derives the basis once (was eleven copies); mass injection halved, velocity drift removed; couette gates improved 26-53% | S (code) / L (re-baseline) |
 
 Sizes are of the *change*, not of the validation. B1, B6 and B9 each move the
@@ -1062,6 +1062,41 @@ chose chi for a completely different reason (a resolution-starved phone). The
 3D measurement retroactively justifies it. Do not "upgrade" 2D's falling card
 to bounce-back on the strength of 3D's *pinned* sphere numbers.
 
+### B8 — DONE (2026-09-14)
+
+`override SOLID_EQ` in all four step kernels, `?solideq=0` to A/B. The gate is
+met in its strongest available form: `dense-reference` is the one
+DETERMINISTIC config in the suite, and `?bounceback` against
+`?bounceback&solideq=0` reads Cd 1.327 / St 0.1605 on both legs — exact, not
+within-a-floor.
+
+**"Latent only" was right about the observables and wrong about the
+magnitude.** This section says the fix "cannot move a single 2D number", which
+is true and is the gate — but it reads as though there were nothing there to
+fix. Measured in the velocity field inside the body, where no observable ever
+looks (dense bounce-back, 4096 steps, U0 = 0.04):
+
+```
+leg                  max|u| inside    max|u| outside
+SOLID_EQ (default)     2.05e-4          5.06e-2
+?solideq=0             4.00e-2          5.11e-2
+```
+
+**The body's interior currently carries 78% of the free-stream velocity.** The
+hazard is real in 2D and was never inherited from 3D's measurement — it is
+simply never read. That is worth knowing before someone points `?bounceback=1`
+at a moving body and reads the result as a solver bug.
+
+**And the control is the reusable part.** `max|u| OUTSIDE` also differed
+between the two legs, by 0.9% — which would have contradicted the
+bit-identical Cd above if taken at face value. Running the SAME leg twice gave
+a ~0.6% spread, because the page runs live for an indeterminate number of
+frames between load and `setLive(false)` and this is an instantaneous field
+quantity in a shedding flow. **A new instrument needs its own noise floor
+measured before either direction is believed**, exactly as CLAUDE.md
+prescribes for AMR Cd — and the first thing this one produced, unchecked, was
+a false contradiction with a result that was already exact.
+
 ### B8 — `SOLID_EQ` on the 2D bounce-back path
 
 Latent, cheap, and free. Under bounce-back `chi` is 0, so interior cells are
@@ -1161,7 +1196,8 @@ B7   chi band ladder                                   DONE -- red cells are
                                                        default unchanged (it
                                                        needs the moving-card
                                                        gates, not this one)
-B8   SOLID_EQ                                         (independent, free)
+B8   SOLID_EQ                                          DONE -- exact on the
+                                                       deterministic leg
 B9   lattice weights                                   DONE -- unblocked B6's
                                                        mass half
 B2   cascade21                                     ◄── needs B0
