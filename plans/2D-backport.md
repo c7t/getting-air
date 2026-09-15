@@ -705,7 +705,10 @@ has**. Give level 1 an `originX/originY` pair at allocation and
    This is the hot kernel and the largest single win. **DONE — see B3-1
    below; it went the other way round in the end (the pool file survived and
    took the name), and the blocker was a wrong claim in its own header.**
-2. `average` — one body, two parent fragments.
+2. `average` — one body, two parent fragments. **DONE — see B3-2 below.
+   The accessor needed a third function (`parentStoreWord`) that 3D's
+   `parentIndex`/`parentPresent` pair does not have, because the two parents
+   are different BUFFERS and WGSL cannot pass one to a function.**
 3. `interp` — `common_interp.wgsl` already holds the shared half; move the
    fetch behind `parentIndex` and collapse the two entry files.
 4. `force1` — same, and it shrinks again under B4.
@@ -791,6 +794,54 @@ one is no better) would have picked exactly the wrong one.
 now the ONLY reader of `originX/originY`, so unifying it the same way retires
 those two buffers and `amr_manage_pool.wgsl`'s write of them, which is the
 binding CLAUDE.md's 16-buffer-ceiling note nominates next.
+
+### B3-2 — DONE (2026-09-14). The average pair, as one body and an accessor.
+
+`amr_average_f2c.wgsl` (142) and `amr_average_pool_parent.wgsl` (147) were
+near-identical copies. They are now 24 and 32 lines -- their binding layout,
+their overrides, and two `@include`s each:
+
+    shaders/common_average.wgsl             the kernel, once
+    shaders/common_avg_parent_dense.wgsl    parent = L0's dense grid
+    shaders/common_avg_parent_pool.wgsl     parent = another pool tile
+
+**This is the accessor shape B3 describes, and it is worth stating what the
+accessor turned out to BE**, since it is what B3-3 and B3-4 will reuse. 3D's
+pair declares `parentIndex(v)` / `parentPresent(v)`. That is not quite enough
+in WGSL here, because the dense parent and the pool parent are DIFFERENT
+BUFFERS with different plane strides, and a buffer cannot be passed to a
+function. So the contract is three functions, and the third is the store
+itself:
+
+    fn parentTau() -> f32
+    fn parentCellForChild(slot, blockID, lcx, lcy) -> u32
+    fn parentStoreWord(cell, wi, word)
+
+The dense fragment reads `state` and writes `f_coarse`; the pool one reads
+`levelParams` and writes `f_parent_pool`. **The fragments reference bindings
+the ENTRY file declares**, which is new for this project -- every existing
+`common_*.wgsl` is a pure function of its arguments -- and it is the thing
+that lets the entry files hold the binding layout (one place, matching the
+page's BGL one-to-one) while the fragment holds the access. Nothing in
+shader-loader.mjs needed to change; it is a textual splice and WGSL module
+scope is order-independent.
+
+**Unlike B3-1, there is no deeper simplification hiding here.** B3-1 collapsed
+its pair because the difference was a wrong claim; this pair's difference is
+real -- L0 is a dense, ghost-free, cellIndex()-addressed grid and stays one
+(plans/AMR-multilevel.md decision 1). The win is that the asymmetry now costs
+three small functions instead of a second copy of the restriction.
+
+**Measured inert**, `index-cylinder-amr.html?levels=3`, 4096 steps from reset:
+bit-IDENTICAL to the pre-B3 baseline. Boot smoke PASS on all seven pages;
+invariants PASS (all eight gates) on amr-dev and both N2/N3 x
+diffuse/bounceback; analytic channel/TGV PASS; Cd/St unchanged apart from the
+two standing red cells.
+
+**AND THE FIRST RUN SAID DIFFERS.** It was the `?levels=3` excursion B3-1
+measured (1 run in 7), and the repeat came back IDENTICAL -- the first live
+use of the rule B3-1 wrote down, on the first opportunity to get it wrong.
+Take the repeat.
 
 ### B3a — the same sweep, in JS
 
@@ -1558,8 +1609,9 @@ B2-2d delete the ?cascade=0 path (16 -> 14),       ◄── DONE; corner balanc
                                                         refactor not a rewrite
 B2   cascade21                                     ◄── needs B0
 B3-1 step1: one kernel, every level               ◄── DONE, bit-identical
-B3   the rest (average, interp, force1,            ◄── needs B2 and B3a
-     criterion, manage LAST)
+B3-2 average: one body, two parent fragments      ◄── DONE, bit-identical
+B3   the rest (interp, force1, criterion,          ◄── needs B2 and B3a
+     manage LAST)
 B5   window = sponge translation                    ◄── independent of B2/B3,
                                                         but smaller after B3
 B1   post-collision rescale                         ◄── needs B0b only; its

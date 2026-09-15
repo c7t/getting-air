@@ -722,9 +722,10 @@ async function init() {
     // see shaders/amr_interp_pool_parent.wgsl's header for the addressing
     // split vs. the dense-parent module above.
     loadShader(device, 'shaders/amr_interp_pool_parent.wgsl'),
-    // Milestone 7 / B3-1: ONE fine-step kernel for every level, and one
-    // average sibling for level>=2 -- see shaders/amr_step1.wgsl /
-    // shaders/amr_average_pool_parent.wgsl.
+    // Milestone 7 / B3-1: ONE fine-step kernel for every level. The two
+    // average entry files below are still two pipelines (their PARENTS have
+    // different storage layouts), but share one body since B3-2 -- see
+    // shaders/amr_step1.wgsl and shaders/common_average.wgsl.
     loadShader(device, 'shaders/amr_step1.wgsl'),
     loadShader(device, 'shaders/amr_average_f2c.wgsl'),
     loadShader(device, 'shaders/amr_average_pool_parent.wgsl'),
@@ -890,8 +891,10 @@ async function init() {
     { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }
   ]});
   // Milestone 7: level>=2 average, writing into a parent POOL tile via
-  // parentSlot/quadrant instead of cellIndex() -- see
-  // shaders/amr_average_pool_parent.wgsl.
+  // parentSlot/quadrant instead of cellIndex(). Since B3-2 that difference
+  // IS the whole difference: both average entry files are their bindings
+  // plus shaders/common_average.wgsl, with the destination and the parent's
+  // tau behind common_avg_parent_{dense,pool}.wgsl.
   const avgPoolBGL = device.createBindGroupLayout({ label: 'avgPoolBGL', entries: [
     { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
     { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
