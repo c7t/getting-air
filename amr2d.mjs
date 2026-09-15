@@ -143,6 +143,22 @@ export function quadrantOfBlock(b) { return [b[0] & 1, b[1] & 1]; }
 // no spatial coordinate involved.
 export function quadrantOrigin(rb, q) { return GHOST + q * rb; }
 
+// A SLOT'S QUADRANT IS A FUNCTION OF THE SLOT INDEX, not stored data.
+//
+// Levels >= 2 allocate in QUADS: a free-list entry is a quad index, and the
+// four children go to `quadIdx*4 + quadrant` for quadrant in 0..3. So
+// `quadrant == slot % 4` by construction, on the GPU allocator
+// (shaders/amr_manage_pool.wgsl's refine) and on the host one
+// (main-amr.js's debugActivateBlock) alike -- both compose the slot that way.
+//
+// The pool nonetheless keeps a per-slot `quadrantBuf` holding exactly this,
+// rewritten on every allocation. That is a buffer storing a constant, and
+// shaders/amr_manage_pool.wgsl sits at EXACTLY the 16-storage-buffer
+// per-stage limit (see CLAUDE.md), so it is also the cheapest binding in the
+// project to get back. amr2d-gpu.mjs's checkSlotQuadrantsOnGPU scores the
+// live buffer against this rule.
+export function quadrantOfSlot(slot) { return slot % 4; }
+
 // A TILE'S PHYSICAL ORIGIN IN L0 UNITS, TWO WAYS, AND THEY MUST AGREE.
 //
 // The GPU builds it RECURSIVELY, at allocation time: a child's origin is its

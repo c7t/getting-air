@@ -100,7 +100,25 @@
 @group(0) @binding(5)  var<storage, read_write> childNewlyActivated : array<u32>;
 @group(0) @binding(6)  var<storage, read>       state             : CardState;
 @group(0) @binding(7)  var<storage, read_write> childParentSlot   : array<i32>;
-@group(0) @binding(8)  var<storage, read_write> childQuadrant     : array<u32>;
+// binding 8 WAS childQuadrant, and it held `slot % 4`.
+//
+// A slot's quadrant is a function of the slot index, not stored data: both
+// allocators compose the slot as `quadIdx*4 + quadrant` (refine() below, and
+// main-amr.js's debugActivateBlock), so the buffer stored a constant and
+// refine() rewrote it on every allocation. amr2d.mjs's `quadrantOfSlot` is
+// the rule; amr2d-gpu.mjs's checkSlotQuadrantsOnGPU scored the live buffer
+// against it over 352 and 212 active slots, at ?levels=3 and ?levels=4, after
+// 8000+ steps of real refinement, before this binding was removed.
+//
+// WHY IT MATTERED ENOUGH TO CHASE. This kernel declared EXACTLY 16 storage
+// buffers, which is `maxStorageBuffersPerShaderStage` on the target hardware
+// -- see CLAUDE.md. There was no room for anything, and the next thing that
+// needs room is plans/2D-backport.md B2's want array. The buffer itself stays
+// (several other shaders read it, and the allocator now writes it once at
+// allocation instead of per-refine); it is this kernel's BINDING that is
+// recovered. 8 is left as a hole rather than renumbered: a renumber is five
+// separate pages' bind groups to land in lockstep, which is the shape that
+// shipped 238e48c.
 @group(0) @binding(9)  var<storage, read_write> childOriginX      : array<f32>;
 @group(0) @binding(10) var<storage, read_write> childOriginY      : array<f32>;
 @group(0) @binding(11) var<storage, read>       parentBlockSlot   : array<i32>;
@@ -386,7 +404,6 @@ fn refine(@builtin(global_invocation_id) gid: vec3<u32>) {
         childBlockSlot[childBlockID] = i32(slot);
         childSlotToBlock[slot] = i32(childBlockID);
         childParentSlot[slot] = i32(parentSlot);
-        childQuadrant[slot] = quadrant;
         // BUGFIX (L2 bounce-back sign/magnitude investigation): the
         // "Milestone 10 BUGFIX" that used to sit here had it backwards --
         // see parentCenterX_L0's own BUGFIX comment above (same file, same
@@ -429,7 +446,9 @@ fn coarsen(@builtin(global_invocation_id) gid: vec3<u32>) {
   // Only quadrant 0 drives the decision -- all 4 release together
   // (decision 3), so evaluating (and freeing) once per quad, not once per
   // slot, avoids 4 threads racing the same freeList push.
-  if (childQuadrant[slot] != 0u) { return; }
+  // One thread per QUAD, and quadrant 0's slot is the one divisible by 4 --
+  // see the binding-8 note above on why this is arithmetic rather than a read.
+  if (slot % 4u != 0u) { return; }
 
   let eps = min(1.0f, log2(max(childCriterion[u32(blockID)], EPS_FLOOR)));
   // Geometric protection uses the PARENT's own center -- matching refine()'s
@@ -473,7 +492,7 @@ fn coarsen(@builtin(global_invocation_id) gid: vec3<u32>) {
   let centerY_L0 = parentOriginY_L0 + f32(RB) * PARENT_CELL_SIZE_L0;
 
   if ((desiredLevelCoarsen(toPhysical(eps)) < myLevel() + 1 || inSpongeBandAt(centerX_L0, centerY_L0)) && !isNearBodyAt(centerX_L0, centerY_L0)) {
-    let quadIdx = slot / 4u; // slot IS quadrant 0's own slot (childQuadrant[slot]==0 checked above), so quadIdx*4u==slot
+    let quadIdx = slot / 4u; // slot IS quadrant 0's own slot (slot % 4 == 0 checked above), so quadIdx*4u==slot
     // See header: blocked if any of the 4 children about to release has
     // an active level-(m+2) grandchild itself, or if any of their own
     // same-level-(m+1) edge-neighbors does -- releasing either would leave

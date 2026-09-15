@@ -37,7 +37,7 @@
 import {
   check21Balance, nbAtLevel, makePool, cellSizeL0AtLevel,
   nearBodyWant, nearBodyWantCentre, bodyPhiL0, bufferToWindow, bufferToWindowLegacy,
-  cascade21,
+  cascade21, quadrantOfSlot,
 } from './amr2d.mjs';
 
 // Every level's blockSlot, copied in one command encoder and one submit, so
@@ -264,6 +264,20 @@ export function allocLevelPool(device, U, m, NBX_m, NBY_m, maxFineBlocks, NCELLS
     // silently zeroing out every OTHER staging buffer in the same save too.
     pool.parentSlotBuf = device.createBuffer({ size: maxFineBlocks * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
     pool.quadrantBuf   = device.createBuffer({ size: maxFineBlocks * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
+    // WRITTEN ONCE, HERE, because its content never changes: a slot's
+    // quadrant is `slot % 4` for the life of the pool (amr2d.mjs's
+    // quadrantOfSlot -- both allocators compose the slot as
+    // `quadIdx*4 + quadrant`). shaders/amr_manage_pool.wgsl's refine() used
+    // to rewrite it on every allocation and needed a whole binding to do it,
+    // from a kernel that sits at the 16-buffer per-stage ceiling.
+    //
+    // Same "fix at the source, for every level" reasoning as the
+    // freeList/freeCount write below -- and the same hazard if it is not
+    // done here: several other shaders read this buffer, and with nothing
+    // writing it per-refine any longer, a zero-initialised or reset copy
+    // would be silently wrong for all of them.
+    device.queue.writeBuffer(pool.quadrantBuf, 0,
+      new Uint32Array(maxFineBlocks).map((_, slot) => quadrantOfSlot(slot)));
     // Milestone 7: a level>=2 tile's own physical (L0-buffer-space) origin,
     // cached at quad-activation time -- unlike ownBX/ownBY (correctly
     // dropped, see the amendment above), this is NOT cheaply re-derivable
@@ -951,4 +965,56 @@ export function makeCascadeSeeds(pools, nLevels) {
 export function closeSeed(pools, nLevels, sets) {
   const nbAt = (m) => [pools[m].NBX, pools[m].NBY];
   return cascade21(sets, nbAt, { levels: nLevels }).sets;
+}
+
+// --- the stored quadrant against the rule ----------------------------------
+//
+// amr2d.mjs's `quadrantOfSlot` says a slot's quadrant is `slot % 4`, because
+// both allocators compose the slot as `quadIdx*4 + quadrant`. This reads the
+// live buffer and checks it -- over ACTIVE slots, which is the only place the
+// value has ever been written.
+//
+// WHY BOTHER, when the argument is two lines of arithmetic: the buffer is
+// about to stop being written by shaders/amr_manage_pool.wgsl's refine (it is
+// the cheapest binding to recover from that kernel's exactly-16 ceiling), and
+// several OTHER shaders still read it. So the claim being relied on is not
+// "the arithmetic is right" but "nothing on any path has ever put a different
+// value there" -- including debugSnapshotLoad, which writes whatever a
+// snapshot recorded. That is an empirical claim about live state, and this is
+// how it gets checked rather than asserted.
+export async function checkSlotQuadrantsOnGPU(device, pools, nLevels) {
+  const U = GPUBufferUsage;
+  const stages = [];
+  const enc = device.createCommandEncoder();
+  // Levels >= 2 only: level 1 allocates per block, not per quad, and has no
+  // quadrantBuf at all.
+  for (let m = 2; m < nLevels; m++) {
+    const pool = pools[m];
+    const bytes = pool.MAX_FINE_BLOCKS * 4;
+    const q = device.createBuffer({ size: bytes, usage: U.MAP_READ | U.COPY_DST });
+    const s2b = device.createBuffer({ size: bytes, usage: U.MAP_READ | U.COPY_DST });
+    enc.copyBufferToBuffer(pool.quadrantBuf, 0, q, 0, bytes);
+    enc.copyBufferToBuffer(pool.slotToBlockBuf, 0, s2b, 0, bytes);
+    stages.push({ m, q, s2b, pool });
+  }
+  if (!stages.length) return { ok: true, checked: 0, violations: [] };
+  device.queue.submit([enc.finish()]);
+  await Promise.all(stages.flatMap(s => [s.q.mapAsync(GPUMapMode.READ), s.s2b.mapAsync(GPUMapMode.READ)]));
+
+  const violations = [];
+  let checked = 0;
+  for (const { m, q, s2b, pool } of stages) {
+    const quad = new Uint32Array(q.getMappedRange());
+    const slotToBlock = new Int32Array(s2b.getMappedRange());
+    for (let slot = 0; slot < pool.MAX_FINE_BLOCKS; slot++) {
+      if (slotToBlock[slot] < 0) continue;   // never allocated -- never written
+      checked++;
+      const want = quadrantOfSlot(slot);
+      if (quad[slot] !== want) {
+        if (violations.length < 8) violations.push({ level: m, slot, stored: quad[slot], rule: want });
+      }
+    }
+    q.unmap(); s2b.unmap(); q.destroy(); s2b.destroy();
+  }
+  return { ok: violations.length === 0, checked, violations };
 }

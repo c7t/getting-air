@@ -61,7 +61,7 @@
 import { reportFatal, refuseConfig, reportNoWebGPU, reportNoAdapter } from './error-overlay.mjs';
 import { loadShader } from './shader-loader.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
-import { check21BalanceOnGPU, readConservedTotals, allocLevelPool, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState , checkRefinementClosureOnGPU , makeCascadePipelines, cascadeRoundTrip, makeCascadeSeeds } from './amr2d-gpu.mjs';
+import { check21BalanceOnGPU, readConservedTotals, allocLevelPool, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState , checkRefinementClosureOnGPU , makeCascadePipelines, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU } from './amr2d-gpu.mjs';
 // tauAtLevel: extracted to card-params.mjs by B3a-1, which landed the CALL
 // in all five AMR pages and this IMPORT in only main-amr.js. The other four
 // threw `ReferenceError: tauAtLevelOf is not defined` at init -- but only at
@@ -507,7 +507,8 @@ async function init() {
     { binding: 5,  visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
     { binding: 6,  visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 7,  visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-    { binding: 8,  visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    // binding 8 (childQuadrant) is gone -- it held `slot % 4`. See
+    // shaders/amr_manage_pool.wgsl on why the hole is not renumbered.
     { binding: 9,  visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
     { binding: 10, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
     { binding: 11, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
@@ -755,7 +756,6 @@ async function init() {
       { binding: 5, resource: { buffer: childPool.newlyActivatedBuf } },
       { binding: 6, resource: { buffer: cardStateBuf } },
       { binding: 7, resource: { buffer: childPool.parentSlotBuf } },
-      { binding: 8, resource: { buffer: childPool.quadrantBuf } },
       { binding: 9, resource: { buffer: childPool.originXBuf } },
       { binding: 10, resource: { buffer: childPool.originYBuf } },
       { binding: 11, resource: { buffer: parentBlockSlotBuf } },
@@ -1011,6 +1011,10 @@ async function init() {
   // per-pass tests and only the VETO half of the refine cascade exists,
   // so this is expected to be nonzero until plans/2D-backport.md B2.
   const debugCheckRefinementClosure = () => checkRefinementClosureOnGPU(device, pools, N_LEVELS);
+  // A slot's quadrant is `slot % 4` by construction -- amr2d.mjs's
+  // quadrantOfSlot. This scores the stored buffer against that rule over
+  // live ACTIVE slots, which is what lets the pool manager stop writing it.
+  const debugCheckSlotQuadrants = () => checkSlotQuadrantsOnGPU(device, pools, N_LEVELS);
 
   // THE GPU CASCADE, SCORED AGAINST THE HOST TWIN (plans/2D-backport.md B2-2).
   //
@@ -1117,6 +1121,7 @@ async function init() {
     debugReadCardState,
     debugCheck21Balance,
     debugCheckRefinementClosure,
+    debugCheckSlotQuadrants,
     debugCascadeRoundTrip,
     debugConservedTotals,
     debugListActiveBlocks,

@@ -75,7 +75,7 @@ const sorted = (s) => [...s].sort();
     refineWhere, nearBodyWant, nearBodyWantCentre, refineNearBody,
     resolveSource, toGlobalFine, fromGlobalFine, storageRatio,
     check21Balance, checkRingParentCoverage, checkGeometryCoverage, cascade21,
-    SQRT2_UP, BLOCK_BB_DEPTH,
+    SQRT2_UP, BLOCK_BB_DEPTH, quadrantOfSlot,
   } = A;
 
   // ── pool geometry ────────────────────────────────────────────────────────
@@ -718,6 +718,31 @@ const sorted = (s) => [...s].sort();
     for (const n of sizes) {
       assert.ok(n >= 3 * BLOCK_BB_DEPTH + 1,
         `stack of ${n} is too small for depth ${BLOCK_BB_DEPTH} (needs ${3 * BLOCK_BB_DEPTH + 1})`);
+    }
+  });
+
+  ok('a slot\'s quadrant is slot % 4 -- the same composition both allocators use', () => {
+    // Both allocators build the slot as `quadIdx*4 + quadrant`:
+    // shaders/amr_manage_pool.wgsl's refine() and main-amr.js's
+    // debugActivateBlock. So the quadrant is recoverable from the index, and
+    // the pool's per-slot quadrant buffer was storing a constant -- which is
+    // what let amr_manage_pool.wgsl drop a binding it had no room for (it sat
+    // at exactly maxStorageBuffersPerShaderStage; see CLAUDE.md).
+    //
+    // Checked against the COMPOSITION rather than against `slot % 4` restated,
+    // so this is the two routes agreeing and not one route twice.
+    for (let quadIdx = 0; quadIdx < 6; quadIdx++) {
+      for (let quadrant = 0; quadrant < 4; quadrant++) {
+        const slot = quadIdx * 4 + quadrant;
+        assert.strictEqual(quadrantOfSlot(slot), quadrant,
+          `slot ${slot} (quad ${quadIdx}, quadrant ${quadrant})`);
+      }
+    }
+    // And quadrant 0's slot is the one the coarsen pass selects on, which is
+    // the single use that became arithmetic.
+    for (let quadIdx = 0; quadIdx < 6; quadIdx++) {
+      assert.strictEqual(quadrantOfSlot(quadIdx * 4), 0);
+      for (let q = 1; q < 4; q++) assert.notStrictEqual(quadrantOfSlot(quadIdx * 4 + q), 0);
     }
   });
 
