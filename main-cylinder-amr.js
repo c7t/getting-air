@@ -2803,20 +2803,15 @@ async function init() {
     device.queue.writeBuffer(diagBuf, 0, new Uint32Array(8));
     return {
       diagEnabled: DIAG !== 0,
-      refineGrantedLastIter: v[3],
-      refineByCascadeLastIter: v[4],
-      refinePoolExhausted: v[5],
-      // converged: has the 2:1-BALANCE CASCADE stopped propagating, and did
-      // nothing starve? Deliberately NOT `granted === 0`. A criterion-driven
-      // grant in the final iteration is normal operation -- a block whose own
-      // vorticity newly crossed threshold -- and is the INPUT to the
-      // fixed-point process, not a failure of it. Measured: amr-N2-bounceback
-      // reports granted=1/byCascade=0 at step 2048 on main with 2:1-balance
-      // passing at that same checkpoint, so gating on `granted` would have
-      // turned a healthy config red. A CASCADE grant outstanding is different:
-      // it means balance was still spreading outward when the loop ran out of
-      // iterations.
-      converged: v[4] === 0 && v[5] === 0,
+      refineGranted: v[3],
+      refineStarved: v[5],
+      // The one thing here that is still a fault. NOT `granted === 0`: a
+      // criterion-driven grant is normal operation (a block whose own
+      // vorticity newly crossed threshold), and gating on it would turn a
+      // healthy config red -- measured on main, amr-N2-bounceback reported
+      // granted=1 at step 2048 with 2:1 balance passing at that same
+      // checkpoint.
+      poolOk: v[5] === 0,
     };
   }
 

@@ -3385,16 +3385,26 @@ async function init() {
   // a running total -- which is what makes "transient while refinement catches
   // up" vs "steady state" answerable.
   //
-  // The refine counters describe the FINAL fixed-point iteration only (they are
-  // cleared just before it, see dispatchMacroStep). converged=false means the
-  // loop was still creating tiles when its fixed iteration count ran out, so
-  // the topology the solver then runs on has outstanding refinement.
-  // byCascade isolates 2:1 balance still propagating outward.
+  // WHAT THESE MEANT AND WHAT THEY MEAN NOW. They described the FINAL
+  // iteration of a fixed-point loop, and `converged` asked whether the 2:1
+  // cascade had stopped propagating when that loop ran out of iterations.
+  // B2 deleted the loop: the closure reaches its fixed point in one sweep by
+  // construction, so there is no iteration budget to run out of and no
+  // cascade-still-spreading state to detect.
   //
-  // If converged reads false, check whether MORE iterations help (?refineIters=)
-  // before assuming slow propagation: if they do not, it is an oscillation --
-  // refine granting tiles that coarsen then releases -- which is a different
-  // bug with a different fix.
+  // SO `converged` AND `refineByCascadeLastIter` ARE GONE rather than left
+  // reading OK. diag[4] stopped being written at all in B2-2d, which made
+  // `converged`'s first clause permanently true -- an always-true gate, the
+  // fourth this project has found (B3a-4 had two, B4-3 one). What was left of
+  // it was the pool-starvation half, so that is what it is now called.
+  //
+  // refineGranted is the tiles created in THIS round -- churn, not a fault.
+  // refineStarved is refines refused for want of a slot, which IS a fault:
+  // geometry-forced refinement being denied means a seam through the body,
+  // and since B4-3 only the finest level computes force, so the refused
+  // region contributes nothing at all. The live loop latches on it
+  // (makeRefusalWatch); this is how the HARNESS path sees it, since
+  // debugStepSync does not go through frame().
   async function debugReadDiag() {
     const enc = device.createCommandEncoder();
     enc.copyBufferToBuffer(diagBuf, 0, diagReadBuf, 0, 32);
@@ -3405,20 +3415,15 @@ async function init() {
     device.queue.writeBuffer(diagBuf, 0, new Uint32Array(8));
     return {
       diagEnabled: DIAG !== 0,
-      refineGrantedLastIter: v[3],
-      refineByCascadeLastIter: v[4],
-      refinePoolExhausted: v[5],
-      // converged: has the 2:1-BALANCE CASCADE stopped propagating, and did
-      // nothing starve? Deliberately NOT `granted === 0`. A criterion-driven
-      // grant in the final iteration is normal operation -- a block whose own
-      // vorticity newly crossed threshold -- and is the INPUT to the
-      // fixed-point process, not a failure of it. Measured: amr-N2-bounceback
-      // reports granted=1/byCascade=0 at step 2048 on main with 2:1-balance
-      // passing at that same checkpoint, so gating on `granted` would have
-      // turned a healthy config red. A CASCADE grant outstanding is different:
-      // it means balance was still spreading outward when the loop ran out of
-      // iterations.
-      converged: v[4] === 0 && v[5] === 0,
+      refineGranted: v[3],
+      refineStarved: v[5],
+      // The one thing here that is still a fault. NOT `granted === 0`: a
+      // criterion-driven grant is normal operation (a block whose own
+      // vorticity newly crossed threshold), and gating on it would turn a
+      // healthy config red -- measured on main, amr-N2-bounceback reported
+      // granted=1 at step 2048 with 2:1 balance passing at that same
+      // checkpoint.
+      poolOk: v[5] === 0,
     };
   }
 

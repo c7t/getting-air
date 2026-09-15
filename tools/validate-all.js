@@ -520,18 +520,18 @@ async function runInvariants(Runtime, opts, global) {
     global,
     // cov/bad come back null (not empty) on a page that exposes no
     // geometry-coverage scan or card-state readback -- print n/a, never OK.
-    onCheckpoint: (stepsDone, { diag, bal, cov, closure, bad }) => {
+    onCheckpoint: (stepsDone, { diag, bal, cov, closure, quad, bad }) => {
       const corner = bal.cornerOk === undefined ? ''
         : `, corner ${bal.cornerOk ? 'OK' : `${bal.cornerViolations.length}`}`;
       // `n/a` is printed, never nothing: an invariant that silently is not
       // checked is the failure mode this whole exercise kept running into.
-      const conv = !diag ? ', converged n/a (no debugReadDiag)' : (!diag.diagEnabled ? ', converged n/a (?diag=1 not set)'
-        : `, converged ${diag.converged ? 'OK' : `NO (${diag.refineByCascadeLastIter} cascade grants outstanding, ${diag.refinePoolExhausted} starved)`}`);
+      const conv = !diag ? ', pool n/a (no debugReadDiag)' : (!diag.diagEnabled ? ', pool n/a (?diag=1 not set)'
+        : `, pool ${diag.poolOk ? 'OK' : `STARVED (${diag.refineStarved} refine(s) refused)`}`);
       console.log(`    step ${stepsDone}: 2:1-balance ${bal.ok ? 'OK' : `FAIL (${bal.violations.length})`}${corner}, ` +
         `coverage ${cov === null ? 'n/a' : cov.ok ? 'OK' : `FAIL (${cov.violations.length})`}, ` +
         `field ${bad === null ? 'n/a' : bad.length ? `FAIL (${bad.join(',')})` : 'OK'}${conv}` +
-        // Reported, not gated -- see tools/lib/amr-invariants.js on why.
-        `${closure === null ? '' : `, closure ${closure.ok ? 'OK' : `${closure.missing} missing`}`}`);
+        `${closure === null ? '' : `, closure ${closure.ok ? 'OK' : `${closure.missing} missing`}`}` +
+        `${quad === null ? '' : `, quadrants ${quad.ok ? 'OK' : `FAIL (${quad.violations.length})`}`}`);
     },
   });
 }
@@ -671,17 +671,21 @@ async function main() {
     if (invariants && !invariants.ok) {
       console.log(`  [${config.name}] invariants (over ${invariants.stepsDone} steps):`);
       if (invariants.balanceViolations.length) console.log(`    2:1-balance FAIL @ step ${invariants.balanceViolations[0].step}: ${JSON.stringify(invariants.balanceViolations[0].violations.slice(0, 4))}`);
-      if (invariants.convergenceViolations && invariants.convergenceViolations.length) {
-        const v = invariants.convergenceViolations[0];
-        console.log(`    refinement NOT CONVERGED @ step ${v.step}: the 2:1-balance cascade granted ${v.byCascade} tile(s) in the FINAL ` +
-          `fixed-point iteration (${v.poolExhausted} starved by an exhausted pool), ${invariants.convergenceViolations.length} checkpoint(s) affected.`);
-        console.log(`      Balance was still spreading outward when the loop ran out of iterations. Criterion-driven grants are NOT`);
-        console.log(`      counted here -- those are normal input to the process. If more rounds (?refineIters=) do NOT fix it, this is`);
-        console.log(`      an OSCILLATION -- refine granting tiles that coarsen then releases -- not slow propagation.`);
+      if (invariants.starvationViolations && invariants.starvationViolations.length) {
+        const v = invariants.starvationViolations[0];
+        console.log(`    refinement STARVED @ step ${v.step}: ${v.starved} refine(s) refused for want of a pool slot ` +
+          `(${v.granted} granted the same round), ${invariants.starvationViolations.length} checkpoint(s) affected.`);
+        console.log(`      A refused refine is abandoned silently. For a criterion-driven one that is the pool working as a budget;`);
+        console.log(`      for a GEOMETRY-forced one it means a coarse/fine seam through the body, and since B4-3 only the finest`);
+        console.log(`      level computes force, so the refused region contributes NOTHING. Raise ?maxFineBlocks= or lower ?levels=.`);
+        console.log(`      (The live rAF loop latches on this itself -- makeRefusalWatch -- but debugStepSync does not go through it,`);
+        console.log(`      which is why the harness needs its own signal.)`);
       }
-      if (invariants.convergenceChecked === false) console.log(`    refinement convergence: NOT CHECKED (page exposes no debugReadDiag, or ?diag=1 did not take)`);
+      if (invariants.starvationChecked === false) console.log(`    pool starvation: NOT CHECKED (page exposes no debugReadDiag, or ?diag=1 did not take)`);
       if (invariants.requireCornerBalance && invariants.cornerViolations.length) console.log(`    corner 2:1-balance FAIL @ step ${invariants.cornerViolations[0].step}: ${invariants.cornerViolations[0].count} violation(s)`);
       if (invariants.coverageViolations.length) console.log(`    geometry-coverage FAIL @ step ${invariants.coverageViolations[0].step}: ${JSON.stringify(invariants.coverageViolations[0].violations.slice(0, 4))}`);
+      if (invariants.closureViolations.length) console.log(`    2:1-closure FAIL @ step ${invariants.closureViolations[0].step}: ${invariants.closureViolations[0].missing} block(s) the rule requires are absent, ${JSON.stringify(invariants.closureViolations[0].byReason)}`);
+      if (invariants.quadrantViolations.length) console.log(`    slot-quadrant rule FAIL @ step ${invariants.quadrantViolations[0].step}: ${JSON.stringify(invariants.quadrantViolations[0].violations.slice(0, 4))}`);
       if (invariants.fieldViolations.length) console.log(`    field blowup @ step ${invariants.fieldViolations[0].step}: ${JSON.stringify(invariants.fieldViolations[0])}`);
     }
   }

@@ -331,11 +331,9 @@ fn refine(@builtin(global_invocation_id) gid: vec3<u32>) {
       if (DIAG != 0u) {
         atomicAdd(&diag[3], 1u);
         // diag[4] counted cascade-only grants -- refines nothing else asked
-        // for. With the closure there is no such category: every want is
-        // either the block's own reason or the rule's, and the two are not
-        // distinguishable from here (nor interestingly different -- both are
-        // requirements). Left at 0 rather than removed, because
-        // tools/lib/amr-invariants.js reads it by name.
+        // for. The closure has no such category (a want is a want), and
+        // nothing reads the slot any more: `converged` was retired with it,
+        // because its other clause had made it an always-true gate.
       }
     } else {
       atomicAdd(&freeCount, 1); // pool exhausted this round -- undo, stay coarse
