@@ -1484,7 +1484,47 @@ exactly this shape.
 `?maxFineBlocks=` run must now FAIL loudly, and a config should exist that
 proves the refusal fires.
 
-### B5 — the window is a translation of the sponge
+### B5 — the window is a translation of the sponge — **CLOSED (2026-09-15)**
+
+**OUTCOME.** The body lives in BUFFER coordinates. `cx`/`cy` are buffer
+positions, integrated and wrapped into [0, W) x [0, H) every step; a kernel
+that owns a buffer cell already has the body's frame and converts nothing.
+Buffer->window survives for exactly three things, all anchored to the VIEW
+rather than the fluid: the ALBC sponge band, the WALL_Y walls, and the render.
+The window-anchored convention, its `?window=` flag and its four frame
+accessors are DELETED -- there is one convention, not a switch.
+
+Stages: B5-0 (dense step buffer-dispatched, two dead kernels deleted), B5-1
+(nine hand-written conversions -> two functions), B5-2 (the frame split, behind
+a flag), B5-3 (the body's initial placement honoured; `?upstream=` made real),
+B5-4 (the precision claim measured, and RETIRED -- it was `TOTAL_WRAP_SCREENS`,
+not the convention), B5-5 (`lbm_force.wgsl`, the one kernel that silently
+ignored the flag), B5-6 (default flipped, old path deleted).
+
+**WHAT IT COST AND WHAT IT BOUGHT.** Net ~150 lines removed. Every pinned-body
+config is bit-identical (`off = 0` makes the two conventions the same map);
+the re-baselining is confined to MOVING bodies and is small --
+`index-reentry.html` at 4096 steps moves by relL2 2.1e-3 in ux. The stated
+precision benefit did NOT survive measurement (B5-4). What B5 actually bought
+is the conversion count: nine sites in six files, in two non-interchangeable
+idioms, down to three view-anchored callers.
+
+**THE ONE RESIDUAL, named rather than quietly dropped.** `lbm_force.wgsl` is
+still DISPATCHED in window coordinates -- its thread index is a window cell
+that it maps to a buffer cell on line 1. Its *frame* is correct (B5-5); what
+remains is bookkeeping, and the plan's wording ("the step, the force kernels
+and the manager lose their window bookkeeping entirely") is therefore met
+everywhere except this dispatch. It was left deliberately: re-tiling the
+dispatch regroups the per-workgroup truncated `atomicAdd`s, so it moves the
+force total's last fixed-point digit on every moving-body page -- a
+re-baselining change, with no correctness benefit, on `index.html`, which has
+no gate beyond boot smoke. Worth doing beside something else that already
+re-baselines that page; not worth doing alone.
+
+**Everything below this line is the original statement of the problem and the
+stage-by-stage record.** It is kept because the reasoning is the useful part;
+read the file/line references as historical.
+
 
 **Where 2D actually stands** (CLAUDE.md's description of the 2D scheme is one
 generation out of date):
@@ -1622,6 +1662,8 @@ seven pages; invariants PASS on all seven gates; every dense and AMR
 analytic/physics config unchanged to the digit.
 
 ### B5-2 — the buffer convention exists, behind `?window=0`, and does NOT validate yet.
+
+*(Superseded: B5-3 made it validate, B5-6 made it the only convention.)*
 
 Implemented and gated as the plan asked (both conventions in one build,
 default unchanged). The DEFAULT path is bit-IDENTICAL on
@@ -1783,11 +1825,13 @@ proper rather than an inert stage.
 
 ### B5-4 — DONE (2026-09-15). B5's PRECISION ARGUMENT DOES NOT SURVIVE MEASUREMENT.
 
-B5 has justified itself on two things: fewer conversions, and **bounded
-precision** -- "the body's position is wrapped into `[0, W)` every step, so its
-ULP is fixed at `W * 2^-24` forever by construction". The second one is now
-measured, and **it is not a property of the convention at all.** It is a
-property of `TOTAL_WRAP_SCREENS`, which is one constant.
+B5's goal is the conversion count -- one coordinate convention, kernels that
+carry no window bookkeeping. Alongside it this document lists **two things
+[that] come free**, and the first is **bounded precision**: "the body's position
+is wrapped into `[0, W)` every step, so its ULP is fixed at `W * 2^-24` forever
+by construction". That freebie is now measured, and **it is not a property of
+the convention at all.** It is a property of `TOTAL_WRAP_SCREENS`, which is one
+constant. This retires a side-claim; it does not touch the goal.
 
 **THE INSTRUMENT.** `?wrapScreens=N` on `index-reentry.html` (same shape as
 B7's `?kEps=` ladder), threaded to BOTH `physics.wgsl`'s override and
@@ -1859,7 +1903,53 @@ argument does not obviously require 16 -- but it has not been tested against a
 live readback cadence, only against this harness's, and that is the check it
 would need first.
 
-### B5-6 — DONE (2026-09-15). The buffer convention is the default, and the window convention is gone. **B5 COMPLETE.**
+### B5-5 — DONE (2026-09-15). The kernel that declared the flag and ignored it.
+
+**THE DEFECT.** Under `?window=0` the dense force kernel computed force and
+torque against a body displaced by exactly `(off_x, off_y)` -- however far the
+window had panned. Measured on `index-reentry.html`: at `off_y = 75`, `fy` read
+-7.102e+0 against a correct -3.140e-2, a factor of **226**. At `off_y = 1` the
+two conventions agreed to 0.7%, and at `off_y = 0` exactly.
+
+**THE CAUSE.** `lbm_force.wgsl` built its sample point straight from the thread
+index, which is a WINDOW cell:
+
+    let p = vec2<f32>(f32(x), f32(y));   // a WINDOW position
+    let phi = get_phi(p, state);         // compared against state.cx/cy
+    var rx = p.x - state.cx;             // ...and the lever arm, so torque too
+
+Correct under the shipped convention, where `state.cx` IS a window coordinate.
+Wrong under `?window=0`, where it is a buffer coordinate. Every other
+body-touching kernel went through the `bodyFrame*` accessors; this one never
+did.
+
+**AND IT WAS SILENT, which is the transferable part.** The file `@include`s
+`common_geometry.wgsl`, so it DECLARED `WINDOW_BODY` and both dense pages duly
+supplied it -- it simply never read it. Supplying an override a shader does not
+declare is a hard pipeline error; supplying one it declares and IGNORES is
+invisible. That is a different failure class from the one this project already
+guards against.
+
+**WHY NO GATE CAUGHT IT.** Every config ever pointed at `?window=0` has
+`off == 0`. B5-3 measured the two conventions agreeing at two different
+placements and called it the strong form; it was not -- both legs are a PINNED
+cylinder, so window and buffer coincide and the frame separation was never
+exercised. Same blind spot B5-0 recorded about `dense-reference`, one layer up.
+**The check that generalises is the audit, not the config:** grep every shader
+for raw `off_x`/`off_y` arithmetic. Done before B5-6 flipped anything, it found
+this was the only physics kernel doing it -- everything else was the render (a
+view by definition) or `physics.wgsl`/`amr_physics.wgsl` WRITING `off`.
+
+**THE FIX, and why it was inert.** The sample point now goes via the buffer
+cell the thread already computes: `bodyFrameCell(vec2<u32>(bx, by), state)`.
+Under `WINDOW_BODY=1` that is `bufferToWindowCell((x + off) % W) = x` exactly,
+in integer arithmetic, so the shipped path stayed bit-identical INCLUDING where
+`off != 0` -- verified on `index-reentry.html` at 4096 steps with `off_y = 75`,
+field relL2 0 and the reported force identical to the digit. Afterwards the two
+conventions agreed to ~0.03% at `off_y = 75` (the residue is B5-4's
+inter-convention position drift) and exactly at `off_y = 1`.
+
+### B5-6 — DONE (2026-09-15). The buffer convention is the default, and the window convention is gone.
 
 The flip and the cleanup, in one commit because they are one change: a flip
 that left the HOST still modelling the body in window coordinates would have
@@ -2309,8 +2399,13 @@ B3-5 retire originX/originY + the 8th gate         ◄── DONE; manage_pool
 B3-6 criterion: shared stencil + reduction only   ◄── DONE; NOT unified,
                                                         and that is measured
 B3-7 manage: predicates unify, allocators do not  ◄── DONE. B3 COMPLETE.
-B5   window = sponge translation                    ◄── independent of B2/B3,
-                                                        but smaller after B3
+B5   window = sponge translation                    ◄── DONE. One convention:
+                                                        the body is buffer-
+                                                        native, only the view
+                                                        converts. Precision
+                                                        claim retired (B5-4);
+                                                        lbm_force's DISPATCH is
+                                                        the one named residual.
 B1   post-collision rescale                         ◄── needs B0b only; its
                                                         channel is MOMENTUM, so
                                                         it does not wait for B9
