@@ -26,7 +26,7 @@ GPU) and that is what made M4/M5 survivable. Build the 2D equivalent first.
 | B2 | `cascade21`: 2:1 as ONE closure on the WANT set | **yes** | replaces 3 live balance bugs, an unbounded fixed-point loop, and closes a measured refinement defect on the shipped page | M |
 | B3 | One kernel per stage + a `parent_{dense,pool}` accessor | **yes** | deletes ~1100 lines of near-duplicate WGSL across 6 kernel pairs | M |
 | B3a | The same sweep in JS: the AMR pages duplicate each other | **largely DONE** | duplication outside `init`/`frame` 3,319 → 2,419 lines; byte-identical 1,129 → 613. Found a stranded comment and two always-true gates on the way | M |
-| B4 | The body lives entirely on the finest level | **in progress** | B4-1 (the coverage gate) and B4-2 (the box predicate) DONE; the masking deletion and the refusals remain | S |
+| B4 | The body lives entirely on the finest level | **DONE** | coverage gate written for the two moving-body pages, the block predicate fixed, ~120 lines of masking + 3 bindings + an override deleted, and 3 refusals now under test | S |
 | B5 | The window is a translation of the SPONGE | **half already true in 2D AMR, not in `main.js`** | removes window bookkeeping from 5 hot kernels; retires `card-total.mjs`'s problem | M |
 | B6 | Explode/coalesce at the coarse/fine interface | **yes, but measure first** | 2D's interface is not conservative, and nothing in 2D measures that | L |
 | B7 | The diffuse band converges at 2nd order; Richardson it | **yes** | may close the standing `dense-reference`/`amr-N2-diffuse` Cd=1.95-vs-1.35 red cells | S |
@@ -697,6 +697,67 @@ computed and discarded unless a config was already red. None of the table
 above would have been visible otherwise, and every remaining stage that moves
 the refined region needs it.
 
+### B4-3 / B4-4 — the masking, and the refusals — DONE (2026-09-14)
+
+**B4-3.** One force pass, at the finest level. The finest-wins masking is gone
+from all three force kernels, with `HAS_CHILD`, three `childBlockSlot`
+bindings, and the last reader of `LevelParams`'s `nbx`/`nby`/`hasChild` — so
+`amr_force1_pool.wgsl` now declares the same 4-field prefix every other pool
+shader does instead of being the one file that needed all 8.
+
+**Measured before deleting, at 8192 steps, raw i32 accumulators (FSCALE=1e7):**
+
+```
+levels=2              L0 0             L1 237344  (finest)
+levels=3              L0 0    L1 1     L2 214591  (finest)
+levels=2 bounceback   L0 0             L1 201702  (finest)
+levels=3 bounceback   L0 0    L1 0     L2 207126  (finest)
+```
+
+Exactly zero bar one 1e-7 unit — a single workgroup's truncated partial.
+**The 4-decimal float form of the same readings says "0.0000" against a total
+of ~0.02**, which still leaves room for 0.25% of the drag on a level about to
+stop being computed. Take the raw integer when the question is "is this
+exactly zero"; the convenience formatting is not the instrument.
+
+**B4-4.** The refusals, and — more usefully — three configs that require each
+one to actually fire (`runBootSmoke`'s new `expectError`). *A guard that never
+fires and a guard that cannot fire are indistinguishable from a green suite*,
+and the rest of this plan adds several more guards.
+
+**Two findings, both the same shape one layer apart, and both found by the
+gate rather than by reading the code.**
+
+1. **`?levels=1` was never the bug B0b recorded.** It is not `resetSim`
+   dereferencing `pools[1]`: all five pages already had
+   `if (N_LEVELS < 2) throw`, and it was always correct. It throws at MODULE
+   SCOPE, which `init().catch(handleErr)` cannot catch — module evaluation has
+   already failed, so `init()` never runs and its `.catch` never attaches. The
+   page refused correctly and said nothing. `refuseConfig` reports first and
+   throws second.
+
+2. **The status line could not hold a fatal either.** Every live page rewrites
+   `#status` every ~250ms from an async readback, so a fatal raised between
+   two of those writes is overwritten by a step counter that never advances
+   again. The pool-exhaustion refusal fired, wrote its message, and vanished;
+   `validate-all` reported *"the page kept running (status [AMR] step 832…)"*
+   for a page that had already stopped. `reportFatal` now latches the element.
+
+   **The general lesson for the rest of this plan: a diagnostic is not
+   delivered until it survives the next 250ms.** Both of these were correct
+   code that produced a misleading observation, and in both cases the
+   misleading observation pointed *away* from the real cause.
+
+**And a mechanism note worth reusing.** The runtime latch needed no shader
+change and no new binding: a cheap always-sound-in-one-direction TRIP-WIRE
+(every level's `freeCount`, 4 bytes, one submit — exhaustion implies zero, so
+a zero cannot be missed) gated onto the AUTHORITATIVE check (coverage) only
+when it trips. The direct signal would have been a refusal counter in the
+manager, but `amr_manage_pool.wgsl` has no diag binding at all, so that is a
+new binding across five pages' bind groups — the 238e48c shape. **Prefer a
+host-side trip-wire over a new binding whenever the authoritative check
+already exists.**
+
 ### B4 — the body lives entirely on the finest level
 
 **2D already asserts this** — `debugCheckGeometryCoverage`: every leaf tile
@@ -1027,11 +1088,17 @@ B4-1 the coverage gate itself                    ──┤ DONE (it was never
                                                    │  to be WRITTEN)
 B4-2 the box predicate + the margin slack         ──┤ DONE (one change, not
                                                    │  two -- see B4-2)
-                                                   │
-B4   finest-level-only + hard failure            ◄──┘  (smallest, proves B0;
-                                                      ?levels=4 is now a live
-                                                      reproducer for the
-                                                      refusal half)
+B4-3 masking deleted, one force pass              ──┤ DONE
+B4-4 refusals, + 3 configs that require them      ──┘ DONE
+                                                      B4 COMPLETE. It did
+                                                      prove B0's harness --
+                                                      every one of its four
+                                                      stages was gated by
+                                                      something B0/B4-1 built,
+                                                      and three real defects
+                                                      were found BY those
+                                                      gates rather than by
+                                                      reading code.
 B7   chi band ladder                                  (independent, cheap)
 B8   SOLID_EQ                                         (independent, free)
 B9   lattice weights                                   DONE -- unblocked B6's
