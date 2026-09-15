@@ -550,6 +550,45 @@ what `node --check` says.
 B3 sequenced it last for: the two files no longer contain two different
 implementations of a balance rule, because they no longer contain one at all.
 
+### The checker sweep B2-2d called for — DONE (2026-09-14)
+
+Scanning the rest of the project's checks for the same shape found three, and
+they were three different failure modes — worth separating, because only one
+of them is the shape B2-2d described:
+
+1. **Reporting-only because the code could not comply.** The closure check
+   (`checkRefinementClosureOnGPU`), deliberately non-gating in B2-1. Now
+   gated. **Its meaning changed with the promotion**, which is worth noticing:
+   it used to ask "is the rule implemented correctly" — true by construction
+   now — and it now asks "could the ALLOCATOR deliver what the rule demanded",
+   a resource question.
+
+2. **An ALWAYS-TRUE GATE, the fourth in this project** (B3a-4 found two, B4-3
+   one). `converged` read `v[4] === 0 && v[5] === 0` and B2-2d stopped writing
+   `v[4]` entirely, so the first clause was permanently satisfied; its whole
+   rationale described the deleted fixed-point loop, down to advising a flag
+   (`?refineIters=`) that B2-2d also deleted. **Deleting a mechanism silently
+   promotes every check that referenced it to vacuous** — that is now three
+   instances, and it is worth grepping the checks for a mechanism's name
+   whenever one is removed. What remained was the pool-starvation half, so it
+   is named for that now.
+
+3. **A check that existed and NEVER RAN** — worse than reporting-only, because
+   it looks like coverage. `checkSlotQuadrantsOnGPU` was added in B2-2b0 to
+   justify removing a binding and then only ever driven by a one-off probe.
+   Now gated at every checkpoint.
+
+The sweep is seven gates, all gating: `2:1-balance, corner, coverage, field,
+pool, closure, quadrants`.
+
+**And they were checked for being vacuous**, which is the point of the whole
+exercise. Under `?maxFineBlocks=16`: six fire (2:1-balance 28, corner 55,
+coverage 28, pool STARVED 2235, closure 19) and **`quadrants` correctly does
+not**, because the quadrant rule is independent of starvation. Six firing and
+one not is the discrimination that says they are not all reading one cause —
+a sweep where everything goes red together has not been shown to test seven
+things.
+
 ### B2 — 2:1 balance as one closure
 
 **What 2D has.** The rule is spread across `amr_manage.wgsl` and

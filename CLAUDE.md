@@ -115,11 +115,18 @@ invariants the AMR machinery depends on:
   `webgpu-verify`) — `validate-all.js` is the one-command version.
 - **`tools/validate-amr-invariants.js`** — AMR structural invariants,
   asserted periodically through a run (not just at the end, so a transient
-  violation can't slip past): 2:1 balance between neighboring tiles
-  (`window.__CYL.debugCheck21Balance`) and the geometry-forced-refinement
-  hard constraint — every leaf tile near the body must already be at the
-  finest configured level (`debugCheckGeometryCoverage`) — plus a cheap
-  field-finite (NaN/blowup) smoke check.
+  violation can't slip past). **Seven gates as of 2026-09-14, all gating:**
+  2:1 balance (`debugCheck21Balance`), CORNER 2:1 balance (same call — gating
+  only since the closure made it satisfiable), geometry-forced refinement
+  (`debugCheckGeometryCoverage` — every leaf near the body already at the
+  finest level), field-finite (NaN/blowup), pool starvation (refines refused
+  for want of a slot; needs `?diag=1` or it reads vacuously true), the 2:1
+  CLOSURE (`debugCheckRefinementClosure` — what the rule requires but the
+  allocator did not deliver), and the slot-quadrant rule
+  (`debugCheckSlotQuadrants`).
+  **Sanity-check the sweep against a starved pool** (`--extra=maxFineBlocks=16`)
+  after touching it: six of the seven go red there and `quadrants` does NOT,
+  which is what shows they are reading seven different things rather than one.
 - **`tools/validate-amr-vs-dense.js`** — standalone/opt-in, **not** part of
   `validate-all.js`'s default sweep (a high-resolution dense run is far more
   expensive than that suite's default configs). Runs the dense reference at
