@@ -9,7 +9,7 @@
 // quadrants, each exactly one workgroup (same "one workgroup = one
 // reduction unit" convention as amr_criterion.wgsl/amr_force*.wgsl).
 // workgroup_id.xy IS the quadrant (qx,qy) directly -- no separate
-// quadrant math needed the way amr_step1_pool.wgsl's quadrant lookup
+// quadrant math needed the way amr_step1.wgsl's quadrant lookup
 // requires, since here we're producing a criterion for a NOT-YET-existing
 // child, not consuming an already-assigned quadrant.
 //

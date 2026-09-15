@@ -18,7 +18,7 @@
 // obtained: 0 when parent=level 1 (origin derived cheaply from blockID,
 // like amr_step1.wgsl -- see that file's header on why level 1 doesn't
 // cache origin at all), 1 when parent=level>=2 (origin read from that
-// level's own cached originX/Y buffers, like amr_step1_pool.wgsl). When 0,
+// level's own cached originX/Y buffers, like amr_force1_pool.wgsl). When 0,
 // parentOriginX/parentOriginY are harmless dummy buffers, never read.
 //
 // 2:1 balance (decision from plans/AMR-multilevel.md's Milestone 9):

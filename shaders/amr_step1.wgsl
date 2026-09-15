@@ -1,20 +1,41 @@
-// Milestone 4 (plans/AMR.md): fine-level (L=1) LBM step, POOL-AWARE.
-// Supersedes Milestone 2's single-fixed-region version -- see
-// amr_interp_c2f.wgsl's file header for the pool addressing scheme this
-// shares (dispatch over (tile, tile, slot), slotToBlock indirection,
-// buffer-space-native coarse addressing).
+// THE fine-level LBM step -- ONE kernel, every pool level (plans/2D-backport.md
+// B3-1). Until then this was the level>=2 half of a pair, with a separate
+// amr_step1.wgsl compiled and dispatched for level 1 alone: 349 and 359 lines
+// stating the same streaming/collision/penalization/sponge body twice.
 //
-// Unlike the interpolation pass, this kernel DOES need window coordinates
-// (for the card SDF and penalization physics, both physically anchored),
-// derived by inverting the moving-window off_x/off_y mapping -- the same
-// derivation amr_step.wgsl's coarse kernel uses, just applied to a
-// continuous fine-cell position instead of an integer coarse-cell one.
+// THE PAIR EXISTED FOR ONE REASON, AND IT WAS NOT A REAL ONE. The level-1 file
+// derived its tile's physical origin as `bx * RB` from blockID; this one read a
+// per-slot originX/originY buffer, on the argument that a level>=2 tile's
+// origin needs a walk up the parent chain (quadrant offset scaled by the
+// parent's cell size, plus the parent's origin, recursively) and so is not
+// something a per-dispatch kernel should redo. But every level's block grid is
+// globally anchored and quadtree-uniform, so that recursion has a closed form
+// -- amr2d.mjs's tileOriginL0, `block * RB * 2^-(m-1)`, which is
+// `f32(bx*RB) * 2 * levelParams.dxL` here. The two routes agree exactly in f32
+// (every term is an integer times a power of two): tools/test-amr2d.js scores
+// the host pair against each other, and debugCheckTileOrigins scores the live
+// buffer against the same closed form at every invariant checkpoint.
 //
-// Streaming resolves a source cell that falls outside this tile's interior
-// against the OWNING same-level tile directly (blockSlot, binding 5) and only
-// falls back to clamping at the slot's own buffer edge where no such neighbour
-// exists -- see the DIRECT_GHOST override. Force integration stays coarse-only
-// this milestone (same scope cut as Milestone 2).
+// With the origin derived, nothing structural is left, and each of the four
+// remaining differences was already a field of the per-level uniform this
+// kernel had:
+//
+//   origin  ->  bx/by (levelParams.nbx) and levelParams.dxL, below
+//   dxL     ->  levelParams.dxL          (level 1: 0.5, the old literal)
+//   tau     ->  levelParams.parentTau    (level 1: L0's own state.tau)
+//   K_EPS   ->  an override on both, and K_EPS * dxL at level 1 is
+//               K_EPS * 0.5, which is exactly what the level-1 file computed
+//
+// tau is worth spelling out because it is the one that is not geometry: a
+// tile's tau_fine derives from its PARENT level's tau, not from L0's. At level
+// 1 those coincide, which is why the old level-1 file could read state.tau
+// directly; at level>=2 they do not. levelParams.parentTau is tauAtLevel(m-1)
+// (card-params.mjs), written per level by the host and re-written when the TAU
+// slider moves.
+//
+// L0 stays a dense, ghost-free, cellIndex()-addressed grid with its own kernel
+// (amr_step.wgsl) -- that asymmetry is deliberate and stays
+// (plans/AMR-multilevel.md decision 1).
 
 // @include "common_geometry.wgsl"
 // @include "common_lattice.wgsl"
@@ -26,18 +47,28 @@
 
 
 
+struct LevelParams {
+  nbx: u32,        // this level's own logical block-grid extent. Names same-level neighbours for DIRECT_GHOST streaming, and (with dxL) places the tile physically -- see the origin derivation in main(). Shared verbatim with amr_interp_pool_parent.wgsl/amr_average_pool_parent.wgsl, not a third near-duplicate.
+  nby: u32,        // same.
+  parentTau: f32,
+  dxL: f32,        // Milestone 8: this level's own grid spacing in L0-buffer-
+                   // space units, used below to scale epsilon (get_chi) and
+                   // to place the tile (2*dxL is the parent's cell size).
+}
+
 @group(0) @binding(0) var<storage, read>       state       : CardState;
 @group(0) @binding(1) var<storage, read>       f_in        : array<u32>;
 @group(0) @binding(2) var<storage, read_write> f_out       : array<u32>;
 @group(0) @binding(3) var<storage, read_write> vel_pool    : array<f32>;
 @group(0) @binding(4) var<storage, read>       slotToBlock : array<i32>;
+@group(0) @binding(5) var<uniform>             levelParams : LevelParams;
 // This level's own logical block grid -> pool slot, indexed by
-// blockID = by*(W/BLOCK)+bx. Read-only, and the ONLY new input
-// neighbour-addressed streaming needs (see DIRECT_GHOST) -- the neighbour
-// tile's f data is already in scope, because f_in is the whole pool.
-@group(0) @binding(5) var<storage, read>       blockSlot   : array<i32>;
+// blockID = by*levelParams.nbx+bx -- the one new input neighbour-addressed
+// streaming needs (see DIRECT_GHOST), the same buffer and the same indexing
+// amr_interp_pool_parent.wgsl's fine-fine consultation already uses.
+@group(0) @binding(6) var<storage, read>       blockSlot   : array<i32>;
 
-override W : u32; // coarse grid dims, needed for the off_x/off_y window wrap
+override W : u32; // GLOBAL domain dims (window periodicity), same at every level -- not level-specific, see header.
 override H : u32;
 override RB : u32;
 // ── Measurement instrument: ?benchSkip=step1-ring ────────────────────────────
@@ -84,7 +115,6 @@ override SKIP_GHOST : u32 = 0u;
 // exactly the legacy path, for exactly the cells that need it.
 override DIRECT_GHOST : u32 = 1u;
 
-const BLOCK = 8u;
 const GHOST = 2u;
 
 // Sponge relaxation target velocity -- mirrors amr_step.wgsl's SPONGE_UX/UY
@@ -95,17 +125,29 @@ override SPONGE_UY : f32 = 0.0f;
 // Sponge ring width in cells -- see lbm_step.wgsl's identical override.
 override SPONGE_W : f32 = 4.0f;
 
-// Optional sharp bounce-back solid coupling -- see lbm_step.wgsl's header
-// for the full method. At this level, "the geometrically-correct source"
-// (used for the sharp inside test) and "the clamped-at-tile-edge source"
-// (the buffer address normal streaming reads) are DIFFERENT things --
-// clamping is purely a buffer-addressing artifact for cells whose true
-// neighbor lies outside this tile's own FB x FB storage (that continuity
-// is handled by the separate ghost-fill pass, not by this kernel), not a
-// physical statement -- so the sharp test below deliberately uses the
-// UNCLAMPED fine-index position (fineToCoarseUnitI, i32-accepting so it
-// stays well-defined for an off-tile index), while the bounce-back VALUE
-// substitution still reads this cell's own (in-tile, always valid) data.
+// Milestone 8 (plans/AMR-multilevel.md): epsilon = K_EPS * dx_L, not a fixed
+// physical constant -- a fixed epsilon means refinement only ever improves
+// *sampling* of an unchanging diffuse-boundary width, never the boundary's
+// own sharpness. K_EPS=1.5 matches today's L0/L1 value exactly (dx_L0=1,
+// dx_L1=0.5; L0's is still a hardcoded literal in amr_step.wgsl, which is why
+// ITS epsilon does not change); this pipeline's dx_L genuinely varies per
+// level (levelParams.dxL, runtime -- see header), so epsilon is computed
+// here, not hardcoded. An OVERRIDE since B7, not a const -- ?kEps= sweeps the
+// diffuse band across every level at once.
+override K_EPS : f32 = 1.5f;
+
+// Optional sharp momentum-exchange bounce-back solid coupling -- see
+// lbm_step.wgsl's header for the full method. At this level, "the
+// geometrically-correct source" (used for the sharp inside test) and "the
+// clamped-at-tile-edge source" (the buffer address normal streaming reads)
+// are DIFFERENT things -- clamping is purely a buffer-addressing artifact
+// for cells whose true neighbor lies outside this tile's own FB x FB storage
+// (that continuity is handled by the separate ghost-fill pass, not by this
+// kernel), not a physical statement -- so the sharp test below deliberately
+// uses the UNCLAMPED fine-index position (fineToCoarseUnitI, i32-accepting
+// so it stays well-defined for an off-tile index), while the bounce-back
+// VALUE substitution still reads this cell's own (in-tile, always valid)
+// data.
 override USE_BOUNCEBACK : u32 = 0u;
 
 // SOLID_EQ: under BOUNCE-BACK, hold cells INSIDE the body at the local solid
@@ -146,17 +188,35 @@ override WALL_U1 : f32 = 0.0f;
 override FORCE_X : f32 = 0.0f;
 override FORCE_Y : f32 = 0.0f;
 
-fn fineToCoarseUnit(fCoord: u32, origin: u32) -> f32 {
+// BUGFIX: this file serves EVERY pool level through one shared pipeline
+// (dx varies per level -- 0.5 at level 1, 0.25 at level 2, 0.125 at level
+// 3, ...), but this function once hardcoded level 1's OWN fixed
+// dx=0.5/half-cell=0.25 (correct only for the level-1-DEDICATED file this
+// was copied from, since deleted) instead of reading levelParams.dxL -- a
+// pre-existing bug (confirmed present before this session's own changes),
+// not something introduced by the bounce-back work that surfaced it.
+// Effect: every level>=2 cell's computed physical position was stretched
+// by (0.5/dxL)x too wide relative to its tile's true origin-anchored
+// footprint -- e.g. 2x at level 2, 4x at level 3 -- corrupting BOTH the
+// diffuse method's chi/phi and bounce-back's sharp inside/outside test.
+// Live-verified impact, NEITHER fully resolved by this fix alone (both
+// have at least one more separate, unresolved issue -- flagged near
+// N_LEVELS in main-cylinder-amr.js for bounce-back's own remaining one):
+// diffuse-method Cd at N=3 moved from 0.152 to 0.228 (still far below the
+// ~1.35 target -- confirms this bug was A contributor to the project's
+// separately-tracked ~9x AMR Cd deficit, not the sole cause); bounce-
+// back's level-2-ONLY force (L1 forced to the diffuse path, isolating
+// level 2) moved from wrong-signed fx=-7.09 (1201 boundary-link triggers)
+// to still-wrong-but-improved fx=-6.05 (797 triggers) -- real
+// measured progress, not a full fix.
+fn fineToCoarseUnit(fCoord: u32, origin: f32) -> f32 {
   let j = f32(i32(fCoord) - i32(GHOST));
-  return f32(origin) - 0.25 + 0.5 * j;
+  return origin - 0.5 * levelParams.dxL + levelParams.dxL * j;
 }
 
-// Same formula as fineToCoarseUnit, but accepting a possibly-negative or
-// possibly-past-FB fine index (a neighbor position that may lie outside
-// this tile's own storage) -- see USE_BOUNCEBACK's own comment above.
-fn fineToCoarseUnitI(fCoordI: i32, origin: u32) -> f32 {
+fn fineToCoarseUnitI(fCoordI: i32, origin: f32) -> f32 {
   let j = f32(fCoordI - i32(GHOST));
-  return f32(origin) - 0.25 + 0.5 * j;
+  return origin - 0.5 * levelParams.dxL + levelParams.dxL * j;
 }
 
 fn wrapf(v: f32, n: f32) -> f32 {
@@ -165,21 +225,8 @@ fn wrapf(v: f32, n: f32) -> f32 {
   return r;
 }
 
-// Milestone 8 (plans/AMR-multilevel.md): epsilon = K_EPS * dx_L1, not the
-// bare physical constant amr_step.wgsl (L0) still uses -- L1's own dx is a
-// fixed 0.5 (in L0-buffer-space units, matching amr_interp_dense_parent.
-// wgsl's 0.5 factor; L1 is a single dedicated file/level, so this is a
-// literal here, not a runtime lookup the way amr_step1_pool.wgsl's shared,
-// multi-level pipeline needs). K_EPS=1.5 matches L0's own hardcoded value
-// (dx_L0=1 there), so this is the SAME constant, just no longer coincident
-// with dx=1 -- a genuine behavior change (0.75, not 1.5), fixing the
-// under-resolved diffuse-boundary sampling this milestone targets.
-// An OVERRIDE since B7, not a const -- ?kEps= sweeps the diffuse band
-// across every level at once. Default unchanged, so this build is
-// byte-identical to the previous one.
-override K_EPS : f32 = 1.5f;
 fn get_chi(phi: f32) -> f32 {
-    return chiFromPhiEps(phi, K_EPS * 0.5f);
+    return chiFromPhiEps(phi, K_EPS * levelParams.dxL);
 }
 
 @compute @workgroup_size(8, 8)
@@ -197,15 +244,34 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (!ringInterior) { return; } // see the SKIP_GHOST override above
   }
 
-  let nbx = W / BLOCK;
-  let nby = H / BLOCK;
+  // Logical (bx,by) within THIS level's own block grid, derived from blockID
+  // exactly as amr_interp_pool_parent.wgsl derives it. Used for two things:
+  // naming this tile's same-level neighbours (DIRECT_GHOST), and placing the
+  // tile physically, just below.
+  let nbx = levelParams.nbx;
+  let nby = levelParams.nby;
   let bx = u32(blockID) % nbx;
   let by = u32(blockID) / nbx;
-  let originX = bx * RB;
-  let originY = by * RB;
-  // Wrapped neighbour columns/rows, hoisted out of the 9-direction gather
-  // below (the block grid is periodic, matching amr_interp_dense_parent.wgsl's
-  // own fine-fine consultation exactly). Dead code under DIRECT_GHOST=0.
+
+  // THIS TILE'S PHYSICAL ORIGIN IN L0 UNITS, AS ONE MULTIPLY.
+  //
+  // It used to be read from a per-slot originX/originY buffer, on the
+  // argument (this file's own former header) that a level>=2 tile's origin
+  // needs a walk up the parent chain and is therefore not something a
+  // per-dispatch kernel should redo. That argument is wrong, and amr2d.mjs
+  // has said so since B0: every level's block grid is globally anchored and
+  // quadtree-uniform, so tileOriginL0 is `block * RB * 2^-(m-1)` in closed
+  // form -- and `2^-(m-1)` is `2 * dxL`. The recursion the manager runs and
+  // this multiply agree exactly in f32 (every term is an integer times a
+  // power of two); tools/test-amr2d.js scores the two host routes against
+  // each other, and debugCheckTileOrigins scores the live buffer against
+  // this same closed form at every invariant checkpoint.
+  //
+  // This is what makes the file level-generic: with the origin derived, the
+  // ONE structural difference between this kernel and the old level-1-only
+  // amr_step1.wgsl is gone, and level 1 is just `dxL = 0.5`.
+  let originX_L0 = f32(bx * RB) * 2.0f * levelParams.dxL;
+  let originY_L0 = f32(by * RB) * 2.0f * levelParams.dxL;
   let RB2 = RB * 2u;
   let bxm = (bx + nbx - 1u) % nbx;
   let bxp = (bx + 1u) % nbx;
@@ -236,10 +302,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   // Position/solid-velocity terms, hoisted ABOVE the gather loop -- see
   // lbm_step.wgsl's identical hoist for why USE_BOUNCEBACK needs these
-  // before streaming, not after. Buffer-space fine position -> window
-  // position by inverting off_x/off_y (see file header).
-  let bufX = fineToCoarseUnit(fx, originX);
-  let bufY = fineToCoarseUnit(fy, originY);
+  // before streaming, not after. Buffer-space fine position (L0 units, via
+  // the origin derived above) -> window position by inverting off_x/off_y
+  // (see file header).
+  let bufX = fineToCoarseUnit(fx, originX_L0);
+  let bufY = fineToCoarseUnit(fy, originY_L0);
   let wx = wrapf(bufX - state.off_x, f32(W));
   let wy = wrapf(bufY - state.off_y, f32(H));
   let p = vec2<f32>(wx, wy);
@@ -261,8 +328,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   var f: array<f32,9>;
   for (var i = 0u; i < 9u; i++) {
     if (USE_BOUNCEBACK != 0u && HAS_BODY != 0u) {
-      let srcBufX = fineToCoarseUnitI(i32(fx) - ex[i], originX);
-      let srcBufY = fineToCoarseUnitI(i32(fy) - ey[i], originY);
+      let srcBufX = fineToCoarseUnitI(i32(fx) - ex[i], originX_L0);
+      let srcBufY = fineToCoarseUnitI(i32(fy) - ey[i], originY_L0);
       let srcWx = wrapf(srcBufX - state.off_x, f32(W));
       let srcWy = wrapf(srcBufY - state.off_y, f32(H));
       if (get_phi(vec2<f32>(srcWx, srcWy), state) < 0f) {
@@ -276,7 +343,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       // shaders/common_walls.wgsl's *F helpers' own comment on why this
       // (not wrapf's periodic result) is the right test, and why it
       // assumes off_y=0 (true for every WALL_Y-using scenario).
-      let srcBufYUnwrapped = fineToCoarseUnitI(i32(fy) - ey[i], originY);
+      let srcBufYUnwrapped = fineToCoarseUnitI(i32(fy) - ey[i], originY_L0);
       if (wallSourceOutsideF(srcBufYUnwrapped)) {
         let wallUx = wallVelocityXF(srcBufYUnwrapped, WALL_U0, WALL_U1);
         let corr = 2f * wt[i] * f32(ex[i]) * wallUx / CS2;
@@ -353,7 +420,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let dist_y = min(wy, f32(H) - 1.0f - wy);
   let sponge_weight = spongeWeight(dist_x, dist_y, SPONGE_W);
 
-  let tau_fine = 2.0f * state.tau - 0.5f;
+  // Relative to THIS level's own parent, not L0 -- see header.
+  let tau_coarse = levelParams.parentTau;
+  let tau_fine = 2.0f * tau_coarse - 0.5f;
   let omg = 1.0f / tau_fine;
   // Gathered, then stored a whole cell at a time: under F16 two planes share
   // a word, so a per-plane store would be a read-modify-write race. See

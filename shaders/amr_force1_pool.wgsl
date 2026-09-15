@@ -1,9 +1,9 @@
 // Milestone 8 (plans/AMR-multilevel.md): level>=2's own force/torque
 // integration -- sibling of amr_force1.wgsl (level 1), same masking/area-
 // weighting reasoning (see that file's header), one shared pipeline reused
-// across every level>=2 the same way amr_step1_pool.wgsl is: origin comes
+// across every level>=2 the same way amr_step1.wgsl is: origin comes
 // from the cached per-slot buffer (not blockID -- see
-// shaders/amr_step1_pool.wgsl's header for why), and dxL/hasChild come
+// shaders/amr_step1.wgsl's header for why), and dxL/hasChild come
 // from the per-level LevelParams uniform at RUNTIME, not a compile-time
 // override, since ONE pipeline here serves multiple levels that may or may
 // not each have their own child (e.g. at N_LEVELS=4, level 2 has a child
@@ -11,7 +11,7 @@
 //
 // LevelParams here is the FULL 8-field struct (unlike
 // amr_interp_pool_parent.wgsl/amr_average_pool_parent.wgsl/
-// amr_step1_pool.wgsl, which only declare the first 4 fields of this same
+// amr_step1.wgsl, which only declare the first 4 fields of this same
 // per-level buffer) -- this is the one shader that actually reads
 // hasChild.
 
@@ -69,10 +69,10 @@ const GHOST = 2u;
 const FSCALE = 10000000f;
 override K_EPS : f32 = 1.5f;
 // Optional sharp momentum-exchange bounce-back force -- see
-// amr_step1_pool.wgsl's USE_BOUNCEBACK header for the shared rationale.
+// amr_step1.wgsl's USE_BOUNCEBACK header for the shared rationale.
 override USE_BOUNCEBACK : u32 = 0u;
 
-// BUGFIX: see amr_step1_pool.wgsl's identical comment -- this file's copy
+// BUGFIX: see amr_step1.wgsl's identical comment -- this file's copy
 // of the same functions had the same pre-existing hardcoded-dx=0.5 bug
 // (this level's own dx varies, levelParams.dxL, not a fixed 0.5/0.25).
 fn fineToCoarseUnit(fCoord: u32, origin: f32) -> f32 {

@@ -285,7 +285,7 @@ export function allocLevelPool(device, U, m, NBX_m, NBY_m, maxFineBlocks, NCELLS
     // quadrant offset, scaled by the parent's own cell size in L0 units,
     // plus the parent's own origin, recursively), a cross-BUFFER,
     // cross-LEVEL computation, not a same-buffer mod/div. See
-    // shaders/amr_step1_pool.wgsl's header.
+    // shaders/amr_step1.wgsl's header.
     pool.originXBuf = device.createBuffer({ size: maxFineBlocks * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
     pool.originYBuf = device.createBuffer({ size: maxFineBlocks * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
     // parentSlot has no meaningful "unset" value read anywhere unless

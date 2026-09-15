@@ -103,6 +103,23 @@ invariants the AMR machinery depends on:
   a build-vs-build claim there needs a same-build repeat, not a comparison
   against a number recorded in another session. The dense configs remain
   deterministic and usable as a strict check.
+  **AND THE FIELD IS NOT REPRODUCIBLE EITHER, BUT NOT UNIFORMLY -- IT
+  DEPENDS ON THE CONFIG, THE OPPOSITE WAY ROUND FROM Cd.** Measured
+  2026-09-14 with `debugSnapshotSave` + `tools/amr-diff.js` on
+  `index-cylinder-amr.html`, 4096 steps from `reset()` (a PINNED body, so
+  force does not feed back into the flow -- unlike the falling card, whose
+  field cannot be compared this way at all):
+
+      ?levels=3   6 of 7 runs BIT-IDENTICAL; one excursion at ux relL2 2.6e-5
+      ?levels=2   every one of 4 runs DIFFERS, at ux relL2 2-4e-5
+
+  So N=2 has no deterministic field baseline and `amr-diff` cannot gate a
+  change there; N=3 usually does, and an IDENTICAL there is conclusive (an
+  excursion can only produce a false DIFFERS, never a false IDENTICAL). A lone
+  DIFFERS is not evidence -- take the same-build repeat on the SAME config.
+  Note this inverts the Cd picture, where N=3 is the WIDER spread: do not
+  assume one config's reproducibility from another's, in either direction.
+
   **AND THE SPREAD WIDENS WITH DEPTH -- ~+/-0.002 at N=3, not +/-0.001.**
   The figure above is `amr-N2-diffuse`'s. Measured 2026-09-14, three runs of
   one build: `amr-N3-diffuse` gave Cd 1.411 / 1.408 / 1.407. Same mechanism,

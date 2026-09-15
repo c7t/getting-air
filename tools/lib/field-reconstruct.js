@@ -77,7 +77,7 @@ function rhoFromF(fUnshifted, W, H) {
 
 // rho for a pool level's flat-per-slot layout (cell = slot*(FB*FB)+fy*FB+fx,
 // per-direction plane stride i*(MAX_FINE_BLOCKS*FB*FB) -- see
-// shaders/amr_step1_pool.wgsl / main-cylinder-amr.js's allocLevelPool).
+// shaders/amr_step1.wgsl / main-cylinder-amr.js's allocLevelPool).
 // Computed once over the WHOLE pool array (not per reconstructed target
 // cell): a fine cell can fan out to many target cells when the AMR's finest
 // level is coarser than the comparison's target resolution, and re-summing
@@ -189,7 +189,7 @@ function loadDenseFields(snapshot) {
 // whole parent block.
 // ---------------------------------------------------------------------
 
-// Inverse of shaders/amr_step1.wgsl / amr_step1_pool.wgsl's
+// Inverse of shaders/amr_step1.wgsl's
 // fineToCoarseUnit: given a level's own dxL (cellSizeL0AtLevel(level) =
 // 2^-level) and physical L0-buffer-space origin, map a fine local index
 // fx/fy in [0,FB) back to L0-buffer-space physical position. Kept only as

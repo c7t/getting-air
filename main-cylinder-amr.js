@@ -330,7 +330,7 @@ if (USE_BOUNCEBACK && N_LEVELS > 3 && !urlParams.has('forceBounceback')) {
 // tier build would).
 // TEMPORARY diagnostic (Milestone 10 Cd investigation): level>=2's own
 // K_EPS override, defaulting to the same 1.5 every other level uses --
-// see shaders/amr_step1_pool.wgsl/amr_force1_pool.wgsl's own K_EPS comment.
+// see shaders/amr_step1.wgsl/amr_force1_pool.wgsl's own K_EPS comment.
 // Defaults to K_EPS (was a second hardcoded 1.5), so ?kEps= sweeps every
 // level and ?kEpsPool= still singles out the pool ones. Before B7 those two
 // literals could disagree with no way to notice.
@@ -708,7 +708,7 @@ async function init() {
   // for the N>=4 2:1-balance cascade fix -- see managePoolBGL's own
   // comment) -- past the WebGPU spec-MINIMUM maxStorageBuffersPerShaderStage
   // of 8 (already the exact ceiling several existing 8-binding layouts sit
-  // at, e.g. step1PoolBGL), same "spec minimum, not a real GPU limit"
+  // at, e.g. step1BGL), same "spec minimum, not a real GPU limit"
   // situation as maxStorageBufferBindingSize above. Same treatment: request
   // what's needed, capped at the adapter's real capability, fail loud (not
   // a cryptic validation error) if this GPU genuinely can't do it.
@@ -844,7 +844,7 @@ async function init() {
   // the whole session, geometric/topological, never change) and
   // updateLevelParams() below (parentTau only -- the one field that
   // actually moves, when the TAU slider changes).
-  for (let c = 2; c < N_LEVELS; c++) {
+  for (let c = 1; c < N_LEVELS; c++) {
     const pool = pools[c];
     pool.levelParamsBuf = device.createBuffer({ size: 32, usage: U.UNIFORM | U.COPY_DST });
     const staticBuf = new ArrayBuffer(32);
@@ -855,7 +855,7 @@ async function init() {
     device.queue.writeBuffer(pool.levelParamsBuf, 0, staticBuf);
   }
   function updateLevelParams() {
-    for (let c = 2; c < N_LEVELS; c++) {
+    for (let c = 1; c < N_LEVELS; c++) {
       device.queue.writeBuffer(pools[c].levelParamsBuf, 8, new Float32Array([tauAtLevel(c - 1)])); // level c's parent is level c-1
     }
   }
@@ -907,7 +907,7 @@ async function init() {
     };
   }
 
-  const [stepSM, frcSM, phySM, renSM, interpDenseSM, interpPoolSM, step1SM, step1PoolSM, avgSM, avgPoolSM, criterionSM, manageSM, force1SM, force1PoolSM, criterionPoolSM, managePoolSM] = await Promise.all([
+  const [stepSM, frcSM, phySM, renSM, interpDenseSM, interpPoolSM, step1SM, avgSM, avgPoolSM, criterionSM, manageSM, force1SM, force1PoolSM, criterionPoolSM, managePoolSM] = await Promise.all([
     loadShader(device, 'shaders/amr_step.wgsl'),
     loadShader(device, 'shaders/amr_force.wgsl'),
     loadShader(device, 'shaders/amr_physics.wgsl'),
@@ -917,11 +917,10 @@ async function init() {
     // see shaders/amr_interp_pool_parent.wgsl's header for the addressing
     // split vs. the dense-parent module above.
     loadShader(device, 'shaders/amr_interp_pool_parent.wgsl'),
+    // Milestone 7 / B3-1: ONE fine-step kernel for every level, and one
+    // average sibling for level>=2 -- see shaders/amr_step1.wgsl /
+    // shaders/amr_average_pool_parent.wgsl.
     loadShader(device, 'shaders/amr_step1.wgsl'),
-    // Milestone 7: sibling shaders for every level>=2 (fine step + average),
-    // same addressing split as M6's interp pair -- see
-    // shaders/amr_step1_pool.wgsl / shaders/amr_average_pool_parent.wgsl.
-    loadShader(device, 'shaders/amr_step1_pool.wgsl'),
     loadShader(device, 'shaders/amr_average_f2c.wgsl'),
     loadShader(device, 'shaders/amr_average_pool_parent.wgsl'),
     loadShader(device, 'shaders/amr_criterion.wgsl'),
@@ -1061,36 +1060,28 @@ async function init() {
     // binding 15 was grandchildBlockSlot, for hasGrandchild.
     // Gone with it (B2-2d).
   ]});
-  const step1BGL = device.createBindGroupLayout({ label: 'step1BGL', entries: [
-    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-    { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-    { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    // binding 5: blockSlot -- neighbour-addressed streaming (see the
-    // DIRECT_GHOST override in shaders/amr_step1.wgsl). Present in the layout
-    // even under ?ghostcopy=1, where the shader simply never reads it.
-    { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }
-  ]});
   const avgBGL = device.createBindGroupLayout({ label: 'avgBGL', entries: [
     { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
     { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }
   ]});
-  // Milestone 7: level>=2 fine step, shared across every level (decision 2)
-  // -- binding 5 is the per-child-level uniform (parentTau, dxL, and nbx/nby,
-  // all four read here since B3-1: dxL and nbx/nby are what place the tile,
-  // now that its origin is derived rather than read from a per-slot buffer.
-  // Shared verbatim with interpPoolParentBGL/avgPoolBGL).
-  const step1PoolBGL = device.createBindGroupLayout({ label: 'step1PoolBGL', entries: [
+  // THE fine step, one layout for every pool level since B3-1 (there was a
+  // second, level-1-only step1BGL here until then). Binding 5 is the
+  // per-level uniform -- parentTau, dxL and nbx/nby, all four read by the
+  // kernel: dxL and nbx/nby are what place the tile, now that its origin is
+  // derived rather than loaded per slot. Shared verbatim with
+  // interpPoolParentBGL/avgPoolBGL.
+  const step1BGL = device.createBindGroupLayout({ label: 'step1BGL', entries: [
     { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
     { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
     { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
-    // binding 6: blockSlot -- see step1BGL's binding 5.
+    // binding 6: blockSlot -- neighbour-addressed streaming (see the
+    // DIRECT_GHOST override in shaders/amr_step1.wgsl). Present in the layout
+    // even under ?ghostcopy=1, where the shader simply never reads it.
     { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }
   ]});
   // Milestone 7: level>=2 average, writing into a parent POOL tile via
@@ -1213,10 +1204,6 @@ async function init() {
     layout: device.createPipelineLayout({ bindGroupLayouts: [interpPoolParentBGL] }),
     compute: { module: interpPoolSM, entryPoint: 'main', constants: interpPoolFFConstants }
   });
-  const step1PL = device.createComputePipeline({
-    layout: device.createPipelineLayout({ bindGroupLayouts: [step1BGL] }),
-    compute: { module: step1SM, entryPoint: 'main', constants: { ...step1Constants } }
-  });
   const avgPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [avgBGL] }),
     compute: { module: avgSM, entryPoint: 'main', constants: avgConstants }
@@ -1224,11 +1211,11 @@ async function init() {
   // Milestone 7: level>=2 fine step / average -- one pipeline object each,
   // reused across every level pair (no per-level overrides needed; NBX/NBY/
   // parentTau are runtime uniform reads, not compile-time constants -- see
-  // shaders/amr_step1_pool.wgsl's header, same reasoning as M6's
+  // shaders/amr_step1.wgsl's header, same reasoning as M6's
   // interpPoolParentPL).
-  const step1PoolPL = device.createComputePipeline({
-    layout: device.createPipelineLayout({ bindGroupLayouts: [step1PoolBGL] }),
-    compute: { module: step1PoolSM, entryPoint: 'main', constants: { ...step1Constants, K_EPS: K_EPS_POOL } }
+  const step1PL = device.createComputePipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [step1BGL] }),
+    compute: { module: step1SM, entryPoint: 'main', constants: { ...step1Constants, K_EPS: K_EPS_POOL } }
   });
   const avgPoolPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [avgPoolBGL] }),
@@ -1354,8 +1341,13 @@ async function init() {
   // Fine ping-pong within a macro-step is a fixed 2-call sequence (ab then
   // ba), not a persistent toggle like the coarse useB -- always call both,
   // in order, every macro-step.
-  const step1BG_ab = device.createBindGroup({ layout: step1BGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: pools[1].finePoolF_a } }, { binding: 2, resource: { buffer: pools[1].finePoolF_b } }, { binding: 3, resource: { buffer: pools[1].finePoolVel } }, { binding: 4, resource: { buffer: pools[1].slotToBlockBuf } }, { binding: 5, resource: { buffer: pools[1].blockSlotBuf } }]});
-  const step1BG_ba = device.createBindGroup({ layout: step1BGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: pools[1].finePoolF_b } }, { binding: 2, resource: { buffer: pools[1].finePoolF_a } }, { binding: 3, resource: { buffer: pools[1].finePoolVel } }, { binding: 4, resource: { buffer: pools[1].slotToBlockBuf } }, { binding: 5, resource: { buffer: pools[1].blockSlotBuf } }]});
+  // Level 1's own fine-step bind groups, in the SAME layout every other level
+  // uses -- the c>=2 loop below builds the identical pair. Level 1 differs
+  // only in what its levelParams says (dxL 0.5, parentTau = L0's own tau);
+  // there is no longer a second kernel, layout or pipeline for it.
+  // plans/2D-backport.md B3-1.
+  pools[1].step1BG_ab = device.createBindGroup({ layout: step1BGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: pools[1].finePoolF_a } }, { binding: 2, resource: { buffer: pools[1].finePoolF_b } }, { binding: 3, resource: { buffer: pools[1].finePoolVel } }, { binding: 4, resource: { buffer: pools[1].slotToBlockBuf } }, { binding: 5, resource: { buffer: pools[1].levelParamsBuf } }, { binding: 6, resource: { buffer: pools[1].blockSlotBuf } }]});
+  pools[1].step1BG_ba = device.createBindGroup({ layout: step1BGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: pools[1].finePoolF_b } }, { binding: 2, resource: { buffer: pools[1].finePoolF_a } }, { binding: 3, resource: { buffer: pools[1].finePoolVel } }, { binding: 4, resource: { buffer: pools[1].slotToBlockBuf } }, { binding: 5, resource: { buffer: pools[1].levelParamsBuf } }, { binding: 6, resource: { buffer: pools[1].blockSlotBuf } }]});
   // Fine-fine-only ghost re-exchange, run BETWEEN f1a and f1b. f1a writes the
   // post-substep-1 pool into pools[1].finePoolF_b (the buffer f1b then reads), so this
   // refreshes each block's fine-fine seam ghosts IN PLACE in pools[1].finePoolF_b from
@@ -1479,7 +1471,7 @@ async function init() {
     // the shared layout (mirrors dense's interpFFBG_b's f_a-unused note).
     childPool.interpPoolParentFFBG_b = device.createBindGroup({ layout: interpPoolParentBGL, entries: interpEntries(parentPool.finePoolF_a).map((e, i) => i === 2 ? { binding: 2, resource: { buffer: childPool.finePoolF_b } } : e) });
 
-    childPool.step1PoolBG_ab = device.createBindGroup({ layout: step1PoolBGL, entries: [
+    childPool.step1BG_ab = device.createBindGroup({ layout: step1BGL, entries: [
       { binding: 0, resource: { buffer: cardStateBuf } },
       { binding: 1, resource: { buffer: childPool.finePoolF_a } },
       { binding: 2, resource: { buffer: childPool.finePoolF_b } },
@@ -1488,7 +1480,7 @@ async function init() {
       { binding: 5, resource: { buffer: childPool.levelParamsBuf } },
       { binding: 6, resource: { buffer: childPool.blockSlotBuf } },
     ]});
-    childPool.step1PoolBG_ba = device.createBindGroup({ layout: step1PoolBGL, entries: [
+    childPool.step1BG_ba = device.createBindGroup({ layout: step1BGL, entries: [
       { binding: 0, resource: { buffer: cardStateBuf } },
       { binding: 1, resource: { buffer: childPool.finePoolF_b } },
       { binding: 2, resource: { buffer: childPool.finePoolF_a } },
@@ -1862,10 +1854,11 @@ async function init() {
   // its own "fixed 2-call sequence, not a persistent toggle" comment,
   // preserved verbatim below). `cur` tracks it within one call.
   //
-  // Level 1 is special the same way it is everywhere else in this codebase
-  // (M5's addressing split, M6's shader split): its OWN substep/fine-fine
-  // use the DENSE-shader pipelines (step1PL/interpFFPL, unchanged), since
-  // its parent is L0. Every level's role as PARENT of level+1 (>=2) always
+  // Level 1 is still special in one narrower way than it used to be. Its
+  // fine-fine refresh uses the DENSE-shader pipeline (interpFFPL), because
+  // its parent is L0 -- but its SUBSTEP no longer does: B3-1 deleted the
+  // level-1-only step kernel, so every level runs step1PL. Every level's
+  // role as PARENT of level+1 (>=2) always
   // uses the POOL-shader pipelines (interpPoolParentPL/avgPoolPL), keyed by
   // the CHILD level's own bind groups -- this includes level 1 acting as
   // level 2's parent, which is why interpPoolParent* bind groups are built
@@ -1906,13 +1899,9 @@ async function init() {
       const p = enc.beginComputePass(); p.setPipeline(avgPoolPL); p.setBindGroup(0, bg); p.dispatchWorkgroups(1, 1, childPool.MAX_FINE_BLOCKS); p.end();
     };
     const substep = (readCur) => {
-      if (isL1) {
-        const bg = readCur === 'a' ? step1BG_ab : step1BG_ba;
-        const p = enc.beginComputePass(); p.setPipeline(step1PL); p.setBindGroup(0, bg); p.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); p.end();
-      } else {
-        const bg = readCur === 'a' ? pool.step1PoolBG_ab : pool.step1PoolBG_ba;
-        const p = enc.beginComputePass(); p.setPipeline(step1PoolPL); p.setBindGroup(0, bg); p.dispatchWorkgroups(WGX1, WGY1, pool.MAX_FINE_BLOCKS); p.end();
-      }
+      // NO LEVEL SPLIT SINCE B3-1: one kernel, one pipeline, every level.
+      const bg = readCur === 'a' ? pool.step1BG_ab : pool.step1BG_ba;
+      const p = enc.beginComputePass(); p.setPipeline(step1PL); p.setBindGroup(0, bg); p.dispatchWorkgroups(WGX1, WGY1, pool.MAX_FINE_BLOCKS); p.end();
     };
     const fineFineRefresh = () => {
       if (isL1) {
@@ -2113,7 +2102,7 @@ async function init() {
   // This tile's own L0-buffer-space origin -- level 1 derives it cheaply
   // from its own (bx,by) (bx*RB, matching amr_step1.wgsl's unchanged
   // derivation exactly); level >=2 reads the cached mirror above (see
-  // shaders/amr_step1_pool.wgsl's header on why level>=2 can't derive this
+  // shaders/amr_step1.wgsl's header on why level>=2 can't derive this
   // as cheaply). `bx,by` are only consulted for level===1.
   function tileOriginL0(level, slot, bx, by) {
     if (level === 1) return { x: bx * RB, y: by * RB };
@@ -2260,7 +2249,7 @@ async function init() {
 
     // Milestone 7: this quad's own L0-buffer-space origin, composed from
     // the PARENT's own cached (or, at level 1, cheaply-derived) origin --
-    // see tileOriginL0/cellSizeL0AtLevel and shaders/amr_step1_pool.wgsl's
+    // see tileOriginL0/cellSizeL0AtLevel and shaders/amr_step1.wgsl's
     // header for why this can't be re-derived per-dispatch the way ownBX/
     // ownBY could.
     const parentOrigin = tileOriginL0(level - 1, parentSlotVal, parentBX, parentBY);

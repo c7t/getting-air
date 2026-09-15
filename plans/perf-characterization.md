@@ -372,7 +372,8 @@ accumulator (~0%). Indirect dispatch was already ruled out twice.
 own header named it: AGAL "addresses neighbor blocks directly during streaming
 instead of materializing ghost cells in a padded buffer". Shipped as the
 `DIRECT_GHOST` override in `shaders/amr_step1.wgsl` /
-`shaders/amr_step1_pool.wgsl` (one new read-only `blockSlot` binding each, no
+`shaders/amr_step1_pool.wgsl` (since B3-1 both are one file,
+`shaders/amr_step1.wgsl`; one new read-only `blockSlot` binding each, no
 new data buffers -- `f_in` was already the whole pool, so the neighbour tile's
 data was always in scope). The between-substep fine-fine ghost COPY pass is no
 longer encoded at all. `?ghostcopy=1` restores the old path on every AMR page,

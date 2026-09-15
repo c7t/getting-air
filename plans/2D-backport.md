@@ -702,7 +702,9 @@ has**. Give level 1 an `originX/originY` pair at allocation and
 **Do it as, in this order, one pair per commit:**
 
 1. `step1` — delete `amr_step1.wgsl`, level 1 runs `amr_step1_pool.wgsl`.
-   This is the hot kernel and the largest single win.
+   This is the hot kernel and the largest single win. **DONE — see B3-1
+   below; it went the other way round in the end (the pool file survived and
+   took the name), and the blocker was a wrong claim in its own header.**
 2. `average` — one body, two parent fragments.
 3. `interp` — `common_interp.wgsl` already holds the shared half; move the
    fetch behind `parentIndex` and collapse the two entry files.
@@ -725,6 +727,70 @@ before believing either direction.
 too. It is genuinely cheaper per cell on what is usually the majority of live
 cells, and the *point* of the accessor split is that this asymmetry then costs
 two functions instead of six files. Do not "unify" L0 into a pool.
+
+### B3-1 — DONE (2026-09-14). One fine step, every level.
+
+`amr_step1.wgsl` (349 lines, level 1 only) and `amr_step1_pool.wgsl` (359,
+level>=2) are one file, `amr_step1.wgsl`, dispatched for every pool level. Two
+commits, both proved inert.
+
+**The pair's whole reason for existing was an argument, and the argument was
+wrong.** The level-1 file derived its tile's physical origin as `bx * RB`; the
+pool file read a per-slot `originX/originY` buffer, because (its own header)
+a level>=2 tile's origin needs a walk up the parent chain. It does not: every
+level's block grid is globally anchored and quadtree-uniform, so the origin
+has a closed form -- `block * RB * 2^-(m-1)`, i.e. `f32(bx*RB) * 2 *
+levelParams.dxL`. amr2d.mjs has held both routes and scored them against each
+other since B0 (`tileOriginL0` vs `tileOriginL0Recursive`). **The refactor was
+blocked on a claim the project had already disproved and not noticed.**
+
+Deriving it (B3-1a) deleted two bindings from every page's step1 layout AND
+removed the one structural difference between the files. What was left was
+four differences, each already a field of the per-level uniform the pool file
+had: `dxL` (0.5 at level 1, the old literal), `parentTau` (L0's own tau at
+level 1), `nbx/nby`, and `K_EPS` -- whose `K_EPS * dxL` at level 1 is exactly
+the `K_EPS * 0.5` the level-1 file computed. So B3-1b is `for (let c = 2;` ->
+`c = 1` on the levelParams loops, one bind-group pair moved onto `pools[1]`,
+and `substep()` losing its `if (isL1)`.
+
+**PROVING IT INERT NEEDED A NEW INSTRUMENT, AND THAT IS THE REUSABLE PART.**
+The stated gate was "bit-identical, `tools/amr-diff.js` against a pre-change
+snapshot". That gate is available here -- a PINNED cylinder does not feed force
+back into the flow, so unlike the falling card its field is reproducible where
+its Cd is not -- but it is a whole-run comparison, and a whole-run comparison
+can only ever say "something moved". The better gate was cheaper and came
+first: `debugCheckTileOrigins` (the eighth invariant gate) scores the LIVE
+origin buffer against the same closed form at every checkpoint, so "the value
+the kernel now computes is the value it used to load" is measured per slot,
+exactly, before anything is removed on the strength of it. Mutation-tested by
+transposing x/y -- the defect class that cost a wrong level-2 force -- which
+turns it red with the other seven green. **Same move as B2-2b0's
+`checkSlotQuadrants`: when a refactor rests on "this stored value is
+redundant", score the stored value first; the gate is then per-slot and exact
+instead of whole-field and statistical.**
+
+Measured, `index-cylinder-amr.html?levels=3`, 4096 steps from reset:
+
+    ?levels=3   pre x2, B3-1a x3, B3-1b x1   all bit-IDENTICAL
+                (maxAbsDiff 0 on ux/uy/rho/omega)
+
+**And the gate turned out to be config-dependent, which is the thing to carry
+forward.** One `?levels=3` run in seven came back different (ux relL2 2.6e-5)
+and has not recurred. At `?levels=2` NO two runs of one build agree -- four
+runs, four different fields, at the SAME magnitude as the pre-vs-post
+difference there. So `amr-diff` cannot gate a change at N=2 at all, and the
+N=2 pre/post DIFFERS is not evidence of anything; N=3 is where the comparison
+has power, and it reads IDENTICAL across both commits. Note this INVERTS the
+Cd picture, where N=3 is the wider spread -- reproducibility does not transfer
+between configs in either direction. Written down in CLAUDE.md next to the Cd
+figures, because the natural move (measure the cheap config, assume the deep
+one is no better) would have picked exactly the wrong one.
+
+**What is left of B3:** `average`, `interp`, `force1`, `criterion`, `manage`.
+`force1` gets easier than the table below suggests -- `amr_force1_pool.wgsl` is
+now the ONLY reader of `originX/originY`, so unifying it the same way retires
+those two buffers and `amr_manage_pool.wgsl`'s write of them, which is the
+binding CLAUDE.md's 16-buffer-ceiling note nominates next.
 
 ### B3a — the same sweep, in JS
 
@@ -1491,7 +1557,9 @@ B2-2d delete the ?cascade=0 path (16 -> 14),       ◄── DONE; corner balanc
                                                         manage pair is a
                                                         refactor not a rewrite
 B2   cascade21                                     ◄── needs B0
-B3   kernel unification, manage LAST                ◄── needs B2 and B3a
+B3-1 step1: one kernel, every level               ◄── DONE, bit-identical
+B3   the rest (average, interp, force1,            ◄── needs B2 and B3a
+     criterion, manage LAST)
 B5   window = sponge translation                    ◄── independent of B2/B3,
                                                         but smaller after B3
 B1   post-collision rescale                         ◄── needs B0b only; its

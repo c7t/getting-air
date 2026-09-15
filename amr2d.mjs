@@ -58,10 +58,11 @@ export const RB_DEFAULT = 8;
 // -- maps to `origin - dx/2 + dx*(j - GHOST)`. Ring cells continue the same
 // line, which is why this takes a signed index.
 //
-// This is shaders/amr_step1.wgsl:120 (dx = 0.5, origin an integer block
-// offset) and shaders/amr_step1_pool.wgsl:151 (dx = levelParams.dxL, origin
-// the cached float) as ONE formula. That they are one formula is the whole
-// claim plans/2D-backport.md B3 rests on.
+// This WAS shaders/amr_step1.wgsl and shaders/amr_step1_pool.wgsl stating the
+// same formula twice, one with dx = 0.5 and an integer block offset, the other
+// with dx = levelParams.dxL and a cached float origin. That they are one
+// formula is the claim plans/2D-backport.md B3 rested on, and since B3-1 there
+// is one kernel -- shaders/amr_step1.wgsl, every level.
 export function fineToCoarseUnit(j, origin, dx = 0.5) {
   return origin - 0.5 * dx + dx * (j - GHOST);
 }
