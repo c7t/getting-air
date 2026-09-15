@@ -23,8 +23,10 @@
 //   origin  ->  bx/by (levelParams.nbx) and levelParams.dxL, below
 //   dxL     ->  levelParams.dxL          (level 1: 0.5, the old literal)
 //   tau     ->  levelParams.parentTau    (level 1: L0's own state.tau)
-//   K_EPS   ->  an override on both, and K_EPS * dxL at level 1 is
-//               K_EPS * 0.5, which is exactly what the level-1 file computed
+//   K_EPS   ->  levelParams.kEps, and kEps * dxL at level 1 is kEps * 0.5,
+//               which is exactly what the level-1 file computed. It was an
+//               override on both files; see get_chi below for why one
+//               pipeline made that untenable.
 //
 // tau is worth spelling out because it is the one that is not geometry: a
 // tile's tau_fine derives from its PARENT level's tau, not from L0's. At level
@@ -54,6 +56,15 @@ struct LevelParams {
   dxL: f32,        // Milestone 8: this level's own grid spacing in L0-buffer-
                    // space units, used below to scale epsilon (get_chi) and
                    // to place the tile (2*dxL is the parent's cell size).
+  hasChild: u32,   // unused here -- declared only to reach kEps at offset 20.
+                   // Real field of the shared 32-byte buffer (amr_force1_pool.
+                   // wgsl reads it), not padding.
+  kEps: f32,       // the diffuse band in units of THIS level's dx. A per-level
+                   // uniform and NOT an override since B3-1's follow-up: one
+                   // pipeline serves every level now, so a compile-time
+                   // constant could no longer say anything per-level, and
+                   // main-cylinder-amr.js's ?kEpsPool= (which singles out
+                   // levels >=2) had silently become a whole-hierarchy flag.
 }
 
 @group(0) @binding(0) var<storage, read>       state       : CardState;
@@ -125,16 +136,19 @@ override SPONGE_UY : f32 = 0.0f;
 // Sponge ring width in cells -- see lbm_step.wgsl's identical override.
 override SPONGE_W : f32 = 4.0f;
 
-// Milestone 8 (plans/AMR-multilevel.md): epsilon = K_EPS * dx_L, not a fixed
+// Milestone 8 (plans/AMR-multilevel.md): epsilon = kEps * dx_L, not a fixed
 // physical constant -- a fixed epsilon means refinement only ever improves
 // *sampling* of an unchanging diffuse-boundary width, never the boundary's
-// own sharpness. K_EPS=1.5 matches today's L0/L1 value exactly (dx_L0=1,
+// own sharpness. kEps=1.5 matches today's L0/L1 value exactly (dx_L0=1,
 // dx_L1=0.5; L0's is still a hardcoded literal in amr_step.wgsl, which is why
-// ITS epsilon does not change); this pipeline's dx_L genuinely varies per
-// level (levelParams.dxL, runtime -- see header), so epsilon is computed
-// here, not hardcoded. An OVERRIDE since B7, not a const -- ?kEps= sweeps the
-// diffuse band across every level at once.
-override K_EPS : f32 = 1.5f;
+// ITS epsilon does not change).
+//
+// BOTH factors are now per-level runtime uniforms, and the second one had to
+// become one: B3-1 made this a single pipeline for every level, so a K_EPS
+// OVERRIDE could only ever carry one value for the whole hierarchy -- which
+// silently turned main-cylinder-amr.js's ?kEpsPool= (documented as singling
+// out levels >=2) into a flag that moved level 1 too. ?kEps= still sweeps
+// every level at once; the host writes the per-level value.
 
 // Optional sharp momentum-exchange bounce-back solid coupling -- see
 // lbm_step.wgsl's header for the full method. At this level, "the
@@ -226,7 +240,7 @@ fn wrapf(v: f32, n: f32) -> f32 {
 }
 
 fn get_chi(phi: f32) -> f32 {
-    return chiFromPhiEps(phi, K_EPS * levelParams.dxL);
+    return chiFromPhiEps(phi, levelParams.kEps * levelParams.dxL);
 }
 
 @compute @workgroup_size(8, 8)

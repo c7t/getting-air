@@ -627,6 +627,12 @@ async function init() {
     staticDv.setUint32(0, pool.NBX, true);
     staticDv.setUint32(4, pool.NBY, true);
     staticDv.setFloat32(12, cellSizeL0AtLevel(c), true);
+    // The diffuse band, in units of THIS level's dx -- a per-level uniform
+    // since B3-1's follow-up, not the compile-time K_EPS override the fine
+    // step used to carry. One pipeline now serves every level, so an override
+    // could only ever say one thing for the whole hierarchy. See
+    // shaders/amr_step1.wgsl's get_chi.
+    staticDv.setFloat32(20, K_EPS, true);
     device.queue.writeBuffer(pool.levelParamsBuf, 0, staticBuf);
   }
   function updateLevelParams() {
@@ -950,7 +956,7 @@ async function init() {
   // Between-substep fine-fine-only ghost re-exchange (see amr_interp_c2f.wgsl's
   // FINE_FINE_ONLY note and the dispatch between f1a/f1b below).
   const interpFFConstants = { W, H, RB, GHOST_ONLY: 1, FINE_FINE_ONLY: 1, F16 };
-  const step1Constants = { W, H, RB, F16, DIRECT_GHOST: GHOST_COPY ? 0 : 1, K_EPS };
+  const step1Constants = { W, H, RB, F16, DIRECT_GHOST: GHOST_COPY ? 0 : 1 };
   const criterionConstants = { W, H };
   const manageConstants = { DIAG, W, H, REFINE_THRESH, COARSEN_THRESH, FORCE_REFINE_MARGIN, FORCE_REFINE_LOOKAHEAD, SPONGE_EXCLUDE_W, BOX_REFINE };
 

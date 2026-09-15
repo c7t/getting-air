@@ -329,11 +329,18 @@ if (USE_BOUNCEBACK && N_LEVELS > 3 && !urlParams.has('forceBounceback')) {
 // the 2:1-balance buffer shell needs a looser threshold than a single-
 // tier build would).
 // TEMPORARY diagnostic (Milestone 10 Cd investigation): level>=2's own
-// K_EPS override, defaulting to the same 1.5 every other level uses --
-// see shaders/amr_step1.wgsl/amr_force1_pool.wgsl's own K_EPS comment.
-// Defaults to K_EPS (was a second hardcoded 1.5), so ?kEps= sweeps every
-// level and ?kEpsPool= still singles out the pool ones. Before B7 those two
-// literals could disagree with no way to notice.
+// diffuse-band width, defaulting to the same 1.5 every other level uses.
+// ?kEps= sweeps every level; ?kEpsPool= singles out the pool ones. Before B7
+// those two literals could disagree with no way to notice.
+//
+// IT IS A PER-LEVEL UNIFORM NOW, NOT AN OVERRIDE, and that is not cosmetic:
+// B3-1 made one fine-step pipeline serve every level, so a compile-time
+// K_EPS could only carry ONE value for the whole hierarchy -- and this flag
+// silently became a flag that moved level 1 too. Measured, ?levels=2
+// ?kEpsPool=0.375: putting the band back on the level moves the field by
+// relL2 0.50 in vorticity, four orders above the run-to-run floor. Written
+// per level into levelParams.kEps below; see shaders/amr_step1.wgsl's
+// get_chi.
 const K_EPS_POOL = urlParams.has('kEpsPool') ? parseFloat(urlParams.get('kEpsPool')) : K_EPS;
 
 const REFINE_EVERY = urlParams.has('refineEvery') ? parseInt(urlParams.get('refineEvery')) : 16;
@@ -852,6 +859,12 @@ async function init() {
     staticDv.setUint32(0, pool.NBX, true);
     staticDv.setUint32(4, pool.NBY, true);
     staticDv.setFloat32(12, cellSizeL0AtLevel(c), true);
+    // The diffuse band, in units of THIS level's dx -- a per-level uniform
+    // since B3-1's follow-up, not the compile-time K_EPS override the fine
+    // step used to carry. One pipeline now serves every level, so an override
+    // could only ever say one thing for the whole hierarchy. See
+    // shaders/amr_step1.wgsl's get_chi.
+    staticDv.setFloat32(20, c === 1 ? K_EPS : K_EPS_POOL, true);
     device.queue.writeBuffer(pool.levelParamsBuf, 0, staticBuf);
   }
   function updateLevelParams() {
@@ -1146,7 +1159,7 @@ async function init() {
   // Fine step(s) also need the freestream sponge target (see amr_step1*.wgsl's
   // SPONGE_UX/UY -- both L1's dedicated file and the level>=2 shared one have
   // their own copy of the sponge, not shared with the coarse kernel).
-  const step1Constants = { W, H, RB, SPONGE_UX: U0, SPONGE_UY: 0, USE_BOUNCEBACK, F16, DIRECT_GHOST: GHOST_COPY ? 0 : 1, K_EPS, SOLID_EQ };
+  const step1Constants = { W, H, RB, SPONGE_UX: U0, SPONGE_UY: 0, USE_BOUNCEBACK, F16, DIRECT_GHOST: GHOST_COPY ? 0 : 1, SOLID_EQ };
   const criterionConstants = { W, H };
   const manageConstants = { DIAG, W, H, REFINE_THRESH, COARSEN_THRESH, FORCE_REFINE_MARGIN, FORCE_REFINE_LOOKAHEAD, BOX_REFINE };
 
@@ -1218,7 +1231,7 @@ async function init() {
   // interpPoolParentPL).
   const step1PL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [step1BGL] }),
-    compute: { module: step1SM, entryPoint: 'main', constants: { ...step1Constants, K_EPS: K_EPS_POOL } }
+    compute: { module: step1SM, entryPoint: 'main', constants: step1Constants }
   });
   const avgPoolPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [avgPoolBGL] }),

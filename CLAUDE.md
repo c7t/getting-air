@@ -110,13 +110,23 @@ invariants the AMR machinery depends on:
   force does not feed back into the flow -- unlike the falling card, whose
   field cannot be compared this way at all):
 
-      ?levels=3   6 of 7 runs BIT-IDENTICAL; one excursion at ux relL2 2.6e-5
-      ?levels=2   every one of 4 runs DIFFERS, at ux relL2 2-4e-5
+      ?levels=3   TWO modes, each EXACTLY reproducible. 9 of 12 runs land on
+                  one, 3 on the other; the two differ by ux relL2 2.6e-5,
+                  vorticity 5.8e-4, and every run reproduces its mode
+                  bit-for-bit -- including across different builds.
+      ?levels=2   every one of 4 runs DIFFERS, at ux relL2 2-4e-5 (more than
+                  two modes, or none)
 
-  So N=2 has no deterministic field baseline and `amr-diff` cannot gate a
-  change there; N=3 usually does, and an IDENTICAL there is conclusive (an
-  excursion can only produce a false DIFFERS, never a false IDENTICAL). A lone
-  DIFFERS is not evidence -- take the same-build repeat on the SAME config.
+  **It is NOT noise and NOT an excursion** -- that was the first reading and it
+  was wrong. A run lands in one of a small number of attractors (the atomicSub
+  free list resolving one way or the other at some early refine), and each
+  attractor is bit-exact. So the way to gate a code motion at N=3 is: run until
+  you match the baseline's mode, and an IDENTICAL is then conclusive; a DIFFERS
+  only tells you which mode you are in. Better, cross-check BOTH modes -- two
+  builds that agree bit-for-bit in each of two modes is much stronger than one
+  IDENTICAL. N=2 has no reproducible baseline at all and `amr-diff` cannot gate
+  there.
+
   Note this inverts the Cd picture, where N=3 is the WIDER spread: do not
   assume one config's reproducibility from another's, in either direction.
 

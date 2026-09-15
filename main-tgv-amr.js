@@ -411,6 +411,12 @@ async function init() {
     staticDv.setUint32(0, pool.NBX, true);
     staticDv.setUint32(4, pool.NBY, true);
     staticDv.setFloat32(12, cellSizeL0AtLevel(c), true);
+    // The diffuse band, in units of THIS level's dx -- a per-level uniform
+    // since B3-1's follow-up, not the compile-time K_EPS override the fine
+    // step used to carry. One pipeline now serves every level, so an override
+    // could only ever say one thing for the whole hierarchy. See
+    // shaders/amr_step1.wgsl's get_chi.
+    staticDv.setFloat32(20, 1.5, true);
     staticDv.setUint32(16, (c + 1) < N_LEVELS ? 1 : 0, true);
     device.queue.writeBuffer(pool.levelParamsBuf, 0, staticBuf);
   }
@@ -568,7 +574,7 @@ async function init() {
   });
   const step1PL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [step1BGL] }),
-    compute: { module: step1SM, entryPoint: 'main', constants: { ...step1Constants, K_EPS: 1.5, F16 } }
+    compute: { module: step1SM, entryPoint: 'main', constants: { ...step1Constants, F16 } }
   });
 
   const renPL = device.createRenderPipeline({
