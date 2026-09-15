@@ -33,6 +33,7 @@ import { check21BalanceOnGPU, allocLevelPool, readPoolIndirection as readPoolInd
 // loop is VACUOUS at the levels=2 default every one of them ships. See
 // plans/2D-backport.md B4.
 import { tauAtLevel as tauAtLevelOf } from './card-params.mjs';
+import { poolSlotsFor } from './amr2d.mjs';
 import { EX, EY, WT } from './lattice-2d.mjs';
 import { makeCanvasFit } from './canvas-fit.mjs';
 
@@ -167,7 +168,6 @@ const NCELLS1 = FB * FB; // cells per pool slot
 // measured (B2-2c: corner 2:1 violations 13 -> 0, level 2's x-extent 80 -> 160
 // L0 units on this page); B2-2d deleted it.
 
-const MAX_FINE_BLOCKS = urlParams.has('maxFineBlocks') ? parseInt(urlParams.get('maxFineBlocks')) : 128;
 const NBX = W / BLOCK, NBY = H / BLOCK, NBLOCKS = NBX * NBY; // coarse block grid
 
 // ── Milestone 5 (plans/AMR-multilevel.md, plans/AMR-multilevel-M5.md):
@@ -179,6 +179,36 @@ const N_LEVELS = urlParams.has('levels') ? parseInt(urlParams.get('levels')) : 2
 // refuseConfig, not throw: this runs at module scope, where
 // init().catch(handleErr) can never see it -- see error-overlay.mjs.
 if (N_LEVELS < 2) refuseConfig(statusEl, `?levels=${N_LEVELS} invalid -- must be >= 2 (L0 + at least one fine level)`);
+
+// ── POOL CAPACITY PER LEVEL, MEASURED (2026-09-15) ───────────────────────────
+// Max live tiles over 40000 steps with every cap lifted, this page's pinned
+// cylinder at Re=100 (far steadier than the card page -- the pinned body
+// gives these almost no run-to-run scatter):
+//
+//                 levels=3   levels=4        role at that depth
+//   level 1          78         95           parent (always)
+//   level 2          96        160           finest at 3, parent at 4
+//   level 3          --        208           finest at 4
+//
+// Same two regimes as main-amr.js and the same mechanism, showing even more
+// clearly here because the body does not move: level 2 goes 96 -> 160 purely
+// from acquiring a child, i.e. 2:1 closure forcing parents.
+//
+// At 1.7x headroom: levels=3 -> L1 162, L2 164 (was 128, 128);
+// levels=4 -> L1 162, L2 272, L3 354 (was 128, 128, 128).
+//
+// THAT FLAT 128 IS CLAUDE.md's RECORDED ?levels=4 FAILURE -- "level 3 at
+// 128/128 with 20 coverage violations" is level 3 wanting 208 and being given
+// 128. Level 4 is not measured on this page; poolSlotsFor extrapolates and
+// says so, and the refusal watch remains the thing that reports it wrong.
+const POOL_PEAKS = {
+  finest: { 2: 96, 3: 208 },
+  parent: { 1: 95, 2: 160 },
+};
+
+const MAX_FINE_BLOCKS = urlParams.has('maxFineBlocks')
+  ? parseInt(urlParams.get('maxFineBlocks'))
+  : poolSlotsFor(POOL_PEAKS, 1, N_LEVELS);
 
 // RESOLVED (was "KNOWN ISSUE, narrowed further"): USE_BOUNCEBACK is now
 // validated correct through N_LEVELS<=3 (Cd/St match the literature within
@@ -828,9 +858,14 @@ async function init() {
   {
     let curNBX = NBX, curNBY = NBY; // level 1's logical grid = today's coarse block grid
     for (let m = 1; m < N_LEVELS; m++) {
+      // ?maxFineBlocks= sizes LEVEL 1; each deeper level takes its own
+      // ?maxFineBlocks<m>=. Defaults come from POOL_PEAKS via poolSlotsFor --
+      // measured per level, not one flat number for all of them.
       const maxFineBlocks = m === 1
-        ? MAX_FINE_BLOCKS // unchanged param/default -- level 1 is byte-identical to today
-        : (urlParams.has(`maxFineBlocks${m}`) ? parseInt(urlParams.get(`maxFineBlocks${m}`)) : 128);
+        ? MAX_FINE_BLOCKS
+        : (urlParams.has(`maxFineBlocks${m}`)
+            ? parseInt(urlParams.get(`maxFineBlocks${m}`))
+            : poolSlotsFor(POOL_PEAKS, m, N_LEVELS));
       const pool = allocLevelPool(device, U, m, curNBX, curNBY, maxFineBlocks, NCELLS1);
       writeF(pool.finePoolF_a, initFPool(maxFineBlocks), maxFineBlocks * NCELLS1);
       pools.push(pool);

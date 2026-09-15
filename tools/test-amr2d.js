@@ -550,6 +550,56 @@ const sorted = (s) => [...s].sort();
       `a quarter turn should bring the major axis under the test point (got ${spun})`);
   });
 
+  ok('pool capacity is sized per level, and a level with children gets more', () => {
+    // The card page's measured table (main-amr.js POOL_PEAKS). The point of
+    // the test is the SHAPE, not the digits: a flat default per level is what
+    // made ?levels=4 refuse, so the thing worth pinning is that deeper levels
+    // get strictly more, and that acquiring a child raises a level's size.
+    const peaks = {
+      finest: { 2: 400, 3: 656, 4: 904 },
+      parent: { 1: 261, 2: 516, 3: 628 },
+    };
+    const H = A.POOL_HEADROOM;
+
+    // Level 2 as the FINEST level (levels=3) vs. with a child (levels=4).
+    const quad = (n) => Math.ceil(n / 4) * 4;   // slots come in quads; see below
+    const finest2 = A.poolSlotsFor(peaks, 2, 3);
+    const parent2 = A.poolSlotsFor(peaks, 2, 4);
+    assert.strictEqual(finest2, quad(400 * H));
+    assert.strictEqual(parent2, quad(516 * H));
+    assert.ok(parent2 > finest2,
+      `a level that must parent a finer one needs MORE, got ${parent2} <= ${finest2}`);
+
+    // Deeper levels want strictly more -- the property the flat 512 violated.
+    const l1 = A.poolSlotsFor(peaks, 1, 5);
+    const l2 = A.poolSlotsFor(peaks, 2, 5);
+    const l3 = A.poolSlotsFor(peaks, 3, 5);
+    const l4 = A.poolSlotsFor(peaks, 4, 5);
+    assert.ok(l1 < l2 && l2 < l3 && l3 < l4,
+      `demand must grow with depth, got ${[l1, l2, l3, l4].join(' ')}`);
+
+    // Every default must clear the measured peak it was derived from --
+    // otherwise the pool is in permanent exhaustion by construction.
+    assert.ok(A.poolSlotsFor(peaks, 3, 4) > 656, 'level 3 must exceed its own measured peak');
+    assert.ok(A.poolSlotsFor(peaks, 4, 5) > 904, 'level 4 must exceed its own measured peak');
+    // 512 -- the old flat default -- did NOT, which is the bug in one line.
+    assert.ok(A.poolSlotsFor(peaks, 3, 4) > 512, 'the old flat 512 sat below level 3 demand');
+
+    // A level nobody measured still gets a number, and a bigger one than the
+    // deepest measured level rather than a silent fallback to something small.
+    const l5 = A.poolSlotsFor(peaks, 5, 6);
+    assert.ok(l5 > l4, `extrapolated level 5 (${l5}) must exceed measured level 4 (${l4})`);
+
+    // EVERY size must be a multiple of 4: slots are allocated a QUAD at a time
+    // (one per child quadrant) and allocLevelPool refuses anything else at
+    // init. Live-verified by getting it wrong -- a bare 1.7x gave level 2 878
+    // and index-amr.html?levels=4 would not boot at all.
+    for (const [m, n] of [[1, 5], [2, 5], [3, 5], [4, 5], [2, 3], [3, 4], [5, 6]]) {
+      const v = A.poolSlotsFor(peaks, m, n);
+      assert.strictEqual(v % 4, 0, `level ${m} of ${n}: ${v} is not a multiple of 4`);
+    }
+  });
+
   ok('the body frame is the buffer frame, and its legacy form truncates', () => {
     // THE BODY IS IN BUFFER COORDINATES since plans/2D-backport.md B5, so the
     // frame accessor the coverage checker uses is the IDENTITY -- and it is

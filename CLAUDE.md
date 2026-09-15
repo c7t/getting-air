@@ -306,6 +306,33 @@ the driver optimized away, with a control that could not detect that.
 layout. Measured NOT viable as a default; kept for re-measurement, not for
 shipping.
 
+**Pool capacity is per level, and `?maxFineBlocks=` sizes LEVEL 1 ONLY.**
+Each deeper level takes its own `?maxFineBlocks2=`, `?maxFineBlocks3=`, ... —
+which was undocumented anywhere outside the allocation loop until 2026-09-15,
+while the pool-exhaustion refusal told you to raise `?maxFineBlocks=` whatever
+level had actually run dry. On `?levels=4` that advice is a no-op, so raising
+it looked like the refusal was spurious rather than the knob being wrong. The
+message now names the saturated level's own knob.
+
+Defaults come from measured demand (`POOL_PEAKS` on each AMR page, sized by
+`amr2d.mjs`'s `poolSlotsFor` at 1.7x the peak), not from one flat number per
+page. Max live tiles over 40k steps with every cap lifted:
+
+      falling card (index-amr.html)        cylinder (index-cylinder-amr.html)
+      L=3    L=4    L=5                    L=3    L=4
+  1   231    213    261                1    78     95
+  2   400    492    516                2    96    160
+  3    --    656    628                3    --    208
+  4    --     --    904
+
+Demand tracks the level INDEX, and STEPS UP when a level acquires a child
+(level 2: 400 as the finest level, ~500 once level 3 exists) — that is 2:1
+closure forcing a parent tile for everything refined below. The old flat 512
+(card) / 128 (cylinder) for every level >= 2 is exactly why `?levels=4`
+refused, and is CLAUDE.md's own recorded "level 3 at 128/128 with 20 coverage
+violations" on the cylinder page. Levels beyond the table are extrapolated and
+say so; the refusal watch remains the thing that reports a wrong guess.
+
 **The body lives in BUFFER coordinates** (plans/2D-backport.md B5, completed
 2026-09-15). `cx`/`cy` are buffer positions, integrated and wrapped into
 [0, W) x [0, H) every step; a kernel that has a buffer cell already has the

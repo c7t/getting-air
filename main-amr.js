@@ -23,6 +23,7 @@ import {
 } from './card-params.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
 import { check21BalanceOnGPU, allocLevelPool, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState, checkGeometryCoverageOnGPU, makeRefusalWatch , checkRefinementClosureOnGPU , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU } from './amr2d-gpu.mjs';
+import { poolSlotsFor } from './amr2d.mjs';
 import { EX, EY, WT } from './lattice-2d.mjs';
 import { makeCanvasFit } from './canvas-fit.mjs';
 
@@ -155,7 +156,6 @@ const NCELLS1 = FB * FB; // cells per pool slot
 // measured (B2-2c: corner 2:1 violations 13 -> 0, level 2's x-extent 80 -> 160
 // L0 units on this page); B2-2d deleted it.
 
-const MAX_FINE_BLOCKS = urlParams.has('maxFineBlocks') ? parseInt(urlParams.get('maxFineBlocks')) : 384;
 const NBX = W / BLOCK, NBY = H / BLOCK, NBLOCKS = NBX * NBY; // coarse block grid
 
 // ── Milestone 5 (plans/AMR-multilevel.md, plans/AMR-multilevel-M5.md):
@@ -167,6 +167,40 @@ const N_LEVELS = urlParams.has('levels') ? parseInt(urlParams.get('levels')) : A
 // refuseConfig, not throw: this runs at module scope, where
 // init().catch(handleErr) can never see it -- see error-overlay.mjs.
 if (N_LEVELS < 2) refuseConfig(statusEl, `?levels=${N_LEVELS} invalid -- must be >= 2 (L0 + at least one fine level)`);
+
+// ── POOL CAPACITY PER LEVEL, MEASURED (2026-09-15) ───────────────────────────
+// Max live tiles over 40000 steps with every cap lifted, on this page's
+// default card and regime:
+//
+//                 levels=3   levels=4   levels=5      role at that depth
+//   level 1         231        213        261         parent (always)
+//   level 2         400        492        516         finest at 3, parent at 4/5
+//   level 3          --        656        628         finest at 4, parent at 5
+//   level 4          --         --        904         finest at 5
+//
+// Demand is set by the level INDEX far more than by total depth, and it STEPS
+// UP when a level acquires a child (level 2: 400 as the finest level, ~500
+// once level 3 exists) -- that is 2:1 closure forcing a parent tile for
+// everything refined below. Hence the two regimes; see amr2d.mjs's
+// poolSlotsFor for the headroom convention.
+//
+// At 1.7x headroom this gives, per level:
+//   levels=3 (shipped):  L1 444, L2 680           (was 384, 512)
+//   levels=4:            L1 444, L2 878, L3 1116  (was 384, 512, 512)
+//   levels=5:            L1 444, L2 878, L3 1068, L4 1537
+//
+// THE OLD FLAT 512 FOR EVERY LEVEL >= 2 IS WHY ?levels=4 REFUSED: level 3
+// wants 656 and was given 512. Raising ?maxFineBlocks= could not fix it --
+// that parameter sizes level 1 only, which is also what the refusal message
+// used to recommend (fixed alongside this).
+const POOL_PEAKS = {
+  finest: { 2: 400, 3: 656, 4: 904 },
+  parent: { 1: 261, 2: 516, 3: 628 },
+};
+
+const MAX_FINE_BLOCKS = urlParams.has('maxFineBlocks')
+  ? parseInt(urlParams.get('maxFineBlocks'))
+  : poolSlotsFor(POOL_PEAKS, 1, N_LEVELS);
 
 // ── Milestone 4b (plans/AMR.md): automatic vorticity-driven refinement ────
 // Simplified AGAL Algorithm 3 for our 2-level case (see amr_criterion.wgsl/
@@ -876,24 +910,14 @@ async function init() {
   {
     let curNBX = NBX, curNBY = NBY; // level 1's logical grid = today's coarse block grid
     for (let m = 1; m < N_LEVELS; m++) {
+      // ?maxFineBlocks= sizes LEVEL 1; each deeper level takes its own
+      // ?maxFineBlocks<m>=. Defaults come from POOL_PEAKS via poolSlotsFor --
+      // measured per level, not one flat number for all of them.
       const maxFineBlocks = m === 1
-        ? MAX_FINE_BLOCKS // unchanged param/default -- level 1 is byte-identical to today
-        // 512, not 256. The old 256 was sized when the level-2 vorticity
-        // criterion was silently dead (blockCriterionBuf all zeros -- see the
-        // parentVel BUGFIX below), so level 2 was purely the geometry halo and
-        // its demand was correspondingly small. With the criterion actually
-        // driving it, measured demand over 40k steps with the caps lifted is
-        // min 100 / median 176 / MAX 304, so 256 would sit below the peak --
-        // and exhaustion is not graceful: slots are granted in blockID order,
-        // so the free list dries up part-way through a row and the denied
-        // blocks form horizontal BANDS across the refined region. 512 is ~1.7x
-        // the measured peak, matching the headroom MAX_FINE_BLOCKS above uses,
-        // and costs ~16.4 MiB of level-2 pool buffers against ~8.2 MiB before.
-        // Level 1 needs no change: its demand over the same run is min 50 /
-        // median 114 / max 172 against a 384 cap. The cylinder harness needs
-        // none either -- its own L2 sits flat at 68 against a 128 cap, since a
-        // pinned body at Re=100 has a far smaller wake than a tumbling card.
-        : (urlParams.has(`maxFineBlocks${m}`) ? parseInt(urlParams.get(`maxFineBlocks${m}`)) : 512);
+        ? MAX_FINE_BLOCKS
+        : (urlParams.has(`maxFineBlocks${m}`)
+            ? parseInt(urlParams.get(`maxFineBlocks${m}`))
+            : poolSlotsFor(POOL_PEAKS, m, N_LEVELS));
       const pool = allocLevelPool(device, U, m, curNBX, curNBY, maxFineBlocks, NCELLS1);
       writeF(pool.finePoolF_a, initFPool(maxFineBlocks), maxFineBlocks * NCELLS1);
       pools.push(pool);

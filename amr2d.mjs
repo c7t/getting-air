@@ -325,6 +325,65 @@ export function bodyFrameL0Legacy(px, py, _state) {
   return [Math.trunc(px), Math.trunc(py)];
 }
 
+// ── POOL CAPACITY, FROM MEASURED DEMAND ──────────────────────────────────────
+//
+// A pool at its cap does not degrade gracefully: slots are granted in blockID
+// order, so the free list dries up part-way through a row and the denied
+// blocks form horizontal BANDS across the refined region. Worse, when the
+// denied blocks are GEOMETRY-forced the body ends up split across levels and
+// only the finest computes force, so the run's force is simply wrong -- which
+// is what makeRefusalWatch exists to catch.
+//
+// So capacity is measured, not guessed: run with every cap lifted, record the
+// max live tile count per level, and give it headroom. Both pages had a FLAT
+// default for every level below the first (512 on the card page, 128 on the
+// cylinder), and demand is nowhere near flat -- it roughly doubles with each
+// level and jumps again when a level acquires a child.
+//
+// TWO REGIMES, because a level's job changes when it gains a CHILD. As the
+// finest level it hosts its own geometry halo and wake. Once a finer level
+// exists beneath it, 2:1 closure additionally forces a parent tile for
+// everything refined below, and the demand steps up -- measured, not
+// reasoned: the card page's level 2 peaks at 400 as the finest level and
+// 492-516 once level 3 exists; the cylinder's goes 96 -> 160, and that body
+// is PINNED, so its numbers carry almost no run-to-run scatter.
+//
+// `peaks` is { finest: {m: peak}, parent: {m: peak} }, per page, in that
+// page's own units -- a tumbling card and a pinned cylinder do not have
+// comparable demand and must not share a table.
+export const POOL_HEADROOM = 1.7;
+
+// Unmeasured levels: extrapolate by this per level and SAY SO. The measured
+// ladder grows 261 -> 516 -> 656 -> 904 (ratios 1.98, 1.27, 1.38), so this is
+// an upper-ish estimate rather than a fit. It is a starting point for a level
+// nobody has run; the refusal watch is still the thing that says it was wrong.
+export const POOL_GROWTH = 1.7;
+
+// A POOL'S CAPACITY MUST BE A MULTIPLE OF 4. Slots are allocated a QUAD at a
+// time -- one per child quadrant -- so allocLevelPool refuses anything else,
+// loudly, at init. Applying the headroom multiplier without rounding produced
+// 878 and the page would not boot; that refusal is the reason this is a
+// rounding rule here rather than a comment somewhere. Round UP: rounding down
+// could put the pool below the measured peak it was derived from, which is the
+// exact failure this table exists to prevent.
+const quad = (n) => Math.ceil(n / 4) * 4;
+
+export function poolSlotsFor(peaks, m, nLevels) {
+  const isFinest = (m === nLevels - 1);
+  const table = isFinest ? peaks.finest : peaks.parent;
+  const direct = table[m];
+  if (direct !== undefined) return quad(direct * POOL_HEADROOM);
+  // Fall back to the other regime at the same level before extrapolating --
+  // a measured number from the wrong regime beats a guess at the right one.
+  const other = (isFinest ? peaks.parent : peaks.finest)[m];
+  if (other !== undefined) return quad(other * POOL_HEADROOM);
+  // Beyond anything measured: extrapolate from the deepest level that was.
+  const known = Object.keys(peaks.finest).concat(Object.keys(peaks.parent)).map(Number);
+  const deepest = Math.max(...known);
+  const base = Math.max(peaks.finest[deepest] ?? 0, peaks.parent[deepest] ?? 0);
+  return quad(base * POOL_HEADROOM * Math.pow(POOL_GROWTH, m - deepest));
+}
+
 // DOES ANY POINT OF THIS BLOCK COME WITHIN `margin` OF THE BODY?
 //
 // THE TWO PREDICATES BELOW ANSWER DIFFERENT QUESTIONS, AND THE DIFFERENCE IS

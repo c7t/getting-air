@@ -637,10 +637,21 @@ export function makeRefusalWatch({ device, pools, nLevels, checkCoverage, minInt
         const cov = await checkCoverage();
         if (cov.ok) return;   // saturated but still covered -- a budget, not a breach
         const v = cov.violations[0];
+        // NAME THE KNOB THAT ACTUALLY REACHES THE SATURATED LEVEL. This said
+        // "Raise ?maxFineBlocks=" for every level, and that parameter sizes
+        // LEVEL 1 ONLY -- levels >= 2 read ?maxFineBlocks<m>= (main-amr.js and
+        // main-cylinder-amr.js both route it that way). So the one piece of
+        // advice a user gets on a level-3 exhaustion sent them to a no-op, and
+        // raising it looked like the refusal was spurious rather than the knob
+        // being wrong. Live-verified 2026-09-15 on
+        // index-amr.html?levels=4: ?maxFineBlocks=4096 still refuses at level
+        // 3, while ?maxFineBlocks3=4096 runs clean past 84k steps.
+        const knobs = saturated.map(m => (m === 1 ? '?maxFineBlocks=' : `?maxFineBlocks${m}=`)).join(' / ');
         watch.error = `geometry-forced refinement REFUSED: level ${saturated.join(',')} pool exhausted `
           + `and ${cov.violations.length} leaf tile(s) within the body's margin have no children `
           + `(first: level ${v.level} block ${v.bx},${v.by}). The body is split across levels and only the `
-          + `finest computes force, so this run's force is wrong. Raise ?maxFineBlocks= or lower ?levels=.`;
+          + `finest computes force, so this run's force is wrong. Raise ${knobs} (that level's own cap -- `
+          + `?maxFineBlocks= sizes level 1 only) or lower ?levels=.`;
       } catch (e) {
         // A readback failure is not evidence of a refusal; say so rather than
         // latching on it, and never take the page down for the watchdog.
