@@ -716,7 +716,10 @@ has**. Give level 1 an `originX/originY` pair at allocation and
 4. `force1` — same, and it shrinks again under B4. **DONE — see B3-4 below.
    It collapsed to ONE kernel like step1, not to a kernel-plus-accessor like
    average/interp, and it leaves `originX`/`originY` with no reader.**
-5. `criterion` — smallest, do it for uniformity.
+5. `criterion` — smallest, do it for uniformity. **DONE, and the answer was
+   NO — see B3-6 below. These two do not differ in a parent accessor, they
+   differ in the dispatch mapping, and ~12 of 146 lines overlap. The stencil
+   and the reduction are shared; the kernels stay two.**
 6. `manage` — **last**, and only after B2 has already deleted the per-pass
    balance tests. Unifying 364+492 lines of two different balance
    implementations is not a refactor, it is a rewrite; B2 makes it a refactor.
@@ -997,6 +1000,57 @@ analytic PASS, and Cd/St to the digit:
 Invariants PASS on all seven gates at every checkpoint, and the starved-pool
 discrimination still holds (`--extra=maxFineBlocks=16`: five go red, `field`
 and `quadrants` do not).
+
+### B3-6 — DONE (2026-09-14). Criterion does NOT fit the shape, and that is the finding.
+
+The plan said "smallest, do it for uniformity". Doing it measured why it is
+not the same job as the other four, and the pair stays two files.
+
+**They do not differ in a parent ACCESSOR. They differ in the DISPATCH
+MAPPING.**
+
+    amr_criterion.wgsl       one workgroup per L0 block -> ONE child criterion
+    amr_criterion_pool.wgsl  one workgroup per QUADRANT of a parent tile's
+                             2*RB x 2*RB interior -> FOUR per parent slot
+
+B3-1..B3-4 each collapsed a pair that was the same kernel over a
+differently-addressed parent; an accessor is exactly the right tool for that.
+Here the loop nest itself is different, and the reason is not storage: level 1
+is footprint-preserving 1:1 with L0 (plans/AMR-multilevel.md decision 1), so
+its parent block IS its own block, while every deeper level takes a quadrant.
+Forcing a shared kernel would mean parameterizing the dispatch shape, which
+buys indirection and removes nothing. **63 + 83 lines, of which ~12 overlap** --
+the worst ratio of the six, and the one place where "unify for uniformity"
+would have made the code worse.
+
+**What IS shared is now shared**, in `shaders/common_criterion.wgsl`:
+
+- `discreteCurl(...)`, the vorticity stencil, which was written out twice
+  (three times counting amr_render.wgsl, which legitimately keeps its own
+  per-level normalized variants and is left alone).
+- `wgReduceMax1(lid)`, the 64-lane tree max. **Both criterion kernels were
+  still running the exact linear form `common_reduce.wgsl`'s header exists to
+  argue against** -- 64 sequential dependent ops in lane 0 while 63 lanes
+  idle, the pattern an on-device profile flagged at 18.6% of the macro-step
+  per force pass. They were missed when the force kernels were converted.
+  *The fix went where the profile pointed and not to every instance of the
+  pattern* -- worth a grep next time a shape like that is fixed.
+
+**AND THE FRAGMENT COULD NOT LIVE IN `common_reduce.wgsl`**, which is where it
+obviously belongs. That file's `wgReduceSum3` reads includer-declared
+`wg_fx`/`wg_fy`/`wg_tz`; adding a reduction that reads `wg_omega` would make
+the fragment compile only in a file declaring all four. Measured, not guessed
+-- the first attempt did that and `make wgsl` refused it with `no definition
+in scope for identifier: wg_fx`. **A fragment that reads includer-declared
+globals must be split along the same lines as those globals**, which is a real
+constraint on this project's whole `common_*.wgsl` convention and was not
+written down anywhere before.
+
+**Measured inert.** The tree max is bit-identical BY CONSTRUCTION (max is
+associative and exact on floats, unlike the sum `common_reduce.wgsl` had to
+re-validate), and it reads that way: bit-IDENTICAL at `?levels=3`, boot smoke
+PASS on all five AMR pages, invariants PASS on all seven gates, analytic
+channel/TGV PASS, Cd/St unchanged.
 
 ### B3a — the same sweep, in JS
 
@@ -1769,7 +1823,10 @@ B3-3 interp: kernel + two parent fragments        ◄── DONE, bit-identical
 B3-4 force1: one kernel, every level              ◄── DONE, bit-identical
 B3-5 retire originX/originY + the 8th gate         ◄── DONE; manage_pool
                                                         14 -> 10 bindings
-B3   the rest (criterion, manage LAST)             ◄── needs B2 and B3a
+B3-6 criterion: shared stencil + reduction only   ◄── DONE; NOT unified,
+                                                        and that is measured
+B3-7 manage                                        ◄── LAST. B2 made it a
+                                                        refactor; see risk 2
 B5   window = sponge translation                    ◄── independent of B2/B3,
                                                         but smaller after B3
 B1   post-collision rescale                         ◄── needs B0b only; its

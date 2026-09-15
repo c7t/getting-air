@@ -31,6 +31,8 @@
 // consultation or coarse interpolation), unlike the dense L0 criterion
 // which must wrap around the WHOLE domain itself.
 
+// @include "common_criterion.wgsl"
+
 @group(0) @binding(0) var<storage, read>       vel            : array<f32>; // parent level's finePoolVel
 @group(0) @binding(1) var<storage, read>       slotToBlock    : array<i32>; // parent level's own
 @group(0) @binding(2) var<storage, read_write> childCriterion : array<f32>; // child level's blockCriterion
@@ -43,6 +45,7 @@ fn velAt(slot: u32, fx: u32, fy: u32, FB: u32, comp: u32) -> f32 {
   return vel[(slot * (FB * FB) + fy * FB + fx) * 2u + comp];
 }
 
+// Read by common_criterion.wgsl's wgReduceMax1 -- see its own comment.
 var<workgroup> wg_omega : array<f32, 64>;
 
 @compute @workgroup_size(8, 8)
@@ -61,19 +64,19 @@ fn main(
   var omega = 0f;
   if (blockID >= 0) {
     let fx = lx + GHOST; let fy = ly + GHOST;
-    // Discrete vorticity: du_y/dx - du_x/dy, same formula as
-    // amr_criterion.wgsl/amr_render.wgsl -- ghost border guarantees fx+-1
-    // in range (see header).
-    omega = (velAt(slot, fx + 1u, fy, FB, 1u) - velAt(slot, fx - 1u, fy, FB, 1u)) * 0.5f
-          - (velAt(slot, fx, fy + 1u, FB, 0u) - velAt(slot, fx, fy - 1u, FB, 0u)) * 0.5f;
+    // The ghost border guarantees fx+-1 is in range (see header), which is
+    // the whole difference from the dense kernel's periodic wrap.
+    omega = discreteCurl(velAt(slot, fx + 1u, fy, FB, 1u), velAt(slot, fx - 1u, fy, FB, 1u),
+                         velAt(slot, fx, fy + 1u, FB, 0u), velAt(slot, fx, fy - 1u, FB, 0u));
   }
 
   wg_omega[lid] = abs(omega);
   workgroupBarrier();
+  // Unconditional: every invocation must reach the barriers inside.
+  wgReduceMax1(lid);
 
   if (lid == 0u && blockID >= 0) {
-    var m = 0f;
-    for (var i = 0u; i < 64u; i++) { m = max(m, wg_omega[i]); }
+    let m = wg_omega[0];
     let bx = u32(blockID) % NBX_PARENT;
     let by = u32(blockID) / NBX_PARENT;
     let nbxChild = NBX_PARENT * 2u;

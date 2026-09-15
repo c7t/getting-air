@@ -15,6 +15,16 @@
 // that ladder collapses to a single number -- this shader just outputs
 // max|omega| per block; amr_manage.wgsl does the (now-trivial) threshold
 // comparison.
+//
+// NOT UNIFIED WITH amr_criterion_pool.wgsl, and plans/2D-backport.md B3-6
+// records why: unlike the other four pairs B3 collapsed, these two do not
+// differ in a parent ACCESSOR, they differ in the DISPATCH MAPPING. This one
+// is one workgroup per L0 block producing ONE child criterion (level 1 is
+// footprint-preserving 1:1 with L0 -- decision 1); the pool one is one
+// workgroup per QUADRANT of a parent tile, producing FOUR. The shared part is
+// the stencil and the reduction, and both are now in common_criterion.wgsl.
+
+// @include "common_criterion.wgsl"
 
 @group(0) @binding(0) var<storage, read>       vel             : array<f32>;
 @group(0) @binding(1) var<storage, read_write> blockCriterion  : array<f32>;
@@ -34,6 +44,7 @@ fn cellIndex(cx: u32, cy: u32) -> u32 {
 fn get_ux(cx: u32, cy: u32) -> f32 { return vel[cellIndex(cx % W, cy % H) * 2u]; }
 fn get_uy(cx: u32, cy: u32) -> f32 { return vel[cellIndex(cx % W, cy % H) * 2u + 1u]; }
 
+// Read by common_criterion.wgsl's wgReduceMax1 -- see its own comment.
 var<workgroup> wg_omega : array<f32, 64>;
 
 @compute @workgroup_size(8, 8)
@@ -46,16 +57,15 @@ fn main(
   let xp1 = (cx + 1u) % W; let xm1 = (cx + W - 1u) % W;
   let yp1 = (cy + 1u) % H; let ym1 = (cy + H - 1u) % H;
 
-  // Discrete vorticity: du_y/dx - du_x/dy (same formula as amr_render.wgsl).
-  let omega = (get_uy(xp1, cy) - get_uy(xm1, cy)) * 0.5f
-            - (get_ux(cx, yp1) - get_ux(cx, ym1)) * 0.5f;
+  let omega = discreteCurl(get_uy(xp1, cy), get_uy(xm1, cy),
+                           get_ux(cx, yp1), get_ux(cx, ym1));
 
   wg_omega[lid] = abs(omega);
   workgroupBarrier();
+  wgReduceMax1(lid);
 
   if (lid == 0u) {
-    var m = 0f;
-    for (var i = 0u; i < 64u; i++) { m = max(m, wg_omega[i]); }
+    let m = wg_omega[0];
     let nbx = W / BLOCK;
     let blockID = wgid.y * nbx + wgid.x;
     blockCriterion[blockID] = m;
