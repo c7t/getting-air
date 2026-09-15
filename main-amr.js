@@ -22,7 +22,7 @@ import {
   tauAtLevel as tauAtLevelOf,
 } from './card-params.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
-import { check21BalanceOnGPU, allocLevelPool, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState, checkGeometryCoverageOnGPU, makeRefusalWatch , checkRefinementClosureOnGPU , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU, checkTileOriginsOnGPU } from './amr2d-gpu.mjs';
+import { check21BalanceOnGPU, allocLevelPool, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState, checkGeometryCoverageOnGPU, makeRefusalWatch , checkRefinementClosureOnGPU , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU } from './amr2d-gpu.mjs';
 import { EX, EY, WT } from './lattice-2d.mjs';
 import { makeCanvasFit } from './canvas-fit.mjs';
 
@@ -1177,13 +1177,12 @@ async function init() {
     // binding 8 was childQuadrant (it held `slot % 4`); B2 is what that
     // recovery was for -- this is the child level's WANT array.
     { binding: 8, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-    { binding: 9,  visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-    { binding: 10, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    // bindings 9/10 were childOriginX/Y and 13/14 parentOriginX/Y. All four
+    // gone (B3-5): the origin is `block * RB * 2^-(m-1)` in closed form, so
+    // the kernel derives it -- see amr_manage_pool.wgsl's parentOriginL0.
     // binding 11 was parentBlockSlot, for the neighbour-active veto.
     // Gone with it (B2-2d).
     { binding: 12, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    { binding: 13, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    { binding: 14, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     // binding 15 was grandchildBlockSlot, for hasGrandchild.
     // Gone with it (B2-2d).
   ]});
@@ -1463,7 +1462,6 @@ async function init() {
       W, H, RB, SDF_FAR,
       NBX_PARENT: parentPool.NBX, NBY_PARENT: parentPool.NBY,
       PARENT_CELL_SIZE_L0: cellSizeL0AtLevel(m),
-      PARENT_HAS_CACHED_ORIGIN: parentIsDense ? 0 : 1,
       SPONGE_EXCLUDE_W,
       ...childParams,
       N_REFINE_INC, N_REFINE_MAX, MAX_LEVEL: N_LEVELS - 1,
@@ -1610,8 +1608,6 @@ async function init() {
     // and the lumpiness induced on the shed vortices.
     const parentVel = parentPool.finePoolVel;
     const parentSlotToBlockBuf = m === 1 ? pools[1].slotToBlockBuf : parentPool.slotToBlockBuf;
-    const parentOriginXBuf = m === 1 ? dummyBlockSlotBuf : parentPool.originXBuf; // dummy: level-1 parent has no cached origin (PARENT_HAS_CACHED_ORIGIN=0 gates it out)
-    const parentOriginYBuf = m === 1 ? dummyBlockSlotBuf : parentPool.originYBuf;
     // Grandchild (level m+2) blockSlot for the 2:1-balance cascade -- dummy
     // when there's no such level (HAS_GRANDCHILD=0 gates it out of ever
     // being read, matching every other dummy-buffer fallback in this file).
@@ -1632,11 +1628,7 @@ async function init() {
       { binding: 6, resource: { buffer: cardStateBuf } },
       { binding: 7, resource: { buffer: childPool.parentSlotBuf } },
       { binding: 8, resource: { buffer: childPool.wantBuf } },
-      { binding: 9, resource: { buffer: childPool.originXBuf } },
-      { binding: 10, resource: { buffer: childPool.originYBuf } },
       { binding: 12, resource: { buffer: parentSlotToBlockBuf } },
-      { binding: 13, resource: { buffer: parentOriginXBuf } },
-      { binding: 14, resource: { buffer: parentOriginYBuf } },
     ]});
   }
 
@@ -1862,8 +1854,6 @@ async function init() {
         slotToBlock: device.createBuffer({ size: pool.MAX_FINE_BLOCKS * 4, usage: U.MAP_READ | U.COPY_DST }),
         parentSlot: device.createBuffer({ size: pool.MAX_FINE_BLOCKS * 4, usage: U.MAP_READ | U.COPY_DST }),
         quadrant: device.createBuffer({ size: pool.MAX_FINE_BLOCKS * 4, usage: U.MAP_READ | U.COPY_DST }),
-        originX: device.createBuffer({ size: pool.MAX_FINE_BLOCKS * 4, usage: U.MAP_READ | U.COPY_DST }),
-        originY: device.createBuffer({ size: pool.MAX_FINE_BLOCKS * 4, usage: U.MAP_READ | U.COPY_DST }),
       };
       enc.copyBufferToBuffer(pool.finePoolF_a, 0, st.f, 0, pool.fSizePool);
       enc.copyBufferToBuffer(pool.finePoolVel, 0, st.vel, 0, pool.MAX_FINE_BLOCKS * NCELLS1 * 2 * 4);
@@ -1871,14 +1861,12 @@ async function init() {
       enc.copyBufferToBuffer(pool.slotToBlockBuf, 0, st.slotToBlock, 0, pool.MAX_FINE_BLOCKS * 4);
       enc.copyBufferToBuffer(pool.parentSlotBuf, 0, st.parentSlot, 0, pool.MAX_FINE_BLOCKS * 4);
       enc.copyBufferToBuffer(pool.quadrantBuf, 0, st.quadrant, 0, pool.MAX_FINE_BLOCKS * 4);
-      enc.copyBufferToBuffer(pool.originXBuf, 0, st.originX, 0, pool.MAX_FINE_BLOCKS * 4);
-      enc.copyBufferToBuffer(pool.originYBuf, 0, st.originY, 0, pool.MAX_FINE_BLOCKS * 4);
       levelStaging.push(st);
     }
 
     device.queue.submit([enc.finish()]);
     const allBuffers = [stagingF, stagingVel, stagingCard, stagingFPool, stagingVelPool, stagingBlockSlot, stagingSlotToBlock];
-    for (const st of levelStaging) allBuffers.push(st.f, st.vel, st.blockSlot, st.slotToBlock, st.parentSlot, st.quadrant, st.originX, st.originY);
+    for (const st of levelStaging) allBuffers.push(st.f, st.vel, st.blockSlot, st.slotToBlock, st.parentSlot, st.quadrant);
     await Promise.all(allBuffers.map(b => b.mapAsync(GPUMapMode.READ)));
 
     const f = readF(stagingF.getMappedRange(), NCELLS);
@@ -1915,13 +1903,11 @@ async function init() {
       const slotToBlockArr_m = Array.from(new Int32Array(st.slotToBlock.getMappedRange()).slice());
       const parentSlotArr = Array.from(new Int32Array(st.parentSlot.getMappedRange()).slice());
       const quadrantArr = Array.from(new Uint32Array(st.quadrant.getMappedRange()).slice());
-      const originXArr = Array.from(new Float32Array(st.originX.getMappedRange()).slice());
-      const originYArr = Array.from(new Float32Array(st.originY.getMappedRange()).slice());
-      for (const b of [st.f, st.vel, st.blockSlot, st.slotToBlock, st.parentSlot, st.quadrant, st.originX, st.originY]) { b.unmap(); b.destroy(); }
+      for (const b of [st.f, st.vel, st.blockSlot, st.slotToBlock, st.parentSlot, st.quadrant]) { b.unmap(); b.destroy(); }
       poolsOut.push({
         level: m, RB, GHOST, FB, MAX_FINE_BLOCKS: pool.MAX_FINE_BLOCKS, NBLOCKS: pool.NBLOCKS, NBX: pool.NBX, NBY: pool.NBY,
         blockSlot: blockSlotArr_m, slotToBlock: slotToBlockArr_m,
-        parentSlot: parentSlotArr, quadrant: quadrantArr, originX: originXArr, originY: originYArr,
+        parentSlot: parentSlotArr, quadrant: quadrantArr,
         fB64: bytesToB64(new Uint8Array(fPool_m.buffer, fPool_m.byteOffset, fPool_m.byteLength)),
         velB64: bytesToB64(new Uint8Array(velPool_m.buffer, velPool_m.byteOffset, velPool_m.byteLength)),
       });
@@ -2019,14 +2005,10 @@ async function init() {
       } else {
         device.queue.writeBuffer(pool.parentSlotBuf, 0, new Int32Array(snapPool.parentSlot));
         device.queue.writeBuffer(pool.quadrantBuf, 0, new Uint32Array(snapPool.quadrant));
-        device.queue.writeBuffer(pool.originXBuf, 0, new Float32Array(snapPool.originX));
-        device.queue.writeBuffer(pool.originYBuf, 0, new Float32Array(snapPool.originY));
 
         const qc = quadCPU[m];
         qc.blockSlotCPU.set(snapPool.blockSlot);
         qc.slotToBlockCPU.set(snapPool.slotToBlock);
-        qc.originXCPU.set(snapPool.originX);
-        qc.originYCPU.set(snapPool.originY);
         // Same free-list-is-redundant-with-slotToBlock reasoning as level 1
         // above, at quad granularity: quadrant 0's own slot stands for the
         // whole quad (decision 3's all-or-nothing invariant).
@@ -2425,21 +2407,7 @@ async function init() {
       blockSlotCPU: new Int32Array(pools[c].NBLOCKS).fill(-1),
       slotToBlockCPU: new Int32Array(pools[c].MAX_FINE_BLOCKS).fill(-1),
       freeQuads: Array.from({ length: pools[c].MAX_FINE_BLOCKS / 4 }, (_, i) => i),
-      // Milestone 7: CPU-side mirror of each active slot's own cached L0-
-      // buffer-space origin (see allocLevelPool's originXBuf/originYBuf
-      // comment) -- written once at activation, alongside blockSlotCPU.
-      originXCPU: new Float32Array(pools[c].MAX_FINE_BLOCKS),
-      originYCPU: new Float32Array(pools[c].MAX_FINE_BLOCKS),
     };
-  }
-  // This tile's own L0-buffer-space origin -- level 1 derives it cheaply
-  // from its own (bx,by) (bx*RB, matching amr_step1.wgsl's unchanged
-  // derivation exactly); level >=2 reads the cached mirror above (see
-  // shaders/amr_step1.wgsl's header on why level>=2 can't derive this
-  // as cheaply). `bx,by` are only consulted for level===1.
-  function tileOriginL0(level, slot, bx, by) {
-    if (level === 1) return { x: bx * RB, y: by * RB };
-    return { x: quadCPU[level].originXCPU[slot], y: quadCPU[level].originYCPU[slot] };
   }
   // This level's own blockSlotCPU mirror, whichever structure holds it --
   // level 1 uses the bare `blockSlotCPU` above, levels >=2 use quadCPU[c].
@@ -2583,13 +2551,6 @@ async function init() {
     const quadIdx = qc.freeQuads.pop();
     const baseSlot = quadIdx * 4;
 
-    // Milestone 7: this quad's own L0-buffer-space origin, composed from
-    // the PARENT's own cached (or, at level 1, cheaply-derived) origin --
-    // see tileOriginL0/cellSizeL0AtLevel and shaders/amr_step1.wgsl's
-    // header for why this can't be re-derived per-dispatch the way ownBX/
-    // ownBY could.
-    const parentOrigin = tileOriginL0(level - 1, parentSlotVal, parentBX, parentBY);
-    const parentCellSizeL0 = cellSizeL0AtLevel(level - 1);
 
     const slotsWritten = [];
     for (let qy = 0; qy <= 1; qy++) {
@@ -2598,24 +2559,12 @@ async function init() {
         const slot = baseSlot + quadrant;
         const childBX = parentBX * 2 + qx, childBY = parentBY * 2 + qy;
         const childBlockID = childBY * pool.NBX + childBX;
-        // BUGFIX (Milestone 10): see shaders/amr_manage_pool.wgsl's refine()
-        // for the derivation -- a quadrant step is HALF the parent's own
-        // block width, not the whole thing. Omitting *0.5 here (this file's
-        // own mirror of the same formula) mis-registered every MANUALLY
-        // activated level>=2 tile's physical origin the identical way the
-        // GPU-side auto-refine path did.
-        const originX_L0 = parentOrigin.x + qx * RB * parentCellSizeL0 * 0.5;
-        const originY_L0 = parentOrigin.y + qy * RB * parentCellSizeL0 * 0.5;
         qc.blockSlotCPU[childBlockID] = slot;
         qc.slotToBlockCPU[slot] = childBlockID;
-        qc.originXCPU[slot] = originX_L0;
-        qc.originYCPU[slot] = originY_L0;
         device.queue.writeBuffer(pool.blockSlotBuf, childBlockID * 4, new Int32Array([slot]));
         device.queue.writeBuffer(pool.slotToBlockBuf, slot * 4, new Int32Array([childBlockID]));
         device.queue.writeBuffer(pool.parentSlotBuf, slot * 4, new Int32Array([parentSlotVal]));
         device.queue.writeBuffer(pool.quadrantBuf, slot * 4, new Uint32Array([quadrant]));
-        device.queue.writeBuffer(pool.originXBuf, slot * 4, new Float32Array([originX_L0]));
-        device.queue.writeBuffer(pool.originYBuf, slot * 4, new Float32Array([originY_L0]));
         device.queue.writeBuffer(pool.newlyActivatedBuf, slot * 4, new Uint32Array([1]));
         slotsWritten.push(slot);
       }
@@ -2856,7 +2805,6 @@ async function init() {
   // quadrantOfSlot. This scores the stored buffer against that rule over
   // live ACTIVE slots, which is what lets the pool manager stop writing it.
   const debugCheckSlotQuadrants = () => checkSlotQuadrantsOnGPU(device, pools, N_LEVELS);
-  const debugCheckTileOrigins = () => checkTileOriginsOnGPU(device, pools, N_LEVELS, RB);
 
   // THE GPU CASCADE, SCORED AGAINST THE HOST TWIN (plans/2D-backport.md B2-2).
   //
@@ -3427,7 +3375,6 @@ async function init() {
     debugCheck21Balance,
     debugCheckRefinementClosure,
     debugCheckSlotQuadrants,
-    debugCheckTileOrigins,
     debugCascadeRoundTrip,
     debugCheckGeometryCoverage,
     debugReadCardState,

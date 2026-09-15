@@ -520,7 +520,7 @@ async function runInvariants(Runtime, opts, global) {
     global,
     // cov/bad come back null (not empty) on a page that exposes no
     // geometry-coverage scan or card-state readback -- print n/a, never OK.
-    onCheckpoint: (stepsDone, { diag, bal, cov, closure, quad, origins, bad }) => {
+    onCheckpoint: (stepsDone, { diag, bal, cov, closure, quad, bad }) => {
       const corner = bal.cornerOk === undefined ? ''
         : `, corner ${bal.cornerOk ? 'OK' : `${bal.cornerViolations.length}`}`;
       // `n/a` is printed, never nothing: an invariant that silently is not
@@ -531,8 +531,7 @@ async function runInvariants(Runtime, opts, global) {
         `coverage ${cov === null ? 'n/a' : cov.ok ? 'OK' : `FAIL (${cov.violations.length})`}, ` +
         `field ${bad === null ? 'n/a' : bad.length ? `FAIL (${bad.join(',')})` : 'OK'}${conv}` +
         `${closure === null ? '' : `, closure ${closure.ok ? 'OK' : `${closure.missing} missing`}`}` +
-        `${quad === null ? '' : `, quadrants ${quad.ok ? 'OK' : `FAIL (${quad.violations.length})`}`}` +
-        `${origins === null ? '' : `, origins ${origins.ok ? 'OK' : `FAIL (${origins.violations.length})`}`}`);
+        `${quad === null ? '' : `, quadrants ${quad.ok ? 'OK' : `FAIL (${quad.violations.length})`}`}`);
     },
   });
 }
@@ -687,7 +686,6 @@ async function main() {
       if (invariants.coverageViolations.length) console.log(`    geometry-coverage FAIL @ step ${invariants.coverageViolations[0].step}: ${JSON.stringify(invariants.coverageViolations[0].violations.slice(0, 4))}`);
       if (invariants.closureViolations.length) console.log(`    2:1-closure FAIL @ step ${invariants.closureViolations[0].step}: ${invariants.closureViolations[0].missing} block(s) the rule requires are absent, ${JSON.stringify(invariants.closureViolations[0].byReason)}`);
       if (invariants.quadrantViolations.length) console.log(`    slot-quadrant rule FAIL @ step ${invariants.quadrantViolations[0].step}: ${JSON.stringify(invariants.quadrantViolations[0].violations.slice(0, 4))}`);
-      if (invariants.originViolations.length) console.log(`    tile-origin rule FAIL @ step ${invariants.originViolations[0].step}: ${JSON.stringify(invariants.originViolations[0].violations.slice(0, 4))}`);
       if (invariants.fieldViolations.length) console.log(`    field blowup @ step ${invariants.fieldViolations[0].step}: ${JSON.stringify(invariants.fieldViolations[0])}`);
     }
   }

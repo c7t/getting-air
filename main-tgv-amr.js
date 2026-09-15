@@ -61,7 +61,7 @@
 import { reportFatal, refuseConfig, reportNoWebGPU, reportNoAdapter } from './error-overlay.mjs';
 import { loadShader } from './shader-loader.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
-import { check21BalanceOnGPU, readConservedTotals, allocLevelPool, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState , checkRefinementClosureOnGPU , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU, checkTileOriginsOnGPU } from './amr2d-gpu.mjs';
+import { check21BalanceOnGPU, readConservedTotals, allocLevelPool, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState , checkRefinementClosureOnGPU , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU } from './amr2d-gpu.mjs';
 // tauAtLevel: extracted to card-params.mjs by B3a-1, which landed the CALL
 // in all five AMR pages and this IMPORT in only main-amr.js. The other four
 // threw `ReferenceError: tauAtLevelOf is not defined` at init -- but only at
@@ -515,13 +515,12 @@ async function init() {
     // binding 8 was childQuadrant (it held `slot % 4`); B2 is what that
     // recovery was for -- this is the child level's WANT array.
     { binding: 8, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-    { binding: 9,  visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-    { binding: 10, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    // bindings 9/10 were childOriginX/Y and 13/14 parentOriginX/Y. All four
+    // gone (B3-5): the origin is `block * RB * 2^-(m-1)` in closed form, so
+    // the kernel derives it -- see amr_manage_pool.wgsl's parentOriginL0.
     // binding 11 was parentBlockSlot, for the neighbour-active veto.
     // Gone with it (B2-2d).
     { binding: 12, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    { binding: 13, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    { binding: 14, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     // binding 15 was grandchildBlockSlot, for hasGrandchild.
     // Gone with it (B2-2d).
   ]});
@@ -655,7 +654,6 @@ async function init() {
       W, H, RB,
       NBX_PARENT: parentPool.NBX, NBY_PARENT: parentPool.NBY,
       PARENT_CELL_SIZE_L0: cellSizeL0AtLevel(m),
-      PARENT_HAS_CACHED_ORIGIN: parentIsDense ? 0 : 1,
       ...childParams,
       HAS_BODY: 0,
     };
@@ -744,8 +742,6 @@ async function init() {
     // and the lumpiness induced on the shed vortices.
     const parentVel = parentPool.finePoolVel;
     const parentSlotToBlockBuf = m === 1 ? pools[1].slotToBlockBuf : parentPool.slotToBlockBuf;
-    const parentOriginXBuf = m === 1 ? dummyBlockSlotBuf : parentPool.originXBuf;
-    const parentOriginYBuf = m === 1 ? dummyBlockSlotBuf : parentPool.originYBuf;
     const grandchildPool = (m + 2) < N_LEVELS ? pools[m + 2] : null;
 
     criterionPoolBGs[m] = device.createBindGroup({ layout: criterionPoolBGL, entries: [
@@ -763,11 +759,7 @@ async function init() {
       { binding: 6, resource: { buffer: cardStateBuf } },
       { binding: 7, resource: { buffer: childPool.parentSlotBuf } },
       { binding: 8, resource: { buffer: childPool.wantBuf } },
-      { binding: 9, resource: { buffer: childPool.originXBuf } },
-      { binding: 10, resource: { buffer: childPool.originYBuf } },
       { binding: 12, resource: { buffer: parentSlotToBlockBuf } },
-      { binding: 13, resource: { buffer: parentOriginXBuf } },
-      { binding: 14, resource: { buffer: parentOriginYBuf } },
     ]});
   }
 
@@ -1029,7 +1021,6 @@ async function init() {
   // quadrantOfSlot. This scores the stored buffer against that rule over
   // live ACTIVE slots, which is what lets the pool manager stop writing it.
   const debugCheckSlotQuadrants = () => checkSlotQuadrantsOnGPU(device, pools, N_LEVELS);
-  const debugCheckTileOrigins = () => checkTileOriginsOnGPU(device, pools, N_LEVELS, RB);
 
   // THE GPU CASCADE, SCORED AGAINST THE HOST TWIN (plans/2D-backport.md B2-2).
   //
@@ -1137,7 +1128,6 @@ async function init() {
     debugCheck21Balance,
     debugCheckRefinementClosure,
     debugCheckSlotQuadrants,
-    debugCheckTileOrigins,
     debugCascadeRoundTrip,
     debugConservedTotals,
     debugListActiveBlocks,

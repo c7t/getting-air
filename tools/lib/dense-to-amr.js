@@ -35,7 +35,8 @@
 //
 // 1. It does NOT synthesize AMR topology. It takes a REAL AMR snapshot and
 //    overwrites only the field arrays, leaving blockSlot/slotToBlock/
-//    parentSlot/originX/originY exactly as the solver produced them. The
+//    parentSlot exactly as the solver produced it (origins are derived,
+//    not stored -- plans/2D-backport.md B3-5). The
 //    entire "did I build a valid quadtree" bug class therefore cannot occur
 //    -- the hierarchy comes from the solver.
 //

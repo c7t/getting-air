@@ -149,22 +149,29 @@ invariants the AMR machinery depends on:
   `webgpu-verify`) — `validate-all.js` is the one-command version.
 - **`tools/validate-amr-invariants.js`** — AMR structural invariants,
   asserted periodically through a run (not just at the end, so a transient
-  violation can't slip past). **Eight gates as of 2026-09-14, all gating:**
+  violation can't slip past). **Seven gates as of 2026-09-14, all gating:**
   2:1 balance (`debugCheck21Balance`), CORNER 2:1 balance (same call — gating
   only since the closure made it satisfiable), geometry-forced refinement
   (`debugCheckGeometryCoverage` — every leaf near the body already at the
   finest level), field-finite (NaN/blowup), pool starvation (refines refused
   for want of a slot; needs `?diag=1` or it reads vacuously true), the 2:1
   CLOSURE (`debugCheckRefinementClosure` — what the rule requires but the
-  allocator did not deliver), the slot-quadrant rule
-  (`debugCheckSlotQuadrants`), and the TILE-ORIGIN rule
-  (`debugCheckTileOrigins` — a tile's cached origin against the closed form
-  `block * RB * 2^-(m-1)`, exact in f32; the pool manager builds it by a
-  parent-chain recursion instead, and that recursion is what got transposed
-  once and cost a wrong level-2 force).
+  allocator did not deliver), and the slot-quadrant rule
+  (`debugCheckSlotQuadrants`).
+  **It was eight for a day.** `debugCheckTileOrigins` scored the per-slot
+  origin buffers against their closed form, to justify taking the kernels off
+  them; once B3-5 deleted the buffers it had nothing to read, and it went in
+  the same commit rather than being left pointing at deleted state — which is
+  how this project collected three vacuous gates. Retiring a checker WITH its
+  subject is the counterpart of that lesson, not an exception to it.
   **Sanity-check the sweep against a starved pool** (`--extra=maxFineBlocks=16`)
-  after touching it: six go red there and `quadrants`/`origins` do NOT,
-  which is what shows they are reading different things rather than one.
+  after touching it. Measured 2026-09-14 on `amr-dev-invariants` at 1024 steps:
+  FIVE go red (2:1-balance 14, corner 26, coverage 36, pool STARVED 2454,
+  closure 11 missing) and `field` and `quadrants` do NOT. Five-of-seven, with
+  the two abstainers being the ones whose rules are genuinely independent of
+  starvation, is the discrimination that says these read seven different things
+  rather than one -- a sweep where everything goes red together has not been
+  shown to test anything.
 - **`tools/validate-amr-vs-dense.js`** — standalone/opt-in, **not** part of
   `validate-all.js`'s default sweep (a high-resolution dense run is far more
   expensive than that suite's default configs). Runs the dense reference at
@@ -230,10 +237,18 @@ itself stays (five other shaders read it) and `allocLevelPool` now writes it
 once; only this kernel's binding went. `amr2d.mjs`'s `quadrantOfSlot` is the
 rule and `checkSlotQuadrantsOnGPU` scores the live buffer against it.
 
-If more room is needed: `parentOriginX`/`parentOriginY` are two buffers
-holding one vec2 per slot. And check the count BEFORE designing around a new
-buffer -- the failure mode is a `CreateBindGroupLayout` error at init, i.e. a
-page that does not boot, not a warning.
+**AND IT IS 10 SINCE B3-5 (2026-09-14), with real slack for the first time.**
+`childOriginX`/`childOriginY` (written here at refine time) and
+`parentOriginX`/`parentOriginY` (read here to write them) are all gone: a
+tile's origin is `block * RB * 2^-(m-1)` in closed form (`amr2d.mjs`'s
+`tileOriginL0`), so it is derived in the three kernels that need it and stored
+nowhere. Same shape as `childQuadrant` -- a buffer holding something cheaper
+to compute -- and the same order of work: prove the closed form against the
+live buffer FIRST, then remove.
+
+Still check the count BEFORE designing around a new buffer -- the failure mode
+is a `CreateBindGroupLayout` error at init, i.e. a page that does not boot, not
+a warning.
 
 ## Performance work
 Read `plans/perf-characterization.md` BEFORE optimizing anything here. The

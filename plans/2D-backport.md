@@ -949,6 +949,55 @@ So a DIFFERS carries no information beyond "different mode", an IDENTICAL is
 conclusive, and the strong form -- used here -- is to match the baseline in
 two different modes, which no race can forge. Written into CLAUDE.md.
 
+### B3-5 — DONE (2026-09-14). The origin buffers, and the gate that guarded them.
+
+`originX`/`originY` are gone. `shaders/amr_manage_pool.wgsl` goes from 14
+declared storage buffers to **10** -- it wrote `childOriginX/Y` at refine time
+and read `parentOriginX/Y` to do it, and all four bindings went with the
+closed form (`parentOriginL0`, one multiply). `PARENT_HAS_CACHED_ORIGIN` went
+with them. That is the kernel CLAUDE.md records as having sat at EXACTLY the
+16-per-stage ceiling; it now has six spare.
+
+It also removed, on three pages: the per-slot GPU buffers, their CPU mirrors
+(`originXCPU`/`originYCPU`), the host `tileOriginL0(level, slot, bx, by)` that
+read them, the origin composition inside `debugActivateBlock`, and the
+`originX`/`originY` arrays in the snapshot format.
+
+**THE COMPOSITION WAS DRIFTED, AND NOBODY KNEW.** `debugActivateBlock`'s
+JS-side mirror of the child-origin formula reads
+
+    main-cylinder-amr.js   parentOrigin.x + qx * RB * parentCellSizeL0
+    main-amr.js            parentOrigin.x + qx * RB * parentCellSizeL0 * 0.5
+    main-reentry-amr.js    parentOrigin.x + qx * RB * parentCellSizeL0 * 0.5
+
+The cylinder page carries a BUGFIX comment saying the `* 0.5` is wrong (RB is
+already half the parent's interior) and that it mis-registered every manually
+activated level>=2 tile. **That fix was never propagated to the other two**,
+which are the pages that MOVE A BODY. It was latent -- only the manual
+activation path writes it, and B3-1a/B3-4 had already taken the solver off
+reading it -- but it is B3a's finding #3 again: a rule written down three
+times, fixed in one copy. Deleting the rule is the fix that cannot drift.
+
+**And the eighth gate went in the same commit as its subject.**
+`debugCheckTileOrigins` (added as B3-1's prerequisite, three days of commits
+ago) scored the live buffers against the closed form, precisely so the kernels
+could be taken off them. With the buffers gone it had nothing to read. Leaving
+it would have made it the FOURTH always-true gate in this project (B3a-4 found
+two, B4-3 one, B2-2d one more). **Retiring a checker WITH its subject is the
+counterpart to B2-2d's lesson, not an exception to it** -- the rule stops
+needing a checker because it stops being stored. Back to seven gates.
+
+**Measured inert.** Bit-IDENTICAL at `?levels=3` (mode A, twice), boot smoke
+PASS on all five AMR pages, all three `refuse-*` configs PASS, channel/TGV
+analytic PASS, and Cd/St to the digit:
+
+    amr-N2-diffuse 1.642 / 0.1478   amr-N2-bounceback 1.322 / 0.1617
+    amr-N3-diffuse 1.425 / 0.1551   amr-N3-bounceback 1.351 / 0.1616
+
+Invariants PASS on all seven gates at every checkpoint, and the starved-pool
+discrimination still holds (`--extra=maxFineBlocks=16`: five go red, `field`
+and `quadrants` do not).
+
 ### B3a — the same sweep, in JS
 
 **Measured 2026-09-14**, after B0 found one rule in five copies. Across
@@ -1718,7 +1767,8 @@ B3-1 step1: one kernel, every level               ◄── DONE, bit-identical
 B3-2 average: one body, two parent fragments      ◄── DONE, bit-identical
 B3-3 interp: kernel + two parent fragments        ◄── DONE, bit-identical
 B3-4 force1: one kernel, every level              ◄── DONE, bit-identical
-B3-5 retire originX/originY + the 8th gate         ◄── unblocked by B3-4
+B3-5 retire originX/originY + the 8th gate         ◄── DONE; manage_pool
+                                                        14 -> 10 bindings
 B3   the rest (criterion, manage LAST)             ◄── needs B2 and B3a
 B5   window = sponge translation                    ◄── independent of B2/B3,
                                                         but smaller after B3

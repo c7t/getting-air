@@ -74,14 +74,12 @@ async function runInvariantSweep(Runtime, opts) {
   // suite would notice if a future writer broke the rule (debugSnapshotLoad
   // writes whatever a snapshot recorded). Cheap, exact, and gated.
   const hasQuadrants = await has('debugCheckSlotQuadrants');
-  // THE OTHER PER-SLOT BUFFER WHOSE CONTENT IS A FUNCTION OF CHEAPER DATA.
-  // A tile's cached origin is `block * RB * 2^-(m-1)`; the pool manager builds
-  // it by a parent-chain recursion instead, and that recursion is what got
-  // transposed once and cost a wrong level-2 force. amr2d.mjs holds both routes
-  // and tools/test-amr2d.js scores them against each other, but only as HOST
-  // twins -- this is the same comparison against the buffer the kernels
-  // actually read. Gated from the start, for the reason hasQuadrants records.
-  const hasOrigins = await has('debugCheckTileOrigins');
+  // THE TILE-ORIGIN GATE WAS HERE AND IS GONE ON PURPOSE (B3-5). It scored the
+  // live originX/originY buffers against amr2d.mjs's closed form, and existed
+  // to justify taking the kernels off those buffers; B3-5 then deleted the
+  // buffers, so there was nothing left for it to read. A checker left pointing
+  // at deleted state is how this project collected three vacuous gates -- so it
+  // went in the same commit as its subject, not later. Back to seven.
   // POOL STARVATION -- refines refused for want of a slot. This used to be
   // "refinement convergence", asking whether the fixed-point loop had stopped
   // creating tiles when its iteration budget ran out; B2 deleted the loop and
@@ -119,7 +117,6 @@ async function runInvariantSweep(Runtime, opts) {
   let diagEnabled = false;
   const closureViolations = [];
   const quadrantViolations = [];
-  const originViolations = [];
   const coverageViolations = [];
   const fieldViolations = [];
   let stepsDone = 0;
@@ -165,14 +162,6 @@ async function runInvariantSweep(Runtime, opts) {
       if (!quad.ok) quadrantViolations.push({ step: stepsDone, violations: quad.violations });
     }
 
-    let origins = null;
-    if (hasOrigins) {
-      const r = await evalExpr(Runtime, `${G}.debugCheckTileOrigins()`, 30000);
-      if (r.exceptionDetails) throw new Error(`debugCheckTileOrigins failed at step ${stepsDone}: ${r.exceptionDetails.text}`);
-      origins = r.result.value;
-      if (!origins.ok) originViolations.push({ step: stepsDone, violations: origins.violations });
-    }
-
     let closure = null;
     if (hasClosure) {
       const r = await evalExpr(Runtime, `${G}.debugCheckRefinementClosure()`, 30000);
@@ -192,7 +181,7 @@ async function runInvariantSweep(Runtime, opts) {
     // cov/bad are null (not empty) when this page doesn't expose that check,
     // so a caller renders "n/a" rather than the "OK" an empty result would
     // otherwise read as.
-    if (onCheckpoint) onCheckpoint(stepsDone, { diag, bal: bal.result.value, cov, closure, quad, origins, bad: hasCardState ? bad : null });
+    if (onCheckpoint) onCheckpoint(stepsDone, { diag, bal: bal.result.value, cov, closure, quad, bad: hasCardState ? bad : null });
 
     if (bad.length) break;
   }
@@ -203,13 +192,12 @@ async function runInvariantSweep(Runtime, opts) {
   // unconditionally -- but only when ?diag=1 actually made the counters live.
   const ok = balanceViolations.length === 0 && coverageViolations.length === 0
     && fieldViolations.length === 0 && !cornerFails && starvationViolations.length === 0
-    && closureViolations.length === 0 && quadrantViolations.length === 0
-    && originViolations.length === 0;
+    && closureViolations.length === 0 && quadrantViolations.length === 0;
   return { ok, stepsDone, balanceViolations, cornerViolations, requireCornerBalance,
     starvationViolations, starvationChecked: hasDiag && diagEnabled,
     coverageViolations,
     closureViolations,
-    quadrantViolations, originViolations, fieldViolations, hasCoverage, hasCardState };
+    quadrantViolations, fieldViolations, hasCoverage, hasCardState };
 }
 
 module.exports = { evalExpr, checkFinite, runInvariantSweep };

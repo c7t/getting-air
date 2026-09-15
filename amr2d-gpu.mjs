@@ -37,7 +37,7 @@
 import {
   check21Balance, nbAtLevel, makePool, cellSizeL0AtLevel,
   nearBodyWant, nearBodyWantCentre, bodyPhiL0, bufferToWindow, bufferToWindowLegacy,
-  cascade21, quadrantOfSlot, tileOriginL0, RB_DEFAULT,
+  cascade21, quadrantOfSlot, tileOriginL0,
 } from './amr2d.mjs';
 
 // Every level's blockSlot, copied in one command encoder and one submit, so
@@ -278,16 +278,15 @@ export function allocLevelPool(device, U, m, NBX_m, NBY_m, maxFineBlocks, NCELLS
     // would be silently wrong for all of them.
     device.queue.writeBuffer(pool.quadrantBuf, 0,
       new Uint32Array(maxFineBlocks).map((_, slot) => quadrantOfSlot(slot)));
-    // Milestone 7: a level>=2 tile's own physical (L0-buffer-space) origin,
-    // cached at quad-activation time -- unlike ownBX/ownBY (correctly
-    // dropped, see the amendment above), this is NOT cheaply re-derivable
-    // per-dispatch: it requires walking the parent chain (this tile's
-    // quadrant offset, scaled by the parent's own cell size in L0 units,
-    // plus the parent's own origin, recursively), a cross-BUFFER,
-    // cross-LEVEL computation, not a same-buffer mod/div. See
-    // shaders/amr_step1.wgsl's header.
-    pool.originXBuf = device.createBuffer({ size: maxFineBlocks * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
-    pool.originYBuf = device.createBuffer({ size: maxFineBlocks * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
+    // NO originX/originY BUFFERS (plans/2D-backport.md B3-5). Milestone 7
+    // allocated a per-slot cached origin on the argument that it was not
+    // cheaply re-derivable -- it required walking the parent chain, a
+    // cross-BUFFER, cross-LEVEL computation rather than a same-buffer
+    // mod/div. That argument was wrong, and amr2d.mjs had said so since B0:
+    // every level's block grid is globally anchored and quadtree-uniform, so
+    // tileOriginL0 is `block * RB * 2^-(m-1)` in closed form. Three kernels
+    // derive it now (amr_step1.wgsl, amr_force1.wgsl, amr_manage_pool.wgsl's
+    // parentOriginL0) and nothing stores it.
     // parentSlot has no meaningful "unset" value read anywhere unless
     // slotToBlock already says active (initialized below) -- 0 is harmless
     // filler, not a correctness requirement, so left at WebGPU's own
@@ -498,17 +497,15 @@ export async function checkGeometryCoverageOnGPU(device, pools, opts) {
     }
   }
 
-  // L(m) -> L(m+1), m = 1 .. nLevels-2. Level 1 caches no origin at all (it
-  // is re-derivable from blockID, and allocLevelPool only allocates
-  // originX/YBuf for m >= 2) -- the same PARENT_HAS_CACHED_ORIGIN split
-  // shaders/amr_manage_pool.wgsl makes.
+  // L(m) -> L(m+1), m = 1 .. nLevels-2. No level caches an origin since B3-5;
+  // tileOriginL0 is the closed form every kernel now derives, so this uses it
+  // directly instead of reading a buffer back for levels >= 2.
   for (let m = 1; m < nLevels - 1; m++) {
     const want = wantFactory(sdf, paramsForChildLevel(m + 1).FORCE_REFINE_MARGIN);
     const pool = pools[m];
     const { slotToBlock } = await readPoolIndirection(device, pools, m);
     const { blockSlot: childBlockSlot } = await readPoolIndirection(device, pools, m + 1);
     const nbxChild = pools[m + 1].NBX;
-    const origin = m >= 2 ? await readTileOrigins(device, pool) : null;
     const e = extentL0(m);
 
     for (let slot = 0; slot < pool.MAX_FINE_BLOCKS; slot++) {
@@ -519,7 +516,7 @@ export async function checkGeometryCoverageOnGPU(device, pools, opts) {
       // level 2 down, the same all-or-nothing invariant
       // amr_manage_pool.wgsl's hasGrandchild leans on.
       if (childBlockSlot[(by * 2) * nbxChild + (bx * 2)] >= 0) continue; // not a leaf
-      const lo = origin ? [origin.x[slot], origin.y[slot]] : [bx * rb, by * rb];
+      const lo = tileOriginL0([bx, by], m, rb);
       const hi = [lo[0] + e, lo[1] + e];
       checked++;
       if (want({ lo, hi, mid: [lo[0] + e / 2, lo[1] + e / 2] })) record(m, bx, by, lo, hi, slot);
@@ -529,23 +526,6 @@ export async function checkGeometryCoverageOnGPU(device, pools, opts) {
   return { ok: violations.length === 0, violations, checked };
 }
 
-// A level's cached per-slot tile origins, in L0 units. Only levels >= 2 have
-// them; level 1's is bx*RB by construction.
-async function readTileOrigins(device, pool) {
-  const U = GPUBufferUsage;
-  const bytes = pool.MAX_FINE_BLOCKS * 4;
-  const sx = device.createBuffer({ size: bytes, usage: U.MAP_READ | U.COPY_DST });
-  const sy = device.createBuffer({ size: bytes, usage: U.MAP_READ | U.COPY_DST });
-  const enc = device.createCommandEncoder();
-  enc.copyBufferToBuffer(pool.originXBuf, 0, sx, 0, bytes);
-  enc.copyBufferToBuffer(pool.originYBuf, 0, sy, 0, bytes);
-  device.queue.submit([enc.finish()]);
-  await Promise.all([sx.mapAsync(GPUMapMode.READ), sy.mapAsync(GPUMapMode.READ)]);
-  const x = new Float32Array(sx.getMappedRange()).slice();
-  const y = new Float32Array(sy.getMappedRange()).slice();
-  sx.unmap(); sy.unmap(); sx.destroy(); sy.destroy();
-  return { x, y };
-}
 
 // --- the rigid body's own state -------------------------------------------
 //
@@ -988,67 +968,18 @@ export function closeSeed(pools, nLevels, sets) {
 // value there" -- including debugSnapshotLoad, which writes whatever a
 // snapshot recorded. That is an empirical claim about live state, and this is
 // how it gets checked rather than asserted.
-// A TILE'S CACHED ORIGIN AGAINST THE CLOSED FORM, ON THE LIVE POOL.
+// THE TILE-ORIGIN GATE WAS HERE, AND IT IS GONE ON PURPOSE (B3-5).
 //
-// shaders/amr_manage_pool.wgsl builds originX/originY RECURSIVELY at refine
-// time (parent origin + quadrant offset * the PARENT's cell size), which is
-// the transposable computation amr2d.mjs's tileOriginL0/tileOriginL0Recursive
-// pair exists to pin down -- but that pair is a HOST twin, and nothing scored
-// the live buffer the kernels actually read.
+// checkTileOriginsOnGPU scored the live originX/originY buffers against
+// amr2d.mjs's closed form, and was added precisely to justify taking the
+// kernels off those buffers. That done, B3-5 deleted the buffers -- so the
+// checker had nothing left to score, and a checker pointed at deleted state
+// is exactly how this project collected three vacuous gates (B2-2d's sweep).
+// It goes in the same commit as the thing it was checking, deliberately.
 //
-// This scores it, against the closed form `block * RB * 2^-(m-1)`. The two
-// routes agree exactly in f32 (every term is a power of two times an integer),
-// so any mismatch is a real defect, not rounding. Same shape and same purpose
-// as checkSlotQuadrantsOnGPU: a per-slot buffer whose content is a function of
-// cheaper data, checked so that reading it that way is a measured fact rather
-// than an argument.
-export async function checkTileOriginsOnGPU(device, pools, nLevels, rb = RB_DEFAULT) {
-  const U = GPUBufferUsage;
-  const stages = [];
-  const enc = device.createCommandEncoder();
-  // Levels >= 2 only: level 1 caches no origin (allocLevelPool allocates
-  // originX/YBuf for m >= 2), it derives `bx * RB` -- which IS the closed
-  // form at m = 1, so there is nothing there to disagree.
-  for (let m = 2; m < nLevels; m++) {
-    const pool = pools[m];
-    const bytes = pool.MAX_FINE_BLOCKS * 4;
-    const ox = device.createBuffer({ size: bytes, usage: U.MAP_READ | U.COPY_DST });
-    const oy = device.createBuffer({ size: bytes, usage: U.MAP_READ | U.COPY_DST });
-    const s2b = device.createBuffer({ size: bytes, usage: U.MAP_READ | U.COPY_DST });
-    enc.copyBufferToBuffer(pool.originXBuf, 0, ox, 0, bytes);
-    enc.copyBufferToBuffer(pool.originYBuf, 0, oy, 0, bytes);
-    enc.copyBufferToBuffer(pool.slotToBlockBuf, 0, s2b, 0, bytes);
-    stages.push({ m, ox, oy, s2b, pool });
-  }
-  if (!stages.length) return { ok: true, checked: 0, violations: [] };
-  device.queue.submit([enc.finish()]);
-  await Promise.all(stages.flatMap(s => [
-    s.ox.mapAsync(GPUMapMode.READ), s.oy.mapAsync(GPUMapMode.READ), s.s2b.mapAsync(GPUMapMode.READ),
-  ]));
-
-  const violations = [];
-  let checked = 0;
-  for (const { m, ox, oy, s2b, pool } of stages) {
-    const x = new Float32Array(ox.getMappedRange());
-    const y = new Float32Array(oy.getMappedRange());
-    const slotToBlock = new Int32Array(s2b.getMappedRange());
-    for (let slot = 0; slot < pool.MAX_FINE_BLOCKS; slot++) {
-      const blockID = slotToBlock[slot];
-      if (blockID < 0) continue;   // never allocated -- never written
-      checked++;
-      const block = [blockID % pool.NBX, Math.floor(blockID / pool.NBX)];
-      const [wx, wy] = tileOriginL0(block, m, rb);
-      if (x[slot] !== wx || y[slot] !== wy) {
-        if (violations.length < 8) {
-          violations.push({ level: m, slot, blockID, stored: [x[slot], y[slot]], rule: [wx, wy] });
-        }
-      }
-    }
-    ox.unmap(); oy.unmap(); s2b.unmap();
-    ox.destroy(); oy.destroy(); s2b.destroy();
-  }
-  return { ok: violations.length === 0, checked, violations };
-}
+// The rule it enforced is not unguarded: it is now computed, not stored, in
+// one closed form in three kernels, and tools/test-amr2d.js still scores that
+// closed form against the recursive route on the host.
 
 export async function checkSlotQuadrantsOnGPU(device, pools, nLevels) {
   const U = GPUBufferUsage;

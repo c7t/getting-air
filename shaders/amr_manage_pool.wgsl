@@ -127,13 +127,18 @@
 // (parentBlockSlot, grandchildBlockSlot -- both dead under the closure) take
 // it to 14.
 @group(0) @binding(8)  var<storage, read_write> childWant         : array<u32>;
-@group(0) @binding(9)  var<storage, read_write> childOriginX      : array<f32>;
-@group(0) @binding(10) var<storage, read_write> childOriginY      : array<f32>;
+// bindings 9/10 WERE childOriginX/childOriginY, written here at refine time,
+// and 13/14 WERE parentOriginX/parentOriginY, read here to write them. All
+// four are gone (plans/2D-backport.md B3-5): a tile's physical origin is
+// `block * RB * 2^-(m-1)` in closed form -- see parentOriginL0() below -- so
+// the recursion this kernel ran, and the per-slot buffers it ran it into, were
+// storing something cheaper to compute. B3-1a and B3-4 took the last two
+// READERS (the fine step and the force pass) off those buffers; this removes
+// the writer, the buffers, and PARENT_HAS_CACHED_ORIGIN with them. 14 -> 10
+// declared, on the kernel that used to sit at the 16 ceiling.
 // binding 11 WAS parentBlockSlot, read only by the neighbour-active veto.
 // Gone with it (B2-2d).
 @group(0) @binding(12) var<storage, read>       parentSlotToBlock : array<i32>;
-@group(0) @binding(13) var<storage, read>       parentOriginX     : array<f32>; // dummy if !PARENT_HAS_CACHED_ORIGIN
-@group(0) @binding(14) var<storage, read>       parentOriginY     : array<f32>; // dummy if !PARENT_HAS_CACHED_ORIGIN
 // Grandchild (level m+2) blockSlot, for the 2:1-balance cascade/coarsen-
 // block checks -- dummy if !HAS_GRANDCHILD, see header. Both refine() and
 // coarsen() only ever need EXISTENCE (hasGrandchild), never level (m+2)'s
@@ -150,7 +155,6 @@ override RB : u32;
 override NBX_PARENT : u32;
 override NBY_PARENT : u32;
 override PARENT_CELL_SIZE_L0 : f32;
-override PARENT_HAS_CACHED_ORIGIN : u32;
 // When 0, isNearBodyAt is unconditionally false -- see amr_manage.wgsl's
 // identical override.
 override HAS_BODY : u32 = 1u;
@@ -176,6 +180,22 @@ override MAX_LEVEL : i32 = 2;
 // raw lattice-cell difference, so converting to a physical gradient means
 // dividing by that -- i.e. adding m in log2. This is AGAL's /(2.0*dx_L).
 fn myLevel() -> i32 { return i32(round(-log2(PARENT_CELL_SIZE_L0))); }
+
+// A TILE'S PHYSICAL ORIGIN IN L0 UNITS, AS ONE MULTIPLY -- here, the PARENT
+// tile's, from the parent's own block index. Every level's block grid is
+// globally anchored and quadtree-uniform, so the origin is
+// `block * RB * 2^-(m-1)`, and `2^-(m-1)` is `2 * PARENT_CELL_SIZE_L0` at the
+// parent level. amr2d.mjs's tileOriginL0 is the host statement of the same
+// closed form, and tools/test-amr2d.js scores it against the recursive route
+// this kernel used to run.
+//
+// That recursion (parent origin + quadrant offset * the parent's cell size,
+// cached per slot) is what got transposed once and cost a wrong level-2 force.
+// It is not here to get wrong any more.
+fn parentOriginL0(bxP: u32, byP: u32) -> vec2<f32> {
+  let s = f32(RB) * 2.0f * PARENT_CELL_SIZE_L0;
+  return vec2<f32>(f32(bxP) * s, f32(byP) * s);
+}
 fn toPhysical(eps: f32) -> f32 { return eps - log2(PARENT_CELL_SIZE_L0); }
 override FORCE_REFINE_MARGIN : f32;
 override FORCE_REFINE_LOOKAHEAD : f32;
@@ -262,12 +282,9 @@ fn decide(@builtin(global_invocation_id) gid: vec3<u32>) {
   }
   let eps = min(1.0f, log2(max(maxCrit, EPS_FLOOR)));
 
-  var parentOriginX_L0 = f32(bxP * RB);
-  var parentOriginY_L0 = f32(byP * RB);
-  if (PARENT_HAS_CACHED_ORIGIN != 0u) {
-    parentOriginX_L0 = parentOriginX[parentSlot];
-    parentOriginY_L0 = parentOriginY[parentSlot];
-  }
+  let parentOrigin_L0 = parentOriginL0(bxP, byP);
+  let parentOriginX_L0 = parentOrigin_L0.x;
+  let parentOriginY_L0 = parentOrigin_L0.y;
   // See refine()'s BUGFIX comment: RB is ALREADY half the parent's own
   // interior, so no further *0.5 belongs here.
   let cx = parentOriginX_L0 + f32(RB) * PARENT_CELL_SIZE_L0;
@@ -315,12 +332,9 @@ fn refine(@builtin(global_invocation_id) gid: vec3<u32>) {
   let eps = min(1.0f, log2(max(maxCrit, EPS_FLOOR)));
 
   // Parent's own physical origin -- see header for the dense-vs-cached split.
-  var parentOriginX_L0 = f32(bxP * RB);
-  var parentOriginY_L0 = f32(byP * RB);
-  if (PARENT_HAS_CACHED_ORIGIN != 0u) {
-    parentOriginX_L0 = parentOriginX[parentSlot];
-    parentOriginY_L0 = parentOriginY[parentSlot];
-  }
+  let parentOrigin_L0 = parentOriginL0(bxP, byP);
+  let parentOriginX_L0 = parentOrigin_L0.x;
+  let parentOriginY_L0 = parentOrigin_L0.y;
   // BUGFIX: center = origin + HALF the block's own physical width. The
   // parent's own interior is 2*RB cells (not RB -- see amr_criterion_pool.
   // wgsl's own header: "a parent slot's own interior is 2*RB x 2*RB
@@ -405,8 +419,6 @@ fn refine(@builtin(global_invocation_id) gid: vec3<u32>) {
         // debugReadSlotForces) correlating each level-2 slot's own (fx,fy)
         // against its geometric position -- restoring this formula to
         // match the ORIGINAL (pre-Milestone-10) version fixes it.
-        childOriginX[slot] = parentOriginX_L0 + f32(qx) * f32(RB) * PARENT_CELL_SIZE_L0;
-        childOriginY[slot] = parentOriginY_L0 + f32(qy) * f32(RB) * PARENT_CELL_SIZE_L0;
         childNewlyActivated[slot] = 1u;
       }
     }
@@ -460,12 +472,9 @@ fn coarsen(@builtin(global_invocation_id) gid: vec3<u32>) {
   let parentBlockID = parentSlotToBlock[parentSlot];
   let bxP = u32(parentBlockID) % NBX_PARENT;
   let byP = u32(parentBlockID) / NBX_PARENT;
-  var parentOriginX_L0 = f32(bxP * RB);
-  var parentOriginY_L0 = f32(byP * RB);
-  if (PARENT_HAS_CACHED_ORIGIN != 0u) {
-    parentOriginX_L0 = parentOriginX[parentSlot];
-    parentOriginY_L0 = parentOriginY[parentSlot];
-  }
+  let parentOrigin_L0 = parentOriginL0(bxP, byP);
+  let parentOriginX_L0 = parentOrigin_L0.x;
+  let parentOriginY_L0 = parentOrigin_L0.y;
   let centerX_L0 = parentOriginX_L0 + f32(RB) * PARENT_CELL_SIZE_L0;
   let centerY_L0 = parentOriginY_L0 + f32(RB) * PARENT_CELL_SIZE_L0;
 
