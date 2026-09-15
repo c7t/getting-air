@@ -23,7 +23,7 @@ GPU) and that is what made M4/M5 survivable. Build the 2D equivalent first.
 | B0 | `d3-amr.mjs` + mutation-checked host tests | **DONE** | `amr2d.mjs` + `amr2d-gpu.mjs`, 34 GPU-free checks; deleted 680 lines of five duplicated checkers | M |
 | B0b | The interface instrument (mass/momentum drift) | **DONE** | `tools/analyze-amr-interface.js`; measured B9 as 93% of the mass channel and the seam at 9.6x the no-interface floor in momentum | M |
 | B1 | Post-collision Dupuis-Chopard `fneq` factor | **yes, a live bug** | 2D uses the pre-collision form on post-collision populations | S (code) / L (re-baseline) |
-| B2 | `cascade21`: 2:1 as ONE closure on the WANT set | **B2-1/2a DONE** | the 3 balance bugs measure as already fixed; what is left is the RING (14 blocks) and the veto half (L2's extent, 80 vs 176 L0 units) | M |
+| B2 | `cascade21`: 2:1 as ONE closure on the WANT set | **DONE** | corner 2:1 violations 13 → 0 and L2's extent 80 → 160 L0 units on the shipped page; `?cascade=0` keeps the old path as a control | M |
 | B3 | One kernel per stage + a `parent_{dense,pool}` accessor | **yes** | deletes ~1100 lines of near-duplicate WGSL across 6 kernel pairs | M |
 | B3a | The same sweep in JS: the AMR pages duplicate each other | **largely DONE** | duplication outside `init`/`frame` 3,319 → 2,419 lines; byte-identical 1,129 → 613. Found a stranded comment and two always-true gates on the way | M |
 | B4 | The body lives entirely on the finest level | **DONE** | coverage gate written for the two moving-body pages, the block predicate fixed, ~120 lines of masking + 3 bindings + an override deleted, and 3 refusals now under test | S |
@@ -465,6 +465,62 @@ of coarsen/refine onto the want array, and the one-sweep dispatch
 All of it passed `make check` and `naga`; only the pool manager's bind group
 could not be created. The dense manager (`amr_manage.wgsl`, 11 buffers) has
 ample room and its half of the change is unaffected by any of this.
+
+### B2-2b / B2-2c — DONE (2026-09-14). The manager acts on the closed set.
+
+`decide` -> close -> coarsen -> refine, once, with `?cascade=0` kept as a
+control. Default flipped in its own commit so a revert of the default does not
+take the mechanism.
+
+```
+index-amr.html?levels=3       ?cascade=0   default
+corner 2:1 violations             13          0
+closure missing                   13          0
+L1 / L2 tiles                 182 / 340   243 / 420
+L2 x-extent (L0 units)            80         160
+```
+
+**Corner balance is clean for the first time.** `check21BalanceOnGPU` has
+reported and not gated it since B0 — the ring path tolerates a missing
+diagonal parent, so failing every run on it would have been wrong. Under the
+closure it is zero at every checkpoint, because the diagonals are four of the
+nine offsets the rule was always written with and the per-pass implementation
+only ever covered the faces. **A check that had to be non-gating because the
+code could not satisfy it can now become a gate.**
+
+**Three things worth carrying.**
+
+1. **The veto was STRONGER than the rule, and that was the bug.** The
+   neighbour-active gate demanded the PARENT's four same-level neighbours be
+   active; 2:1 balance only demands the parents of the block's OWN
+   neighbours. The extra strength is not a safety margin, it is the deadlock
+   — a refine blocked by a neighbour that would only ever have been created BY
+   that refine. **A conservative-looking local test is worth checking against
+   the rule it approximates**; this one cost level 2 half its reach for as
+   long as it shipped.
+
+2. **The right instrument is not Cd/St, and this is a clean example.** The
+   change moves St on the two bounce-back configs ~0.004 AWAY from the
+   literature centre (0.1654 → 0.1616) while making the topology correct. No
+   verdict changes, and `channel-poiseuille-amr-N2` — the analytic gate with a
+   closed-form answer — reads 9.06e-4 against a 5.0e-3 tolerance. CLAUDE.md
+   already says Cd/St averages far-field structure away; a refinement-region
+   change is squarely in that class, so **report the Cd/St move and gate on
+   the analytic one.**
+
+3. **The staging only worked because B2-2b0 came first.** The flagged
+   switch-over was impossible at 16 bindings and trivial at 15. Two attempts:
+   the first hit `CreateBindGroupLayout` and was reverted whole; the second
+   was the same code with the want array in a recovered slot. **When a change
+   is blocked by a hard limit, the unblocking step is its own stage** — it is
+   cheaper, it is bit-identical, and it converts a leap back into a step.
+
+**Left for B2-2d:** delete the `?cascade=0` path — the per-pass tests,
+`FIXED_POINT_ITERS`, `?demandCascade`, `?refineIters`, and the two bindings
+that go dead with them (`parentBlockSlot`, `grandchildBlockSlot`, taking the
+pool manager 16 → 14). Then `requireCornerBalance` can become the default in
+`tools/lib/amr-invariants.js`, and B3's `manage` pair becomes a refactor
+instead of a rewrite — which is what B3 sequenced it last for.
 
 ### B2 — 2:1 balance as one closure
 
@@ -1359,9 +1415,10 @@ B2-2a the GPU closure, proved, unused             ◄── DONE
 B2-2b0 get the pool manager off the 16-buffer      ◄── DONE, 16 -> 15
        ceiling                                          (childQuadrant held
                                                         slot % 4)
-B2-2b the switch-over                             ◄── stageable again: there
-                                                        is now room for the want
-                                                        array behind ?cascade=1
+B2-2b the switch-over, measured, default off      ◄── DONE
+B2-2c default flipped                             ◄── DONE
+B2-2d delete the ?cascade=0 path (16 -> 14),       ◄── next; unblocks B3's
+      then corner balance can GATE                      manage pair
 B2   cascade21                                     ◄── needs B0
 B3   kernel unification, manage LAST                ◄── needs B2 and B3a
 B5   window = sponge translation                    ◄── independent of B2/B3,
