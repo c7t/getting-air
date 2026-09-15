@@ -65,12 +65,32 @@ invariants the AMR machinery depends on:
 
   **The default sweep is not currently all-green on `main`.**
   `dense-reference` and `amr-N2-diffuse` fail at Re=100 (Cd 1.950 and 1.620
-  against 1.35±0.15). That is the open diffuse-interface-width issue, not a
-  regression: the chi band is ~±4 cells regardless of resolution, so the
-  effective body radius exceeds the nominal one and Cd converges from above
-  (1.908 at res=9 → 1.597 at res=10). The bounce-back variants of the same
-  configs pass, which is consistent. Re-baseline against these numbers rather
-  than assuming a red cell is yours.
+  against 1.35±0.15). That is the diffuse-interface-width issue, not a
+  regression. Re-baseline against these numbers rather than assuming a red
+  cell is yours.
+  **AND IT IS NO LONGER OPEN — IT IS MEASURED (2026-09-14, `?kEps=`).** The
+  band is `K_EPS * dx_level` and `?kEps=` now sweeps every level at once
+  (plans/2D-backport.md B7); the instrument is a BAND ladder at fixed
+  resolution, not the resolution ladder this note used to cite (that moves the
+  band and everything else together). `dense-reference`, Re=100:
+
+      kEps     Cd      St          kEps 1.5 is the shipped default
+      1.5     1.951   0.1260
+      0.75    1.617   0.1485
+      0.375   1.453   0.1571
+      0.1875  1.366   0.1593
+      bounce-back (sharp, same body)   Cd 1.327   St 0.1605
+
+  **First order in the band width** — halving it halves the error (ratios 2.04,
+  1.89). Note that 3D measured SECOND order for its sphere; it does not
+  transfer. So the shipped band inflates Cd by ~47% and depresses St by 21%,
+  and both red cells close when it is narrowed: `amr-N2-diffuse` at
+  `?kEps=0.375` reads Cd 1.380 / St 0.1643, passing both.
+  **The default deliberately stays 1.5.** Every number above is a PINNED
+  cylinder, and the page this project ships is a falling card; narrowing the
+  band moves toward bounce-back's sharpness, which 3D's D4 measured as worse
+  for a MOVING body (frame consistency and force noise). Adopting a narrower
+  default needs the moving-card gates, not this ladder.
   **AMR Cd is only reproducible to ~+/-0.001; dense Cd is exact.** Measured
   2026-09-09: two runs of the SAME build gave `amr-N2-diffuse` Cd 1.619 and
   1.620, while `dense-reference` was bit-identical (1.950 / St 0.1258) across

@@ -29,7 +29,7 @@ GPU) and that is what made M4/M5 survivable. Build the 2D equivalent first.
 | B4 | The body lives entirely on the finest level | **DONE** | coverage gate written for the two moving-body pages, the block predicate fixed, ~120 lines of masking + 3 bindings + an override deleted, and 3 refusals now under test | S |
 | B5 | The window is a translation of the SPONGE | **half already true in 2D AMR, not in `main.js`** | removes window bookkeeping from 5 hot kernels; retires `card-total.mjs`'s problem | M |
 | B6 | Explode/coalesce at the coarse/fine interface | **yes, but measure first** | 2D's interface is not conservative, and nothing in 2D measures that | L |
-| B7 | The diffuse band converges at 2nd order; Richardson it | **yes** | may close the standing `dense-reference`/`amr-N2-diffuse` Cd=1.95-vs-1.35 red cells | S |
+| B7 | The diffuse band ladder | **DONE** | `?kEps=` sweeps all nine chi sites; the band is FIRST order in 2D (3D's 2nd does not transfer) and both red cells are quantified band error, closing at `?kEps=0.375` | S |
 | B8 | `SOLID_EQ` on the bounce-back path | **latent only** | free on every 2D gate (all bounce-back bodies are pinned); disarms a landmine | S |
 | B9 | f32 lattice weights do not sum to 1 | **DONE** | `lattice-2d.mjs` derives the basis once (was eleven copies); mass injection halved, velocity drift removed; couette gates improved 26-53% | S (code) / L (re-baseline) |
 
@@ -969,6 +969,63 @@ then `validate-amr-vs-dense.js` and `validate-divergence.js` (whose `edge`
 column exists for exactly this class) showing the interface error falling
 toward the `fullrefine` noise floor.
 
+### B7 — DONE (2026-09-14)
+
+`?kEps=` threads one `K_EPS` override through all nine chi sites (the render
+pass included — its chi draws the body outline, and a ladder whose picture
+still showed the old band would misrepresent the thing being swept).
+`?kEpsPool=` survives and now defaults to `K_EPS` rather than a second
+hardcoded 1.5. Default unchanged and byte-identical, asserted on the one
+deterministic config in the suite.
+
+**The ladder**, `dense-reference`, Re=100, D=21.33:
+
+```
+kEps     Cd      St        dCd      ratio
+1.5     1.951   0.1260
+0.75    1.617   0.1485   -0.334
+0.375   1.453   0.1571   -0.164    2.04
+0.1875  1.366   0.1593   -0.087    1.89
+bounce-back (sharp, same body)  Cd 1.327  St 0.1605
+                                literature 1.35+/-0.15, 0.165+/-0.015
+```
+
+**Three things, in order of how much they change what is written above.**
+
+1. **FIRST order, not second. 3D's convergence rate does not transfer.** This
+   section proposed inheriting "the diffuse body converges at SECOND order in
+   the band width" from 3D's D3Q19 sphere (ratio 3.85 ~ 4). 2D measures 2.04
+   and 1.89, i.e. p ~ 1. The neighbouring B6 bullet already says not to
+   inherit D3Q19's corner-counting argument without re-deriving it; **the same
+   caution was needed here and was not stated**, which is the generalizable
+   part — a 3D *rate* is as unportable as a 3D *counting argument*, and both
+   look like physics rather than geometry when you read them.
+
+2. **The gate's first branch is the answer: the red cells are a quantified
+   band error, not a second defect.** The shipped band inflates Cd by ~47% and
+   depresses St by 21%, both first-order, and both red cells close when it is
+   narrowed (`amr-N2-diffuse` at `?kEps=0.375`: Cd 1.380 / St 0.1643, from
+   failing both to passing both). CLAUDE.md now carries the ladder instead of
+   the "open issue" framing.
+
+3. **Richardson is the weakest number here, and the write-up should not lean
+   on it.** Extrapolating the last pair gives Cd -> 1.279, but at kEps=0.1875
+   the tanh transition is ~0.4 cells — NARROWER THAN THE MESH — so the smooth
+   power-law it assumes is already contaminated. The tell is that the sign of
+   the disagreement with the sharp answer flips relative to 3D (there 1.478
+   against bounce-back's 1.3951, above; here 1.279 against 1.327, below).
+   **The sharp-interface run on the same body is the better anchor for "zero
+   band"** and needs no extrapolation at all — 2D has one and 3D's write-up
+   used it only as a check.
+
+**The default stays 1.5, deliberately.** Every number here is a PINNED
+cylinder; the shipped page is a falling card. Narrowing the band moves toward
+bounce-back's sharpness, which 3D's D4 measured as worse for a MOVING body
+(9x on frame consistency, 600x on force noise). Adopting a narrower default is
+a separate change gated by the moving-card harnesses — making it on the
+strength of a pinned-body sweep is exactly the mistake this section's own
+closing note warns about, one parameter over.
+
 ### B7 — the diffuse band, and the standing Cd red cells
 
 `dense-reference` and `amr-N2-diffuse` fail at Re=100 (Cd 1.950 and 1.620
@@ -1099,7 +1156,11 @@ B4-4 refusals, + 3 configs that require them      ──┘ DONE
                                                       were found BY those
                                                       gates rather than by
                                                       reading code.
-B7   chi band ladder                                  (independent, cheap)
+B7   chi band ladder                                   DONE -- red cells are
+                                                       quantified band error;
+                                                       default unchanged (it
+                                                       needs the moving-card
+                                                       gates, not this one)
 B8   SOLID_EQ                                         (independent, free)
 B9   lattice weights                                   DONE -- unblocked B6's
                                                        mass half
