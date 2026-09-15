@@ -13,8 +13,15 @@ step** — the source *is* the artifact; GitHub Pages serves it directly.
 
 ## Validate before committing (no GPU needed)
 Run `make check` and make it pass before committing shader/JS changes:
-- `make js` — `node --check` every `*.js` and `*.mjs` (needs Node). The
+- `make js` — syntax-check every `*.js` and `*.mjs` (needs Node). The
   shared `.mjs` modules were outside this glob until 2026-09-08.
+  **It parsed as a SCRIPT until 2026-09-15, which meant it silently checked
+  NOTHING in any file using ESM `import`** — i.e. every page entry point. On
+  node v26.1.0 `node --check m.js` exits 0 on a file with a real syntax error
+  if that file opens with an `import`; only `node --input-type=module --check
+  < m.js` reports it, which is what the target does now. A mangled object
+  literal in `main.js` passed this gate and wedged `index.html` at
+  "initializing..."; the GPU boot smoke was what caught it.
 - `make test` — the GPU-free unit tests (`tools/test-*.js`): the shared
   card/regime parameterization, the AMR field reconstructor, the dense→AMR
   injector, and the packed-`f` host/shader layout agreement. Add a `tools/test-<name>.js` and it is picked up
@@ -298,6 +305,22 @@ the driver optimized away, with a control that could not detect that.
 `f-pack.mjs`). Default 0 and byte-identical to the previous `array<f32>`
 layout. Measured NOT viable as a default; kept for re-measurement, not for
 shipping.
+
+**The body lives in BUFFER coordinates** (plans/2D-backport.md B5, completed
+2026-09-15). `cx`/`cy` are buffer positions, integrated and wrapped into
+[0, W) x [0, H) every step; a kernel that has a buffer cell already has the
+body's frame and needs no conversion. Only the ALBC sponge band, the WALL_Y
+walls and the render convert (`bufferToWindowCell`/`bufferToWindowPos` in
+`common_geometry.wgsl`). The old window-anchored convention and its `?window=`
+flag are DELETED — there is one convention, not a switch.
+
+If you add a kernel that touches the body, it needs no frame call at all. The
+failure mode to know about: `lbm_force.wgsl` spent B5-2 and B5-3 building a
+WINDOW position while `state.cx` had become a buffer one, and because the two
+coincide whenever `off == 0` — which is every pinned-cylinder config, i.e.
+every config in the sweep — nothing caught it until a moving window was
+measured directly (B5-5, 226x wrong in fy). **Grep new kernels for raw
+`off_x`/`off_y` arithmetic; only the render should have any.**
 
 `?wrapScreens=N` (index-reentry.html) — domain-heights of accumulated travel
 before `x_total`/`y_total` wrap; default 16, byte-identical when absent. The

@@ -1282,7 +1282,7 @@ async function init() {
   });
   const phyPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [phyBGL] }),
-    compute: { module: phySM, entryPoint: 'main', constants: { ...constants, INITIAL_CX: W / 2, INITIAL_CY: H / 2 } }
+    compute: { module: phySM, entryPoint: 'main', constants }
   });
   // VORT_SCALE/VORT_GAMMA are pipeline-overridable constants specialized into
   // the fragment shader here, so changing them live means rebuilding this one

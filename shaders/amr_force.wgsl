@@ -112,7 +112,7 @@ fn main(
 
   if (cx < W && cy < H) {
     {
-      let p    = bodyFrameCell(vec2<u32>(cx, cy), state);
+      let p    = vec2<f32>(f32(cx), f32(cy));
       let cell = cellIndex(cx, cy);
 
       let phi = get_phi(p, state);
@@ -131,7 +131,7 @@ fn main(
           for (var i = 0u; i < 9u; i++) {
             let bx_src = (cx + W - u32(ex[i])) % W;
             let by_src = (cy + H - u32(ey[i])) % H;
-            if (get_phi(bodyFrameCell(vec2<u32>(bx_src, by_src), state), state) < 0f) {
+            if (get_phi(vec2<f32>(f32(bx_src), f32(by_src)), state) < 0f) {
               let f_opp = fUnpack(f_in[fIdx(opp[i], (W * H), cell)], opp[i]);
               let corr = 2f * wt[i] * (f32(ex[i]) * usx + f32(ey[i]) * usy) / CS2;
               fx_body += -f32(ex[i]) * (2f * f_opp + corr);

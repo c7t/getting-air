@@ -315,12 +315,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   // (see file header).
   let bufX = fineToCoarseUnit(fx, originX_L0);
   let bufY = fineToCoarseUnit(fy, originY_L0);
-  // WINDOW position, for the sponge band below. BODY frame, for the SDF and
-  // the lever arm -- the same value under the shipped convention, the bare
-  // buffer position under ?window=0 (common_geometry.wgsl's WINDOW_BODY).
+  // WINDOW position, for the sponge band below. The BODY's frame is just the
+  // buffer position itself since B5 (common_geometry.wgsl).
   let wpos = bufferToWindowPos(vec2<f32>(bufX, bufY), state);
   let wx = wpos.x; let wy = wpos.y;
-  let p = bodyFrame(vec2<f32>(bufX, bufY), state);
+  let p = vec2<f32>(bufX, bufY);
   // Periodic minimum-image lever arm, matching amr_step.wgsl / amr_force.wgsl
   // (the coarse step and force pass wrap rx/ry; the fine step previously did
   // not, so a cell reached across a seam got the wrong rotational velocity).
@@ -341,7 +340,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (USE_BOUNCEBACK != 0u && HAS_BODY != 0u) {
       let srcBufX = fineToCoarseUnitI(i32(fx) - ex[i], originX_L0);
       let srcBufY = fineToCoarseUnitI(i32(fy) - ey[i], originY_L0);
-      if (get_phi(bodyFrame(vec2<f32>(srcBufX, srcBufY), state), state) < 0f) {
+      if (get_phi(vec2<f32>(srcBufX, srcBufY), state) < 0f) {
         let corr = 2f * wt[i] * (f32(ex[i]) * usx + f32(ey[i]) * usy) / CS2;
         f[i] = fUnpack(f_in[fIdx(opp[i], poolPlaneStride, cell)], opp[i]) + corr;
         continue;

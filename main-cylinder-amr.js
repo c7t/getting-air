@@ -1173,7 +1173,7 @@ async function init() {
   });
   const phyPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [phyBGL] }),
-    compute: { module: phySM, entryPoint: 'main', constants: { ...constants, INITIAL_CX: CX0, INITIAL_CY: CY0 } }
+    compute: { module: phySM, entryPoint: 'main', constants }
   });
   const renPL = device.createRenderPipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [renBGL] }),

@@ -116,9 +116,11 @@ fn epsOf(crit: f32) -> f32 {
 //
 // THE BOX, NOT THE CENTRE -- plans/2D-backport.md B4. This used to be one
 // get_phi at the centre, which under-reports by the block's own circumradius
-// (5.66 L0 cells at BLOCK=8). ?boxrefine=0 restores that exactly, truncated
-// window conversion and all, so the two live in one build and the difference
-// can be measured rather than argued.
+// (5.66 L0 cells at BLOCK=8). ?boxrefine=0 restores that exactly, truncation
+// and all, so the two live in one build and the difference can be measured
+// rather than argued. (It used to restore a truncated WINDOW conversion too;
+// the body is in buffer coordinates since B5, so only the truncation is left
+// to preserve.)
 //
 // The box path drops the `(c + W - u32(off_x)) % W` window reduction with it:
 // get_phi already takes the NEAREST PERIODIC IMAGE, so the modulo bought
@@ -129,11 +131,15 @@ fn nearBodyAt(centre: vec2<f32>, halfExtent: f32) -> bool {
   if (HAS_BODY == 0u) { return false; }
 
   if (BOX_REFINE == 0u) {
-    return phiMinPose(bodyFrameCell(vec2<u32>(u32(centre.x), u32(centre.y)), state),
-                      FORCE_REFINE_LOOKAHEAD, state) < FORCE_REFINE_MARGIN;
+    // The u32() round-trip is the LEGACY TRUNCATION, kept deliberately: this
+    // path exists to reproduce the pre-B4 predicate exactly, and truncating a
+    // fractional tile centre by up to a cell is precisely the error being
+    // preserved for comparison. amr2d.mjs's bodyFrameL0Legacy mirrors it.
+    let truncated = vec2<f32>(f32(u32(centre.x)), f32(u32(centre.y)));
+    return phiMinPose(truncated, FORCE_REFINE_LOOKAHEAD, state) < FORCE_REFINE_MARGIN;
   }
 
-  let p = bodyFrameBare(centre, state);
+  let p = centre;
   return nearBodyBox(p, halfExtent, FORCE_REFINE_MARGIN, FORCE_REFINE_LOOKAHEAD, state);
 }
 

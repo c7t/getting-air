@@ -550,31 +550,29 @@ const sorted = (s) => [...s].sort();
       `a quarter turn should bring the major axis under the test point (got ${spun})`);
   });
 
-  ok('bufferToWindow is EXACT, and its legacy form truncates like the old kernel', () => {
-    // The pre-B4 kernels computed
-    // `(u32(centerX_L0) + W - u32(state.off_x)) % W`, and a level-2 tile
-    // centre is FRACTIONAL -- so the u32() cost up to a cell, compared
-    // against a margin of a few, on exactly the borderline blocks a coverage
-    // check is about. Both forms survive because ?boxrefine=0 keeps the
-    // kernel path the legacy one mirrors. The modulo is dropped from both:
-    // ellipsePhi takes the nearest image itself.
+  ok('the body frame is the buffer frame, and its legacy form truncates', () => {
+    // THE BODY IS IN BUFFER COORDINATES since plans/2D-backport.md B5, so the
+    // frame accessor the coverage checker uses is the IDENTITY -- and it is
+    // named rather than inlined precisely so this test can pin it. The day
+    // the host and the kernels disagree about which frame the body is in is
+    // the day the coverage gate silently stops measuring anything; that is
+    // B5-5's bug (lbm_force.wgsl kept a window position while state.cx had
+    // become a buffer one) one layer up.
     const st = { off_x: 10.75, off_y: -3.25 };
     const close2 = (got, want, what) => {
       close(got[0], want[0], 1e-12, what + ' x');
       close(got[1], want[1], 1e-12, what + ' y');
     };
-    close2(A.bufferToWindow(34.25, 7.9, st), [23.5, 11.15], 'exact');
-    close2(A.bufferToWindowLegacy(34.25, 7.9, st), [24, 10], 'legacy');
-    close2(A.bufferToWindow(34, 8, { off_x: 0, off_y: 0 }), [34, 8], 'zero offset');
-    // trunc, not floor, in the legacy form: a negative offset moves the
-    // window the other way and Math.floor(-3.25) = -4 would shift the body by
-    // a whole cell relative to what the kernel did.
-    assert.strictEqual(A.bufferToWindowLegacy(0, 0, st)[1], 3);
-    // And the exact form is a pure translation -- differences are preserved,
-    // which is what lets a box be subdivided in window space at all.
-    const a = A.bufferToWindow(10, 20, st), b = A.bufferToWindow(14, 26, st);
-    close(b[0] - a[0], 4, 1e-12, 'dx preserved');
-    close(b[1] - a[1], 6, 1e-12, 'dy preserved');
+    // Identity, and INDEPENDENT OF off -- that is the whole point of B5.
+    close2(A.bodyFrameL0(34.25, 7.9, st), [34.25, 7.9], 'exact');
+    close2(A.bodyFrameL0(34.25, 7.9, { off_x: 0, off_y: 0 }), [34.25, 7.9], 'off-independent');
+    // The ?boxrefine=0 path still reaches the kernel through vec2<u32>(...),
+    // so it truncates a FRACTIONAL tile centre by up to a cell -- compared
+    // against a margin of a few, on exactly the borderline blocks a coverage
+    // check is about. common_refine.wgsl's BOX_REFINE == 0u branch mirrors it.
+    close2(A.bodyFrameL0Legacy(34.25, 7.9, st), [34, 7], 'legacy truncates');
+    // trunc, not floor: a negative coordinate must not shift by a whole cell.
+    assert.strictEqual(A.bodyFrameL0Legacy(-3.25, -0.5, st)[0], -3);
   });
 
   // ── the geometry predicate, and the gap the kernel still has ─────────────

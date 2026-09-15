@@ -36,7 +36,7 @@
 
 import {
   check21Balance, nbAtLevel, makePool, cellSizeL0AtLevel,
-  nearBodyWant, nearBodyWantCentre, bodyPhiL0, bufferToWindow, bufferToWindowLegacy,
+  nearBodyWant, nearBodyWantCentre, bodyPhiL0, bodyFrameL0, bodyFrameL0Legacy,
   cascade21, quadrantOfSlot, tileOriginL0,
 } from './amr2d.mjs';
 
@@ -443,7 +443,7 @@ export async function checkGeometryCoverageOnGPU(device, pools, opts) {
     paramsForChildLevel, boxRefine = true,
   } = opts;
   const wantFactory = boxRefine ? nearBodyWant : nearBodyWantCentre;
-  const toWindow = boxRefine ? bufferToWindow : bufferToWindowLegacy;
+  const toBody = boxRefine ? bodyFrameL0 : bodyFrameL0Legacy;
   const state = cardState;
   const violations = [];
   if (nLevels < 2) return { ok: true, violations, checked: 0 };
@@ -467,8 +467,8 @@ export async function checkGeometryCoverageOnGPU(device, pools, opts) {
   // main-cylinder-amr.js's original never noticed because its body is PINNED:
   // with v = omega = 0 the future pose IS the current one.
   const sdf = (x, y) => {
-    const [wx, wy] = toWindow(x, y, state);
-    return bodyPhiL0(wx, wy, state, { W, H }, 0);
+    const [bx2, by2] = toBody(x, y, state);
+    return bodyPhiL0(bx2, by2, state, { W, H }, 0);
   };
 
   let checked = 0;

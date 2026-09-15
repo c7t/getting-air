@@ -1859,6 +1859,91 @@ argument does not obviously require 16 -- but it has not been tested against a
 live readback cadence, only against this harness's, and that is the check it
 would need first.
 
+### B5-6 — DONE (2026-09-15). The buffer convention is the default, and the window convention is gone. **B5 COMPLETE.**
+
+The flip and the cleanup, in one commit because they are one change: a flip
+that left the HOST still modelling the body in window coordinates would have
+had the coverage gate scoring the kernels in a frame they no longer use.
+
+**WHAT MOVED, AND WHAT DID NOT.** Everything with a PINNED body is bit-
+identical, because `off = 0` makes the two conventions the same map -- every
+Cd/St config to the digit (`dense-reference` 1.951/0.1260, `amr-N2-diffuse`
+1.643/0.1478, `amr-N2-bounceback` 1.321/0.1617, `amr-N3-diffuse` 1.425/0.1551,
+`amr-N3-bounceback` 1.351/0.1616), every channel and TGV gate, all seven
+invariant gates on every AMR config, all three refusal configs, boot smoke on
+all seven pages.
+
+The re-baselining is confined to MOVING bodies, and it is small:
+`index-reentry.html` at 4096 steps differs by relL2 **2.1e-3** in ux, 6.1e-3 in
+vorticity. That is rounding, not a frame error -- the two conventions integrate
+the position differently (B5-4), so the body sits ~0.026 cells apart by that
+step. A frame error is O(1), as B5-5's 226x force bug was. Control: the new
+path is exactly deterministic (same build twice, relL2 0), so the difference is
+reproducible rather than noise.
+
+**THE AUDIT THAT PRECEDED IT.** B5-5 found one kernel silently ignoring the
+convention, so before flipping anything, every shader was grepped for raw
+`off_x`/`off_y` arithmetic. `lbm_force.wgsl` was the only physics kernel doing
+it; everything else was either the render (a view by definition, correctly
+window-dispatched) or `physics.wgsl`/`amr_physics.wgsl` WRITING `off`. That is
+the check to repeat before trusting any future frame change -- the accessors
+being available does not mean they are used.
+
+**WHAT WENT.** `override WINDOW_BODY` and its four frame accessors
+(`bodyFrameCell`, `bodyFrame`, `bodyFrameBare`) collapse: 13 call sites across
+7 shaders now write `vec2<f32>(f32(bx), f32(by))` inline, because the body's
+frame IS the buffer cell they already hold. `windowToBody` survives as
+`windowToBufferPos` for the render, the one caller that legitimately starts in
+window space. `INITIAL_CX`/`INITIAL_CY` (B5-3) are deleted from both physics
+shaders and all six pages -- the buffer convention honours whatever
+`cardInit()` seeded, by construction, so the override that re-pinned the body
+every step has nothing left to do. `?window=` goes from both dense pages.
+Host-side, `bufferToWindow`/`bufferToWindowLegacy` are retired WITH their test,
+which is re-pointed at `bodyFrameL0`/`bodyFrameL0Legacy` so the truncation
+lesson stays gated rather than deleted (B3-5's rule).
+
+Net 152 lines removed. **`?upstream=`'s default stays 12** -- that is what
+keeps the cylinder at W/2 and the baselines intact (B5-3).
+
+**NO ACCESSOR SURVIVES AS AN IDENTITY.** `bodyFrameCell` would now be
+`vec2<f32>(c)`, and a function named after a frame that does nothing is exactly
+what let `lbm_force.wgsl` look converted while it was not. The host keeps its
+named identity (`bodyFrameL0`) on purpose, because there it is what the
+coverage gate is scoring and the test pins it; the shaders do not, because
+there it would be the camouflage.
+
+**AND `card-total.mjs` LOST HALF ITS REASON TO EXIST.** Its header argued the
+accumulator's ULP mattered for the trail AND for "THE CARD ITSELF, which
+matters more", since the body's sub-cell position was `frac(y_total)`. The body
+no longer reads the accumulator at all: what `x_total` still feeds the
+simulation is `off`, and only through `floor()`, an integer the ULP does not
+reach. `TOTAL_WRAP_SCREENS` now buys trail/CSV resolution, not physics. Both
+comments are corrected in place rather than left to rot.
+
+### The gate hole this uncovered, which is not about B5
+
+A scripted edit mangled an object literal in `main.js`; `make js` reported
+"57 module(s) parse"; `index.html` then wedged at "initializing..." with an
+uncaught SyntaxError, caught only by the GPU boot smoke.
+
+**`node --check FILE` PARSES AS A SCRIPT AND SILENTLY EXITS 0 ON ANY FILE THAT
+USES ESM `import`.** Measured on node v26.1.0:
+
+    printf 'const a = {p: 1\nb();\n'                            > s.js  -> exit 1  caught
+    printf 'import x from "./y.mjs";\nconst a = {p: 1\nb();\n' > m.js  -> exit 0  MISSED
+
+Every page entry point opens with `import`, so `make js` -- CLAUDE.md's first
+gate -- had never checked a single one of them, and had not since they became
+modules. The fix is one word: pipe the file to stdin under
+`--input-type=module`. Applied to EVERY file, not just the ones that look like
+modules, because CommonJS is valid module syntax too (`require(...)` is a call,
+`module.exports = x` an assignment) -- so it widens coverage rather than
+trading one blind spot for another.
+
+**And the fixed gate was made to fail before it was trusted:** with the brace
+removed again `make js` exits 2 pointing at the line, and 0 once restored. A
+gate that has not been shown to fire is the thing this project keeps finding.
+
 ### B9 — DONE (2026-09-14)
 
 `lattice-2d.mjs` + `tools/gen-lattice-2d.js` + `tools/test-lattice-2d.js`, and

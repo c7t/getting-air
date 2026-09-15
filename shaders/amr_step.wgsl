@@ -132,9 +132,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   // the window: the ALBC sponge band and the WALL_Y walls.
   let w = bufferToWindowCell(vec2<u32>(cx, cy), state);
   let wx = w.x; let wy = w.y;
-  // ... and the BODY's frame, for the SDF and the lever arm. The same thing
-  // under the shipped convention; the bare buffer cell under ?window=0.
-  let p = bodyFrameCell(vec2<u32>(cx, cy), state);
+  // ... and the BODY's frame, which since B5 is just this cell's own buffer
+  // position (common_geometry.wgsl).
+  let p = vec2<f32>(f32(cx), f32(cy));
 
   // Position/solid-velocity/own-cell-index terms, hoisted ABOVE the gather
   // loop -- see lbm_step.wgsl's identical hoist for why USE_BOUNCEBACK
@@ -155,7 +155,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   for (var i = 0u; i < 9u; i++) {
     let bx_src = (cx + W - u32(ex[i])) % W;
     let by_src = (cy + H - u32(ey[i])) % H;
-    if (USE_BOUNCEBACK != 0u && HAS_BODY != 0u && get_phi(bodyFrameCell(vec2<u32>(bx_src, by_src), state), state) < 0f) {
+    if (USE_BOUNCEBACK != 0u && HAS_BODY != 0u && get_phi(vec2<f32>(f32(bx_src), f32(by_src)), state) < 0f) {
       // Bounce-back -- see lbm_step.wgsl's identical branch for the
       // formula/derivation.
       let corr = 2f * wt[i] * (f32(ex[i]) * usx + f32(ey[i]) * usy) / CS2;

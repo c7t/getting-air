@@ -180,7 +180,7 @@ fn main(
         let originY_L0 = f32(by * RB) * 2.0f * levelParams.dxL;
         let bufX = fineToCoarseUnit(fx, originX_L0);
         let bufY = fineToCoarseUnit(fy, originY_L0);
-        let p = bodyFrame(vec2<f32>(bufX, bufY), state);
+        let p = vec2<f32>(bufX, bufY);
 
         let phi = get_phi(p, state);
         let poolPlaneStride = arrayLength(&f_in) / 9u;
@@ -209,7 +209,7 @@ fn main(
             for (var i = 0u; i < 9u; i++) {
               let srcBufX = fineToCoarseUnitI(i32(fx) - ex[i], originX_L0);
               let srcBufY = fineToCoarseUnitI(i32(fy) - ey[i], originY_L0);
-              if (get_phi(bodyFrame(vec2<f32>(srcBufX, srcBufY), state), state) < 0f) {
+              if (get_phi(vec2<f32>(srcBufX, srcBufY), state) < 0f) {
                 let f_opp = fUnpack(f_in[fIdx(opp[i], poolPlaneStride, cell)], opp[i]);
                 let corr = 2f * wt[i] * (f32(ex[i]) * usx + f32(ey[i]) * usy) / CS2;
                 fx_body += -f32(ex[i]) * (2f * f_opp + corr) * lineWeight;

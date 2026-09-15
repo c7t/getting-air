@@ -267,28 +267,21 @@ fn nearBodyBox(center: vec2<f32>, half: f32, margin: f32, lookahead: f32, state:
 // BUFFER -> WINDOW, THE ONLY TWO PLACES IT HAPPENS (plans/2D-backport.md B5-1)
 //
 // The solver is buffer-coordinate native: a thread owns a buffer cell and
-// everything it indexes is a buffer index. Three things are anchored to the
-// WINDOW instead and have to convert -- the body SDF, the ALBC sponge band,
-// and the refinement geometry predicates -- and until B5-1 each of the nine
-// call sites spelled the conversion out for itself, in one of two idioms that
-// are NOT interchangeable:
+// everything it indexes is a buffer index. Since B5 the BODY is buffer-native
+// too, so only things anchored to the VIEW convert -- the ALBC sponge band,
+// the WALL_Y walls, and the render. That used to include the body SDF and the
+// refinement geometry predicates, and each of NINE call sites spelled the
+// conversion out for itself, in one of two idioms that are NOT
+// interchangeable:
 //
 //   cells      (c + N - u32(off)) % N       integer, truncates off
 //   positions  wrapf(p - off, N)            continuous, keeps off's fraction
 //
-// The second is the one B5 exists to remove: it is the sub-cell precision
-// exposure, because `off` is a float carrying the body's fractional travel
-// and the fine levels evaluate at fractional L0 positions. Naming both here
-// does not change either -- the arithmetic below is verbatim what every site
-// had -- but it makes them countable, keeps a site from picking the wrong one
-// by copy-paste, and puts the B5 switch in ONE function instead of nine.
-//
-// amr2d.mjs's `bufferToWindow` is the host twin, and it is the BARE
-// SUBTRACTION with no wrap at all: get_phi already takes the nearest periodic
-// image, so wrapping first is work whose result get_phi immediately redoes.
-// The kernels keep their wrap here only because this commit is inert by
-// construction; dropping it is a real (if tiny) numerical change and belongs
-// with B5 proper.
+// Keeping both named matters even now that the body no longer uses either:
+// the sponge is sampled per cell and the fine levels evaluate at fractional
+// L0 positions, so a site that picks the wrong one by copy-paste gets a
+// sub-cell error that nothing rounds away. B5-1 counted them; B5-2 and B5-5
+// took the body off them entirely.
 //
 // DEPENDS ON THE INCLUDER declaring `override W` / `override H`, like get_phi
 // above.
@@ -315,59 +308,44 @@ fn bufferToWindowPos(p: vec2<f32>, state: CardState) -> vec2<f32> {
 // ─────────────────────────────────────────────────────────────────────────────
 // WHICH FRAME IS THE BODY IN? (plans/2D-backport.md B5)
 //
-// WINDOW_BODY = 1 (the shipped convention): the body is pinned to a fixed
-// WINDOW position and the moving window pans the buffer under it, so every
-// kernel that evaluates the SDF converts its buffer cell to window
-// coordinates first. `cx`/`cy` are window coordinates; `x_total`/`y_total`
-// are unbounded accumulators whose FRACTIONAL part IS the body's sub-cell
-// position, which is why card-total.mjs and TOTAL_WRAP_SCREENS exist.
+// THE BODY LIVES IN BUFFER COORDINATES. `cx`/`cy` are buffer positions,
+// integrated and wrapped into [0, W) x [0, H) every step, and the SDF is
+// evaluated directly on a cell's own buffer position -- get_phi takes the
+// nearest periodic image, so there is no conversion and no wrap to do. A
+// kernel that has a buffer cell already has everything the body needs.
 //
-// WINDOW_BODY = 0 (?window=0, 3D's convention): the body's position is held
-// in BUFFER coordinates, wrapped into [0, W) x [0, H) every step, and the SDF
-// is evaluated directly on the buffer position -- get_phi already takes the
-// nearest periodic image, so no conversion and no wrap are needed at all. The
-// conversion survives in exactly two places, and both are genuinely
-// window-anchored: the ALBC sponge band and the WALL_Y channel walls (plus
-// the render, which is a view by definition).
+// So the buffer->window conversion below survives for exactly three things,
+// and all three are genuinely anchored to the VIEW rather than to the fluid:
+// the ALBC sponge band, the WALL_Y channel walls, and the render.
 //
-// WHAT THAT BUYS: the body's ULP becomes W*2^-24 forever, by construction,
-// instead of tracking an accumulator that grows without bound. x_total
-// survives as REPORTING ONLY -- nothing reads it back into the simulation.
+// THIS REPLACED A WINDOW-ANCHORED BODY (?window=1, deleted 2026-09-15 after
+// B5-5). Under that convention the body was pinned to a fixed WINDOW position
+// and the buffer panned beneath it, so every kernel touching the SDF
+// converted first -- nine hand-written sites across six files, in two
+// different flavours, which is what B5-1 collapsed and B5-2/B5-5 finished.
+// Two things are worth keeping from it:
 //
-// AND WHY IT CANNOT BE BIT-IDENTICAL, which the plan's own gate wording does
-// not quite say: the two conventions do not merely re-label cells, they
-// INTEGRATE THE POSITION DIFFERENTLY (frac of a long accumulation vs. a
-// wrapped accumulator). Same physics, different rounding every step, so a
-// free body's trajectory diverges from step one. Only a pinned or prescribed
-// body agrees, and only a single step from a shared state agrees exactly.
-// That is what the flag is for.
-override WINDOW_BODY : u32 = 1u;
+//   - The conversions were not interchangeable. The CELL form truncated the
+//     offset, the POSITION form kept its fraction, and the fine levels
+//     evaluate at fractional L0 positions. Anything reintroducing a
+//     conversion has to pick deliberately; see bufferToWindowCell vs.
+//     bufferToWindowPos above.
+//   - The two conventions did NOT merely re-label cells, they integrated the
+//     position differently, so a free body's trajectory diverged from step
+//     one. Measured at the swap: a pinned body agreed exactly (every Cd/St
+//     config to the digit), while index-reentry.html's prescribed moving body
+//     differed by relL2 2.1e-3 in ux. That is rounding, not a frame error --
+//     a frame error is O(1), as B5-5's 226x force bug was.
 
-// A buffer CELL, in the frame the body is expressed in.
-fn bodyFrameCell(c: vec2<u32>, state: CardState) -> vec2<f32> {
-  if (WINDOW_BODY != 0u) {
-    let w = bufferToWindowCell(c, state);
-    return vec2<f32>(f32(w.x), f32(w.y));
-  }
-  return vec2<f32>(f32(c.x), f32(c.y));
-}
+// A kernel that needs the body's frame writes its own buffer cell inline, as
+// `vec2<f32>(f32(bx), f32(by))`. There is no accessor: an identity function
+// named after a frame is exactly the thing that let lbm_force.wgsl look
+// converted while it was not.
 
-// A continuous buffer POSITION, in the frame the body is expressed in.
-fn bodyFrame(p: vec2<f32>, state: CardState) -> vec2<f32> {
-  if (WINDOW_BODY != 0u) { return bufferToWindowPos(p, state); }
-  return p;
-}
-
-// Same, without the wrap -- get_phi takes the nearest image, so a caller that
-// only feeds get_phi does not need one. amr2d.mjs's bufferToWindow is this.
-fn bodyFrameBare(p: vec2<f32>, state: CardState) -> vec2<f32> {
-  if (WINDOW_BODY != 0u) { return p - vec2<f32>(state.off_x, state.off_y); }
-  return p;
-}
-
-// The inverse, for the one caller that starts in WINDOW space: the render,
-// which draws the view and must ask where the body is within it.
-fn windowToBody(pWin: vec2<f32>, state: CardState) -> vec2<f32> {
-  if (WINDOW_BODY != 0u) { return pWin; }
+// The inverse of bufferToWindowPos, for the one caller that legitimately
+// starts in WINDOW space: the render, which rasterizes the VIEW and therefore
+// has a window position in hand, but must ask about the body, which is in
+// buffer coordinates.
+fn windowToBufferPos(pWin: vec2<f32>, state: CardState) -> vec2<f32> {
   return pWin + vec2<f32>(state.off_x, state.off_y);
 }

@@ -146,9 +146,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   // the window: the sponge band and the WALL_Y walls.
   let w = bufferToWindowCell(vec2<u32>(bx, by), state);
   let x = w.x; let y = w.y;
-  // ... and the BODY's frame, for the SDF and the lever arm (see
-  // common_geometry.wgsl's WINDOW_BODY).
-  let p = bodyFrameCell(vec2<u32>(bx, by), state);
+  // ... and the BODY's frame, which since B5 is just this cell's own buffer
+  // position (common_geometry.wgsl).
+  let p = vec2<f32>(f32(bx), f32(by));
 
   // Position/solid-velocity/own-cell-index terms, hoisted ABOVE the gather
   // loop (unchanged math, just moved earlier from where section "3" used
@@ -170,7 +170,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // The source cell, in BUFFER coordinates -- one wrap, no round trip.
     let bx_src = (bx + W - u32(ex[i])) % W;
     let by_src = (by + H - u32(ey[i])) % H;
-    if (USE_BOUNCEBACK != 0u && HAS_BODY != 0u && get_phi(bodyFrameCell(vec2<u32>(bx_src, by_src), state), state) < 0f) {
+    if (USE_BOUNCEBACK != 0u && HAS_BODY != 0u && get_phi(vec2<f32>(f32(bx_src), f32(by_src)), state) < 0f) {
       // Bounce-back: the streaming source is inside the solid, so there's
       // no valid fluid population to pull -- reflect this cell's OWN
       // pre-streaming population that was heading toward that same

@@ -11,14 +11,23 @@
 //     ULP approaches the per-sample increment the y coordinate advances in
 //     visible stair-steps while x keeps moving smoothly -- the flat spots in
 //     the white line on a long-running page.
-//   - The CARD ITSELF, which matters more. Both shaders take the card's
-//     sub-cell position straight out of the accumulator's FRACTIONAL part
-//     (`cy = initial_cy + (y_total - floor(y_total))`). The fraction is the
-//     part the ULP eats first, so the sub-cell position quantizes to coarser
-//     and coarser steps -- and get_phi tests that position, so the whole
-//     solid coupling inherits the quantization. That is a physics effect, not
-//     a cosmetic one, and it has no lower bound: run long enough and the
-//     fraction disappears entirely.
+//   - The CARD ITSELF -- NO LONGER TRUE, and this is the more important half
+//     to have retired. Both shaders used to take the card's sub-cell position
+//     straight out of the accumulator's FRACTIONAL part
+//     (`cy = initial_cy + (y_total - floor(y_total))`), so the ULP ate the
+//     fraction first and the whole solid coupling inherited the quantization.
+//     Since plans/2D-backport.md B5 the body is integrated in BUFFER
+//     coordinates and wrapped into [0, H) every step: its magnitude is bounded
+//     by the domain and it never reads this accumulator at all. What the
+//     accumulator still feeds the SIMULATION is off_x/off_y, and only through
+//     `floor()` -- an integer, which the ULP does not reach until the value is
+//     enormous.
+//
+//     Measured before that change (B5-4, ?wrapScreens=, 262144 steps against
+//     an exact prescribed trajectory): the body's position error was 8.5 cells
+//     at the shipped 16 screens and 0.71 at 1 -- so this was worth ~12x, and
+//     the buffer convention independently delivers the same 12x. Both were the
+//     same mechanism, which is why only one of them was needed.
 //
 // WHY WRAPPING IS EXACT, AND INVISIBLE TO THE SIMULATION. The shaders use the
 // accumulator for exactly two things, and a wrap by a whole multiple of the
@@ -40,11 +49,15 @@
 // Domain-heights of accumulated displacement to allow before wrapping. Must
 // match TOTAL_WRAP_SCREENS in shaders/physics.wgsl and amr_physics.wgsl.
 //
-// The tension: SMALLER keeps more mantissa for the sub-cell fraction, LARGER
-// keeps the unwrap below unambiguous. 16 screens is far more than any single
-// readback can cross (a frame moves the card a few lattice units at most,
-// against a half-wrap of 8 domain heights) while holding the ULP at W=256 to
-// 16*256*2^-23 ~= 4.9e-4 of a cell, permanently, instead of letting it grow.
+// The tension: SMALLER keeps more mantissa, LARGER keeps the unwrap
+// unambiguous. 16 screens is far more than any single readback can cross (a
+// frame moves the card a few lattice units at most, against a half-wrap of 8
+// domain heights) while holding the ULP at W=256 to 16*256*2^-23 ~= 4.9e-4 of
+// a cell, permanently, instead of letting it grow.
+//
+// That trade is much less sharp than it was: since B5 this number no longer
+// touches the body, so what it buys is trail/CSV resolution rather than
+// physics. Lowering it is therefore cheap to try and no longer urgent.
 export const TOTAL_WRAP_SCREENS = 16;
 
 // Phase-unwraps a pair of wrapped accumulators into float64 running totals.

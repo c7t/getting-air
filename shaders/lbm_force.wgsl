@@ -91,7 +91,7 @@ fn main(
     // exactly (off_x, off_y): measured 226x wrong in fy at off_y=75, and
     // exactly right at off_y=0 -- which is every pinned-cylinder config, and
     // therefore every config that had ever been pointed at ?window=0.
-    let p    = bodyFrameCell(vec2<u32>(bx, by), state);
+    let p    = vec2<f32>(f32(bx), f32(by));
 
     let phi = get_phi(p, state);
     let chi = get_chi(phi);
@@ -113,7 +113,7 @@ fn main(
           let wy_src = (y + H - u32(ey[i])) % H;
           let bx_nb  = (wx_src + u32(state.off_x)) % W;
           let by_nb  = (wy_src + u32(state.off_y)) % H;
-          if (get_phi(bodyFrameCell(vec2<u32>(bx_nb, by_nb), state), state) < 0f) {
+          if (get_phi(vec2<f32>(f32(bx_nb), f32(by_nb)), state) < 0f) {
             let f_opp = fUnpack(f_in[fIdx(opp[i], (W * H), cell)], opp[i]);
             let corr = 2f * wt[i] * (f32(ex[i]) * usx + f32(ey[i]) * usy) / CS2;
             fx_body += -f32(ex[i]) * (2f * f_opp + corr);

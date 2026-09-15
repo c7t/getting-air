@@ -301,27 +301,28 @@ export function bodyPhiL0(px, py, state, dims, lookahead) {
   return Math.min(now, future);
 }
 
-// Buffer (L0) coordinates -> window coordinates. Buffer blocks are fixed in
-// memory; the body is anchored in WINDOW space, which is what every kernel's
-// `(u32(c) + W - u32(state.off_x)) % W` is doing.
+
+// L0 buffer coordinates -> THE BODY'S frame. Since plans/2D-backport.md B5 the
+// body lives in BUFFER coordinates, so this is the identity -- but it is a
+// named identity on purpose. The checker that calls it is scoring the kernels,
+// and the day the host and the kernels disagree about which frame the body is
+// in is the day the coverage gate silently stops measuring anything. That is
+// exactly B5-5's bug one layer down: lbm_force.wgsl went on building a WINDOW
+// position after state.cx had become a buffer one, and because the two
+// coincide whenever off == 0 -- which is every pinned-cylinder config -- no
+// gate could see it.
 //
-// THE EXACT FORM IS WHAT THE KERNELS DO NOW. The modulo is dropped because
-// ellipsePhi (like get_phi) already takes the nearest image, so reducing into
-// [0, W) first changes nothing.
-//
-// `bufferToWindowLegacy` is the pre-B4 form, kept because ?boxrefine=0 keeps
-// the kernel path it mirrors. It applied `u32()` to the centre as well as to
-// off_x, so a level-2 tile centre of 34.25 was tested at 34 -- a
-// sub-cell-to-one-cell error compared against a margin of a few cells, on
-// exactly the borderline blocks a coverage check is about. A checker that
-// silently used the exact centre would have disagreed with the kernel there,
-// which is why it was mirrored rather than hidden.
-export function bufferToWindow(px, py, state) {
-  return [px - state.off_x, py - state.off_y];
+// `bodyFrameL0Legacy` mirrors ?boxrefine=0's kernel path, which reaches the
+// body through vec2<u32>(...) and therefore TRUNCATES a fractional tile centre
+// by up to a cell, compared against a margin of a few, on exactly the
+// borderline blocks a coverage check is about. common_refine.wgsl's
+// BOX_REFINE == 0u branch carries the same truncation deliberately.
+export function bodyFrameL0(px, py, _state) {
+  return [px, py];
 }
 
-export function bufferToWindowLegacy(px, py, state) {
-  return [Math.trunc(px) - Math.trunc(state.off_x), Math.trunc(py) - Math.trunc(state.off_y)];
+export function bodyFrameL0Legacy(px, py, _state) {
+  return [Math.trunc(px), Math.trunc(py)];
 }
 
 // DOES ANY POINT OF THIS BLOCK COME WITHIN `margin` OF THE BODY?

@@ -36,36 +36,24 @@ const statusEl = document.getElementById('status');
 
 const urlParams = new URLSearchParams(window.location.search);
 
-// ?window=0 -- THE BODY IN BUFFER COORDINATES (plans/2D-backport.md B5).
-// Default 1 is the shipped convention and is byte-identical to the build
-// before the flag existed. See shaders/common_geometry.wgsl's WINDOW_BODY for
-// what the two conventions are, and for why they cannot agree bit-for-bit
-// once the body actually moves.
-//
-// REFUSE, DO NOT DEGRADE. The buffer convention needs a body to place, and it
-// needs the sponge to still be the thing anchored to the window -- with no
-// absorbing band the wake wraps round the periodic domain and the body flies
-// back into its own wake, which looks perfectly healthy on screen and is not.
-// A walled axis is the same argument: WALL_Y is window-anchored, and a body
-// free to translate past a wall is not a scenario this convention describes.
-// Neither of those scenarios is reachable from this page; the pages where
-// they are (main-tgv*, main-channel*) do not offer the flag at all.
-const WINDOW_BODY = urlParams.has('window') ? parseInt(urlParams.get('window')) : 1;
-if (WINDOW_BODY !== 0 && WINDOW_BODY !== 1) {
-  refuseConfig(statusEl, `?window=${urlParams.get('window')} invalid -- 1 (the shipped window convention) or 0 (the buffer convention).`);
-}
 
-// ?wrapScreens=N -- THE INSTRUMENT FOR B5's PRECISION CLAIM (B5-4), the same
-// shape as B7's ?kEps= ladder. Domain-heights of accumulated displacement
-// allowed before x_total/y_total wrap; default 16 matches card-total.mjs and
-// is byte-identical to the build before this existed.
+// ?wrapScreens=N -- domain-heights of accumulated travel before x_total/
+// y_total wrap; default 16, matching card-total.mjs. Same shape as B7's
+// ?kEps= ladder, and byte-identical when absent.
 //
-// It exists because the body's sub-cell position under the SHIPPED convention
-// is frac(y_total), so the accumulator's MAGNITUDE is the body's precision --
+// WHAT IT SETTLED (B5-4). The body's sub-cell position USED to be
+// frac(y_total), so the accumulator's magnitude was the body's precision --
 // and that magnitude is set by this constant, not by the window/buffer choice
-// B5 is about. Sweeping it separates the two. card-total.mjs must be handed
-// the SAME value (a mismatch silently mis-attributes every wrap as motion),
-// which is why both consumers below read this one variable.
+// B5 was about. Sweeping the two separately showed they were the same
+// mechanism: 262144 steps against an exact prescribed trajectory gave 8.5
+// cells of error at 16 screens, 0.71 at 1 screen, and 0.72 under the buffer
+// convention. B5 was taken for its kernel simplification, and this knob is
+// why that was the honest reason rather than precision.
+//
+// Since B5 the body no longer reads the accumulator at all, so what this now
+// bounds is the TRAIL and the CSV export, not the physics. card-total.mjs must
+// still be handed the SAME value -- a mismatch silently re-reads every wrap as
+// motion -- which is why both consumers below take this one variable.
 const WRAP_SCREENS = urlParams.has('wrapScreens') ? parseInt(urlParams.get('wrapScreens')) : 16;
 if (!Number.isFinite(WRAP_SCREENS) || WRAP_SCREENS < 1) {
   refuseConfig(statusEl, `?wrapScreens=${urlParams.get('wrapScreens')} invalid -- must be an integer >= 1 (domain-heights of travel before the accumulator wraps).`);
@@ -291,9 +279,9 @@ async function init() {
   // No SPONGE_UX/UY, no USE_BOUNCEBACK override -- both default (0), matching
   // main.js's own falling-card convention: quiescent far field, diffuse
   // (Brinkman/Guo) body coupling. See this file's own header.
-  const constants = { W, H, WINDOW_BODY };
+  const constants = { W, H };
   // See main.js: only the f-touching pipelines may be given F16.
-  const fConstants = { W, H, WINDOW_BODY, F16, K_EPS };
+  const fConstants = { W, H, F16, K_EPS };
 
   const stepPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [stepBGL] }),
@@ -307,7 +295,7 @@ async function init() {
   // main-reentry-amr.js's identical phyPL construction.
   const phyPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [phyBGL] }),
-    compute: { module: phySM, entryPoint: 'main', constants: { W, H, WINDOW_BODY, KINEMATIC: 1, VY_FIXED: VY, OMEGA_FIXED: OMEGA, INITIAL_CX: W / 2, INITIAL_CY: H / 2, TOTAL_WRAP_SCREENS: WRAP_SCREENS } }
+    compute: { module: phySM, entryPoint: 'main', constants: { W, H, KINEMATIC: 1, VY_FIXED: VY, OMEGA_FIXED: OMEGA, TOTAL_WRAP_SCREENS: WRAP_SCREENS } }
   });
   const renPL = device.createRenderPipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [renBGL] }),
