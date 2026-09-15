@@ -74,6 +74,14 @@ let NCELLS = W * H;
 // pairs with. Default off (0) reproduces today's exact behavior.
 const USE_BOUNCEBACK = urlParams.has('bounceback') ? 1 : 0;
 
+// ?solideq=0 restores the pre-B8 behaviour: cells INSIDE the body evolve as
+// ordinary fluid under bounce-back, with chi forced to 0 and nothing damping
+// them. Default 1 holds them at the local solid equilibrium. See
+// shaders/lbm_step.wgsl's SOLID_EQ header -- on a PINNED body this cannot
+// move a number either way, which is why it ships on by default rather than
+// waiting for a re-baseline.
+const SOLID_EQ = urlParams.has('solideq') ? (parseInt(urlParams.get('solideq')) ? 1 : 0) : 1;
+
 // ?f16=1 / ?f16=2: real packed-half storage for `f` -- see
 // shaders/common_fpack.wgsl for the layout and f-pack.mjs for the host side.
 // Default 0 is byte-identical to the old array<f32> layout.
@@ -1130,7 +1138,7 @@ async function init() {
   // Coarse step needs the freestream sponge target; force/physics/render/
   // criterion/manage don't reference SPONGE_UX/UY at all, so they keep the
   // plain {W,H} constants dict above.
-  const stepConstants = { W, H, SPONGE_UX: U0, SPONGE_UY: 0, USE_BOUNCEBACK, K_EPS };
+  const stepConstants = { W, H, SPONGE_UX: U0, SPONGE_UY: 0, USE_BOUNCEBACK, K_EPS, SOLID_EQ };
   const fineConstants = { W, H, RB, K_EPS };
   // Split from fineConstants: that one also drives the render fragment,
   // whose module has no F16 override, and WebGPU makes passing an
@@ -1146,7 +1154,7 @@ async function init() {
   // Fine step(s) also need the freestream sponge target (see amr_step1*.wgsl's
   // SPONGE_UX/UY -- both L1's dedicated file and the level>=2 shared one have
   // their own copy of the sponge, not shared with the coarse kernel).
-  const step1Constants = { W, H, RB, SPONGE_UX: U0, SPONGE_UY: 0, USE_BOUNCEBACK, F16, DIRECT_GHOST: GHOST_COPY ? 0 : 1, K_EPS };
+  const step1Constants = { W, H, RB, SPONGE_UX: U0, SPONGE_UY: 0, USE_BOUNCEBACK, F16, DIRECT_GHOST: GHOST_COPY ? 0 : 1, K_EPS, SOLID_EQ };
   const criterionConstants = { W, H };
   const manageConstants = { DIAG, W, H, REFINE_THRESH, COARSEN_THRESH, FORCE_REFINE_MARGIN, FORCE_REFINE_LOOKAHEAD, DEMAND_CASCADE, HAS_LEVEL2: N_LEVELS > 2 ? 1 : 0, BOX_REFINE };
 

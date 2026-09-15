@@ -51,6 +51,14 @@ if (resLog2 > 11) resLog2 = 11;
 // sets this at all, so the falling-card scenario is untouched either way.
 const USE_BOUNCEBACK = urlParams.has('bounceback') ? 1 : 0;
 
+// ?solideq=0 restores the pre-B8 behaviour: cells INSIDE the body evolve as
+// ordinary fluid under bounce-back, with chi forced to 0 and nothing damping
+// them. Default 1 holds them at the local solid equilibrium. See
+// shaders/lbm_step.wgsl's SOLID_EQ header -- on a PINNED body this cannot
+// move a number either way, which is why it ships on by default rather than
+// waiting for a re-baseline.
+const SOLID_EQ = urlParams.has('solideq') ? (parseInt(urlParams.get('solideq')) ? 1 : 0) : 1;
+
 // ?f16=1 / ?f16=2: real packed-half storage for `f` -- see
 // shaders/common_fpack.wgsl for the layout and f-pack.mjs for the host side.
 // Default 0 is byte-identical to the old array<f32> layout.
@@ -312,7 +320,7 @@ async function init() {
     { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } }
   ]});
 
-  const stepConstants = { W, H, SPONGE_UX: U0, SPONGE_UY: 0, USE_BOUNCEBACK, K_EPS };
+  const stepConstants = { W, H, SPONGE_UX: U0, SPONGE_UY: 0, USE_BOUNCEBACK, K_EPS, SOLID_EQ };
   const constants     = { W, H };
 
   const stepPL = device.createComputePipeline({

@@ -52,6 +52,35 @@ override SPONGE_W : f32 = 4.0f;
 // file's header for the full rationale.
 override USE_BOUNCEBACK : u32 = 0u;
 
+// SOLID_EQ: under BOUNCE-BACK, hold cells INSIDE the body at the local solid
+// equilibrium instead of letting them evolve (plans/2D-backport.md B8).
+//
+// THE HAZARD, and why 2D cannot currently see it. Under bounce-back `chi` is
+// forced to 0, so the penalty term that damps the interior under the diffuse
+// coupling is not there -- and the gather above only redirects a source that
+// is solid, which says nothing about a cell that IS solid. Interior cells are
+// therefore stepped as ordinary fluid with reflected gathers and nothing
+// bounds them: 3D measured max|u| inside the body at 6x the body's own speed
+// at tau=0.6, and a moving body dead in 200 steps at tau=0.514.
+//
+// A PINNED body never notices, because nothing reads a solid cell: the
+// bounce-back branch reads f_in[opp[i]] at the FLUID cell, and the force
+// kernel runs only where phi >= 0. 2D's only bounce-back body is pinned
+// (?bounceback lives in main-cylinder.js and main-cylinder-amr.js, both
+// fixed), so this fix cannot move a single 2D number today -- which is
+// exactly why it is worth landing now rather than after ?bounceback=1 is
+// first pointed at a moving body.
+//
+// IT IS ALSO THE FRESH-NODE REFILL, done unconditionally. A cell the body
+// vacates becomes fluid holding whatever it last had; writing the solid
+// equilibrium every step means the value it is uncovered with is already the
+// right one, at no cost and with no need to detect the uncovering. rho = 1 is
+// the same near-incompressible choice the bounce-back correction term above
+// already makes.
+//
+// ?solideq=0 restores the old behaviour for A/B.
+override SOLID_EQ : u32 = 1u;
+
 // Channel/TGV-scenario overrides -- see shaders/lbm_step.wgsl's identical
 // set for the full rationale (HAS_BODY, WALL_Y/WALL_U0/WALL_U1,
 // FORCE_X/FORCE_Y). All default to a no-op, so this file's existing
@@ -184,6 +213,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   // Gathered, then stored a whole cell at a time: under F16 two planes share
   // a word, so a per-plane store would be a read-modify-write race. See
   // common_fpack.wgsl.
+  // Uniform over this cell: is it INSIDE the body, on the bounce-back path?
+  let inSolid = SOLID_EQ != 0u && USE_BOUNCEBACK != 0u && HAS_BODY != 0u && phi < 0f;
   var fo: array<f32,9>;
   for (var i = 0u; i < 9u; i++) {
     let exf = f32(ex[i]); let eyf = f32(ey[i]);
@@ -200,7 +231,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let eu_far = exf*SPONGE_UX + eyf*SPONGE_UY;
     let f_target = wt[i] * (1.0f + 3.0f*eu_far + 4.5f*eu_far*eu_far - 1.5f*(SPONGE_UX*SPONGE_UX + SPONGE_UY*SPONGE_UY)); // rho=1.0, u=(SPONGE_UX,SPONGE_UY) equilibrium
 
-    fo[i] = mix(f_collide, f_target, sponge_weight);
+    // SOLID_EQ (see header): inside the body, discard the collision entirely
+    // and write the local solid equilibrium. Hoisted flag, per-direction
+    // value -- the branch is uniform across the cell.
+    fo[i] = select(mix(f_collide, f_target, sponge_weight),
+                   feqD2Q9(1.0f, usx, usy, i), inSolid);
   }
   let nw = fWords();
   for (var wi = 0u; wi < nw; wi++) {
