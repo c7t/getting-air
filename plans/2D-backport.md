@@ -1499,7 +1499,8 @@ Stages: B5-0 (dense step buffer-dispatched, two dead kernels deleted), B5-1
 a flag), B5-3 (the body's initial placement honoured; `?upstream=` made real),
 B5-4 (the precision claim measured, and RETIRED -- it was `TOTAL_WRAP_SCREENS`,
 not the convention), B5-5 (`lbm_force.wgsl`, the one kernel that silently
-ignored the flag), B5-6 (default flipped, old path deleted).
+ignored the flag), B5-6 (default flipped, old path deleted), B5-7 (that
+kernel's DISPATCH, the last window bookkeeping in the tree).
 
 **WHAT IT COST AND WHAT IT BOUGHT.** Net ~150 lines removed. Every pinned-body
 config is bit-identical (`off = 0` makes the two conventions the same map);
@@ -1509,17 +1510,12 @@ precision benefit did NOT survive measurement (B5-4). What B5 actually bought
 is the conversion count: nine sites in six files, in two non-interchangeable
 idioms, down to three view-anchored callers.
 
-**THE ONE RESIDUAL, named rather than quietly dropped.** `lbm_force.wgsl` is
-still DISPATCHED in window coordinates -- its thread index is a window cell
-that it maps to a buffer cell on line 1. Its *frame* is correct (B5-5); what
-remains is bookkeeping, and the plan's wording ("the step, the force kernels
-and the manager lose their window bookkeeping entirely") is therefore met
-everywhere except this dispatch. It was left deliberately: re-tiling the
-dispatch regroups the per-workgroup truncated `atomicAdd`s, so it moves the
-force total's last fixed-point digit on every moving-body page -- a
-re-baselining change, with no correctness benefit, on `index.html`, which has
-no gate beyond boot smoke. Worth doing beside something else that already
-re-baselines that page; not worth doing alone.
+**NO RESIDUAL.** B5-7 took `lbm_force.wgsl`, the last window-DISPATCHED
+kernel, onto buffer dispatch, so the plan's wording ("the step, the force
+kernels and the manager lose their window bookkeeping entirely") is now met
+without exception. **`state.off_x`/`off_y` are read by the render alone**, and
+written by `physics.wgsl`/`amr_physics.wgsl` -- which makes the audit that
+found B5-5's bug a one-line grep with no exceptions to remember.
 
 **Everything below this line is the original statement of the problem and the
 stage-by-stage record.** It is kept because the reasoning is the useful part;
@@ -2033,6 +2029,49 @@ trading one blind spot for another.
 **And the fixed gate was made to fail before it was trusted:** with the brace
 removed again `make js` exits 2 pointing at the line, and 0 once restored. A
 gate that has not been shown to fire is the thing this project keeps finding.
+
+### B5-7 — DONE (2026-09-15). The last window-dispatched kernel.
+
+B5-5 fixed `lbm_force.wgsl`'s FRAME; its DISPATCH stayed in window coordinates,
+converting to buffer at every load and back out again for every neighbour --
+composing a shift with its own inverse once per direction per cell, exactly
+what B5-0 removed from `lbm_step.wgsl`:
+
+    window:  wx_src = (x - e) mod W,  bx_src = (wx_src + off) mod W
+    buffer:  bx_src = (bx - e) mod W          with bx = (x + off) mod W
+
+The kernel touches no sponge and no walls, so with the body buffer-native it
+needs no window coordinate at all: `state.off_x`/`off_y` are gone from the file.
+
+**THE REASON IS THE AUDIT, NOT THE CODE SHAPE.** "Only the render does raw
+`off_x`/`off_y` arithmetic" is the check that finds a kernel silently stuck in
+the wrong frame -- the thing no gate could see in B5-5, because every config
+ever pointed at the flag had `off == 0`. That invariant was false by exactly
+this one file, and an invariant with one remembered exception is much weaker
+than one with none. It now holds with no exceptions.
+
+**THE COST, PREDICTED THEN MEASURED.** The reduction truncates PER WORKGROUP:
+each 8x8 group sums 64 contributions and `atomicAdd`s one i32 at FSCALE = 1e7.
+Re-tiling changes which cells share a workgroup, so the partials truncate
+differently. It is inert exactly when `off ≡ 0 (mod 8)`, because then a window
+tile maps onto a buffer tile and the PARTITION is unchanged. So:
+
+    index-cylinder.html   pinned, off = 0   bit-identical (dense-reference 1.951/0.1260)
+    index-reentry.html    prescribed        FIELD bit-identical; reported force moves
+    index.html            free body         trajectory diverges (no gate but boot smoke)
+
+Measured on `index-reentry.html` at 4096 steps, where `off_y = 75` and
+75 mod 8 = 3, so the partition genuinely differs:
+
+    fx   -1.7560500652e-02 -> -1.7560500652e-02   unchanged
+    fy   -3.1409200281e-02 -> -3.1409598887e-02   -4.0e-07  (1.3e-05 rel)
+    tz    2.6860749722e-01 ->  2.6860710979e-01   -3.9e-07  (1.4e-06 rel)
+
+~4 units at FSCALE across 1024 workgroups -- the predicted mechanism at the
+predicted magnitude. The FIELD is bit-identical (relL2 0 on ux/uy/rho/omega)
+because this page is KINEMATIC: the force is reported and discarded, and this
+kernel never writes `f`. Channel and TGV are untouched by construction -- they
+have no body and never dispatch it.
 
 ### B9 — DONE (2026-09-14)
 

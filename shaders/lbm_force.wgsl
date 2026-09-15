@@ -68,30 +68,31 @@ fn main(
   @builtin(global_invocation_id) gid: vec3<u32>,
   @builtin(local_invocation_index) lid: u32
 ) {
-  let x = gid.x; let y = gid.y;
+  // A THREAD OWNS A BUFFER CELL. This was the last kernel in the tree still
+  // dispatched in WINDOW coordinates, converting to buffer at every load --
+  // and converting back out again for every neighbour, which composed a shift
+  // with its own inverse once per direction per cell:
+  //
+  //   window:  wx_src = (x - e) mod W,  bx_src = (wx_src + off) mod W
+  //   buffer:  bx_src = (bx - e) mod W          with bx = (x + off) mod W
+  //
+  // Provably the same integer. This kernel touches no sponge and no walls, so
+  // with the body buffer-native since B5 it needs NO window coordinate at all:
+  // `state.off_x`/`off_y` do not appear in this file any more. That matters
+  // beyond tidiness -- "only the render does raw off_x/off_y arithmetic" is
+  // the audit that finds a kernel silently stuck in the wrong frame, and it
+  // was false by exactly this one file (see plans/2D-backport.md B5-5, where
+  // being in the wrong frame here read 226x wrong and no gate could see it).
+  let bx = gid.x; let by = gid.y;
   
   var fx_body = 0.0f;
   var fy_body = 0.0f;
   var tz_body = 0.0f;
 
-  if (x < W && y < H) {
-    let bx   = (x + u32(state.off_x)) % W;
-    let by   = (y + u32(state.off_y)) % H;
+  if (bx < W && by < H) {
     let cell = by * W + bx;
-    let base = cell * 9u;
-    // THE BODY'S FRAME, not the window's. This was `vec2<f32>(f32(x), f32(y))`
-    // -- the WINDOW position, built straight from the thread index -- which
-    // silently pinned this kernel to the shipped convention no matter what
-    // WINDOW_BODY said. It @includes common_geometry.wgsl, so it DECLARED the
-    // override and every page duly supplied it; it just never read it. An
-    // override a shader does not declare is a hard pipeline error, but one it
-    // declares and ignores is invisible, which is why this survived B5-2 and
-    // B5-3. Under ?window=0 `state.cx` is a BUFFER coordinate while `p` stayed
-    // a window position, so the force integral swept a body displaced by
-    // exactly (off_x, off_y): measured 226x wrong in fy at off_y=75, and
-    // exactly right at off_y=0 -- which is every pinned-cylinder config, and
-    // therefore every config that had ever been pointed at ?window=0.
-    let p    = vec2<f32>(f32(bx), f32(by));
+    // The body's frame is this cell's own buffer position.
+    let p = vec2<f32>(f32(bx), f32(by));
 
     let phi = get_phi(p, state);
     let chi = get_chi(phi);
@@ -109,10 +110,8 @@ fn main(
         let usy = state.vy + state.omega * rx;
 
         for (var i = 0u; i < 9u; i++) {
-          let wx_src = (x + W - u32(ex[i])) % W;
-          let wy_src = (y + H - u32(ey[i])) % H;
-          let bx_nb  = (wx_src + u32(state.off_x)) % W;
-          let by_nb  = (wy_src + u32(state.off_y)) % H;
+          let bx_nb = (bx + W - u32(ex[i])) % W;
+          let by_nb = (by + H - u32(ey[i])) % H;
           if (get_phi(vec2<f32>(f32(bx_nb), f32(by_nb)), state) < 0f) {
             let f_opp = fUnpack(f_in[fIdx(opp[i], (W * H), cell)], opp[i]);
             let corr = 2f * wt[i] * (f32(ex[i]) * usx + f32(ey[i]) * usy) / CS2;
@@ -134,10 +133,8 @@ fn main(
       // applied to the fluid.
       var rho = 0f; var ux_star = 0f; var uy_star = 0f;
       for (var i = 0u; i < 9u; i++) {
-        let wx_src = (x + W - u32(ex[i])) % W;
-        let wy_src = (y + H - u32(ey[i])) % H;
-        let bx_src = (wx_src + u32(state.off_x)) % W;
-        let by_src = (wy_src + u32(state.off_y)) % H;
+        let bx_src = (bx + W - u32(ex[i])) % W;
+        let by_src = (by + H - u32(ey[i])) % H;
         let fi = fUnpack(f_in[fIdx(i, (W * H), (by_src * W + bx_src))], i);
         rho     += fi;
         ux_star += fi * f32(ex[i]);
