@@ -22,10 +22,10 @@
 // setAutoRefine, getLevelPoolSizes, getNumLevels) for the same kind of
 // CDP-driven validation this whole plan has used throughout.
 
-import { reportFatal, reportNoWebGPU, reportNoAdapter } from './error-overlay.mjs';
+import { reportFatal, refuseConfig, setStatus, reportNoWebGPU, reportNoAdapter } from './error-overlay.mjs';
 import { loadShader } from './shader-loader.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
-import { check21BalanceOnGPU, allocLevelPool, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState, checkGeometryCoverageOnGPU } from './amr2d-gpu.mjs';
+import { check21BalanceOnGPU, allocLevelPool, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState, checkGeometryCoverageOnGPU, makeRefusalWatch } from './amr2d-gpu.mjs';
 // tauAtLevel: extracted to card-params.mjs by B3a-1, which landed the CALL
 // in all five AMR pages and this IMPORT in only main-amr.js. The other four
 // threw `ReferenceError: tauAtLevelOf is not defined` at init -- but only at
@@ -150,7 +150,9 @@ const NBX = W / BLOCK, NBY = H / BLOCK, NBLOCKS = NBX * NBY; // coarse block gri
 // baseline -- see the sub-plan). N_LEVELS>=3 allocates additional
 // quadtree pool levels that no shader/dispatch reads yet (Milestone 6/7).
 const N_LEVELS = urlParams.has('levels') ? parseInt(urlParams.get('levels')) : 2;
-if (N_LEVELS < 2) throw new Error(`?levels=${N_LEVELS} invalid -- must be >= 2 (L0 + at least one fine level)`);
+// refuseConfig, not throw: this runs at module scope, where
+// init().catch(handleErr) can never see it -- see error-overlay.mjs.
+if (N_LEVELS < 2) refuseConfig(statusEl, `?levels=${N_LEVELS} invalid -- must be >= 2 (L0 + at least one fine level)`);
 
 // RESOLVED (was "KNOWN ISSUE, narrowed further"): USE_BOUNCEBACK is now
 // validated correct through N_LEVELS<=3 (Cd/St match the literature within
@@ -285,7 +287,7 @@ if (N_LEVELS < 2) throw new Error(`?levels=${N_LEVELS} invalid -- must be >= 2 (
 // calibrated effective-radius offset (standard practice for volume
 // penalization / IBM) or a sharper epsilon; neither is attempted here.
 if (USE_BOUNCEBACK && N_LEVELS > 3 && !urlParams.has('forceBounceback')) {
-  throw new Error('?bounceback with ?levels>3 is untested against the N=3 bounce-back fix -- see this file\'s own comment above N_LEVELS. Use ?levels<=3 for a validated bounce-back run, or ?forceBounceback to bypass for investigation.');
+  refuseConfig(statusEl, '?bounceback with ?levels>3 is untested against the N=3 bounce-back fix -- see this file\'s own comment above N_LEVELS. Use ?levels<=3 for a validated bounce-back run, or ?forceBounceback to bypass for investigation.');
 }
 
 // ── Milestone 4b (plans/AMR.md): automatic vorticity-driven refinement,
@@ -321,6 +323,48 @@ const COARSEN_THRESH = urlParams.has('coarsenThresh') ? parseFloat(urlParams.get
 // REFINE_THRESH/COARSEN_THRESH once exercised against a live run.
 const FORCE_REFINE_MARGIN = urlParams.has('forceRefineMargin') ? parseFloat(urlParams.get('forceRefineMargin')) : 8;
 const FORCE_REFINE_LOOKAHEAD = urlParams.has('forceRefineLookahead') ? parseFloat(urlParams.get('forceRefineLookahead')) : REFINE_EVERY;
+
+// REFINE-AHEAD, AND WHY IT IS A HARD REQUIREMENT RATHER THAN A FUDGE.
+//
+// The constraint geometry-forced refinement enforces is "no leaf within
+// FORCE_REFINE_MARGIN of the body, at EVERY step". The manager only gets to
+// decide every REFINE_EVERY macro-steps, so a decision at t0 must keep that
+// true all the way to t0 + REFINE_EVERY -- which it does by testing the body
+// at its current pose AND at t0 + FORCE_REFINE_LOOKAHEAD. A lookahead shorter
+// than the decision interval therefore leaves the interval it does not cover
+// unprotected, by construction and regardless of margin or speed.
+//
+// This is not hypothetical bookkeeping: it is the exact asymmetry that made
+// B4-1's coverage check fire on the first MOVING body it saw (the checker
+// applied the lookahead, so it demanded coverage of a window the last
+// decision was never responsible for). A pinned body cannot show either
+// side of it.
+//
+// The default already satisfies this -- FORCE_REFINE_LOOKAHEAD defaults to
+// REFINE_EVERY -- so this refuses nothing that ships. It exists because the
+// relationship is invisible at the two declarations, and someone tuning
+// ?forceRefineLookahead down to save refinement churn would be removing a
+// correctness guarantee while appearing to tune a performance knob.
+if (FORCE_REFINE_LOOKAHEAD < REFINE_EVERY) {
+  refuseConfig(statusEl, `?forceRefineLookahead=${FORCE_REFINE_LOOKAHEAD} is below ?refineEvery=${REFINE_EVERY} -- ` +
+    `geometry-forced refinement would leave the last ${REFINE_EVERY - FORCE_REFINE_LOOKAHEAD} macro-step(s) of ` +
+    `every refinement round unprotected, because the body can reach a block the previous decision did not cover. ` +
+    `The lookahead must be at least the decision interval.`);
+}
+
+// A BODY WITH NO GEOMETRY FORCING IS NOT A CONFIGURATION, it is a silent
+// downgrade to "refine wherever the vorticity happens to look interesting".
+// The vorticity criterion is a LAGGING signal (see shaders/amr_manage.wgsl's
+// header: it only fires once the coarse grid has already produced incorrect
+// under-resolved vorticity at the surface), so with the margin at zero the
+// body's own surface is refined late or not at all -- and since B4-3 only the
+// finest level computes any force at all, a coarse patch at the surface now
+// contributes NOTHING rather than something crude.
+if (!(FORCE_REFINE_MARGIN > 0)) {
+  refuseConfig(statusEl, `?forceRefineMargin=${FORCE_REFINE_MARGIN} disables geometry-forced refinement on a page ` +
+    `that HAS a body. Only the finest level computes force (plans/2D-backport.md B4-3), so the body must be ` +
+    `guaranteed to reach it -- which is exactly what this margin does.`);
+}
 
 // ?boxrefine=0 restores the pre-B4 geometry TEST: ONE get_phi at a block's
 // CENTRE against FORCE_REFINE_MARGIN, truncated window conversion included.
@@ -2726,8 +2770,19 @@ async function init() {
     tauAtLevel,
   };
 
+  // GEOMETRY-FORCED REFINEMENT REFUSED -> stop, loudly. amr2d-gpu.mjs's
+  // makeRefusalWatch explains the trip-wire and why the authority is the
+  // coverage check; this is the "stop advancing" half. Latched: once set it
+  // never clears, so the rAF chain ends here and the status line is not
+  // overwritten by the next frame's own readout.
+  const refusalWatch = makeRefusalWatch({
+    device, pools, nLevels: N_LEVELS,
+    checkCoverage: () => debugCheckGeometryCoverage(),
+  });
+
   async function frame() {
     try {
+      if (refusalWatch.error) { handleErr(new Error(refusalWatch.error)); return; }
       if (!liveMode) {
         requestAnimationFrame(() => frame().catch(handleErr));
         return;
@@ -2789,7 +2844,7 @@ async function init() {
         }
 
         if (performance.now() - lastT > 250) {
-          statusEl.textContent = `[AMR] step ${st.step}  Re=${RE.toFixed(0)}  Cd=${Cd.toFixed(3)}  Cl=${Cl.toFixed(3)}`;
+          setStatus(statusEl, `[AMR] step ${st.step}  Re=${RE.toFixed(0)}  Cd=${Cd.toFixed(3)}  Cl=${Cl.toFixed(3)}`);
           lastT = performance.now();
         }
 
@@ -2798,6 +2853,10 @@ async function init() {
       };
 
       processReadback(stage);
+      // Self-throttled and fire-and-forget: at most one readback in flight
+      // and at most one every 500ms, so this costs nothing per frame. It
+      // only reads 4 bytes per level unless a pool is actually saturated.
+      refusalWatch.poll();
 
       currentStageIdx = (currentStageIdx + 1) % STAGES;
       requestAnimationFrame(() => frame().catch(handleErr));

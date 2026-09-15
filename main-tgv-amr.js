@@ -58,7 +58,7 @@
 // a green tick standing for nothing, which is exactly what the probe exists
 // to avoid.
 
-import { reportFatal, reportNoWebGPU, reportNoAdapter } from './error-overlay.mjs';
+import { reportFatal, refuseConfig, reportNoWebGPU, reportNoAdapter } from './error-overlay.mjs';
 import { loadShader } from './shader-loader.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
 import { check21BalanceOnGPU, readConservedTotals, allocLevelPool, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState } from './amr2d-gpu.mjs';
@@ -161,7 +161,9 @@ const MAX_FINE_BLOCKS = urlParams.has('maxFineBlocks') ? parseInt(urlParams.get(
 const NBX = W / BLOCK, NBY = H / BLOCK, NBLOCKS = NBX * NBY;
 
 const N_LEVELS = urlParams.has('levels') ? parseInt(urlParams.get('levels')) : 2;
-if (N_LEVELS < 2) throw new Error(`?levels=${N_LEVELS} invalid -- must be >= 2 (L0 + at least one fine level)`);
+// refuseConfig, not throw: this runs at module scope, where
+// init().catch(handleErr) can never see it -- see error-overlay.mjs.
+if (N_LEVELS < 2) refuseConfig(statusEl, `?levels=${N_LEVELS} invalid -- must be >= 2 (L0 + at least one fine level)`);
 
 // Vorticity-driven refinement -- REFINE_THRESH/COARSEN_THRESH default to
 // main-amr.js's own fixed -6/-7 (unchanged, NOT scaled to this case's own

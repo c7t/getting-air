@@ -557,3 +557,96 @@ export async function readCardState(device, cardStateBuf) {
   stage.destroy();
   return out;
 }
+
+// --- geometry-forced refinement REFUSED: latch, don't degrade --------------
+//
+// THE HAZARD. A refine that cannot get a pool slot is silently abandoned --
+// amr_manage.wgsl undoes its atomicSub and the block stays coarse; so does
+// amr_manage_pool.wgsl one level down. For a criterion-driven refine that is
+// the design working (the pool is a budget and vorticity demand is
+// unbounded). For a GEOMETRY-forced one it is the hard constraint being
+// refused, which means a coarse/fine seam through the body -- and since B4-3
+// only the finest level computes force at all, the refused region contributes
+// NOTHING rather than something crude. The run keeps going and looks healthy.
+//
+// Live reproducer, found by B4-2's probe: index-cylinder-amr.html?levels=4 has
+// level 3 at 128/128 with 20 coverage violations, and reads L2 fx=-2.33
+// against L3 fx=+2.26 -- large cancelling contributions from a body split
+// across two levels.
+//
+// WHY A TRIP-WIRE AND THEN THE REAL CHECK, rather than a counter in the
+// shader. A refusal counter is the direct signal, but the pool manager has no
+// diag binding at all today, so adding one is a new binding on two manage
+// shaders across FIVE pages' bind groups -- which is precisely the change
+// shape that shipped 238e48c. This needs no shader change:
+//
+//   1. TRIP-WIRE, cheap and always sound in one direction: read every level's
+//      freeCount (4 bytes each, one submit). Exhaustion IMPLIES freeCount ==
+//      0 at the end of the round, so a zero cannot be missed. It is not
+//      sufficient -- a pool exactly consumed reads zero too.
+//   2. AUTHORITY: on a zero, run the coverage check, which asks the actual
+//      question ("is any leaf within the margin missing its children"). Only
+//      that decides.
+//
+// So benign saturation costs one extra readback and reports nothing, and a
+// real refusal is named by the check that defines the constraint.
+//
+// LIVE LOOP ONLY, deliberately. debugStepSync is not gated by this: the
+// validation harness runs debugCheckGeometryCoverage itself, periodically and
+// unconditionally (tools/lib/amr-invariants.js), which is a stronger check
+// than this trip-wire and already fails loudly. A second implicit latch there
+// would change what existing tooling means without adding coverage.
+export function makeRefusalWatch({ device, pools, nLevels, checkCoverage, minIntervalMs = 500 }) {
+  const U = GPUBufferUsage;
+  let inFlight = false;
+  let last = -Infinity;
+  const watch = { error: null };
+
+  watch.poll = () => {
+    if (watch.error || inFlight) return;
+    const now = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+    if (now - last < minIntervalMs) return;
+    last = now;
+    inFlight = true;
+    (async () => {
+      try {
+        // One submit for every level, same discipline as readAllBlockSlots:
+        // a torn read across levels would be a different topology than any
+        // that existed.
+        const stages = [];
+        const enc = device.createCommandEncoder();
+        for (let m = 1; m < nLevels; m++) {
+          const stage = device.createBuffer({ size: 4, usage: U.MAP_READ | U.COPY_DST });
+          enc.copyBufferToBuffer(pools[m].freeCountBuf, 0, stage, 0, 4);
+          stages.push({ m, stage });
+        }
+        device.queue.submit([enc.finish()]);
+        await Promise.all(stages.map(s => s.stage.mapAsync(GPUMapMode.READ)));
+        const saturated = [];
+        for (const { m, stage } of stages) {
+          const free = new Int32Array(stage.getMappedRange())[0];
+          stage.unmap();
+          stage.destroy();
+          if (free <= 0) saturated.push(m);
+        }
+        if (saturated.length === 0) return;
+
+        const cov = await checkCoverage();
+        if (cov.ok) return;   // saturated but still covered -- a budget, not a breach
+        const v = cov.violations[0];
+        watch.error = `geometry-forced refinement REFUSED: level ${saturated.join(',')} pool exhausted `
+          + `and ${cov.violations.length} leaf tile(s) within the body's margin have no children `
+          + `(first: level ${v.level} block ${v.bx},${v.by}). The body is split across levels and only the `
+          + `finest computes force, so this run's force is wrong. Raise ?maxFineBlocks= or lower ?levels=.`;
+      } catch (e) {
+        // A readback failure is not evidence of a refusal; say so rather than
+        // latching on it, and never take the page down for the watchdog.
+        console.warn('[getting-air] refusal watch readback failed:', e);
+      } finally {
+        inFlight = false;
+      }
+    })();
+  };
+
+  return watch;
+}

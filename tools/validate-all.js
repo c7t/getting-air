@@ -151,6 +151,38 @@ function defaultConfigs(baseUrl) {
       url: `${baseUrl}/index-channel-amr.html?levels=3`,
       checkBoots: true,
     },
+    // REFUSALS UNDER TEST (plans/2D-backport.md B4-4). Each deliberately
+    // misconfigures a page and requires the refusal to ARRIVE -- see
+    // runBootSmoke's expectError note on why a guard that never fires and a
+    // guard that cannot fire are indistinguishable from a green suite.
+    {
+      // A module-scope guard. It was always there and always correct, and
+      // until B4-4 it threw where init().catch(handleErr) could not see it,
+      // so the page sat at "initializing..." with the reason only in the
+      // console (plans/2D-backport.md B0b recorded the symptom).
+      name: 'refuse-levels-1',
+      url: `${baseUrl}/index-tgv-amr.html?levels=1`,
+      checkBoots: true,
+      expectError: /levels=1 invalid/i,
+    },
+    {
+      // The refine-ahead requirement: a lookahead below the decision interval
+      // leaves part of every refinement round unprotected by construction.
+      name: 'refuse-short-lookahead',
+      url: `${baseUrl}/index-cylinder-amr.html?levels=2&refineEvery=16&forceRefineLookahead=1`,
+      checkBoots: true,
+      expectError: /forceRefineLookahead/i,
+    },
+    {
+      // The RUNTIME latch: an under-provisioned pool means geometry-forced
+      // refinement is being refused, which since B4-3 means the body's force
+      // is simply missing rather than crude. Starved hard enough that the
+      // trip-wire and the coverage check must both agree.
+      name: 'refuse-pool-exhausted',
+      url: `${baseUrl}/index-cylinder-amr.html?levels=3&maxFineBlocks=8`,
+      checkBoots: true,
+      expectError: /geometry-forced refinement REFUSED/i,
+    },
     // index-amr.html under the structural-invariant sweep. This is the page
     // the project SHIPS, it defaults to levels=3, and until now the sweep
     // only ever drove window.__CYL -- so the falling-card page's own 2:1
@@ -300,14 +332,29 @@ async function waitForCYL(Runtime, timeoutMs, global = 'window.__CYL') {
 // either starting with "error:" or never advancing past its initial
 // "initializing..." text, so that's what this polls for instead of relying
 // on the exception listener.
-async function runBootSmoke(Runtime) {
+// `expectError` inverts this check: the config PASSES only if #status reaches
+// an `error:` matching that pattern, and FAILS if the page boots happily.
+//
+// WHY AN INVERTED CONFIG IS WORTH HAVING. Every refusal added by
+// plans/2D-backport.md B4 is code that runs only when something has gone
+// wrong, which is exactly the code most likely to be broken without anyone
+// noticing -- a guard that never fires and a guard that cannot fire look
+// identical from a green suite. These configs deliberately misconfigure a
+// page and require the refusal to arrive, so "refuse rather than degrade" is
+// itself under test rather than asserted in a comment.
+async function runBootSmoke(Runtime, expectError = null) {
   const readStatus = async () => {
     const r = await evalExprCyl(Runtime, `document.getElementById('status') ? document.getElementById('status').textContent : null`);
     return r.exceptionDetails ? null : r.result.value;
   };
+  const matchesExpected = (t) => expectError && /^error:/i.test(t) && expectError.test(t);
+  const wrongError = (t) => (expectError
+    ? `status shows an error, but not the expected one: "${t}" (wanted ${expectError})`
+    : `status shows an error: "${t}"`);
   const first = await readStatus();
   if (first == null) return { ok: false, reason: 'no #status element found' };
-  if (/^error:/i.test(first)) return { ok: false, reason: `status shows an error: "${first}"` };
+  if (matchesExpected(first)) return { ok: true, first, second: first };
+  if (/^error:/i.test(first)) return { ok: false, reason: wrongError(first) };
   // POLL until the status advances, rather than sampling once after a fixed
   // sleep. The fixed-4s version this replaces was flaky on a COLD run: a
   // freshly-launched Chrome with an empty profile has no pipeline cache, and
@@ -331,12 +378,18 @@ async function runBootSmoke(Runtime) {
     await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
     second = await readStatus();
     if (second == null) return { ok: false, reason: 'no #status element found (second read)' };
-    if (/^error:/i.test(second)) return { ok: false, reason: `status shows an error: "${second}"` };
-    if (second !== first) return { ok: true, first, second };
+    if (matchesExpected(second)) return { ok: true, first, second };
+    if (/^error:/i.test(second)) return { ok: false, reason: wrongError(second) };
+    // An expectError config is waiting for the refusal, so a status that
+    // merely ADVANCED is not success there -- it is the page running on,
+    // which is the failure this config exists to catch.
+    if (!expectError && second !== first) return { ok: true, first, second };
   }
   return {
     ok: false,
-    reason: `status never advanced past "${first}" in ${BOOT_SMOKE_TIMEOUT_MS}ms -- page may be stuck`,
+    reason: expectError
+      ? `expected a refusal matching ${expectError} within ${BOOT_SMOKE_TIMEOUT_MS}ms, but the page kept running (status "${second}")`
+      : `status never advanced past "${first}" in ${BOOT_SMOKE_TIMEOUT_MS}ms -- page may be stuck`,
   };
 }
 
@@ -535,7 +588,7 @@ async function main() {
         await navigateTo(Page, config.url);
         if (config.checkBoots) {
           console.log('  -- boot smoke (#status advancing, no error) --');
-          boot = await runBootSmoke(Runtime);
+          boot = await runBootSmoke(Runtime, config.expectError || null);
           console.log(`    ${boot.ok ? 'OK' : 'FAIL: ' + boot.reason}`);
         } else {
           await waitForCYL(Runtime, 15000, config.global);

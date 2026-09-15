@@ -9,7 +9,7 @@
 // flags (commit 83d3c8c), so this build checks eagerly rather than
 // discovering that kind of bug from wrong-looking output.
 
-import { reportFatal, reportNoWebGPU, reportNoAdapter } from './error-overlay.mjs';
+import { reportFatal, refuseConfig, setStatus, reportNoWebGPU, reportNoAdapter } from './error-overlay.mjs';
 import { installVortControls } from './vort-controls.mjs';
 import { createTrail } from './trajectory-trail.mjs';
 import { createTotalUnwrapper } from './card-total.mjs';
@@ -22,7 +22,7 @@ import {
   tauAtLevel as tauAtLevelOf,
 } from './card-params.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
-import { check21BalanceOnGPU, allocLevelPool, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState, checkGeometryCoverageOnGPU } from './amr2d-gpu.mjs';
+import { check21BalanceOnGPU, allocLevelPool, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState, checkGeometryCoverageOnGPU, makeRefusalWatch } from './amr2d-gpu.mjs';
 import { EX, EY, WT } from './lattice-2d.mjs';
 import { makeCanvasFit } from './canvas-fit.mjs';
 
@@ -142,7 +142,9 @@ const NBX = W / BLOCK, NBY = H / BLOCK, NBLOCKS = NBX * NBY; // coarse block gri
 // baseline -- see the sub-plan). N_LEVELS>=3 allocates additional
 // quadtree pool levels that no shader/dispatch reads yet (Milestone 6/7).
 const N_LEVELS = urlParams.has('levels') ? parseInt(urlParams.get('levels')) : AMR_DEFAULT_LEVELS;
-if (N_LEVELS < 2) throw new Error(`?levels=${N_LEVELS} invalid -- must be >= 2 (L0 + at least one fine level)`);
+// refuseConfig, not throw: this runs at module scope, where
+// init().catch(handleErr) can never see it -- see error-overlay.mjs.
+if (N_LEVELS < 2) refuseConfig(statusEl, `?levels=${N_LEVELS} invalid -- must be >= 2 (L0 + at least one fine level)`);
 
 // ── Milestone 4b (plans/AMR.md): automatic vorticity-driven refinement ────
 // Simplified AGAL Algorithm 3 for our 2-level case (see amr_criterion.wgsl/
@@ -412,12 +414,54 @@ const DIAG = urlParams.has('diag') ? (parseInt(urlParams.get('diag')) || 0) : 0;
 const REFINE_ITERS_OVERRIDE = urlParams.has('refineIters') ? (parseInt(urlParams.get('refineIters')) || 0) : 0;
 
 if (FORCE_REFINE_MARGIN >= SDF_FAR) {
-  throw new Error(`?forceRefineMargin=${FORCE_REFINE_MARGIN} is at or above get_phi's SDF_FAR cutoff (${SDF_FAR}) -- ` +
+  refuseConfig(statusEl, `?forceRefineMargin=${FORCE_REFINE_MARGIN} is at or above get_phi's SDF_FAR cutoff (${SDF_FAR}) -- ` +
     `beyond that the far-field early-out in shaders/common_geometry.wgsl returns a lower bound and isNearBody ` +
     `would silently under-refine. Raise SDF_FAR together with it if you really need a margin this large.`);
 }
 
 const FORCE_REFINE_LOOKAHEAD = urlParams.has('forceRefineLookahead') ? parseFloat(urlParams.get('forceRefineLookahead')) : REFINE_EVERY;
+
+// REFINE-AHEAD, AND WHY IT IS A HARD REQUIREMENT RATHER THAN A FUDGE.
+//
+// The constraint geometry-forced refinement enforces is "no leaf within
+// FORCE_REFINE_MARGIN of the body, at EVERY step". The manager only gets to
+// decide every REFINE_EVERY macro-steps, so a decision at t0 must keep that
+// true all the way to t0 + REFINE_EVERY -- which it does by testing the body
+// at its current pose AND at t0 + FORCE_REFINE_LOOKAHEAD. A lookahead shorter
+// than the decision interval therefore leaves the interval it does not cover
+// unprotected, by construction and regardless of margin or speed.
+//
+// This is not hypothetical bookkeeping: it is the exact asymmetry that made
+// B4-1's coverage check fire on the first MOVING body it saw (the checker
+// applied the lookahead, so it demanded coverage of a window the last
+// decision was never responsible for). A pinned body cannot show either
+// side of it.
+//
+// The default already satisfies this -- FORCE_REFINE_LOOKAHEAD defaults to
+// REFINE_EVERY -- so this refuses nothing that ships. It exists because the
+// relationship is invisible at the two declarations, and someone tuning
+// ?forceRefineLookahead down to save refinement churn would be removing a
+// correctness guarantee while appearing to tune a performance knob.
+if (FORCE_REFINE_LOOKAHEAD < REFINE_EVERY) {
+  refuseConfig(statusEl, `?forceRefineLookahead=${FORCE_REFINE_LOOKAHEAD} is below ?refineEvery=${REFINE_EVERY} -- ` +
+    `geometry-forced refinement would leave the last ${REFINE_EVERY - FORCE_REFINE_LOOKAHEAD} macro-step(s) of ` +
+    `every refinement round unprotected, because the body can reach a block the previous decision did not cover. ` +
+    `The lookahead must be at least the decision interval.`);
+}
+
+// A BODY WITH NO GEOMETRY FORCING IS NOT A CONFIGURATION, it is a silent
+// downgrade to "refine wherever the vorticity happens to look interesting".
+// The vorticity criterion is a LAGGING signal (see shaders/amr_manage.wgsl's
+// header: it only fires once the coarse grid has already produced incorrect
+// under-resolved vorticity at the surface), so with the margin at zero the
+// body's own surface is refined late or not at all -- and since B4-3 only the
+// finest level computes any force at all, a coarse patch at the surface now
+// contributes NOTHING rather than something crude.
+if (!(FORCE_REFINE_MARGIN > 0)) {
+  refuseConfig(statusEl, `?forceRefineMargin=${FORCE_REFINE_MARGIN} disables geometry-forced refinement on a page ` +
+    `that HAS a body. Only the finest level computes force (plans/2D-backport.md B4-3), so the body must be ` +
+    `guaranteed to reach it -- which is exactly what this margin does.`);
+}
 
 // ?boxrefine=0 restores the pre-B4 geometry TEST: ONE get_phi at a block's
 // CENTRE against FORCE_REFINE_MARGIN, truncated window conversion included.
@@ -3011,7 +3055,7 @@ async function init() {
         body.bench.startedAtStep = benchStartStep;
         body.bench.endedAtStep = step;
         benchDone = true;
-        statusEl.textContent = '[AMR-dev] benchmark sweep complete -- results sent';
+        setStatus(statusEl, '[AMR-dev] benchmark sweep complete -- results sent');
       } catch (e) { body.benchError = String(e && e.message || e); benchDone = true; }
       finally { benchRunning = false; }
     }
@@ -3160,7 +3204,7 @@ async function init() {
     let doneSteps = 0;
     const progress = (label) => {
       const pct = Math.round((doneSteps / totalSteps) * 100);
-      statusEl.textContent = `[AMR-dev] benchmark ${pct}% -- ${label} (do not switch away)`;
+      setStatus(statusEl, `[AMR-dev] benchmark ${pct}% -- ${label} (do not switch away)`);
     };
     // How many macro-steps is ~BENCH_MEASURE_MS on THIS device? The two target
     // devices differ by ~40x in frame time, so a fixed step count would be
@@ -3350,8 +3394,19 @@ async function init() {
     tauAtLevel,
   };
 
+  // GEOMETRY-FORCED REFINEMENT REFUSED -> stop, loudly. amr2d-gpu.mjs's
+  // makeRefusalWatch explains the trip-wire and why the authority is the
+  // coverage check; this is the "stop advancing" half. Latched: once set it
+  // never clears, so the rAF chain ends here and the status line is not
+  // overwritten by the next frame's own readout.
+  const refusalWatch = makeRefusalWatch({
+    device, pools, nLevels: N_LEVELS,
+    checkCoverage: () => debugCheckGeometryCoverage(),
+  });
+
   async function frame() {
     try {
+      if (refusalWatch.error) { handleErr(new Error(refusalWatch.error)); return; }
       if (deviceLost) return; // stop the rAF chain; every submit would be a no-op
       // Flush pending slider changes BEFORE the liveMode early-return.
       // With this after it, a parameter changed while the sim was paused was
@@ -3608,7 +3663,7 @@ async function init() {
           // messages within a frame, so "benchmark round 2/3" was never
           // actually visible to anyone asked to watch for it.
           if (!benchRunning) {
-            statusEl.textContent = `[AMR-dev] step ${st.step}  y=${yTotal.toFixed(1)}  x=${xTotal.toFixed(1)}  vy=${d[4].toFixed(4)}  Fy=${d[7].toExponential(2)}  θ=${d[2].toFixed(2)}`;
+            setStatus(statusEl, `[AMR-dev] step ${st.step}  y=${yTotal.toFixed(1)}  x=${xTotal.toFixed(1)}  vy=${d[4].toFixed(4)}  Fy=${d[7].toExponential(2)}  θ=${d[2].toFixed(2)}`);
           }
           lastT = performance.now();
         }
@@ -3618,6 +3673,10 @@ async function init() {
       };
 
       processReadback(stage);
+      // Self-throttled and fire-and-forget: at most one readback in flight
+      // and at most one every 500ms, so this costs nothing per frame. It
+      // only reads 4 bytes per level unless a pool is actually saturated.
+      refusalWatch.poll();
 
       currentStageIdx = (currentStageIdx + 1) % STAGES;
       requestAnimationFrame(() => frame().catch(handleErr));
