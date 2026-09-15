@@ -72,7 +72,10 @@ const BLOCK = 8u;
 // FSCALE: see shaders/amr_force1_pool.wgsl's FSCALE comment for why this
 // is 1e7 and not 1e4 (per-workgroup truncation in the atomic reduction).
 const FSCALE = 10000000f;
-const K_EPS = 1.5f;
+// An OVERRIDE since B7, not a const -- ?kEps= sweeps the diffuse band
+// across every level at once. Default unchanged, so this build is
+// byte-identical to the previous one.
+override K_EPS : f32 = 1.5f;
 const AREA_WEIGHT = 0.5f; // dx_L1^1 -- see header point 2
 // Bounce-back's MEM sum is a PERIMETER (line) integral over boundary
 // links, not the diffuse method's VOLUME integral over penalized cells --

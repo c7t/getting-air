@@ -40,6 +40,25 @@ const canvas   = document.getElementById('c');
 const statusEl = document.getElementById('status');
 
 const urlParams = new URLSearchParams(window.location.search);
+
+// THE DIFFUSE BAND'S WIDTH, in units of a level's own cell size:
+// epsilon = K_EPS * dx_level (plans/2D-backport.md B7). Threaded into every
+// shader that evaluates chi -- step, force and render, at every level -- so
+// the band can be swept without touching a literal in nine files.
+//
+// Default 1.5 is the value every one of those sites already hardcoded, so
+// this build is byte-identical to the previous one. ?kEps=0.75 halves it.
+//
+// It is a BAND ladder, not a resolution ladder, that settles the standing Cd
+// red cells: CLAUDE.md diagnoses them as diffuse-interface width (the
+// effective body radius exceeds the nominal one, so Cd converges from ABOVE),
+// and a resolution ladder moves the band and everything else at once.
+//
+// THE RENDER PASS GETS IT TOO. Its chi is what draws the body outline, so a
+// ladder run whose picture still showed the 1.5 band would be quietly
+// misleading about the thing being swept.
+const K_EPS = urlParams.has('kEps') ? parseFloat(urlParams.get('kEps')) : 1.5;
+if (!(K_EPS > 0)) throw new Error(`?kEps=${urlParams.get('kEps')} must be > 0`);
 let resLog2 = parseInt(urlParams.get('res')) || 9;
 if (resLog2 < 7) resLog2 = 7;
 if (resLog2 > 11) resLog2 = 11;
@@ -305,7 +324,10 @@ if (USE_BOUNCEBACK && N_LEVELS > 3 && !urlParams.has('forceBounceback')) {
 // TEMPORARY diagnostic (Milestone 10 Cd investigation): level>=2's own
 // K_EPS override, defaulting to the same 1.5 every other level uses --
 // see shaders/amr_step1_pool.wgsl/amr_force1_pool.wgsl's own K_EPS comment.
-const K_EPS_POOL = urlParams.has('kEpsPool') ? parseFloat(urlParams.get('kEpsPool')) : 1.5;
+// Defaults to K_EPS (was a second hardcoded 1.5), so ?kEps= sweeps every
+// level and ?kEpsPool= still singles out the pool ones. Before B7 those two
+// literals could disagree with no way to notice.
+const K_EPS_POOL = urlParams.has('kEpsPool') ? parseFloat(urlParams.get('kEpsPool')) : K_EPS;
 
 const REFINE_EVERY = urlParams.has('refineEvery') ? parseInt(urlParams.get('refineEvery')) : 16;
 const REFINE_THRESH = urlParams.has('refineThresh') ? parseFloat(urlParams.get('refineThresh')) : -8;
@@ -1108,8 +1130,8 @@ async function init() {
   // Coarse step needs the freestream sponge target; force/physics/render/
   // criterion/manage don't reference SPONGE_UX/UY at all, so they keep the
   // plain {W,H} constants dict above.
-  const stepConstants = { W, H, SPONGE_UX: U0, SPONGE_UY: 0, USE_BOUNCEBACK };
-  const fineConstants = { W, H, RB };
+  const stepConstants = { W, H, SPONGE_UX: U0, SPONGE_UY: 0, USE_BOUNCEBACK, K_EPS };
+  const fineConstants = { W, H, RB, K_EPS };
   // Split from fineConstants: that one also drives the render fragment,
   // whose module has no F16 override, and WebGPU makes passing an
   // undeclared override a pipeline-creation error.
@@ -1124,7 +1146,7 @@ async function init() {
   // Fine step(s) also need the freestream sponge target (see amr_step1*.wgsl's
   // SPONGE_UX/UY -- both L1's dedicated file and the level>=2 shared one have
   // their own copy of the sponge, not shared with the coarse kernel).
-  const step1Constants = { W, H, RB, SPONGE_UX: U0, SPONGE_UY: 0, USE_BOUNCEBACK, F16, DIRECT_GHOST: GHOST_COPY ? 0 : 1 };
+  const step1Constants = { W, H, RB, SPONGE_UX: U0, SPONGE_UY: 0, USE_BOUNCEBACK, F16, DIRECT_GHOST: GHOST_COPY ? 0 : 1, K_EPS };
   const criterionConstants = { W, H };
   const manageConstants = { DIAG, W, H, REFINE_THRESH, COARSEN_THRESH, FORCE_REFINE_MARGIN, FORCE_REFINE_LOOKAHEAD, DEMAND_CASCADE, HAS_LEVEL2: N_LEVELS > 2 ? 1 : 0, BOX_REFINE };
 
@@ -1134,7 +1156,7 @@ async function init() {
   });
   const frcPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [frcBGL] }),
-    compute: { module: frcSM, entryPoint: 'main', constants: { ...constants, USE_BOUNCEBACK, F16 } }
+    compute: { module: frcSM, entryPoint: 'main', constants: { ...constants, USE_BOUNCEBACK, F16, K_EPS } }
   });
   const phyPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [phyBGL] }),
@@ -1212,7 +1234,7 @@ async function init() {
   // whole session (see amr_force1.wgsl's header).
   const force1PL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [force1BGL] }),
-    compute: { module: force1SM, entryPoint: 'main', constants: { W, H, RB, USE_BOUNCEBACK, F16 } }
+    compute: { module: force1SM, entryPoint: 'main', constants: { W, H, RB, USE_BOUNCEBACK, F16, K_EPS } }
   });
   // Milestone 8: level>=2's own force pass, one pipeline reused across
   // every such level (no per-level overrides -- hasChild/dxL are runtime

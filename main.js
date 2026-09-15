@@ -16,6 +16,21 @@ const canvas   = document.getElementById('c');
 const statusEl = document.getElementById('status');
 
 const urlParams = new URLSearchParams(window.location.search);
+
+// THE DIFFUSE BAND'S WIDTH, in units of a level's own cell size:
+// epsilon = K_EPS * dx_level (plans/2D-backport.md B7). Threaded into every
+// shader that evaluates chi -- step, force and render, at every level -- so
+// the band can be swept without touching a literal in nine files.
+//
+// Default 1.5 is the value every one of those sites already hardcoded, so
+// this build is byte-identical to the previous one. ?kEps=0.75 halves it.
+//
+// It is a BAND ladder, not a resolution ladder, that settles the standing
+// Cd red cells: CLAUDE.md diagnoses them as diffuse-interface width (the
+// effective body radius exceeds the nominal one, so Cd converges from ABOVE),
+// and a resolution ladder moves the band and everything else at once.
+const K_EPS = urlParams.has('kEps') ? parseFloat(urlParams.get('kEps')) : 1.5;
+if (!(K_EPS > 0)) throw new Error(`?kEps=${urlParams.get('kEps')} must be > 0`);
 // ?f16=1 / ?f16=2: real packed-half storage for `f` -- see shaders/common_fpack.wgsl
 // and f-pack.mjs. Wired on EVERY page that consumes those shaders, including
 // the ones with no accuracy check of their own: a page that quietly ignored
@@ -273,13 +288,13 @@ async function init() {
   const constants = { W, H };
   // Separate dict for the pipelines whose shaders @include common_fpack.wgsl;
   // phy/render don't declare F16 and WebGPU makes that a hard error.
-  const fConstants = { W, H, F16 };
+  const fConstants = { W, H, F16, K_EPS };
   // Likewise the render fragment needs its own dict: only render.wgsl declares
   // VORT_SCALE/VORT_GAMMA (via common_vortcolor.wgsl), and supplying an
   // override a pipeline's shader does not declare is the same hard error.
   // The two VORT_* values are supplied by makeRenderPipeline below, which is
   // the only thing that ever varies them.
-  const renderConstants = { W, H };
+  const renderConstants = { W, H, K_EPS };
 
   const stepPL = device.createComputePipeline({ 
     layout: device.createPipelineLayout({ bindGroupLayouts: [stepBGL] }), 

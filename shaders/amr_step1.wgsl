@@ -145,7 +145,10 @@ fn wrapf(v: f32, n: f32) -> f32 {
 // (dx_L0=1 there), so this is the SAME constant, just no longer coincident
 // with dx=1 -- a genuine behavior change (0.75, not 1.5), fixing the
 // under-resolved diffuse-boundary sampling this milestone targets.
-const K_EPS = 1.5f;
+// An OVERRIDE since B7, not a const -- ?kEps= sweeps the diffuse band
+// across every level at once. Default unchanged, so this build is
+// byte-identical to the previous one.
+override K_EPS : f32 = 1.5f;
 fn get_chi(phi: f32) -> f32 {
     return chiFromPhiEps(phi, K_EPS * 0.5f);
 }
