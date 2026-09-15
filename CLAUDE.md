@@ -299,6 +299,19 @@ the driver optimized away, with a control that could not detect that.
 layout. Measured NOT viable as a default; kept for re-measurement, not for
 shipping.
 
+`?wrapScreens=N` (index-reentry.html) — domain-heights of accumulated travel
+before `x_total`/`y_total` wrap; default 16, byte-identical when absent. The
+instrument for the body's sub-cell precision, because under the shipped window
+convention that position IS `frac(y_total)`, so the accumulator's magnitude is
+the resolution. Measured 2026-09-15 (plans/2D-backport.md B5-4), 262144 steps
+against an exact prescribed trajectory: wrap=16 errs 8.5 cells, wrap=1 errs
+0.71 -- and `?window=0`, the whole point of B5, errs 0.72. **The buffer
+convention and `wrapScreens=1` are the same number**, so B5 buys no precision
+that one constant does not. Note also there is NO fixed ULP under either: the
+drift grows roughly linearly with step count, and the buffer convention is
+~10x WORSE below ~7000 steps (its `cy` starts at H/2 while `y_total` starts
+at 0). Both candidate defaults are re-baselining; neither has been adopted.
+
 `?ghostcopy=1` — restores the legacy materialized same-level ghost cells on
 every AMR page. Default 0: the fine step addresses neighbour tiles directly
 during streaming (`DIRECT_GHOST` in `shaders/amr_step1*.wgsl`), so the

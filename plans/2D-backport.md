@@ -1781,6 +1781,84 @@ window-DISPATCHED kernel, and converting it re-groups its per-workgroup
 truncated atomicAdds, so it is a re-baselining change that belongs with B5
 proper rather than an inert stage.
 
+### B5-4 — DONE (2026-09-15). B5's PRECISION ARGUMENT DOES NOT SURVIVE MEASUREMENT.
+
+B5 has justified itself on two things: fewer conversions, and **bounded
+precision** -- "the body's position is wrapped into `[0, W)` every step, so its
+ULP is fixed at `W * 2^-24` forever by construction". The second one is now
+measured, and **it is not a property of the convention at all.** It is a
+property of `TOTAL_WRAP_SCREENS`, which is one constant.
+
+**THE INSTRUMENT.** `?wrapScreens=N` on `index-reentry.html` (same shape as
+B7's `?kEps=` ladder), threaded to BOTH `physics.wgsl`'s override and
+`card-total.mjs`'s unwrapper -- they are two halves of one convention and a
+mismatch does not fail loudly, it silently re-reads every wrap as motion.
+Default 16 is unchanged and the page is bit-IDENTICAL with the flag absent.
+
+**WHY THIS PAGE.** `index-reentry.html` is KINEMATIC: `vy` is set to exactly
+`VY_FIXED` every step, so after n steps the body's true displacement is exactly
+`n * f32(VY)` -- an exact reference, in closed form, with no solver in the way.
+It is also the only dense page whose body MOVES, which is what the pinned
+cylinder cannot test (`off = 0` there makes the two conventions trivially
+agree -- the same blind spot B5-0 recorded about `dense-reference`).
+
+**THE LADDER.** Body position error vs. that exact trajectory, 262144 steps:
+
+    leg                          err (cells)   vs shipped
+    window=1  wrapScreens=16      8.541e+0        1.0x      <- shipped
+    window=1  wrapScreens=4       1.413e+0        6.0x
+    window=1  wrapScreens=2       1.162e+0        7.3x
+    window=1  wrapScreens=1       7.114e-1       12.0x
+    window=0  (B5)                7.176e-1       11.9x
+
+**`window=1 wrapScreens=1` AND `window=0` ARE THE SAME NUMBER** (0.9% apart).
+The buffer convention holds the body in `[0, H)`; `wrapScreens=1` holds the
+accumulator in `[0, H)`. Same magnitude, same ULP, same answer. B5 buys nothing
+here that one constant does not already buy.
+
+**AND THERE IS NO FIXED ULP, under either convention.** The plan's wording says
+the error is pinned "forever by construction". It is not: the REPRESENTATION's
+ULP is fixed, but the accumulated drift still grows roughly linearly in the
+step count, because every step rounds. Measured on the shipped convention:
+
+    step       window=1      window=0
+    4096       2.609e-3      2.600e-2
+    16384      5.386e-2      5.386e-2
+    65536      2.548e-1      1.933e-1
+    262144     8.541e+0      7.176e-1
+    524288     1.868e+1      1.435e+0
+
+**AND THE BUFFER CONVENTION IS TEN TIMES WORSE FOR THE FIRST ~7000 STEPS.**
+`cy` starts at `H/2` and is ~128 from step zero, while `y_total` starts at 0
+and is small for a long time -- so the shipped convention has the smaller
+magnitude, and therefore the finer ULP, until `y_total` grows past `H/2`. The
+crossover sits between 4096 and 16384 steps, where `H/2 / VY = 6919` predicts
+it. A short run is not a small version of a long one here; the ordering
+reverses.
+
+(The 16384 row reading identically for both is a coincidence of the crossover
+-- the two accumulations are independent, and they differ at every other
+sample. Single samples of an accumulating rounding process, so read the decade,
+not the digit.)
+
+**WHAT THIS LEAVES B5 WITH.** The conversion-count argument, which is real and
+already largely banked (B5-1 collapsed nine hand-written sites into two
+functions; B5-2 split the body's frame from the window's). What is NOT
+supported is flipping the default FOR PRECISION: that is a re-baselining change
+across every page, and the same 12x is available from `TOTAL_WRAP_SCREENS`
+without touching the convention. **Both are re-baselining and neither is done
+here** -- this stage is inert by construction, and the choice belongs to
+whoever owns the published numbers.
+
+**THE CHEAPER CANDIDATE, for whoever takes that decision.** `card-total.mjs`
+picked 16 for unwrap headroom, not for precision: "far more than any single
+readback can cross (a frame moves the card a few lattice units at most,
+against a half-wrap of 8 domain heights)". At `wrapScreens=1` the half-wrap is
+still 128 cells against that same few-lattice-unit frame, so the headroom
+argument does not obviously require 16 -- but it has not been tested against a
+live readback cadence, only against this harness's, and that is the check it
+would need first.
+
 ### B9 — DONE (2026-09-14)
 
 `lattice-2d.mjs` + `tools/gen-lattice-2d.js` + `tools/test-lattice-2d.js`, and

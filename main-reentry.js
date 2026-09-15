@@ -55,6 +55,22 @@ if (WINDOW_BODY !== 0 && WINDOW_BODY !== 1) {
   refuseConfig(statusEl, `?window=${urlParams.get('window')} invalid -- 1 (the shipped window convention) or 0 (the buffer convention).`);
 }
 
+// ?wrapScreens=N -- THE INSTRUMENT FOR B5's PRECISION CLAIM (B5-4), the same
+// shape as B7's ?kEps= ladder. Domain-heights of accumulated displacement
+// allowed before x_total/y_total wrap; default 16 matches card-total.mjs and
+// is byte-identical to the build before this existed.
+//
+// It exists because the body's sub-cell position under the SHIPPED convention
+// is frac(y_total), so the accumulator's MAGNITUDE is the body's precision --
+// and that magnitude is set by this constant, not by the window/buffer choice
+// B5 is about. Sweeping it separates the two. card-total.mjs must be handed
+// the SAME value (a mismatch silently mis-attributes every wrap as motion),
+// which is why both consumers below read this one variable.
+const WRAP_SCREENS = urlParams.has('wrapScreens') ? parseInt(urlParams.get('wrapScreens')) : 16;
+if (!Number.isFinite(WRAP_SCREENS) || WRAP_SCREENS < 1) {
+  refuseConfig(statusEl, `?wrapScreens=${urlParams.get('wrapScreens')} invalid -- must be an integer >= 1 (domain-heights of travel before the accumulator wraps).`);
+}
+
 // THE DIFFUSE BAND'S WIDTH, in units of a level's own cell size:
 // epsilon = K_EPS * dx_level (plans/2D-backport.md B7). Threaded into every
 // shader that evaluates chi -- step, force and render, at every level -- so
@@ -291,7 +307,7 @@ async function init() {
   // main-reentry-amr.js's identical phyPL construction.
   const phyPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [phyBGL] }),
-    compute: { module: phySM, entryPoint: 'main', constants: { W, H, WINDOW_BODY, KINEMATIC: 1, VY_FIXED: VY, OMEGA_FIXED: OMEGA, INITIAL_CX: W / 2, INITIAL_CY: H / 2 } }
+    compute: { module: phySM, entryPoint: 'main', constants: { W, H, WINDOW_BODY, KINEMATIC: 1, VY_FIXED: VY, OMEGA_FIXED: OMEGA, INITIAL_CX: W / 2, INITIAL_CY: H / 2, TOTAL_WRAP_SCREENS: WRAP_SCREENS } }
   });
   const renPL = device.createRenderPipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [renBGL] }),
@@ -327,7 +343,7 @@ async function init() {
   const trajectory = [];
   // Restores true totals from the shaders' wrapped x_total/y_total --
   // see card-total.mjs.
-  const totals = createTotalUnwrapper(W, H);
+  const totals = createTotalUnwrapper(W, H, WRAP_SCREENS);
 
   function dispatchMacroStep(enc) {
     const stepBG = useB ? stepBG_ba : stepBG_ab;

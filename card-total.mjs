@@ -51,9 +51,14 @@ export const TOTAL_WRAP_SCREENS = 16;
 // `span` is the domain size in lattice units (W for x, H for y -- equal on
 // every page here, but kept as two arguments so it stays correct if that ever
 // stops being true).
-export function createTotalUnwrapper(spanX, spanY) {
-  const wrapX = spanX * TOTAL_WRAP_SCREENS;
-  const wrapY = spanY * TOTAL_WRAP_SCREENS;
+// `screens` overrides TOTAL_WRAP_SCREENS and MUST equal whatever the page fed
+// the shader's override of the same name -- they are two halves of one
+// convention, and a mismatch does not fail loudly: the unwrap simply
+// mis-attributes every wrap as motion. Pages that expose ?wrapScreens= pass
+// the same parsed value to both; everything else takes the default.
+export function createTotalUnwrapper(spanX, spanY, screens = TOTAL_WRAP_SCREENS) {
+  const wrapX = spanX * screens;
+  const wrapY = spanY * screens;
   let prevX = null, prevY = null;
   let totalX = 0, totalY = 0;
 
