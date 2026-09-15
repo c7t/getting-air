@@ -99,8 +99,11 @@
 // which is the use the existence switch never covered. Keeping the binding
 // is what makes that fix free: managePoolBGL is already at the 16-storage-
 // buffer per-stage limit, so a new buffer for this would not have fit.
-@group(0) @binding(7) var<storage, read>       blockCriterionL2 : array<f32>;
-@group(0) @binding(8) var<storage, read>       blockSlotL2      : array<i32>;
+// bindings 7 and 8 WERE level 2's own blockCriterion and blockSlot, read by
+// the per-pass cascade tests. Gone with them (B2-2d) -- the closure needs no
+// cross-level read here at all, because shaders/amr_cascade.wgsl has already
+// put level 2's demands into level 1's want array. Holes, not renumbered:
+// see amr_manage_pool.wgsl on why.
 // ── Refinement convergence counters (?diag=1) ────────────────────────────────
 // The refine round is a FIXED-POINT LOOP run a fixed N_LEVELS-1 times with no
 // convergence check -- it stops because the counter ran out, not because the
@@ -133,9 +136,7 @@ override N_REFINE_MAX : f32 = 1.0f;
 override MAX_LEVEL : i32 = 1;
 override FORCE_REFINE_MARGIN : f32;
 override FORCE_REFINE_LOOKAHEAD : f32;
-override HAS_LEVEL2 : u32 = 0u;
 // 0 leaves level2Wanted uncalled, so behaviour is exactly as before.
-override DEMAND_CASCADE : u32 = 0u;
 // When 0, isNearBody is unconditionally false -- no interior geometry to
 // force-refine toward (channel-flow/TGV scenarios), so refinement is
 // purely vorticity-driven. See shaders/lbm_step.wgsl's identical override.
@@ -144,27 +145,17 @@ override HAS_BODY : u32 = 1u;
 // (?boxrefine=0). Default 1: the whole block is tested. See isNearBody.
 override BOX_REFINE : u32 = 1u;
 
-// ?cascade=1: TAKE THE 2:1 DECISION OUT OF THIS FILE (plans/2D-backport.md B2).
+// THE 2:1 DECISION IS NOT IN THIS FILE (plans/2D-backport.md B2). decide()
+// writes each block's OWN reason into the want array, shaders/amr_cascade.wgsl
+// closes it under the rule, and coarsen/refine below are pure lookups.
 //
-// Default 0 keeps every per-pass test below exactly as it shipped, so this
-// build is byte-identical. At 1, coarsen and refine stop deciding anything
-// about balance and simply act on the WANT array: decide() writes each block's
-// OWN reason (criterion, geometry, sponge) into it, shaders/amr_cascade.wgsl
-// closes it under the 2:1 rule, and then a tile exists if and only if it is
-// wanted. Both paths live in one build so the difference can be measured --
-// B2-1 recorded what it should be: level 2's x-extent on index-amr.html is 80
-// L0 units against 176 with the growth half enabled, and the closure count
-// should reach zero.
-//
-// WHY THE VETOES CAN GO RATHER THAN BEING PORTED. Every balance test here is
-// one direction of the closure read locally, and each was conservative in a
-// way that cost something. The neighbour-active gate is STRONGER than 2:1
-// balance -- it demands the parent's four same-level neighbours, where the
-// rule only demands the parents of the block's OWN neighbours -- and that is
-// precisely what deadlocks growth: a refine blocked by a neighbour that would
-// only ever have been created BY that refine. Applied to the want set the two
-// directions are the same function, so there is nothing left to veto.
-override CASCADE : u32 = 0u;
+// WHY THE VETOES WERE DELETED RATHER THAN PORTED. Every balance test that used
+// to live here was one direction of the closure read locally, and the pool
+// manager's equivalent was STRONGER than the rule it approximated -- which is
+// what deadlocked growth rather than what protected it. Applied to the want
+// set, "refine forced by a deeper neighbour" and "coarsen blocked by one" are
+// the same function. ?cascade=0 kept both paths in one build for one commit;
+// the measurement is in B2-2c and the path is gone.
 
 // L0 window-space edge band (coarse cells) excluded from vorticity-driven
 // refinement -- keeps fine blocks out of the ALBC sponge (amr_step.wgsl
@@ -236,15 +227,6 @@ fn inSpongeBand(blockID: u32) -> bool {
   return min(distX, distY) < SPONGE_EXCLUDE_W;
 }
 
-// True if the L1 tile at `blockID1` currently has an active level-2 child
-// (quadrant 0 stands for all 4 -- decision 3's all-or-nothing invariant).
-fn hasLevel2Child(blockID1: u32) -> bool {
-  let nbx = W / BLOCK;
-  let bx = blockID1 % nbx; let by = blockID1 / nbx;
-  let nbxL2 = nbx * 2u;
-  let childBlockID0 = (by * 2u) * nbxL2 + (bx * 2u);
-  return blockSlotL2[childBlockID0] >= 0;
-}
 
 // True if the L1 tile at `blockID1` -- which must already be active -- has a
 // vorticity criterion that ASKS for a level-2 child, whether or not it has
@@ -282,43 +264,7 @@ fn hasLevel2Child(blockID1: u32) -> bool {
 // iteration. AGAL does the same thing rather than recursing (mesh_amr.cu
 // drives a cblock_ID_ref mark field through staged kernels).
 //
-// SCOPE: this is the L0->L1 hop only. The same deadlock exists one level down
-// at N_LEVELS>=4 (an L2 tile wanting L3 children, vetoed for want of an L2
-// neighbour), and it cannot be fixed the same way -- amr_manage_pool.wgsl
-// would need the level-(m+2) criterion, and it has no binding left. N>=4 is
-// unvalidated anyway; fixing it needs a binding freed first.
-fn level2Wanted(blockID1: u32) -> bool {
-  let nbx = W / BLOCK;
-  let bx = blockID1 % nbx; let by = blockID1 / nbx;
-  let nbxL2 = nbx * 2u;
-  var m = 0f;
-  for (var qy = 0u; qy < 2u; qy++) {
-    for (var qx = 0u; qx < 2u; qx++) {
-      m = max(m, blockCriterionL2[(by * 2u + qy) * nbxL2 + (bx * 2u + qx)]);
-    }
-  }
-  // blockCriterionL2 is reduced from LEVEL 1's own field, so it is in level-1
-  // lattice units; the ladder wants physical. A level-1 cell is half an L0
-  // cell, so physical log2|omega| = lattice + 1 -- the same +m shift
-  // amr_manage_pool.wgsl's toPhysical() applies, and common_refine.wgsl's
-  // "PHYSICAL UNITS" note explains why omitting it under-refines by 2^m.
-  let eps = min(1.0f, log2(max(m, EPS_FLOOR)));
-  return desiredLevel(eps + 1.0f) >= 2;
-}
 
-// Same 4 edge-neighbor blockIDs every fine-fine/manage neighbor lookup in
-// this codebase uses, factored out since both the cascade and coarsen-
-// block checks below need them.
-fn edgeNeighbors(blockID: u32) -> array<u32, 4> {
-  let nbx = W / BLOCK; let nby = H / BLOCK;
-  let bx = blockID % nbx; let by = blockID / nbx;
-  return array<u32, 4>(
-    ((by + nby - 1u) % nby) * nbx + bx,
-    ((by + 1u) % nby) * nbx + bx,
-    by * nbx + ((bx + 1u) % nbx),
-    by * nbx + ((bx + nbx - 1u) % nbx),
-  );
-}
 
 // THIS BLOCK'S OWN REASON TO EXIST -- criterion, geometry, sponge, and nothing
 // about its neighbours. Factored out so decide() and the legacy refine() path
@@ -344,24 +290,15 @@ fn coarsen(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (blockID >= nblocks) { return; }
 
   let currentSlot = blockSlot[blockID];
-  // Ladder: release this block's level-1 tile only if its own flow no longer
-  // asks for ANY refinement (desired < 1), hysteresis-shifted. Level 0's dx
-  // is 1, so epsFor is already the physical log2|omega|.
-  // Under CASCADE the want set already answers this: the closure guarantees
-  // that a wanted level-2 block implies a wanted level-1 parent, so a tile
-  // still needed as a parent is still wanted and needs no separate test.
-  let release = select(
-    (desiredLevelCoarsen(epsFor(blockID)) < 1 || inSpongeBand(blockID)) && !isNearBody(blockID),
-    want[blockID] == 0u,
-    CASCADE != 0u);
-  if (release && currentSlot >= 0) {
-    if (CASCADE == 0u && HAS_LEVEL2 != 0u) {
-      if (hasLevel2Child(blockID)) { return; }
-      let neighbors = edgeNeighbors(blockID);
-      for (var i = 0u; i < 4u; i++) {
-        if (blockSlot[neighbors[i]] >= 0 && hasLevel2Child(neighbors[i])) { return; }
-      }
-    }
+  // A tile exists if and only if it is WANTED. The want set arrives already
+  // closed under the 2:1 rule (decide -> shaders/amr_cascade.wgsl -> here), so
+  // "can't release a tile that is still a parent" needs no test: a wanted
+  // level-2 block implies a wanted level-1 parent by construction. The three
+  // per-pass tests that used to live here -- hasLevel2Child on this block, on
+  // each edge neighbour, and the criterion ladder -- are all one direction of
+  // that closure read locally, and they are gone with plans/2D-backport.md
+  // B2-2d.
+  if (want[blockID] == 0u && currentSlot >= 0) {
     let oldCount = atomicAdd(&freeCount, 1);
     freeList[u32(oldCount)] = currentSlot;
     blockSlot[blockID] = -1;
@@ -376,28 +313,15 @@ fn refine(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (blockID >= nblocks) { return; }
 
   let currentSlot = blockSlot[blockID];
-  // Milestone 9: cascade -- refine even if blockID's OWN criterion doesn't
-  // call for it, if an ALREADY-ACTIVE same-level neighbor ALREADY HAS a
-  // level-2 child (2:1 balance: that neighbor's level-2 child can't sit
-  // directly next to a level-0-only region) -- see this file's header.
-  // EXISTENCE (hasLevel2Child), not desire -- see amr_manage_pool.wgsl's
-  // own identical fix/rationale (a criterion-based "wants" test can
-  // flicker false for a still-genuinely-active child whose criterion
-  // dipped this round, letting a real imbalance go uncascaded).
-  var cascadeWanted = false;
-  if (CASCADE == 0u && HAS_LEVEL2 != 0u && currentSlot < 0) {
-    let neighbors = edgeNeighbors(blockID);
-    for (var i = 0u; i < 4u; i++) {
-      if (blockSlot[neighbors[i]] >= 0 && hasLevel2Child(neighbors[i])) { cascadeWanted = true; }
-      // GROWTH: the neighbour has no L2 child yet but its criterion asks for
-      // one, and it cannot get one until this block exists. Union with the
-      // existence test above, never a replacement -- see level2Wanted.
-      if (DEMAND_CASCADE != 0u && blockSlot[neighbors[i]] >= 0 && level2Wanted(neighbors[i])) { cascadeWanted = true; }
-    }
-  }
-  let ownReason = ownWant(blockID);
-  let create = select(ownReason || cascadeWanted, want[blockID] != 0u, CASCADE != 0u);
-  if (create && currentSlot < 0) {
+  // Milestone 9's cascade lived here as two tests over the four edge
+  // neighbours -- an EXISTENCE one (does a neighbour already have a level-2
+  // child) and, behind ?demandCascade, a DESIRE one (does it want one). They
+  // were the same rule read twice from one side, and only the veto half was
+  // ever complete: a criterion-driven refine could be blocked forever by a
+  // neighbour that would only ever have been created BY that refine (B2-1
+  // measured level 2 pinned to half its allowed reach because of it).
+  // The want set arrives closed, so this is now a lookup.
+  if (want[blockID] != 0u && currentSlot < 0) {
     let oldCount = atomicSub(&freeCount, 1);
     if (oldCount > 0) {
       let slot = freeList[u32(oldCount - 1)];
@@ -406,10 +330,12 @@ fn refine(@builtin(global_invocation_id) gid: vec3<u32>) {
       newlyActivated[u32(slot)] = 1u;
       if (DIAG != 0u) {
         atomicAdd(&diag[3], 1u);
-        // Attributed to the cascade only when nothing else asked for it: a
-        // block its own criterion or geometry already wanted is not evidence
-        // that the balance cascade is still propagating.
-        if (cascadeWanted && !ownReason) { atomicAdd(&diag[4], 1u); }
+        // diag[4] counted cascade-only grants -- refines nothing else asked
+        // for. With the closure there is no such category: every want is
+        // either the block's own reason or the rule's, and the two are not
+        // distinguishable from here (nor interestingly different -- both are
+        // requirements). Left at 0 rather than removed, because
+        // tools/lib/amr-invariants.js reads it by name.
       }
     } else {
       atomicAdd(&freeCount, 1); // pool exhausted this round -- undo, stay coarse

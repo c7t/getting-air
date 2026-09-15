@@ -508,7 +508,12 @@ async function runInvariants(Runtime, opts, global) {
       // its bilinear parent stencil reads the parent's corner cell directly --
       // and is NOT required by the default ring path. Asserted exactly when
       // the run is a ghost-free one. See plans/ghost-free.md.
-      requireCornerBalance: /(^|&)ghostfree=1(&|$)/.test(opts.extra || ''),
+      // Gated by default since B2-2d -- see tools/lib/amr-invariants.js. The
+      // ?ghostfree=1 special case is gone with it: that path NEEDED corner
+      // balance (its bilinear parent stencil reads the parent's corner cell
+      // directly), which is why it alone used to require it. Now everything
+      // does, so there is nothing to special-case.
+      requireCornerBalance: true,
     steps: opts.invariantSteps,
     checkEvery: opts.invariantCheckEvery,
     timeout: opts.physicsTimeout,

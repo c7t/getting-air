@@ -37,7 +37,20 @@ function checkFinite(state) {
 // a pass, so this can't quietly look greener than it is.
 async function runInvariantSweep(Runtime, opts) {
   const { steps, checkEvery, timeout = 300, onCheckpoint, global: G = 'window.__CYL',
-          requireCornerBalance = false } = opts;
+          // DEFAULT TRUE SINCE B2-2d. Corner 2:1 balance was reported and not
+          // gated from B0 until then, for a good reason: the default ring path
+          // tolerates a missing diagonal parent (interp fills the corner ghost
+          // from the parent when the corner tile is absent), and the shipped
+          // per-pass cascade covered only the four FACES -- so the count was
+          // reliably nonzero, 13 on index-amr.html, and gating it would have
+          // failed every run for a defect that was already written down.
+          //
+          // The closure covers all nine offsets, so it is now zero at every
+          // checkpoint. A check that had to be non-gating because the code
+          // could not satisfy it becomes a gate the moment the code can --
+          // and leaving it reporting-only after that is how a fixed invariant
+          // silently regresses.
+          requireCornerBalance = true } = opts;
 
   const has = async (fn) => {
     const r = await evalExpr(Runtime, `typeof ${G}.${fn} === 'function'`);

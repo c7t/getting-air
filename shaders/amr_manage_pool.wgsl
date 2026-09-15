@@ -129,7 +129,8 @@
 @group(0) @binding(8)  var<storage, read_write> childWant         : array<u32>;
 @group(0) @binding(9)  var<storage, read_write> childOriginX      : array<f32>;
 @group(0) @binding(10) var<storage, read_write> childOriginY      : array<f32>;
-@group(0) @binding(11) var<storage, read>       parentBlockSlot   : array<i32>;
+// binding 11 WAS parentBlockSlot, read only by the neighbour-active veto.
+// Gone with it (B2-2d).
 @group(0) @binding(12) var<storage, read>       parentSlotToBlock : array<i32>;
 @group(0) @binding(13) var<storage, read>       parentOriginX     : array<f32>; // dummy if !PARENT_HAS_CACHED_ORIGIN
 @group(0) @binding(14) var<storage, read>       parentOriginY     : array<f32>; // dummy if !PARENT_HAS_CACHED_ORIGIN
@@ -138,7 +139,10 @@
 // coarsen() only ever need EXISTENCE (hasGrandchild), never level (m+2)'s
 // criterion -- see hasGrandchild's own comment on why "wants" isn't the
 // right test for maintaining balance against an already-active grandchild.
-@group(0) @binding(15) var<storage, read>       grandchildBlockSlot : array<i32>;
+// binding 15 WAS grandchildBlockSlot, read only by hasGrandchild. Gone with
+// it (B2-2d). Holes at 11 and 15 rather than a renumber: five separate
+// pages' bind groups would have to land in lockstep, which is the shape
+// that shipped 238e48c. 16 -> 14 declared.
 
 override W : u32;
 override H : u32;
@@ -147,7 +151,6 @@ override NBX_PARENT : u32;
 override NBY_PARENT : u32;
 override PARENT_CELL_SIZE_L0 : f32;
 override PARENT_HAS_CACHED_ORIGIN : u32;
-override HAS_GRANDCHILD : u32 = 0u;
 // When 0, isNearBodyAt is unconditionally false -- see amr_manage.wgsl's
 // identical override.
 override HAS_BODY : u32 = 1u;
@@ -155,27 +158,11 @@ override HAS_BODY : u32 = 1u;
 // (?boxrefine=0) -- see amr_manage.wgsl's identical override.
 override BOX_REFINE : u32 = 1u;
 
-// ?cascade=1: TAKE THE 2:1 DECISION OUT OF THIS FILE (plans/2D-backport.md B2).
-//
-// Default 0 keeps every per-pass test below exactly as it shipped, so this
-// build is byte-identical. At 1, coarsen and refine stop deciding anything
-// about balance and simply act on the WANT array: decide() writes each block's
-// OWN reason (criterion, geometry, sponge) into it, shaders/amr_cascade.wgsl
-// closes it under the 2:1 rule, and then a tile exists if and only if it is
-// wanted. Both paths live in one build so the difference can be measured --
-// B2-1 recorded what it should be: level 2's x-extent on index-amr.html is 80
-// L0 units against 176 with the growth half enabled, and the closure count
-// should reach zero.
-//
-// WHY THE VETOES CAN GO RATHER THAN BEING PORTED. Every balance test here is
-// one direction of the closure read locally, and each was conservative in a
-// way that cost something. The neighbour-active gate is STRONGER than 2:1
-// balance -- it demands the parent's four same-level neighbours, where the
-// rule only demands the parents of the block's OWN neighbours -- and that is
-// precisely what deadlocks growth: a refine blocked by a neighbour that would
-// only ever have been created BY that refine. Applied to the want set the two
-// directions are the same function, so there is nothing left to veto.
-override CASCADE : u32 = 0u;
+// THE 2:1 DECISION IS NOT IN THIS FILE (plans/2D-backport.md B2). decide()
+// writes each parent's OWN reason into the child level's want array,
+// shaders/amr_cascade.wgsl closes it under the rule, and coarsen/refine are
+// pure lookups. ?cascade=0 kept both paths in one build for one commit; the
+// measurement is in B2-2c and the path is gone.
 
 override REFINE_THRESH : f32;
 override COARSEN_THRESH : f32;
@@ -238,30 +225,7 @@ fn inSpongeBandAt(centerX_L0: f32, centerY_L0: f32) -> bool {
   return min(distX, distY) < SPONGE_EXCLUDE_W;
 }
 
-// True if the level-(m+1) tile at `childBlockID` currently has an active
-// level-(m+2) child (quadrant 0 stands for all 4 -- decision 3's all-or-
-// nothing invariant, same as hasLevel2Child in amr_manage.wgsl).
-fn hasGrandchild(childBlockID: u32) -> bool {
-  let nbxChild = NBX_PARENT * 2u;
-  let bx = childBlockID % nbxChild; let by = childBlockID / nbxChild;
-  let nbxGrandchild = nbxChild * 2u;
-  let gcBlockID0 = (by * 2u) * nbxGrandchild + (bx * 2u);
-  return grandchildBlockSlot[gcBlockID0] >= 0;
-}
 
-// Level-(m+1)'s own 4 edge-neighbor blockIDs (level-(m+1) coordinate
-// space, NBX_PARENT*2 wide) -- same shape as amr_manage.wgsl's
-// edgeNeighbors, just at the child level instead of the dense L0/L1 one.
-fn childEdgeNeighbors(childBlockID: u32) -> array<u32, 4> {
-  let nbxChild = NBX_PARENT * 2u; let nbyChild = NBY_PARENT * 2u;
-  let bx = childBlockID % nbxChild; let by = childBlockID / nbxChild;
-  return array<u32, 4>(
-    ((by + nbyChild - 1u) % nbyChild) * nbxChild + bx,
-    ((by + 1u) % nbyChild) * nbxChild + bx,
-    by * nbxChild + ((bx + 1u) % nbxChild),
-    by * nbxChild + ((bx + nbxChild - 1u) % nbxChild),
-  );
-}
 
 
 // THE WANT SET FOR THE CHILD LEVEL. Dispatched over PARENT slots, like
@@ -377,118 +341,32 @@ fn refine(@builtin(global_invocation_id) gid: vec3<u32>) {
   let parentCenterX_L0 = parentOriginX_L0 + f32(RB) * PARENT_CELL_SIZE_L0;
   let parentCenterY_L0 = parentOriginY_L0 + f32(RB) * PARENT_CELL_SIZE_L0;
 
-  // Grandchild cascade (see header): even if THIS parent's own criterion
-  // doesn't call for a level-(m+1) child, force one anyway if a same-
-  // level-m edge-neighbor ALREADY HAS an active level-(m+1) child that
-  // itself already has an active level-(m+2) grandchild -- otherwise that
-  // grandchild sits directly adjacent to this still-level-m region, a
-  // 2-level gap. Existence (hasGrandchild), not desire: a "would level-
-  // (m+2) want to refine here right now" test can flicker false on a round
-  // where the ALREADY-ACTIVE grandchild's own criterion has since dropped
-  // (flow evolved, criterion re-evaluated fresh each round) even though
-  // coarsen() hasn't released it yet -- using "wants" here let a genuinely
-  // still-active depth-(m+2) region go uncascaded for however many rounds
-  // its own criterion stayed fresh-per-round negative, a live-verified bug
-  // in an earlier version of this fix (debugCheck21Balance caught real
-  // depth-1-vs-depth-3 violations with the "wants" version).
+  // The grandchild-cascade essay that stood here is in git history: two
+  // separately live-verified index bugs in an 8-cell ring walk, and a
+  // "wants"-vs-"has" flicker that forced an existence test. All of it was
+  // this file computing one hop of a transitive closure by hand.
+  // A QUAD EXISTS IF AND ONLY IF IT IS WANTED (plans/2D-backport.md B2-2d).
   //
-  // BUGFIX: this used to walk the 4 same-level-m EDGE-NEIGHBOR PARENTS and
-  // test hasGrandchild on each one's QUADRANT-0 child -- the (-x,-y) corner
-  // child, whichever side that neighbor was on. A parent has 4 children,
-  // each with its OWN independent grandchild quad, so quadrant 0 is simply
-  // the wrong child on every side but one: for the W neighbor (and the N
-  // one) it is the child FURTHEST from this parent, and for the E/S
-  // neighbors it is only one of the TWO children that actually share the
-  // face. (Quadrant 0 IS the right stand-in for "does this quad exist at
-  // all" -- decision 3's all-or-nothing invariant -- which is what made the
-  // wrong index look right; grandchild EXISTENCE is per-child and carries no
-  // such invariant.) Both error directions were live-verified at N=4 on
-  // index-cylinder-amr.html, and they produce the two violation classes
-  // tools/validate-amr-invariants.js reports there:
-  //   - FALSE NEGATIVE (a bordering child skipped): a genuine level-(m+2)
-  //     region sits edge-adjacent to an un-cascaded level-m leaf --
-  //     debugCheck21Balance's depth-1-next-to-depth-3 pairs.
-  //   - FALSE POSITIVE (a far-side child counted): refine() recreates a quad
-  //     for a grandchild that is NOT adjacent to it, while coarsen()'s own
-  //     guard below -- which walks each child's TRUE same-level-(m+1) edge
-  //     neighbors (childEdgeNeighbors) and so does not see that grandchild
-  //     -- releases it again on the very next fixed-point iteration. That
-  //     create/destroy oscillation is the same mechanism the coarsen()
-  //     BUGFIX below documents one level up: amr_manage.wgsl's own L0->L1
-  //     cascade runs immediately AFTER coarsen() and before refine() in
-  //     dispatch order, so it only ever observed the quad in its destroyed
-  //     state and never granted the L1 tile 2:1 balance needed, leaving a
-  //     depth-2-next-to-depth-0 pair frozen in place for thousands of steps
-  //     (live-verified: identical violating tile coordinates at every
-  //     checkpoint, and unchanged by raising every pool cap 4-8x, which
-  //     rules out pool exhaustion).
+  // Three separate mechanisms used to stand between here and the allocator,
+  // and all three were the 2:1 rule read locally from one side:
   //
-  // So test the children that actually SHARE A FACE with this parent: the 8
-  // level-(m+1) cells ringing this parent's own 2x2 child footprint, 2 per
-  // side. That set is exactly coarsen()'s own guard set minus this parent's
-  // own 4 children (which cannot exist here -- the quadrant-0 early-out
-  // above already returned if they did), so refine() and coarsen() now agree
-  // about which grandchildren matter, which is what closes the oscillation.
-  var cascadeWanted = false;
-  if (HAS_GRANDCHILD != 0u) {
-    let nbyChild = NBY_PARENT * 2u;
-    let cx0 = bxP * 2u;              let cy0 = byP * 2u;
-    let cx1 = (cx0 + 1u) % nbxChild; let cy1 = (cy0 + 1u) % nbyChild;
-    let xW = (cx0 + nbxChild - 1u) % nbxChild; let xE = (cx0 + 2u) % nbxChild;
-    let yN = (cy0 + nbyChild - 1u) % nbyChild; let yS = (cy0 + 2u) % nbyChild;
-    let ring = array<u32, 8>(
-      yN * nbxChild + cx0, yN * nbxChild + cx1,   // N face
-      yS * nbxChild + cx0, yS * nbxChild + cx1,   // S face
-      cy0 * nbxChild + xE, cy1 * nbxChild + xE,   // E face
-      cy0 * nbxChild + xW, cy1 * nbxChild + xW,   // W face
-    );
-    for (var i = 0u; i < 8u; i++) {
-      if (childBlockSlot[ring[i]] >= 0 && hasGrandchild(ring[i])) {
-        cascadeWanted = true;
-      }
-    }
-  }
-
-  // HARD constraints, never blocked by the 2:1-balance neighbor gate below
-  // -- geometry (this candidate's own surface proximity) and cascade (a
-  // same-level neighbor ALREADY has a 2-level-deeper descendant) are both
-  // mandatory: the body's surface must reach the finest configured level
-  // regardless of a same-level neighbor's current activity, and 2:1
-  // balance is then DRIVEN from that requirement outward (neighbors get
-  // pulled up to satisfy it -- see amr_manage.wgsl's own cascade, now
-  // existence- not criterion-based, for the mechanism one level further
-  // out) rather than used to VETO the requirement itself. Only a
-  // criterion (vorticity)-only refine -- no geometric or cascade reason,
-  // just "this cell's own flow looks interesting" -- keeps the
-  // conservative gate, so criterion-driven growth alone still can't
-  // outrun its own coarser neighborhood.
-  let isHardRequired = isNearBodyAt(parentCenterX_L0, parentCenterY_L0) || cascadeWanted;
-  // Ladder: this parent wants children only if its own flow asks for a level
-  // DEEPER than the one it already holds.
-  let wantsRefine = select(
-    isHardRequired
-      || (desiredLevel(toPhysical(eps)) > myLevel() && !inSpongeBandAt(parentCenterX_L0, parentCenterY_L0)),
-    childWant[childBlockID0] != 0u,
-    CASCADE != 0u);
-  if (!wantsRefine) { return; }
-
-  // THE NEIGHBOUR-ACTIVE GATE IS THE DEADLOCK, and under CASCADE it is gone.
-  // It demands all four of the PARENT's same-level neighbours be active, which
-  // is strictly stronger than 2:1 balance -- the rule only demands that the
-  // parents of this child's OWN neighbours exist, and the closure has already
-  // put those in the want set.
-  if (CASCADE == 0u && !isHardRequired) {
-    // 2:1 balance (see header): all 4 same-level (level-m) edge-neighbors
-    // of the PARENT must already be active, or this refine is blocked
-    // this round -- whichever shader manages the parent's own level is
-    // responsible for cascading them active (reading THIS shader's own
-    // childCriterion to detect the demand -- see amr_manage.wgsl's header).
-    let neighborN = parentBlockSlot[((byP + NBY_PARENT - 1u) % NBY_PARENT) * NBX_PARENT + bxP];
-    let neighborS = parentBlockSlot[((byP + 1u) % NBY_PARENT) * NBX_PARENT + bxP];
-    let neighborE = parentBlockSlot[byP * NBX_PARENT + ((bxP + 1u) % NBX_PARENT)];
-    let neighborW = parentBlockSlot[byP * NBX_PARENT + ((bxP + NBX_PARENT - 1u) % NBX_PARENT)];
-    if (neighborN < 0 || neighborS < 0 || neighborE < 0 || neighborW < 0) { return; }
-  }
+  //   the GRANDCHILD CASCADE -- an 8-cell ring walk testing hasGrandchild,
+  //     whose own removed comment records getting the wrong child index on
+  //     three sides out of four, twice, with both error directions
+  //     live-verified at N=4;
+  //   the HARD-REQUIRED split -- geometry and cascade bypassing the gate
+  //     while a criterion-only refine kept it, which is the distinction the
+  //     closure erases (a want is a want);
+  //   the NEIGHBOUR-ACTIVE GATE -- all four of the PARENT's same-level
+  //     neighbours active, which is STRICTLY STRONGER than 2:1 balance. The
+  //     rule only demands the parents of this child's own neighbours. That
+  //     extra strength was not a safety margin, it was the deadlock: a refine
+  //     blocked by a neighbour that would only ever have been created BY that
+  //     refine, measured (B2-1) as level 2 pinned to half its allowed reach.
+  //
+  // The want array arrives closed under the rule, so none of it has anything
+  // left to decide.
+  if (childWant[childBlockID0] == 0u) { return; }
 
   let oldCount = atomicSub(&childFreeCount, 1);
   if (oldCount > 0) {
@@ -591,30 +469,13 @@ fn coarsen(@builtin(global_invocation_id) gid: vec3<u32>) {
   let centerX_L0 = parentOriginX_L0 + f32(RB) * PARENT_CELL_SIZE_L0;
   let centerY_L0 = parentOriginY_L0 + f32(RB) * PARENT_CELL_SIZE_L0;
 
-  // Under CASCADE the want set has already answered this. The closure
-  // guarantees a wanted grandchild implies a wanted child, so a tile still
-  // needed as a parent is still wanted -- and the HAS_GRANDCHILD walk below,
-  // whose own BUGFIX comment records getting the wrong child index on three
-  // sides out of four, has nothing left to decide.
-  let release = select(
-    (desiredLevelCoarsen(toPhysical(eps)) < myLevel() + 1 || inSpongeBandAt(centerX_L0, centerY_L0))
-      && !isNearBodyAt(centerX_L0, centerY_L0),
-    childWant[u32(childSlotToBlock[slot])] == 0u,
-    CASCADE != 0u);
-  if (release) {
+  // Want-only, for the same reason refine() is: the closure guarantees a
+  // wanted grandchild implies a wanted child, so a tile still needed as a
+  // parent is still wanted. The HAS_GRANDCHILD walk that used to guard this
+  // -- each of the 4 releasing children plus each of their own edge
+  // neighbours -- is gone with it.
+  if (childWant[u32(childSlotToBlock[slot])] == 0u) {
     let quadIdx = slot / 4u; // slot IS quadrant 0's own slot (slot % 4 == 0 checked above), so quadIdx*4u==slot
-    if (CASCADE == 0u && HAS_GRANDCHILD != 0u) {
-      for (var q = 0u; q < 4u; q++) {
-        let s = quadIdx * 4u + q;
-        let bID = childSlotToBlock[s];
-        if (bID < 0) { continue; }
-        if (hasGrandchild(u32(bID))) { return; }
-        let nbrs = childEdgeNeighbors(u32(bID));
-        for (var i = 0u; i < 4u; i++) {
-          if (childBlockSlot[nbrs[i]] >= 0 && hasGrandchild(nbrs[i])) { return; }
-        }
-      }
-    }
     let oldCount = atomicAdd(&childFreeCount, 1);
     childFreeList[u32(oldCount)] = i32(quadIdx);
     for (var q = 0u; q < 4u; q++) {
