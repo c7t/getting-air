@@ -23,7 +23,7 @@ GPU) and that is what made M4/M5 survivable. Build the 2D equivalent first.
 | B0 | `d3-amr.mjs` + mutation-checked host tests | **DONE** | `amr2d.mjs` + `amr2d-gpu.mjs`, 34 GPU-free checks; deleted 680 lines of five duplicated checkers | M |
 | B0b | The interface instrument (mass/momentum drift) | **DONE** | `tools/analyze-amr-interface.js`; measured B9 as 93% of the mass channel and the seam at 9.6x the no-interface floor in momentum | M |
 | B1 | Post-collision Dupuis-Chopard `fneq` factor | **yes, a live bug** | 2D uses the pre-collision form on post-collision populations | S (code) / L (re-baseline) |
-| B2 | `cascade21`: 2:1 as ONE closure on the WANT set | **yes** | replaces 3 live balance bugs, an unbounded fixed-point loop, and closes a measured refinement defect on the shipped page | M |
+| B2 | `cascade21`: 2:1 as ONE closure on the WANT set | **B2-1 DONE** | the 3 balance bugs measure as already fixed; what is left is the RING (14 blocks) and the veto half (L2's extent, 80 vs 176 L0 units) | M |
 | B3 | One kernel per stage + a `parent_{dense,pool}` accessor | **yes** | deletes ~1100 lines of near-duplicate WGSL across 6 kernel pairs | M |
 | B3a | The same sweep in JS: the AMR pages duplicate each other | **largely DONE** | duplication outside `init`/`frame` 3,319 → 2,419 lines; byte-identical 1,129 → 613. Found a stranded comment and two always-true gates on the way | M |
 | B4 | The body lives entirely on the finest level | **DONE** | coverage gate written for the two moving-body pages, the block predicate fixed, ~120 lines of masking + 3 bindings + an override deleted, and 3 refusals now under test | S |
@@ -311,6 +311,54 @@ loudly, not divided by ~0 quietly.
 reproducibility caveat honoured (same-build repeats, not a comparison against
 a number recorded in another session — dense stays bit-identical and is the
 strict check).
+
+### B2-1 — the before-number — DONE (2026-09-14)
+
+`debugCheckRefinementClosure` on all five AMR pages runs `cascade21` against
+the live present set; reported at every checkpoint of the standing sweep,
+never gated. **Two measurements, and the second exists because of what the
+first cannot do.**
+
+1. **Every closure violation on the shipped pages is the DIAGONAL.**
+   `{parentOf: 0, siblingOf: 0, edge: 0, diagonal: 14}` on
+   `index-amr.html?levels=3`, and the same shape on the cylinder. So of the
+   four defects this section lists, the three that were fixed really are
+   fixed; what is left in the TOPOLOGY is exactly the corner half
+   `debugCheck21Balance` already reports and deliberately does not gate.
+   Closing a set and walking shared edges are independent computations and
+   they agree, with `forced <= cornerViolations` always — two violating PAIRS
+   can demand the same parent BLOCK, which is why the counts differ by one or
+   two rather than never.
+
+2. **THE CLOSURE CHECK STRUCTURALLY CANNOT SEE THE VETO DEFECT**, and this is
+   the part worth carrying. Closing the PRESENT set only finds blocks implied
+   by what exists. The fourth bug is about wants that were never granted, and
+   a block that was never created cannot be observed as missing from a closure
+   over what is. **That is the argument for putting the closure on the WANT
+   set stated as a measurement rather than a design preference** — and it
+   means the natural instrument covers one half only.
+
+   The other half, via the knob that already exists (`?demandCascade=1`),
+   `index-amr.html?levels=3` at ~8300 steps:
+
+```
+leg                 L1 tiles   L2 tiles   L2 bx range   L2 x-extent (L0)
+default (veto only)    189        352       [22,41]          80
+?demandCascade=1       259        468       [16,59]         176
+```
+
+   **Level 2's extent more than doubles.** L1 barely moves (184 -> 200 L0
+   units) while L2 goes 80 -> 176, so the constraint is specifically on the
+   deeper level — the L1/L2 boundary pinned a few cells off the body, exactly
+   as described. That is B2-2's target, now a number.
+
+**What this changes about B2-2.** The rewrite's gate is no longer "expect Cd/St
+to move and report it": the two measurements above are the gate, and they are
+directional. `closure -> 0` (the ring half) and `L2 extent -> ~176 without
+?demandCascade` (the veto half). Cd/St moving is a consequence to be reported,
+not the thing being checked — which matters because the AMR configs' own
+reproducibility floor (+/-0.002 at N=3, CLAUDE.md) is wide enough to hide a
+real regression underneath a change this size.
 
 ### B2 — 2:1 balance as one closure
 
@@ -1200,6 +1248,7 @@ B8   SOLID_EQ                                          DONE -- exact on the
                                                        deterministic leg
 B9   lattice weights                                   DONE -- unblocked B6's
                                                        mass half
+B2-1 the before-number                             ◄── DONE
 B2   cascade21                                     ◄── needs B0
 B3   kernel unification, manage LAST                ◄── needs B2 and B3a
 B5   window = sponge translation                    ◄── independent of B2/B3,
