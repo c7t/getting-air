@@ -96,14 +96,50 @@ fn main() {
   let initial_cx = f32(W) / 2.0f;
   let initial_cy = f32(H) / 2.0f;
 
-  let shift_x = i32(floor(state.x_total));
-  let shift_y = i32(floor(state.y_total));
+  if (WINDOW_BODY != 0u) {
+    // THE SHIPPED CONVENTION. The body is pinned to a fixed WINDOW position;
+    // off_x/off_y take floor(total) and cx/cy take the fraction, so the
+    // body's sub-cell position IS the fractional part of an accumulator that
+    // grows without bound. That is what card-total.mjs and TOTAL_WRAP_SCREENS
+    // above exist to contain.
+    let shift_x = i32(floor(state.x_total));
+    let shift_y = i32(floor(state.y_total));
 
-  state.off_x = f32((shift_x % i32(W) + i32(W)) % i32(W));
-  state.off_y = f32((shift_y % i32(H) + i32(H)) % i32(H));
+    state.off_x = f32((shift_x % i32(W) + i32(W)) % i32(W));
+    state.off_y = f32((shift_y % i32(H) + i32(H)) % i32(H));
 
-  state.cx = initial_cx + (state.x_total - f32(shift_x));
-  state.cy = initial_cy + (state.y_total - f32(shift_y));
+    state.cx = initial_cx + (state.x_total - f32(shift_x));
+    state.cy = initial_cy + (state.y_total - f32(shift_y));
+  } else {
+    // ?window=0 -- THE BODY LIVES IN BUFFER COORDINATES (plans/2D-backport.md
+    // B5, 3D's convention). Integrated here and wrapped into [0, W) x [0, H)
+    // every step, so its ULP is fixed at W*2^-24 forever BY CONSTRUCTION
+    // rather than tracking an accumulator. x_total/y_total keep accumulating
+    // but are REPORTING ONLY from here on -- nothing reads them back into the
+    // simulation, which is exactly 3D's arrangement.
+    //
+    // off_x/off_y are UNCHANGED, and that is a correction to the first
+    // attempt at this: I derived them from the body's absolute position
+    // (floor(cx - W/2)), on the assumption that the view is centred on the
+    // body. IT IS NOT. main-cylinder.js places its cylinder UPSTREAM
+    // diameters in, at cx = 170.67 with W = 512, and deriving the view from
+    // that put off_x at 426 instead of 0 -- the sponge band landed in the
+    // middle of the domain and Cd came back 808.897 against a literature
+    // 1.35. Measured, not reasoned: the pinned cylinder is the config where
+    // the two conventions MUST agree, so it caught it on the first run.
+    //
+    // The view tracks the body's TRAVEL, not its position, and travel is
+    // exactly what x_total already measures. So off keeps its existing
+    // derivation, and only the INTEGER part of x_total is ever consulted --
+    // which is not the precision-sensitive quantity. The sub-cell position,
+    // which is, no longer comes from that accumulator at all.
+    state.cx = wrapf(state.cx + state.vx, f32(W));
+    state.cy = wrapf(state.cy + state.vy, f32(H));
+    let shift_x = i32(floor(state.x_total));
+    let shift_y = i32(floor(state.y_total));
+    state.off_x = f32((shift_x % i32(W) + i32(W)) % i32(W));
+    state.off_y = f32((shift_y % i32(H) + i32(H)) % i32(H));
+  }
 
   state.fx = fx_fluid;
   state.fy = fy_fluid;

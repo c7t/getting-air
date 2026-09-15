@@ -142,16 +142,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (bx >= W || by >= H) { return; }
   let cell = by * W + bx;
 
-  // ... and its WINDOW position, needed only by the three physically-anchored
-  // things below: the body SDF, the sponge band, and the WALL_Y walls.
+  // ... its WINDOW position, needed by the two things genuinely anchored to
+  // the window: the sponge band and the WALL_Y walls.
   let w = bufferToWindowCell(vec2<u32>(bx, by), state);
   let x = w.x; let y = w.y;
+  // ... and the BODY's frame, for the SDF and the lever arm (see
+  // common_geometry.wgsl's WINDOW_BODY).
+  let p = bodyFrameCell(vec2<u32>(bx, by), state);
 
   // Position/solid-velocity/own-cell-index terms, hoisted ABOVE the gather
   // loop (unchanged math, just moved earlier from where section "3" used
   // to compute them) -- USE_BOUNCEBACK's gather-time sharp test and
   // own-cell reflection lookup both need these before streaming, not after.
-  let p = vec2<f32>(f32(x), f32(y));
   var rx = p.x - state.cx;
   var ry = p.y - state.cy;
   rx -= f32(W) * round(rx / f32(W));
@@ -168,12 +170,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // The source cell, in BUFFER coordinates -- one wrap, no round trip.
     let bx_src = (bx + W - u32(ex[i])) % W;
     let by_src = (by + H - u32(ey[i])) % H;
-    // Its WINDOW position, for the two physically-anchored source tests
-    // below. Same shift as this cell's own, so it stays exact.
-    let wx_src = (x + W - u32(ex[i])) % W;
-    let wy_src = (y + H - u32(ey[i])) % H;
-
-    if (USE_BOUNCEBACK != 0u && HAS_BODY != 0u && get_phi(vec2<f32>(f32(wx_src), f32(wy_src)), state) < 0f) {
+    if (USE_BOUNCEBACK != 0u && HAS_BODY != 0u && get_phi(bodyFrameCell(vec2<u32>(bx_src, by_src), state), state) < 0f) {
       // Bounce-back: the streaming source is inside the solid, so there's
       // no valid fluid population to pull -- reflect this cell's OWN
       // pre-streaming population that was heading toward that same

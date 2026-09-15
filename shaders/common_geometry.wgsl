@@ -311,3 +311,63 @@ fn bufferToWindowPos(p: vec2<f32>, state: CardState) -> vec2<f32> {
   return vec2<f32>(wrapf(p.x - state.off_x, f32(W)),
                    wrapf(p.y - state.off_y, f32(H)));
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WHICH FRAME IS THE BODY IN? (plans/2D-backport.md B5)
+//
+// WINDOW_BODY = 1 (the shipped convention): the body is pinned to a fixed
+// WINDOW position and the moving window pans the buffer under it, so every
+// kernel that evaluates the SDF converts its buffer cell to window
+// coordinates first. `cx`/`cy` are window coordinates; `x_total`/`y_total`
+// are unbounded accumulators whose FRACTIONAL part IS the body's sub-cell
+// position, which is why card-total.mjs and TOTAL_WRAP_SCREENS exist.
+//
+// WINDOW_BODY = 0 (?window=0, 3D's convention): the body's position is held
+// in BUFFER coordinates, wrapped into [0, W) x [0, H) every step, and the SDF
+// is evaluated directly on the buffer position -- get_phi already takes the
+// nearest periodic image, so no conversion and no wrap are needed at all. The
+// conversion survives in exactly two places, and both are genuinely
+// window-anchored: the ALBC sponge band and the WALL_Y channel walls (plus
+// the render, which is a view by definition).
+//
+// WHAT THAT BUYS: the body's ULP becomes W*2^-24 forever, by construction,
+// instead of tracking an accumulator that grows without bound. x_total
+// survives as REPORTING ONLY -- nothing reads it back into the simulation.
+//
+// AND WHY IT CANNOT BE BIT-IDENTICAL, which the plan's own gate wording does
+// not quite say: the two conventions do not merely re-label cells, they
+// INTEGRATE THE POSITION DIFFERENTLY (frac of a long accumulation vs. a
+// wrapped accumulator). Same physics, different rounding every step, so a
+// free body's trajectory diverges from step one. Only a pinned or prescribed
+// body agrees, and only a single step from a shared state agrees exactly.
+// That is what the flag is for.
+override WINDOW_BODY : u32 = 1u;
+
+// A buffer CELL, in the frame the body is expressed in.
+fn bodyFrameCell(c: vec2<u32>, state: CardState) -> vec2<f32> {
+  if (WINDOW_BODY != 0u) {
+    let w = bufferToWindowCell(c, state);
+    return vec2<f32>(f32(w.x), f32(w.y));
+  }
+  return vec2<f32>(f32(c.x), f32(c.y));
+}
+
+// A continuous buffer POSITION, in the frame the body is expressed in.
+fn bodyFrame(p: vec2<f32>, state: CardState) -> vec2<f32> {
+  if (WINDOW_BODY != 0u) { return bufferToWindowPos(p, state); }
+  return p;
+}
+
+// Same, without the wrap -- get_phi takes the nearest image, so a caller that
+// only feeds get_phi does not need one. amr2d.mjs's bufferToWindow is this.
+fn bodyFrameBare(p: vec2<f32>, state: CardState) -> vec2<f32> {
+  if (WINDOW_BODY != 0u) { return p - vec2<f32>(state.off_x, state.off_y); }
+  return p;
+}
+
+// The inverse, for the one caller that starts in WINDOW space: the render,
+// which draws the view and must ask where the body is within it.
+fn windowToBody(pWin: vec2<f32>, state: CardState) -> vec2<f32> {
+  if (WINDOW_BODY != 0u) { return pWin; }
+  return pWin + vec2<f32>(state.off_x, state.off_y);
+}

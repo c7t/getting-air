@@ -15,7 +15,7 @@
 // window.__CYL is the CDP-tooling surface (see tools/validate-cylinder.js),
 // modeled directly on main-amr.js's window.__AMR.
 
-import { reportFatal, reportNoWebGPU, reportNoAdapter } from './error-overlay.mjs';
+import { reportFatal, refuseConfig, reportNoWebGPU, reportNoAdapter } from './error-overlay.mjs';
 import { loadShader } from './shader-loader.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
 import { EX, EY, WT } from './lattice-2d.mjs';
@@ -25,6 +25,25 @@ const canvas   = document.getElementById('c');
 const statusEl = document.getElementById('status');
 
 const urlParams = new URLSearchParams(window.location.search);
+
+// ?window=0 -- THE BODY IN BUFFER COORDINATES (plans/2D-backport.md B5).
+// Default 1 is the shipped convention and is byte-identical to the build
+// before the flag existed. See shaders/common_geometry.wgsl's WINDOW_BODY for
+// what the two conventions are, and for why they cannot agree bit-for-bit
+// once the body actually moves.
+//
+// REFUSE, DO NOT DEGRADE. The buffer convention needs a body to place, and it
+// needs the sponge to still be the thing anchored to the window -- with no
+// absorbing band the wake wraps round the periodic domain and the body flies
+// back into its own wake, which looks perfectly healthy on screen and is not.
+// A walled axis is the same argument: WALL_Y is window-anchored, and a body
+// free to translate past a wall is not a scenario this convention describes.
+// Neither of those scenarios is reachable from this page; the pages where
+// they are (main-tgv*, main-channel*) do not offer the flag at all.
+const WINDOW_BODY = urlParams.has('window') ? parseInt(urlParams.get('window')) : 1;
+if (WINDOW_BODY !== 0 && WINDOW_BODY !== 1) {
+  refuseConfig(statusEl, `?window=${urlParams.get('window')} invalid -- 1 (the shipped window convention) or 0 (the buffer convention).`);
+}
 
 // THE DIFFUSE BAND'S WIDTH, in units of a level's own cell size:
 // epsilon = K_EPS * dx_level (plans/2D-backport.md B7). Threaded into every
@@ -320,8 +339,8 @@ async function init() {
     { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } }
   ]});
 
-  const stepConstants = { W, H, SPONGE_UX: U0, SPONGE_UY: 0, USE_BOUNCEBACK, K_EPS, SOLID_EQ };
-  const constants     = { W, H };
+  const stepConstants = { W, H, WINDOW_BODY, SPONGE_UX: U0, SPONGE_UY: 0, USE_BOUNCEBACK, K_EPS, SOLID_EQ };
+  const constants     = { W, H, WINDOW_BODY };
 
   const stepPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [stepBGL] }),

@@ -128,14 +128,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let cx = gid.x; let cy = gid.y;
   if (cx >= W || cy >= H) { return; }
 
-  // Window/physical coordinates: invert the moving-window shift.
+  // WINDOW coordinates, for the two things that are genuinely anchored to
+  // the window: the ALBC sponge band and the WALL_Y walls.
   let w = bufferToWindowCell(vec2<u32>(cx, cy), state);
   let wx = w.x; let wy = w.y;
+  // ... and the BODY's frame, for the SDF and the lever arm. The same thing
+  // under the shipped convention; the bare buffer cell under ?window=0.
+  let p = bodyFrameCell(vec2<u32>(cx, cy), state);
 
   // Position/solid-velocity/own-cell-index terms, hoisted ABOVE the gather
   // loop -- see lbm_step.wgsl's identical hoist for why USE_BOUNCEBACK
   // needs these before streaming, not after.
-  let p = vec2<f32>(f32(wx), f32(wy));
   var rx = p.x - state.cx;
   var ry = p.y - state.cy;
   rx -= f32(W) * round(rx / f32(W));
@@ -150,9 +153,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   // 1. Pull Streaming: buffer-space neighbor (see file header derivation).
   var f: array<f32,9>;
   for (var i = 0u; i < 9u; i++) {
-    let wx_src = (wx + W - u32(ex[i])) % W;
-    let wy_src = (wy + H - u32(ey[i])) % H;
-    if (USE_BOUNCEBACK != 0u && HAS_BODY != 0u && get_phi(vec2<f32>(f32(wx_src), f32(wy_src)), state) < 0f) {
+    let bx_src = (cx + W - u32(ex[i])) % W;
+    let by_src = (cy + H - u32(ey[i])) % H;
+    if (USE_BOUNCEBACK != 0u && HAS_BODY != 0u && get_phi(bodyFrameCell(vec2<u32>(bx_src, by_src), state), state) < 0f) {
       // Bounce-back -- see lbm_step.wgsl's identical branch for the
       // formula/derivation.
       let corr = 2f * wt[i] * (f32(ex[i]) * usx + f32(ey[i]) * usy) / CS2;
@@ -166,8 +169,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       let corr = 2f * wt[i] * f32(ex[i]) * wallUx / CS2;
       f[i] = fUnpack(f_in[fIdx(opp[i], (W * H), cell)], opp[i]) + corr;
     } else {
-      let bx_src = (cx + W - u32(ex[i])) % W;
-      let by_src = (cy + H - u32(ey[i])) % H;
       f[i] = fUnpack(f_in[fIdx(i, (W * H), cellIndex(bx_src, by_src))], i);
     }
   }

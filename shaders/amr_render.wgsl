@@ -194,7 +194,9 @@ fn fs_main(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> {
   let subY = state.y_total - floor(state.y_total);
   let fx = uv.x * f32(W) + subX; let fy = (1.0 - uv.y) * f32(H) + subY;
 
-  let chi = get_chi(get_phi(vec2(fx, fy), state));
+  // The render draws the WINDOW; under ?window=0 the body lives in buffer
+  // coordinates, so this is the one place that converts the other way.
+  let chi = get_chi(get_phi(windowToBody(vec2(fx, fy), state), state));
 
   // Level-consistent vorticity RECONSTRUCTION. Compute the discrete curl as a
   // cell-centred scalar FIELD (per coarse cell, and per fine cell in refined

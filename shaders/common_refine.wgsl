@@ -129,12 +129,11 @@ fn nearBodyAt(centre: vec2<f32>, halfExtent: f32) -> bool {
   if (HAS_BODY == 0u) { return false; }
 
   if (BOX_REFINE == 0u) {
-    let w = bufferToWindowCell(vec2<u32>(u32(centre.x), u32(centre.y)), state);
-    let wx = w.x; let wy = w.y;
-    return phiMinPose(vec2<f32>(f32(wx), f32(wy)), FORCE_REFINE_LOOKAHEAD, state) < FORCE_REFINE_MARGIN;
+    return phiMinPose(bodyFrameCell(vec2<u32>(u32(centre.x), u32(centre.y)), state),
+                      FORCE_REFINE_LOOKAHEAD, state) < FORCE_REFINE_MARGIN;
   }
 
-  let p = vec2<f32>(centre.x - state.off_x, centre.y - state.off_y);
+  let p = bodyFrameBare(centre, state);
   return nearBodyBox(p, halfExtent, FORCE_REFINE_MARGIN, FORCE_REFINE_LOOKAHEAD, state);
 }
 

@@ -1621,6 +1621,70 @@ window) AND on `index-cylinder-amr.html?levels=3`; boot smoke PASS on all
 seven pages; invariants PASS on all seven gates; every dense and AMR
 analytic/physics config unchanged to the digit.
 
+### B5-2 — the buffer convention exists, behind `?window=0`, and does NOT validate yet.
+
+Implemented and gated as the plan asked (both conventions in one build,
+default unchanged). The DEFAULT path is bit-IDENTICAL on
+`index-reentry.html` and `index-cylinder-amr.html?levels=3`, boot smoke PASSes
+on all seven pages, invariants PASS on all seven gates, and every physics
+number is unchanged. `?window=0` runs. It does not yet reproduce the pinned
+cylinder, which it must, so the default stays 1 and nothing was flipped.
+
+`common_geometry.wgsl` gains `WINDOW_BODY` and four frame accessors --
+`bodyFrameCell`, `bodyFrame`, `bodyFrameBare`, `windowToBody` -- and every SDF
+site now asks for the BODY's frame while the sponge and the WALL_Y walls keep
+asking for the WINDOW's. That separation is the substance of B5 and it is
+done; what is unresolved is where the body's position comes from.
+
+**TWO THINGS MEASURED, AND THE SECOND IS NOT ABOUT B5 AT ALL.**
+
+**1. The view tracks TRAVEL, not position.** My first derivation set
+`off_x = floor(cx - W/2)`, assuming the view is centred on the body. It is
+not: `main-cylinder.js` places its cylinder UPSTREAM diameters in, at
+cx = 170.67 with W = 512, so that put `off_x` at 426, the sponge band landed
+mid-domain, and Cd came back **808.897** against a literature 1.35. Caught on
+the first run, because the pinned cylinder is the one config where the two
+conventions MUST agree exactly. `off` now keeps its existing derivation from
+`x_total`, and only the INTEGER part of that accumulator is ever consulted --
+the sub-cell position, which is the precision-sensitive part, no longer comes
+from it at all. Cd went 808.897 -> 2.028.
+
+**2. `?upstream=` IS INERT ON THE DENSE CYLINDER PAGE, and has been all
+along.** That remaining 2.028-vs-1.951 gap is not a B5 bug. `physics.wgsl`
+step 5 overwrites `cx` with `initial_cx + frac(x_total)` = W/2 EVERY STEP,
+discarding the page's own `CX0 = UPSTREAM * 2 * R` placement. The buffer
+convention integrates the body's position instead of recomputing it, so it
+HONOURS that placement -- which is why its cylinder sits at 170.67 and drags
+differently. Confirmed directly on the shipped path:
+
+    ?upstream=4    Cd 1.951  St 0.1260
+    ?upstream=8    Cd 1.951  St 0.1260     (the default)
+    ?upstream=20   Cd 1.951  St 0.1260
+
+Bit-identical across a 5x change in a documented knob, on this project's
+reference config. `dense-reference` is not running the cylinder where its own
+parameter says it is.
+
+**AND THE DEBUG PATH DISAGREES WITH THE LIVE PATH**, which is why this hid.
+`debugStepSync` leaves `cx` at 170.67; the live loop parks it at 256. A probe
+of the card state says one thing and the harness measures another, so
+`?upstream=` looks like it is doing something to anyone who checks it the
+cheap way.
+
+**What B5 needs next, and it is a DECISION not a fix.** The window convention
+throws the body's initial placement away; the buffer convention keeps it.
+Making `?window=0` reproduce `?window=1` on the cylinder means replicating
+"overwrite cx with W/2 every step" -- i.e. deliberately discarding the
+placement freedom the buffer convention exists to provide. The alternative is
+to fix `?upstream=` so it means what it says, which MOVES `dense-reference`'s
+numbers and re-baselines the project's reference config. That is a physics
+call, not a refactor, and it belongs to whoever owns the validation harness.
+
+**Also still open:** `lbm_force.wgsl` is the last window-DISPATCHED kernel. It
+needs no window coordinates at all under `?window=0` (its only window use is
+the SDF), so converting it is free once the default flips -- and it is the
+same atomicAdd-regrouping re-baselining noted in B5-0.
+
 **What is left of B5** is the real change: the BODY moves into buffer
 coordinates, the SDF takes the nearest image, and the conversion survives only
 in the sponge -- with `?window=` selecting old/new, and a refusal (not a

@@ -93,7 +93,9 @@ fn fs_main(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> {
   let fx = uv.x * f32(W) + subX; let fy = (1.0 - uv.y) * f32(H) + subY;
   let ix = i32(fx); let iy = i32(fy);
   
-  let chi = get_chi(get_phi(vec2(fx, fy), state));
+  // The render draws the WINDOW; under ?window=0 the body lives in buffer
+  // coordinates, so this is the one place that converts the other way.
+  let chi = get_chi(get_phi(windowToBody(vec2(fx, fy), state), state));
 
   // Discrete vorticity: du_y/dx - du_x/dy
   let omega = (get_uy(ix + 1, iy) - get_uy(ix - 1, iy)) * 0.5f
