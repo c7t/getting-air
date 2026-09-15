@@ -25,7 +25,7 @@
 import { reportFatal, refuseConfig, setStatus, reportNoWebGPU, reportNoAdapter } from './error-overlay.mjs';
 import { loadShader } from './shader-loader.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
-import { check21BalanceOnGPU, allocLevelPool, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState, checkGeometryCoverageOnGPU, makeRefusalWatch , checkRefinementClosureOnGPU , makeCascadePipelines, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU } from './amr2d-gpu.mjs';
+import { check21BalanceOnGPU, allocLevelPool, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState, checkGeometryCoverageOnGPU, makeRefusalWatch , checkRefinementClosureOnGPU , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU } from './amr2d-gpu.mjs';
 // tauAtLevel: extracted to card-params.mjs by B3a-1, which landed the CALL
 // in all five AMR pages and this IMPORT in only main-amr.js. The other four
 // threw `ReferenceError: tauAtLevelOf is not defined` at init -- but only at
@@ -167,6 +167,18 @@ const NCELLS1 = FB * FB; // cells per pool slot
 // Default 0 -- provably byte-identical to the previous behaviour (level2Wanted
 // is never called) until the physics is validated on the cylinder harness.
 const DEMAND_CASCADE = urlParams.has('demandCascade') ? (parseInt(urlParams.get('demandCascade')) || 0) : 0;
+
+// ?cascade=1: the 2:1 rule as ONE closure on the want set, instead of per-pass
+// tests inside coarsen and refine (plans/2D-backport.md B2).
+//
+// Default 0 is the shipped path, byte-identical. At 1, decide() writes each
+// block's own reason into the want array, shaders/amr_cascade.wgsl closes it
+// under the rule, and coarsen/refine simply act on the result -- so the
+// fixed-point loop, the neighbour-active veto and ?demandCascade all become
+// dead, and ONE sweep replaces N_LEVELS-1 iterations. Both paths in one build
+// so the difference is measurable rather than argued; B2-1 recorded the target
+// (level 2's x-extent 80 -> ~176 L0 units, and the closure count to zero).
+const CASCADE = urlParams.has('cascade') ? (parseInt(urlParams.get('cascade')) ? 1 : 0) : 0;
 
 const MAX_FINE_BLOCKS = urlParams.has('maxFineBlocks') ? parseInt(urlParams.get('maxFineBlocks')) : 128;
 const NBX = W / BLOCK, NBY = H / BLOCK, NBLOCKS = NBX * NBY; // coarse block grid
@@ -1026,7 +1038,10 @@ async function init() {
     { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 8, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     // binding 9: ?diag=1 convergence counters. Always bound; never touched at DIAG=0.
-    { binding: 9, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }
+    { binding: 9, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    // binding 10: level 1's WANT array (B2). Always bound; only read when
+    // CASCADE != 0, and only written by the decide() entry point.
+    { binding: 10, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }
   ]});
   // Milestone 9: per-quadrant criterion for any level-(m+1) decision,
   // parent=level m -- see amr_criterion_pool.wgsl's header (one pipeline
@@ -1052,8 +1067,9 @@ async function init() {
     { binding: 5,  visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
     { binding: 6,  visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 7,  visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-    // binding 8 (childQuadrant) is gone -- it held `slot % 4`. See
-    // shaders/amr_manage_pool.wgsl on why the hole is not renumbered.
+    // binding 8 was childQuadrant (it held `slot % 4`); B2 is what that
+    // recovery was for -- this is the child level's WANT array.
+    { binding: 8, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
     { binding: 9,  visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
     { binding: 10, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
     { binding: 11, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
@@ -1157,7 +1173,7 @@ async function init() {
   // their own copy of the sponge, not shared with the coarse kernel).
   const step1Constants = { W, H, RB, SPONGE_UX: U0, SPONGE_UY: 0, USE_BOUNCEBACK, F16, DIRECT_GHOST: GHOST_COPY ? 0 : 1, K_EPS, SOLID_EQ };
   const criterionConstants = { W, H };
-  const manageConstants = { DIAG, W, H, REFINE_THRESH, COARSEN_THRESH, FORCE_REFINE_MARGIN, FORCE_REFINE_LOOKAHEAD, DEMAND_CASCADE, HAS_LEVEL2: N_LEVELS > 2 ? 1 : 0, BOX_REFINE };
+  const manageConstants = { DIAG, W, H, REFINE_THRESH, COARSEN_THRESH, FORCE_REFINE_MARGIN, FORCE_REFINE_LOOKAHEAD, DEMAND_CASCADE, HAS_LEVEL2: N_LEVELS > 2 ? 1 : 0, BOX_REFINE, CASCADE };
 
   const stepPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [stepBGL] }),
@@ -1265,6 +1281,12 @@ async function init() {
   const cascadeSM = await loadShader(device, 'shaders/amr_cascade.wgsl');
   const cascade = makeCascadePipelines(device, cascadeSM, pools, N_LEVELS);
 
+  // B2: the want-set producers. Same bind group and constants as
+  // coarsen/refine -- they are the same decision, minus the neighbours.
+  const manageDecidePL = device.createComputePipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [manageBGL] }),
+    compute: { module: manageSM, entryPoint: 'decide', constants: manageConstants }
+  });
   const manageCoarsenPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [manageBGL] }),
     compute: { module: manageSM, entryPoint: 'coarsen', constants: manageConstants }
@@ -1282,6 +1304,7 @@ async function init() {
   // amr_manage_pool.wgsl's header for why that's the right tradeoff here).
   // Keyed by PARENT level m, deciding child level m+1.
   const criterionPoolPLs = {};
+  const managePoolDecidePLs = {};
   const managePoolCoarsenPLs = {};
   const managePoolRefinePLs = {};
   for (let m = 1; m < N_LEVELS - 1; m++) {
@@ -1306,10 +1329,15 @@ async function init() {
       ...childParams,
       HAS_GRANDCHILD: hasGrandchild ? 1 : 0,
       BOX_REFINE,
+      CASCADE,
     };
     criterionPoolPLs[m] = device.createComputePipeline({
       layout: device.createPipelineLayout({ bindGroupLayouts: [criterionPoolBGL] }),
       compute: { module: criterionPoolSM, entryPoint: 'main', constants: { RB, NBX_PARENT: parentPool.NBX } }
+    });
+    managePoolDecidePLs[m] = device.createComputePipeline({
+      layout: device.createPipelineLayout({ bindGroupLayouts: [managePoolBGL] }),
+      compute: { module: managePoolSM, entryPoint: 'decide', constants: poolConstants }
     });
     managePoolCoarsenPLs[m] = device.createComputePipeline({
       layout: device.createPipelineLayout({ bindGroupLayouts: [managePoolBGL] }),
@@ -1370,7 +1398,7 @@ async function init() {
 
   // Milestone 4b bind groups.
   const criterionBG = device.createBindGroup({ layout: criterionBGL, entries: [{ binding: 0, resource: { buffer: velBuf } }, { binding: 1, resource: { buffer: pools[1].blockCriterionBuf } }]});
-  const manageBG = device.createBindGroup({ layout: manageBGL, entries: [{ binding: 0, resource: { buffer: pools[1].blockCriterionBuf } }, { binding: 1, resource: { buffer: pools[1].blockSlotBuf } }, { binding: 2, resource: { buffer: pools[1].slotToBlockBuf } }, { binding: 3, resource: { buffer: pools[1].freeListBuf } }, { binding: 4, resource: { buffer: pools[1].freeCountBuf } }, { binding: 5, resource: { buffer: pools[1].newlyActivatedBuf } }, { binding: 6, resource: { buffer: cardStateBuf } }, { binding: 7, resource: { buffer: N_LEVELS > 2 ? pools[2].blockCriterionBuf : dummyCriterionBuf } }, { binding: 8, resource: { buffer: N_LEVELS > 2 ? pools[2].blockSlotBuf : dummyBlockSlotBuf } }, { binding: 9, resource: { buffer: diagBuf } }]});
+  const manageBG = device.createBindGroup({ layout: manageBGL, entries: [{ binding: 0, resource: { buffer: pools[1].blockCriterionBuf } }, { binding: 1, resource: { buffer: pools[1].blockSlotBuf } }, { binding: 2, resource: { buffer: pools[1].slotToBlockBuf } }, { binding: 3, resource: { buffer: pools[1].freeListBuf } }, { binding: 4, resource: { buffer: pools[1].freeCountBuf } }, { binding: 5, resource: { buffer: pools[1].newlyActivatedBuf } }, { binding: 6, resource: { buffer: cardStateBuf } }, { binding: 7, resource: { buffer: N_LEVELS > 2 ? pools[2].blockCriterionBuf : dummyCriterionBuf } }, { binding: 8, resource: { buffer: N_LEVELS > 2 ? pools[2].blockSlotBuf : dummyBlockSlotBuf } }, { binding: 9, resource: { buffer: diagBuf } }, { binding: 10, resource: { buffer: pools[1].wantBuf } }]});
 
   // Milestone 9: one criterion/manage bind group per PARENT level
   // (1..N_LEVELS-2), deciding child level m+1. Parent=level 1 sources from
@@ -1434,6 +1462,7 @@ async function init() {
       { binding: 5, resource: { buffer: childPool.newlyActivatedBuf } },
       { binding: 6, resource: { buffer: cardStateBuf } },
       { binding: 7, resource: { buffer: childPool.parentSlotBuf } },
+      { binding: 8, resource: { buffer: childPool.wantBuf } },
       { binding: 9, resource: { buffer: childPool.originXBuf } },
       { binding: 10, resource: { buffer: childPool.originYBuf } },
       { binding: 11, resource: { buffer: parentBlockSlotBuf } },
@@ -1987,31 +2016,79 @@ async function init() {
       // (N<=3, plans/AMR-multilevel.md's Milestone 9 text) -- see
       // amr_manage_pool.wgsl's header for why cascades don't chain deeper
       // than one hop there.
-      const FIXED_POINT_ITERS = REFINE_ITERS_OVERRIDE > 0 ? REFINE_ITERS_OVERRIDE
-        : Math.max(1, N_LEVELS - 1);
-      for (let iter = 0; iter < FIXED_POINT_ITERS; iter++) {
-        // Zero the convergence counters before the LAST iteration only, so what
-        // they hold afterwards describes exactly that iteration. A nonzero
-        // `granted` then means the loop was still creating tiles when its fixed
-        // iteration count ran out -- the topology handed to the solver has
-        // outstanding refinement. See debugReadDiag().
-        if (DIAG && iter === FIXED_POINT_ITERS - 1) enc.clearBuffer(diagBuf, 12, 20);
+      // ── B2: ONE SWEEP, NO FIXED POINT ────────────────────────────────────
+      //
+      // decide (every level, own reason only) -> close under the 2:1 rule ->
+      // coarsen finest-first -> refine coarsest-first. Once.
+      //
+      // WHY ONE PASS IS ENOUGH: the closure is transitive, so after it runs
+      // want[m] already contains everything want[m+1] will need a parent for.
+      // The legacy loop below iterates because its per-pass tests only ever
+      // see one hop at a time.
+      //
+      // THE ORDERS STILL MATTER, but for the ALLOCATOR, not for balance.
+      // Coarsen runs finest-first because a child's slots must return to the
+      // free list before its parent's tile does; refine runs coarsest-first
+      // because a level-(m+1) quad can only be carved from an ACTIVE level-m
+      // parent slot. Neither is about 2:1 any more.
+      if (CASCADE !== 0) {
+        // The want buffers must be CLEARED, not just overwritten: decide() at
+        // level >= 2 is dispatched over PARENT slots and never visits a block
+        // whose parent is inactive, so a stale want would survive there and
+        // resurrect a tile the criterion has stopped asking for.
+        for (let m = 1; m < N_LEVELS; m++) enc.clearBuffer(pools[m].wantBuf);
+
+        { const p = enc.beginComputePass(); p.setPipeline(manageDecidePL); p.setBindGroup(0, manageBG); p.dispatchWorkgroups(WG_MANAGE); p.end(); }
+        for (let m = 1; m < N_LEVELS - 1; m++) {
+          const wg = Math.ceil(pools[m].MAX_FINE_BLOCKS / 64);
+          const p = enc.beginComputePass(); p.setPipeline(managePoolDecidePLs[m]); p.setBindGroup(0, managePoolBGs[m]); p.dispatchWorkgroups(wg); p.end();
+        }
+
+        encodeCascade(enc, cascade, N_LEVELS);
+
         for (let m = N_LEVELS - 1; m >= 1; m--) {
           if (m === 1) {
             const p = enc.beginComputePass(); p.setPipeline(manageCoarsenPL); p.setBindGroup(0, manageBG); p.dispatchWorkgroups(WG_MANAGE); p.end();
           } else {
-            const parentLevel = m - 1;
             const wg = Math.ceil(pools[m].MAX_FINE_BLOCKS / 64);
-            const p = enc.beginComputePass(); p.setPipeline(managePoolCoarsenPLs[parentLevel]); p.setBindGroup(0, managePoolBGs[parentLevel]); p.dispatchWorkgroups(wg); p.end();
+            const p = enc.beginComputePass(); p.setPipeline(managePoolCoarsenPLs[m - 1]); p.setBindGroup(0, managePoolBGs[m - 1]); p.dispatchWorkgroups(wg); p.end();
           }
         }
         for (let m = 1; m < N_LEVELS; m++) {
           if (m === 1) {
             const p = enc.beginComputePass(); p.setPipeline(manageRefinePL); p.setBindGroup(0, manageBG); p.dispatchWorkgroups(WG_MANAGE); p.end();
           } else {
-            const parentLevel = m - 1;
-            const wg = Math.ceil(pools[parentLevel].MAX_FINE_BLOCKS / 64);
-            const p = enc.beginComputePass(); p.setPipeline(managePoolRefinePLs[parentLevel]); p.setBindGroup(0, managePoolBGs[parentLevel]); p.dispatchWorkgroups(wg); p.end();
+            const wg = Math.ceil(pools[m - 1].MAX_FINE_BLOCKS / 64);
+            const p = enc.beginComputePass(); p.setPipeline(managePoolRefinePLs[m - 1]); p.setBindGroup(0, managePoolBGs[m - 1]); p.dispatchWorkgroups(wg); p.end();
+          }
+        }
+      } else {
+        const FIXED_POINT_ITERS = REFINE_ITERS_OVERRIDE > 0 ? REFINE_ITERS_OVERRIDE
+          : Math.max(1, N_LEVELS - 1);
+        for (let iter = 0; iter < FIXED_POINT_ITERS; iter++) {
+          // Zero the convergence counters before the LAST iteration only, so what
+          // they hold afterwards describes exactly that iteration. A nonzero
+          // `granted` then means the loop was still creating tiles when its fixed
+          // iteration count ran out -- the topology handed to the solver has
+          // outstanding refinement. See debugReadDiag().
+          if (DIAG && iter === FIXED_POINT_ITERS - 1) enc.clearBuffer(diagBuf, 12, 20);
+          for (let m = N_LEVELS - 1; m >= 1; m--) {
+            if (m === 1) {
+              const p = enc.beginComputePass(); p.setPipeline(manageCoarsenPL); p.setBindGroup(0, manageBG); p.dispatchWorkgroups(WG_MANAGE); p.end();
+            } else {
+              const parentLevel = m - 1;
+              const wg = Math.ceil(pools[m].MAX_FINE_BLOCKS / 64);
+              const p = enc.beginComputePass(); p.setPipeline(managePoolCoarsenPLs[parentLevel]); p.setBindGroup(0, managePoolBGs[parentLevel]); p.dispatchWorkgroups(wg); p.end();
+            }
+          }
+          for (let m = 1; m < N_LEVELS; m++) {
+            if (m === 1) {
+              const p = enc.beginComputePass(); p.setPipeline(manageRefinePL); p.setBindGroup(0, manageBG); p.dispatchWorkgroups(WG_MANAGE); p.end();
+            } else {
+              const parentLevel = m - 1;
+              const wg = Math.ceil(pools[parentLevel].MAX_FINE_BLOCKS / 64);
+              const p = enc.beginComputePass(); p.setPipeline(managePoolRefinePLs[parentLevel]); p.setBindGroup(0, managePoolBGs[parentLevel]); p.dispatchWorkgroups(wg); p.end();
+            }
           }
         }
       }

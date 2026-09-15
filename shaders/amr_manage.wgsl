@@ -114,6 +114,9 @@
 //   [5] refines wanted but the pool was exhausted
 // Gated by DIAG: at 0 no atomic is touched.
 @group(0) @binding(9) var<storage, read_write> diag : array<atomic<u32>, 8>;
+// Level 1's WANT array, one u32 per L0 block -- written by decide(), closed
+// by shaders/amr_cascade.wgsl, consumed by coarsen/refine when CASCADE != 0.
+@group(0) @binding(10) var<storage, read_write> want : array<u32>;
 
 override DIAG : u32 = 0u;
 
@@ -140,6 +143,29 @@ override HAS_BODY : u32 = 1u;
 // When 0, isNearBody reverts to the pre-B4 single sample at the block CENTRE
 // (?boxrefine=0). Default 1: the whole block is tested. See isNearBody.
 override BOX_REFINE : u32 = 1u;
+
+// ?cascade=1: TAKE THE 2:1 DECISION OUT OF THIS FILE (plans/2D-backport.md B2).
+//
+// Default 0 keeps every per-pass test below exactly as it shipped, so this
+// build is byte-identical. At 1, coarsen and refine stop deciding anything
+// about balance and simply act on the WANT array: decide() writes each block's
+// OWN reason (criterion, geometry, sponge) into it, shaders/amr_cascade.wgsl
+// closes it under the 2:1 rule, and then a tile exists if and only if it is
+// wanted. Both paths live in one build so the difference can be measured --
+// B2-1 recorded what it should be: level 2's x-extent on index-amr.html is 80
+// L0 units against 176 with the growth half enabled, and the closure count
+// should reach zero.
+//
+// WHY THE VETOES CAN GO RATHER THAN BEING PORTED. Every balance test here is
+// one direction of the closure read locally, and each was conservative in a
+// way that cost something. The neighbour-active gate is STRONGER than 2:1
+// balance -- it demands the parent's four same-level neighbours, where the
+// rule only demands the parents of the block's OWN neighbours -- and that is
+// precisely what deadlocks growth: a refine blocked by a neighbour that would
+// only ever have been created BY that refine. Applied to the want set the two
+// directions are the same function, so there is nothing left to veto.
+override CASCADE : u32 = 0u;
+
 // L0 window-space edge band (coarse cells) excluded from vorticity-driven
 // refinement -- keeps fine blocks out of the ALBC sponge (amr_step.wgsl
 // SPONGE_W=4). Default 0 disables it; the JS default is 8. Preserves
@@ -294,6 +320,23 @@ fn edgeNeighbors(blockID: u32) -> array<u32, 4> {
   );
 }
 
+// THIS BLOCK'S OWN REASON TO EXIST -- criterion, geometry, sponge, and nothing
+// about its neighbours. Factored out so decide() and the legacy refine() path
+// cannot drift: it is verbatim what `ownReason` was computed as inline.
+fn ownWant(blockID: u32) -> bool {
+  return (desiredLevel(epsFor(blockID)) >= 1 && !inSpongeBand(blockID)) || isNearBody(blockID);
+}
+
+// Write the want set. No allocation, no neighbour test, no ordering
+// requirement -- every thread writes its own block and reads nothing another
+// thread writes, which is what makes the closure that follows well-defined.
+@compute @workgroup_size(64)
+fn decide(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let blockID = gid.x;
+  if (blockID >= (W / BLOCK) * (H / BLOCK)) { return; }
+  want[blockID] = select(0u, 1u, ownWant(blockID));
+}
+
 @compute @workgroup_size(64)
 fn coarsen(@builtin(global_invocation_id) gid: vec3<u32>) {
   let blockID = gid.x;
@@ -304,11 +347,15 @@ fn coarsen(@builtin(global_invocation_id) gid: vec3<u32>) {
   // Ladder: release this block's level-1 tile only if its own flow no longer
   // asks for ANY refinement (desired < 1), hysteresis-shifted. Level 0's dx
   // is 1, so epsFor is already the physical log2|omega|.
-  if ((desiredLevelCoarsen(epsFor(blockID)) < 1 || inSpongeBand(blockID)) && currentSlot >= 0 && !isNearBody(blockID)) {
-    // Milestone 9: can't release a tile that's still a parent, or whose
-    // release would leave a neighbor's level-2 child directly adjacent to
-    // a level-0-only region -- see this file's header.
-    if (HAS_LEVEL2 != 0u) {
+  // Under CASCADE the want set already answers this: the closure guarantees
+  // that a wanted level-2 block implies a wanted level-1 parent, so a tile
+  // still needed as a parent is still wanted and needs no separate test.
+  let release = select(
+    (desiredLevelCoarsen(epsFor(blockID)) < 1 || inSpongeBand(blockID)) && !isNearBody(blockID),
+    want[blockID] == 0u,
+    CASCADE != 0u);
+  if (release && currentSlot >= 0) {
+    if (CASCADE == 0u && HAS_LEVEL2 != 0u) {
       if (hasLevel2Child(blockID)) { return; }
       let neighbors = edgeNeighbors(blockID);
       for (var i = 0u; i < 4u; i++) {
@@ -338,7 +385,7 @@ fn refine(@builtin(global_invocation_id) gid: vec3<u32>) {
   // flicker false for a still-genuinely-active child whose criterion
   // dipped this round, letting a real imbalance go uncascaded).
   var cascadeWanted = false;
-  if (HAS_LEVEL2 != 0u && currentSlot < 0) {
+  if (CASCADE == 0u && HAS_LEVEL2 != 0u && currentSlot < 0) {
     let neighbors = edgeNeighbors(blockID);
     for (var i = 0u; i < 4u; i++) {
       if (blockSlot[neighbors[i]] >= 0 && hasLevel2Child(neighbors[i])) { cascadeWanted = true; }
@@ -348,8 +395,9 @@ fn refine(@builtin(global_invocation_id) gid: vec3<u32>) {
       if (DEMAND_CASCADE != 0u && blockSlot[neighbors[i]] >= 0 && level2Wanted(neighbors[i])) { cascadeWanted = true; }
     }
   }
-  let ownReason = (desiredLevel(epsFor(blockID)) >= 1 && !inSpongeBand(blockID)) || isNearBody(blockID);
-  if ((ownReason || cascadeWanted) && currentSlot < 0) {
+  let ownReason = ownWant(blockID);
+  let create = select(ownReason || cascadeWanted, want[blockID] != 0u, CASCADE != 0u);
+  if (create && currentSlot < 0) {
     let oldCount = atomicSub(&freeCount, 1);
     if (oldCount > 0) {
       let slot = freeList[u32(oldCount - 1)];

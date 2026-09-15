@@ -845,6 +845,12 @@ export function writeWantSets(device, pools, nLevels, sets) {
 // tolerance, and not merely in size. Returns the disagreement both ways round,
 // because "the GPU forced something the host did not" and "the host forced
 // something the GPU did not" are different bugs.
+// IT WRITES LIVE STATE, and since B2 wired the want arrays into the manager
+// that is worth saying out loud: seeding clobbers whatever the last refinement
+// round decided. It self-heals -- the next round clears and rewrites every
+// want buffer before reading it, which is exactly why that clear is not
+// optional -- but do not read a topology measurement taken between this and
+// the next refinement round and expect it to mean anything.
 export async function cascadeRoundTrip(device, pools, nLevels, cascade, seedSets) {
   writeWantSets(device, pools, nLevels, seedSets);
   const enc = device.createCommandEncoder();

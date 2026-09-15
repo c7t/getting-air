@@ -119,6 +119,14 @@
 // recovered. 8 is left as a hole rather than renumbered: a renumber is five
 // separate pages' bind groups to land in lockstep, which is the shape that
 // shipped 238e48c.
+//
+// AND B2 IS WHAT IT WAS RECOVERED FOR. The child level's WANT array now sits
+// here -- written by decide(), closed by shaders/amr_cascade.wgsl, consumed by
+// coarsen/refine when CASCADE != 0. That puts this kernel back at exactly 16,
+// which is legal but leaves no slack again; B2-2c's deletions
+// (parentBlockSlot, grandchildBlockSlot -- both dead under the closure) take
+// it to 14.
+@group(0) @binding(8)  var<storage, read_write> childWant         : array<u32>;
 @group(0) @binding(9)  var<storage, read_write> childOriginX      : array<f32>;
 @group(0) @binding(10) var<storage, read_write> childOriginY      : array<f32>;
 @group(0) @binding(11) var<storage, read>       parentBlockSlot   : array<i32>;
@@ -146,6 +154,29 @@ override HAS_BODY : u32 = 1u;
 // When 0, isNearBodyAt reverts to the pre-B4 single sample at the tile CENTRE
 // (?boxrefine=0) -- see amr_manage.wgsl's identical override.
 override BOX_REFINE : u32 = 1u;
+
+// ?cascade=1: TAKE THE 2:1 DECISION OUT OF THIS FILE (plans/2D-backport.md B2).
+//
+// Default 0 keeps every per-pass test below exactly as it shipped, so this
+// build is byte-identical. At 1, coarsen and refine stop deciding anything
+// about balance and simply act on the WANT array: decide() writes each block's
+// OWN reason (criterion, geometry, sponge) into it, shaders/amr_cascade.wgsl
+// closes it under the 2:1 rule, and then a tile exists if and only if it is
+// wanted. Both paths live in one build so the difference can be measured --
+// B2-1 recorded what it should be: level 2's x-extent on index-amr.html is 80
+// L0 units against 176 with the growth half enabled, and the closure count
+// should reach zero.
+//
+// WHY THE VETOES CAN GO RATHER THAN BEING PORTED. Every balance test here is
+// one direction of the closure read locally, and each was conservative in a
+// way that cost something. The neighbour-active gate is STRONGER than 2:1
+// balance -- it demands the parent's four same-level neighbours, where the
+// rule only demands the parents of the block's OWN neighbours -- and that is
+// precisely what deadlocks growth: a refine blocked by a neighbour that would
+// only ever have been created BY that refine. Applied to the want set the two
+// directions are the same function, so there is nothing left to veto.
+override CASCADE : u32 = 0u;
+
 override REFINE_THRESH : f32;
 override COARSEN_THRESH : f32;
 // Ladder parameters -- see common_refine.wgsl.
@@ -230,6 +261,67 @@ fn childEdgeNeighbors(childBlockID: u32) -> array<u32, 4> {
     by * nbxChild + ((bx + 1u) % nbxChild),
     by * nbxChild + ((bx + nbxChild - 1u) % nbxChild),
   );
+}
+
+
+// THE WANT SET FOR THE CHILD LEVEL. Dispatched over PARENT slots, like
+// refine(), because that is where the criterion and the geometry live.
+//
+// TWO DIFFERENCES FROM refine(), both load-bearing:
+//
+//   NO "already refined" EARLY-OUT. Want is about desire, not about what
+//   exists. A quad that already exists and is still wanted must be MARKED
+//   wanted, or coarsen() releases it on the same round.
+//   NO CASCADE AND NO VETO. Neighbours are not this function's business --
+//   that is what shaders/amr_cascade.wgsl is for, and keeping it out of here
+//   is the entire point of B2.
+//
+// Blocks whose parent slot is inactive are never visited, so the caller must
+// CLEAR the want buffer before dispatching this.
+@compute @workgroup_size(64)
+fn decide(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let parentSlot = gid.x;
+  if (parentSlot >= arrayLength(&parentSlotToBlock)) { return; }
+  let parentBlockID = parentSlotToBlock[parentSlot];
+  if (parentBlockID < 0) { return; }
+
+  let bxP = u32(parentBlockID) % NBX_PARENT;
+  let byP = u32(parentBlockID) / NBX_PARENT;
+  let nbxChild = NBX_PARENT * 2u;
+
+  var maxCrit = 0f;
+  for (var qy = 0u; qy < 2u; qy++) {
+    for (var qx = 0u; qx < 2u; qx++) {
+      let cb = (byP * 2u + qy) * nbxChild + (bxP * 2u + qx);
+      maxCrit = max(maxCrit, childCriterion[cb]);
+    }
+  }
+  let eps = min(1.0f, log2(max(maxCrit, EPS_FLOOR)));
+
+  var parentOriginX_L0 = f32(bxP * RB);
+  var parentOriginY_L0 = f32(byP * RB);
+  if (PARENT_HAS_CACHED_ORIGIN != 0u) {
+    parentOriginX_L0 = parentOriginX[parentSlot];
+    parentOriginY_L0 = parentOriginY[parentSlot];
+  }
+  // See refine()'s BUGFIX comment: RB is ALREADY half the parent's own
+  // interior, so no further *0.5 belongs here.
+  let cx = parentOriginX_L0 + f32(RB) * PARENT_CELL_SIZE_L0;
+  let cy = parentOriginY_L0 + f32(RB) * PARENT_CELL_SIZE_L0;
+
+  let wanted = isNearBodyAt(cx, cy)
+    || (desiredLevel(toPhysical(eps)) > myLevel() && !inSpongeBandAt(cx, cy));
+
+  // All four children, because the pool allocates quads and nothing else --
+  // so the want this level produces is quad-complete by construction, and
+  // amr_cascade.wgsl's completeQuads only ever has the CLOSURE's own
+  // single-block additions left to finish.
+  let v = select(0u, 1u, wanted);
+  for (var q = 0u; q < 4u; q++) {
+    let cbx = bxP * 2u + (q & 1u);
+    let cby = byP * 2u + ((q >> 1u) & 1u);
+    childWant[cby * nbxChild + cbx] = v;
+  }
 }
 
 @compute @workgroup_size(64)
@@ -373,11 +465,19 @@ fn refine(@builtin(global_invocation_id) gid: vec3<u32>) {
   let isHardRequired = isNearBodyAt(parentCenterX_L0, parentCenterY_L0) || cascadeWanted;
   // Ladder: this parent wants children only if its own flow asks for a level
   // DEEPER than the one it already holds.
-  let wantsRefine = isHardRequired
-    || (desiredLevel(toPhysical(eps)) > myLevel() && !inSpongeBandAt(parentCenterX_L0, parentCenterY_L0));
+  let wantsRefine = select(
+    isHardRequired
+      || (desiredLevel(toPhysical(eps)) > myLevel() && !inSpongeBandAt(parentCenterX_L0, parentCenterY_L0)),
+    childWant[childBlockID0] != 0u,
+    CASCADE != 0u);
   if (!wantsRefine) { return; }
 
-  if (!isHardRequired) {
+  // THE NEIGHBOUR-ACTIVE GATE IS THE DEADLOCK, and under CASCADE it is gone.
+  // It demands all four of the PARENT's same-level neighbours be active, which
+  // is strictly stronger than 2:1 balance -- the rule only demands that the
+  // parents of this child's OWN neighbours exist, and the closure has already
+  // put those in the want set.
+  if (CASCADE == 0u && !isHardRequired) {
     // 2:1 balance (see header): all 4 same-level (level-m) edge-neighbors
     // of the PARENT must already be active, or this refine is blocked
     // this round -- whichever shader manages the parent's own level is
@@ -491,13 +591,19 @@ fn coarsen(@builtin(global_invocation_id) gid: vec3<u32>) {
   let centerX_L0 = parentOriginX_L0 + f32(RB) * PARENT_CELL_SIZE_L0;
   let centerY_L0 = parentOriginY_L0 + f32(RB) * PARENT_CELL_SIZE_L0;
 
-  if ((desiredLevelCoarsen(toPhysical(eps)) < myLevel() + 1 || inSpongeBandAt(centerX_L0, centerY_L0)) && !isNearBodyAt(centerX_L0, centerY_L0)) {
+  // Under CASCADE the want set has already answered this. The closure
+  // guarantees a wanted grandchild implies a wanted child, so a tile still
+  // needed as a parent is still wanted -- and the HAS_GRANDCHILD walk below,
+  // whose own BUGFIX comment records getting the wrong child index on three
+  // sides out of four, has nothing left to decide.
+  let release = select(
+    (desiredLevelCoarsen(toPhysical(eps)) < myLevel() + 1 || inSpongeBandAt(centerX_L0, centerY_L0))
+      && !isNearBodyAt(centerX_L0, centerY_L0),
+    childWant[u32(childSlotToBlock[slot])] == 0u,
+    CASCADE != 0u);
+  if (release) {
     let quadIdx = slot / 4u; // slot IS quadrant 0's own slot (slot % 4 == 0 checked above), so quadIdx*4u==slot
-    // See header: blocked if any of the 4 children about to release has
-    // an active level-(m+2) grandchild itself, or if any of their own
-    // same-level-(m+1) edge-neighbors does -- releasing either would leave
-    // that grandchild directly adjacent to this now-coarser region.
-    if (HAS_GRANDCHILD != 0u) {
+    if (CASCADE == 0u && HAS_GRANDCHILD != 0u) {
       for (var q = 0u; q < 4u; q++) {
         let s = quadIdx * 4u + q;
         let bID = childSlotToBlock[s];
