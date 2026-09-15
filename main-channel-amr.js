@@ -164,14 +164,17 @@ const DEMAND_CASCADE = urlParams.has('demandCascade') ? (parseInt(urlParams.get(
 // ?cascade=1: the 2:1 rule as ONE closure on the want set, instead of per-pass
 // tests inside coarsen and refine (plans/2D-backport.md B2).
 //
-// Default 0 is the shipped path, byte-identical. At 1, decide() writes each
+// DEFAULT 1 SINCE B2-2c. ?cascade=0 restores the per-pass path -- kept so the
+// difference stays measurable, not because it is correct: it leaves 13 corner
+// 2:1 violations standing on this page and pins level 2's reach to half what
+// the rule allows. At 1, decide() writes each
 // block's own reason into the want array, shaders/amr_cascade.wgsl closes it
 // under the rule, and coarsen/refine simply act on the result -- so the
 // fixed-point loop, the neighbour-active veto and ?demandCascade all become
 // dead, and ONE sweep replaces N_LEVELS-1 iterations. Both paths in one build
 // so the difference is measurable rather than argued; B2-1 recorded the target
 // (level 2's x-extent 80 -> ~176 L0 units, and the closure count to zero).
-const CASCADE = urlParams.has('cascade') ? (parseInt(urlParams.get('cascade')) ? 1 : 0) : 0;
+const CASCADE = urlParams.has('cascade') ? (parseInt(urlParams.get('cascade')) ? 1 : 0) : 1;
 
 const MAX_FINE_BLOCKS = urlParams.has('maxFineBlocks') ? parseInt(urlParams.get('maxFineBlocks')) : 128;
 const NBX = W / BLOCK, NBY = H / BLOCK, NBLOCKS = NBX * NBY;
