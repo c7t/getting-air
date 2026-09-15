@@ -513,11 +513,9 @@ async function init() {
     { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
     { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
     { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
-    // binding 8: blockSlot -- see step1BGL's binding 5.
-    { binding: 8, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }
+    { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+    // binding 6: blockSlot -- see step1BGL's binding 5.
+    { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }
   ]});
   const avgPoolBGL = device.createBindGroupLayout({ label: 'avgPoolBGL', entries: [
     { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
@@ -792,10 +790,8 @@ async function init() {
       { binding: 2, resource: { buffer: childPool.finePoolF_b } },
       { binding: 3, resource: { buffer: childPool.finePoolVel } },
       { binding: 4, resource: { buffer: childPool.slotToBlockBuf } },
-      { binding: 5, resource: { buffer: childPool.originXBuf } },
-      { binding: 6, resource: { buffer: childPool.originYBuf } },
-      { binding: 7, resource: { buffer: childPool.levelParamsBuf } },
-      { binding: 8, resource: { buffer: childPool.blockSlotBuf } },
+      { binding: 5, resource: { buffer: childPool.levelParamsBuf } },
+      { binding: 6, resource: { buffer: childPool.blockSlotBuf } },
     ]});
     childPool.step1PoolBG_ba = device.createBindGroup({ layout: step1PoolBGL, entries: [
       { binding: 0, resource: { buffer: cardStateBuf } },
@@ -803,10 +799,8 @@ async function init() {
       { binding: 2, resource: { buffer: childPool.finePoolF_a } },
       { binding: 3, resource: { buffer: childPool.finePoolVel } },
       { binding: 4, resource: { buffer: childPool.slotToBlockBuf } },
-      { binding: 5, resource: { buffer: childPool.originXBuf } },
-      { binding: 6, resource: { buffer: childPool.originYBuf } },
-      { binding: 7, resource: { buffer: childPool.levelParamsBuf } },
-      { binding: 8, resource: { buffer: childPool.blockSlotBuf } },
+      { binding: 5, resource: { buffer: childPool.levelParamsBuf } },
+      { binding: 6, resource: { buffer: childPool.blockSlotBuf } },
     ]});
 
     const avgEntries = (parentBuf) => [

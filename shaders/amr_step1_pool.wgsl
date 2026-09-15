@@ -42,11 +42,12 @@
 
 
 struct LevelParams {
-  nbx: u32,        // this level's own logical block-grid extent, used ONLY to name same-level neighbours for DIRECT_GHOST streaming (the tile's physical origin still comes from originX/originY -- see header). Shared verbatim with amr_interp_pool_parent.wgsl/amr_average_pool_parent.wgsl, not a third near-duplicate.
+  nbx: u32,        // this level's own logical block-grid extent. Names same-level neighbours for DIRECT_GHOST streaming, and (with dxL) places the tile physically -- see the origin derivation in main(). Shared verbatim with amr_interp_pool_parent.wgsl/amr_average_pool_parent.wgsl, not a third near-duplicate.
   nby: u32,        // same.
   parentTau: f32,
   dxL: f32,        // Milestone 8: this level's own grid spacing in L0-buffer-
-                   // space units, used below to scale epsilon (get_chi).
+                   // space units, used below to scale epsilon (get_chi) and
+                   // to place the tile (2*dxL is the parent's cell size).
 }
 
 @group(0) @binding(0) var<storage, read>       state       : CardState;
@@ -54,14 +55,12 @@ struct LevelParams {
 @group(0) @binding(2) var<storage, read_write> f_out       : array<u32>;
 @group(0) @binding(3) var<storage, read_write> vel_pool    : array<f32>;
 @group(0) @binding(4) var<storage, read>       slotToBlock : array<i32>;
-@group(0) @binding(5) var<storage, read>       originX     : array<f32>;
-@group(0) @binding(6) var<storage, read>       originY     : array<f32>;
-@group(0) @binding(7) var<uniform>             levelParams : LevelParams;
+@group(0) @binding(5) var<uniform>             levelParams : LevelParams;
 // This level's own logical block grid -> pool slot, indexed by
 // blockID = by*levelParams.nbx+bx -- the one new input neighbour-addressed
 // streaming needs (see DIRECT_GHOST), the same buffer and the same indexing
 // amr_interp_pool_parent.wgsl's fine-fine consultation already uses.
-@group(0) @binding(8) var<storage, read>       blockSlot   : array<i32>;
+@group(0) @binding(6) var<storage, read>       blockSlot   : array<i32>;
 
 override W : u32; // GLOBAL domain dims (window periodicity), same at every level -- not level-specific, see header.
 override H : u32;
@@ -212,20 +211,34 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (!ringInterior) { return; } // see the SKIP_GHOST override above
   }
 
-  // The one structural difference vs. amr_step1.wgsl: origin comes from a
-  // cached per-slot value (set at quad-activation time), not derived from
-  // blockID.
-  let originX_L0 = originX[slot];
-  let originY_L0 = originY[slot];
-
   // Logical (bx,by) within THIS level's own block grid, derived from blockID
-  // exactly as amr_interp_pool_parent.wgsl derives it -- needed only to name
-  // this tile's same-level neighbours, not to place it physically (that is
-  // what the cached origin above is for). Dead code under DIRECT_GHOST=0.
+  // exactly as amr_interp_pool_parent.wgsl derives it. Used for two things:
+  // naming this tile's same-level neighbours (DIRECT_GHOST), and placing the
+  // tile physically, just below.
   let nbx = levelParams.nbx;
   let nby = levelParams.nby;
   let bx = u32(blockID) % nbx;
   let by = u32(blockID) / nbx;
+
+  // THIS TILE'S PHYSICAL ORIGIN IN L0 UNITS, AS ONE MULTIPLY.
+  //
+  // It used to be read from a per-slot originX/originY buffer, on the
+  // argument (this file's own former header) that a level>=2 tile's origin
+  // needs a walk up the parent chain and is therefore not something a
+  // per-dispatch kernel should redo. That argument is wrong, and amr2d.mjs
+  // has said so since B0: every level's block grid is globally anchored and
+  // quadtree-uniform, so tileOriginL0 is `block * RB * 2^-(m-1)` in closed
+  // form -- and `2^-(m-1)` is `2 * dxL`. The recursion the manager runs and
+  // this multiply agree exactly in f32 (every term is an integer times a
+  // power of two); tools/test-amr2d.js scores the two host routes against
+  // each other, and debugCheckTileOrigins scores the live buffer against
+  // this same closed form at every invariant checkpoint.
+  //
+  // This is what makes the file level-generic: with the origin derived, the
+  // ONE structural difference between this kernel and the old level-1-only
+  // amr_step1.wgsl is gone, and level 1 is just `dxL = 0.5`.
+  let originX_L0 = f32(bx * RB) * 2.0f * levelParams.dxL;
+  let originY_L0 = f32(by * RB) * 2.0f * levelParams.dxL;
   let RB2 = RB * 2u;
   let bxm = (bx + nbx - 1u) % nbx;
   let bxp = (bx + 1u) % nbx;
