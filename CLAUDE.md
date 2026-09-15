@@ -110,11 +110,13 @@ invariants the AMR machinery depends on:
   force does not feed back into the flow -- unlike the falling card, whose
   field cannot be compared this way at all):
 
-      ?levels=3   at least THREE modes, each EXACTLY reproducible. Over 16
-                  runs and 6 builds: mode A 9 runs, mode B 4, mode C 2. Modes
-                  differ from each other by ux relL2 1.6-2.6e-5, vorticity
+      ?levels=3   at least FOUR modes, each EXACTLY reproducible. Over 22
+                  runs and 8 builds: mode A 12 runs, B 4, C 3, D 1. Modes
+                  differ from each other by ux relL2 1.6-3.0e-5, vorticity
                   3.4-5.8e-4 -- and every run reproduces its mode BIT-FOR-BIT,
-                  including across different builds.
+                  including across different builds. The count keeps going up
+                  as more runs are taken: treat it as "several", not as a
+                  closed set, and never as "it must be A or B".
       ?levels=2   every one of 4 runs DIFFERS, at ux relL2 2-4e-5 (more modes,
                   or none)
 

@@ -164,67 +164,17 @@ override BOX_REFINE : u32 = 1u;
 // 2:1-balance cascade, gating only the vorticity (epsFor) term.
 override SPONGE_EXCLUDE_W : f32 = 0.0f;
 const BLOCK = 8u;
-const EPS_FLOOR = 1e-6f;
 
-fn epsFor(blockID: u32) -> f32 {
-  return min(1.0f, log2(max(blockCriterion[blockID], EPS_FLOOR)));
-}
-
-// True if ANY POINT OF blockID's L0 block comes within FORCE_REFINE_MARGIN of
-// the card's surface, either right now or FORCE_REFINE_LOOKAHEAD macro-steps
-// from now. common_geometry.wgsl's nearBodyBox is the test and phiMinPose is
-// the two-pose distance; see that file for the Lipschitz bound and for why
-// the future pose moves the TEST POINT backward rather than the ellipse
-// forward.
-//
-// THE BOX, NOT THE CENTRE -- plans/2D-backport.md B4. This used to be one
-// get_phi at the block centre, which under-reports by the block's own
-// circumradius (5.66 L0 cells at BLOCK=8). ?boxrefine=0 restores that exactly,
-// truncated window conversion and all, so the two live in one build and the
-// difference can be measured rather than argued.
-//
-// The new path drops the `(c + W - u32(off_x)) % W` window reduction with it:
-// get_phi already takes the NEAREST PERIODIC IMAGE, so the modulo bought
-// nothing, and the u32() truncated a fractional offset (and, in the pool
-// version, a fractional tile centre) by up to a cell -- error of the same
-// order as the margin it is compared against.
-fn isNearBody(blockID: u32) -> bool {
-  if (HAS_BODY == 0u) { return false; }
+// This block's own centre and half-extent in L0 buffer space. An L0 block is
+// BLOCK cells of size 1, so its footprint is BLOCK L0 units -- the same
+// footprint a level-1 tile has at half the cell size, which is what makes
+// level 1 footprint-preserving 1:1 with L0 (decision 1). The predicates that
+// consume these are common_refine.wgsl's, shared with amr_manage_pool.wgsl.
+const HALF_EXTENT_L0 = f32(BLOCK) * 0.5f;
+fn blockCentreL0(blockID: u32) -> vec2<f32> {
   let nbx = W / BLOCK;
   let bx = blockID % nbx; let by = blockID / nbx;
-  let cx_buf = bx * BLOCK + BLOCK / 2u;
-  let cy_buf = by * BLOCK + BLOCK / 2u;
-
-  if (BOX_REFINE == 0u) {
-    let wx = (cx_buf + W - u32(state.off_x)) % W;
-    let wy = (cy_buf + H - u32(state.off_y)) % H;
-    return phiMinPose(vec2<f32>(f32(wx), f32(wy)), FORCE_REFINE_LOOKAHEAD, state) < FORCE_REFINE_MARGIN;
-  }
-
-  // An L0 block is BLOCK coarse cells across, so its half-extent is BLOCK/2
-  // L0 units. (A level-1 tile's interior is 2*RB cells at half the size --
-  // the same footprint, which is what "level 1 is footprint-preserving 1:1
-  // with L0's blocks" means, and why this one function serves both the L0->L1
-  // decision and the L1->L2 cascade's reuse of it.)
-  let p = vec2<f32>(f32(cx_buf) - state.off_x, f32(cy_buf) - state.off_y);
-  return nearBodyBox(p, f32(BLOCK) * 0.5f, FORCE_REFINE_MARGIN, FORCE_REFINE_LOOKAHEAD, state);
-}
-
-// True if blockID's center lies within SPONGE_EXCLUDE_W (coarse cells) of any
-// window edge, i.e. inside/near the ALBC sponge band (amr_step.wgsl SPONGE_W).
-// Window-space conversion mirrors isNearBody exactly. Gated off when
-// SPONGE_EXCLUDE_W <= 0 (the JS default is 8, ?spongeExclude=0 disables it).
-fn inSpongeBand(blockID: u32) -> bool {
-  if (SPONGE_EXCLUDE_W <= 0.0f) { return false; }
-  let nbx = W / BLOCK;
-  let bx = blockID % nbx; let by = blockID / nbx;
-  let cx_buf = bx * BLOCK + BLOCK / 2u;
-  let cy_buf = by * BLOCK + BLOCK / 2u;
-  let wx = (cx_buf + W - u32(state.off_x)) % W;
-  let wy = (cy_buf + H - u32(state.off_y)) % H;
-  let distX = min(f32(wx), f32(W - wx));
-  let distY = min(f32(wy), f32(H - wy));
-  return min(distX, distY) < SPONGE_EXCLUDE_W;
+  return vec2<f32>(f32(bx * BLOCK + BLOCK / 2u), f32(by * BLOCK + BLOCK / 2u));
 }
 
 
@@ -270,7 +220,9 @@ fn inSpongeBand(blockID: u32) -> bool {
 // about its neighbours. Factored out so decide() and the legacy refine() path
 // cannot drift: it is verbatim what `ownReason` was computed as inline.
 fn ownWant(blockID: u32) -> bool {
-  return (desiredLevel(epsFor(blockID)) >= 1 && !inSpongeBand(blockID)) || isNearBody(blockID);
+  let c = blockCentreL0(blockID);
+  return (desiredLevel(epsOf(blockCriterion[blockID])) >= 1 && !inSpongeBandAt(c))
+      || nearBodyAt(c, HALF_EXTENT_L0);
 }
 
 // Write the want set. No allocation, no neighbour test, no ordering

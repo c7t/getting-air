@@ -723,6 +723,9 @@ has**. Give level 1 an `originX/originY` pair at allocation and
 6. `manage` — **last**, and only after B2 has already deleted the per-pass
    balance tests. Unifying 364+492 lines of two different balance
    implementations is not a refactor, it is a rewrite; B2 makes it a refactor.
+   **DONE — see B3-7 below. B2 had made it small: the predicates unified, the
+   per-block vs per-quad ALLOCATORS did not and should not, and the job turned
+   up dead code B2 itself had left behind.**
 
 **Gate:** bit-identical. Each of these is a pure code motion and must be
 proved so — `tools/amr-diff.js` against a pre-change snapshot, and
@@ -1051,6 +1054,79 @@ associative and exact on floats, unlike the sum `common_reduce.wgsl` had to
 re-validate), and it reads that way: bit-IDENTICAL at `?levels=3`, boot smoke
 PASS on all five AMR pages, invariants PASS on all seven gates, analytic
 channel/TGV PASS, Cd/St unchanged.
+
+### B3-7 — DONE (2026-09-14). manage: the predicates unify, the allocators do not.
+
+The stage the plan flagged as able to eat the schedule (risk 2: "364 + 492
+lines implementing two different balance schemes"). B2 had already removed
+both balance schemes, so what was left was a small, sharp job -- 840 lines to
+875 across three files, of which the two managers drop 343+497 to 295+427.
+
+**WHAT UNIFIED: the decision predicates.** `isNearBody`/`inSpongeBand` existed
+in both files. They are the same tests; they differed only in how the
+candidate's centre and half-extent were derived, which is the one thing each
+manager genuinely knows for itself:
+
+    dense   an L0 block is BLOCK cells of size 1   -> half-extent BLOCK/2
+    pool    a level-m tile's interior is 2*RB cells of size 2^-m
+                                                   -> half-extent RB * 2^-m
+
+Those are the SAME FOOTPRINT written two ways (decision 1's
+footprint-preserving 1:1), and **at level 1 they are the same NUMBER** -- the
+exact arrangement that lets two copies drift while agreeing on every test
+anyone runs. The pool file's own comment said so and left it. B3-5 had just
+found that shape biting for real: a sibling formula fixed on one page and left
+wrong on the two that move a body.
+
+So the caller supplies the centre and half-extent, and `nearBodyAt` /
+`inSpongeBandAt` / `epsOf` live once in `common_refine.wgsl` -- which is
+already the two managers' shared decision fragment and is included by nothing
+else. Same split as B3-3's `parentOrigin`/`sampleParent`: what varies stays
+with the caller, the rule is shared.
+
+**WHAT DID NOT, and should not: the allocators.** Per-BLOCK (dense, one slot
+from a slot free list) vs per-QUAD (pool, four slots from a quad free list) is
+plans/AMR-multilevel.md decision 3, not an addressing accident. Like B3-6's
+criterion pair, these differ in the DISPATCH AND ALLOCATION shape, and forcing
+one kernel would parameterize the granularity to remove nothing. **Two of six
+pairs did not fit the accessor shape, and both for the same reason** -- worth
+saying plainly, because "six near-duplicate pairs" in B3's own table reads as
+six of one kind and it is four and two.
+
+**AND IT FOUND DEAD CODE THAT B2 LEFT.** `refine()` still computed a max over
+its four prospective quadrants, its log2, the parent's origin and the parent's
+centre. `coarsen()` still computed the child's eps, walked up to the parent
+slot and derived the parent's centre. **Nothing below read any of it** -- B2-2d
+deleted the three tests that consumed them (the grandchild cascade, the
+hard-required split, the neighbour-active gate) and left the inputs standing.
+Legal WGSL, free at runtime (a compiler drops an unused `let`), which is
+exactly why it survived: the cost was that `refine()` READ as though it still
+weighed the criterion, beside a twenty-line BUGFIX comment about a centre it
+no longer computed for anything.
+
+**Deleting a mechanism has to include deleting what fed it.** B2-2d ran a
+sweep over the CHECKS that referenced the deleted machinery and found three
+vacuous gates; the same sweep over its INPUTS was never run. That is the third
+distinct way this project has been bitten by a removal's blast radius (vacuous
+gates, a flag whose meaning silently widened in B3-1, and now dead inputs) --
+and the general rule is: after removing a mechanism, grep for its name in
+checks, in flags, AND in what computed its arguments.
+
+**Measured inert.** Bit-IDENTICAL at `?levels=3` to the pre-B3 baseline; boot
+smoke PASS on all five AMR pages; invariants PASS on all seven gates at every
+checkpoint on amr-dev and N2/N3 x diffuse/bounceback; all three `refuse-*`
+PASS; channel/TGV analytic PASS; Cd/St to the digit (1.642/0.1478,
+1.322/0.1617, 1.425/0.1551, 1.351/0.1616).
+
+**A FOURTH ATTRACTOR.** The first `?levels=3` run matched none of the three
+known modes; the repeat was bit-identical to mode A. Consistent with the
+family (ux relL2 1.9e-5, same scale as the others) and with the rule as
+written -- a DIFFERS names the mode and nothing else, an IDENTICAL is
+conclusive. Do not read "none of the known modes" as evidence of a change.
+
+**B3 IS COMPLETE.** Six pairs: four collapsed to one kernel or one
+kernel-plus-accessor, two measured as not that shape and left as two with
+their genuine overlap extracted.
 
 ### B3a — the same sweep, in JS
 
@@ -1825,8 +1901,7 @@ B3-5 retire originX/originY + the 8th gate         ◄── DONE; manage_pool
                                                         14 -> 10 bindings
 B3-6 criterion: shared stencil + reduction only   ◄── DONE; NOT unified,
                                                         and that is measured
-B3-7 manage                                        ◄── LAST. B2 made it a
-                                                        refactor; see risk 2
+B3-7 manage: predicates unify, allocators do not  ◄── DONE. B3 COMPLETE.
 B5   window = sponge translation                    ◄── independent of B2/B3,
                                                         but smaller after B3
 B1   post-collision rescale                         ◄── needs B0b only; its

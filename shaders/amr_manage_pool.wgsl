@@ -197,56 +197,28 @@ fn parentOriginL0(bxP: u32, byP: u32) -> vec2<f32> {
   return vec2<f32>(f32(bxP) * s, f32(byP) * s);
 }
 fn toPhysical(eps: f32) -> f32 { return eps - log2(PARENT_CELL_SIZE_L0); }
+
+// This parent tile's centre and half-extent in L0 buffer space, the pair
+// common_refine.wgsl's predicates consume. The parent's interior is 2*RB cells
+// of size PARENT_CELL_SIZE_L0, so the footprint is 2*RB*PARENT_CELL_SIZE_L0
+// and the half of it is RB*PARENT_CELL_SIZE_L0 -- RB is ALREADY "half the
+// interior" by construction, which is why no further *0.5 belongs in either.
+//
+// Deriving the centre and the half-extent from the same expression is
+// deliberate: if one is ever wrong the other is wrong with it, rather than the
+// box silently straddling a tile it does not belong to. Both bugs this file's
+// git history records (a centre off by half a tile, and a quadrant step off by
+// the same factor) were exactly that pair disagreeing.
+fn parentHalfExtentL0() -> f32 { return f32(RB) * PARENT_CELL_SIZE_L0; }
+fn parentCentreL0(bxP: u32, byP: u32) -> vec2<f32> {
+  return parentOriginL0(bxP, byP) + vec2<f32>(parentHalfExtentL0(), parentHalfExtentL0());
+}
 override FORCE_REFINE_MARGIN : f32;
 override FORCE_REFINE_LOOKAHEAD : f32;
 // L0 window-space edge band excluded from vorticity-driven refinement (same
 // fixed L0-window strip as amr_manage.wgsl -- unscaled per level, since the
 // sponge is a fixed L0 strip). Gated off when <= 0.
 override SPONGE_EXCLUDE_W : f32 = 0.0f;
-const EPS_FLOOR = 1e-6f;
-
-// Same test as amr_manage.wgsl's isNearBody, parametrized by an
-// already-computed L0-buffer-space center instead of deriving it from a dense
-// blockID -- see that file for the box-vs-centre change and ?boxrefine=0, and
-// common_geometry.wgsl for the bound itself.
-//
-// THE HALF-EXTENT IS f32(RB) * PARENT_CELL_SIZE_L0, and it is not the same
-// expression as amr_manage.wgsl's BLOCK/2 even though at level 1 it is the
-// same NUMBER. A level-m tile's interior is 2*RB cells of size
-// PARENT_CELL_SIZE_L0, so its footprint is 2*RB*PARENT_CELL_SIZE_L0 L0 units
-// and its half-extent is half of that -- which is exactly the offset both
-// callers already add to the tile ORIGIN to get the centre they pass in here
-// (see refine()'s parentCenterX_L0 and its BUGFIX comment on why no further
-// *0.5 belongs there). Deriving it the same way as the centre is deliberate:
-// if one is ever wrong the other is wrong with it, rather than the box
-// silently straddling a tile it does not belong to.
-fn isNearBodyAt(centerX_L0: f32, centerY_L0: f32) -> bool {
-  if (HAS_BODY == 0u) { return false; }
-
-  if (BOX_REFINE == 0u) {
-    let wx = (u32(centerX_L0) + W - u32(state.off_x)) % W;
-    let wy = (u32(centerY_L0) + H - u32(state.off_y)) % H;
-    return phiMinPose(vec2<f32>(f32(wx), f32(wy)), FORCE_REFINE_LOOKAHEAD, state) < FORCE_REFINE_MARGIN;
-  }
-
-  let p = vec2<f32>(centerX_L0 - state.off_x, centerY_L0 - state.off_y);
-  return nearBodyBox(p, f32(RB) * PARENT_CELL_SIZE_L0, FORCE_REFINE_MARGIN, FORCE_REFINE_LOOKAHEAD, state);
-}
-
-// True if the given L0-buffer-space center lies within SPONGE_EXCLUDE_W of any
-// window edge (the ALBC sponge band). Mirrors amr_manage.wgsl's inSpongeBand,
-// parametrized by an already-computed L0 center like isNearBodyAt above.
-fn inSpongeBandAt(centerX_L0: f32, centerY_L0: f32) -> bool {
-  if (SPONGE_EXCLUDE_W <= 0.0f) { return false; }
-  let wx = (u32(centerX_L0) + W - u32(state.off_x)) % W;
-  let wy = (u32(centerY_L0) + H - u32(state.off_y)) % H;
-  let distX = min(f32(wx), f32(W - wx));
-  let distY = min(f32(wy), f32(H - wy));
-  return min(distX, distY) < SPONGE_EXCLUDE_W;
-}
-
-
-
 
 // THE WANT SET FOR THE CHILD LEVEL. Dispatched over PARENT slots, like
 // refine(), because that is where the criterion and the geometry live.
@@ -280,18 +252,12 @@ fn decide(@builtin(global_invocation_id) gid: vec3<u32>) {
       maxCrit = max(maxCrit, childCriterion[cb]);
     }
   }
-  let eps = min(1.0f, log2(max(maxCrit, EPS_FLOOR)));
+  let eps = epsOf(maxCrit);
 
-  let parentOrigin_L0 = parentOriginL0(bxP, byP);
-  let parentOriginX_L0 = parentOrigin_L0.x;
-  let parentOriginY_L0 = parentOrigin_L0.y;
-  // See refine()'s BUGFIX comment: RB is ALREADY half the parent's own
-  // interior, so no further *0.5 belongs here.
-  let cx = parentOriginX_L0 + f32(RB) * PARENT_CELL_SIZE_L0;
-  let cy = parentOriginY_L0 + f32(RB) * PARENT_CELL_SIZE_L0;
+  let centre = parentCentreL0(bxP, byP);
 
-  let wanted = isNearBodyAt(cx, cy)
-    || (desiredLevel(toPhysical(eps)) > myLevel() && !inSpongeBandAt(cx, cy));
+  let wanted = nearBodyAt(centre, parentHalfExtentL0())
+    || (desiredLevel(toPhysical(eps)) > myLevel() && !inSpongeBandAt(centre));
 
   // All four children, because the pool allocates quads and nothing else --
   // so the want this level produces is quad-complete by construction, and
@@ -321,39 +287,19 @@ fn refine(@builtin(global_invocation_id) gid: vec3<u32>) {
   let childBlockID0 = (byP * 2u) * nbxChild + (bxP * 2u);
   if (childBlockSlot[childBlockID0] >= 0) { return; }
 
-  // Own criterion: max over the 4 prospective quadrants.
-  var maxCrit = 0f;
-  for (var qy = 0u; qy < 2u; qy++) {
-    for (var qx = 0u; qx < 2u; qx++) {
-      let cb = (byP * 2u + qy) * nbxChild + (bxP * 2u + qx);
-      maxCrit = max(maxCrit, childCriterion[cb]);
-    }
-  }
-  let eps = min(1.0f, log2(max(maxCrit, EPS_FLOOR)));
-
-  // Parent's own physical origin -- see header for the dense-vs-cached split.
-  let parentOrigin_L0 = parentOriginL0(bxP, byP);
-  let parentOriginX_L0 = parentOrigin_L0.x;
-  let parentOriginY_L0 = parentOrigin_L0.y;
-  // BUGFIX: center = origin + HALF the block's own physical width. The
-  // parent's own interior is 2*RB cells (not RB -- see amr_criterion_pool.
-  // wgsl's own header: "a parent slot's own interior is 2*RB x 2*RB
-  // cells"), each PARENT_CELL_SIZE_L0 wide, so the full physical width is
-  // 2*RB*PARENT_CELL_SIZE_L0 and the HALF-width is RB*PARENT_CELL_SIZE_L0
-  // -- RB is already "half the interior" by construction, so no further
-  // *0.5 belongs here. The previous "Milestone 10 BUGFIX" comment at this
-  // exact spot claimed to match amr_manage.wgsl's own (correct, already-
-  // validated) `bx*BLOCK+BLOCK/2u` convention but actually computed HALF
-  // of that (RB=BLOCK=8, PARENT_CELL_SIZE_L0=0.5 at m=1 numerically gives
-  // RB*dx*0.5=2, not BLOCK/2=4) -- a real, live-verified bug: candidates
-  // well within the geometric force-refine margin (phi as low as ~2
-  // against a ~4-unit margin) were STILL not getting their required
-  // level-(m+1) child, because THIS shader's own idea of "near the body"
-  // was evaluated 2 L0-units off from where amr_manage.wgsl (and every
-  // other shader's own chi/phi position, which all use the correct,
-  // unscaled-by-an-extra-0.5 physical center) actually place it.
-  let parentCenterX_L0 = parentOriginX_L0 + f32(RB) * PARENT_CELL_SIZE_L0;
-  let parentCenterY_L0 = parentOriginY_L0 + f32(RB) * PARENT_CELL_SIZE_L0;
+  // NO CRITERION AND NO GEOMETRY HERE. Both were still being computed at this
+  // point -- a max over the 4 prospective quadrants, its log2, the parent's
+  // origin and its centre -- and NOTHING below read any of it. B2-2d deleted
+  // the three tests that consumed them (the grandchild cascade, the
+  // hard-required split, the neighbour-active gate) and left the inputs
+  // behind. Dead since then; removed in B3-7 (plans/2D-backport.md).
+  //
+  // Legal WGSL and free at runtime (any compiler drops an unused `let`), which
+  // is exactly why it survived: the cost was that this function READ as though
+  // it still weighed the criterion, next to a 20-line BUGFIX comment about a
+  // centre it no longer computed for anything. Deleting a mechanism has to
+  // include deleting what fed it -- the same sweep B2-2d ran over the CHECKS
+  // should have run over the INPUTS.
 
   // The grandchild-cascade essay that stood here is in git history: two
   // separately live-verified index bugs in an 8-cell ring walk, and a
@@ -440,43 +386,27 @@ fn coarsen(@builtin(global_invocation_id) gid: vec3<u32>) {
   // see the binding-8 note above on why this is arithmetic rather than a read.
   if (slot % 4u != 0u) { return; }
 
-  let eps = min(1.0f, log2(max(childCriterion[u32(blockID)], EPS_FLOOR)));
-  // Geometric protection uses the PARENT's own center -- matching refine()'s
-  // isHardRequired/inSpongeBandAt test EXACTLY (same parentCenterX_L0/Y_L0
-  // derivation as that function), not this quad's own (quadrant-0) center
-  // as before.
+  // NO CRITERION AND NO GEOMETRY HERE EITHER, and for the same reason as
+  // refine() above -- this computed the child's eps, walked up to the parent
+  // slot, and derived the parent's centre, none of which anything below reads.
+  // Dead since B2-2d; removed in B3-7.
   //
-  // BUGFIX: using the quad's own center here let refine() and coarsen()
-  // disagree about whether the SAME quad qualifies as "near body," because
-  // they tested DIFFERENT points -- refine()'s isHardRequired decides for
-  // the WHOLE quad using the PARENT's center, but this function's old
-  // isNearBodyAt/inSpongeBandAt used quadrant-0's own center instead (up to
-  // half a parent-cell away). Live-verified: a parent phi=1.98 (comfortably
-  // under a 4-unit margin, hard-required) whose OWN quadrant-0 child center
-  // measured phi=4.56 (just OVER that same margin) -- refine() recreated
-  // the quad every fixed-point iteration (parent qualifies), coarsen()
-  // released it every iteration right after (quadrant-0 doesn't) -- a
-  // genuine create/destroy oscillation on EVERY evaluation, not a rare edge
-  // case. This starved amr_manage.wgsl's own L0->L1 cascade (checking
-  // hasLevel2Child) of ever observing the child in its "exists" state,
-  // since coarsen() (always releasing it) runs immediately before that
-  // cascade check in dispatch order every fixed-point iteration -- ground-
-  // truth confirmed via a temporary GPU-side instrumentation capture (not
-  // just static reasoning) that hasLevel2Child read false at every single
-  // one of 20 consecutive evaluations despite the child externally
-  // appearing active "most of the time." This was the actual mechanism
-  // behind a debugCheck21Balance violation that reproduced identically
-  // across thousands of steps, previously characterized only as "wake/
-  // criterion-driven... not yet root-caused."
-  let parentSlot = u32(childParentSlot[slot]);
-  let parentBlockID = parentSlotToBlock[parentSlot];
-  let bxP = u32(parentBlockID) % NBX_PARENT;
-  let byP = u32(parentBlockID) / NBX_PARENT;
-  let parentOrigin_L0 = parentOriginL0(bxP, byP);
-  let parentOriginX_L0 = parentOrigin_L0.x;
-  let parentOriginY_L0 = parentOrigin_L0.y;
-  let centerX_L0 = parentOriginX_L0 + f32(RB) * PARENT_CELL_SIZE_L0;
-  let centerY_L0 = parentOriginY_L0 + f32(RB) * PARENT_CELL_SIZE_L0;
+  // What that code was FOR is worth keeping, because it is the sharpest
+  // argument in this file for why the closure replaced it. refine() and
+  // coarsen() each ran their own geometric test, and for a while they ran it
+  // at DIFFERENT POINTS -- refine() at the parent's centre, coarsen() at
+  // quadrant 0's. Live-verified: a parent at phi=1.98 (well inside a 4-unit
+  // margin) whose own quadrant-0 centre measured phi=4.56 (just outside it).
+  // refine() recreated the quad every fixed-point iteration and coarsen()
+  // released it again immediately, a create/destroy oscillation on EVERY
+  // evaluation rather than a rare edge case -- and that starved the L0->L1
+  // cascade, which checked hasLevel2Child, of ever seeing the child exist
+  // (false at 20 of 20 consecutive evaluations, from a GPU-side capture).
+  // It was the mechanism behind a debugCheck21Balance violation that
+  // reproduced identically across thousands of steps.
+  //
+  // TWO FUNCTIONS DECIDING THE SAME THING SEPARATELY IS THE BUG CLASS. Now
+  // they both read one want array that one pass wrote.
 
   // Want-only, for the same reason refine() is: the closure guarantees a
   // wanted grandchild implies a wanted child, so a tile still needed as a
