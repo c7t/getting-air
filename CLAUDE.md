@@ -301,6 +301,20 @@ cylinder configs while missing every channel tolerance by 5-20x. The same
 document records how the previous fp16 answer came out wrong — an emulation
 the driver optimized away, with a control that could not detect that.
 
+**BUT NOT FOR A COARSE/FINE COUPLING CHANGE: THE ANALYTIC *AMR* CONFIGS
+REFINE NOTHING.** `channel-poiseuille-amr-N2`, `channel-couette-amr-N2`,
+`tgv-amr-N2` and `tgv-amr-N3` all hold ZERO active tiles at every level —
+measured with `debugListActiveBlocks` after 2048 steps, and deliberate on both
+pages (`main-channel-amr.js` defaults `autoRefine` OFF over a Couette
+wall-seam trigger; `main-tgv-amr.js` keeps thresholds that never fire at TGV's
+vorticity scale). `tgv-amr-N2` and `tgv-amr-N3` therefore print the IDENTICAL
+number, which is the tell. They gate the solver, not the seam: all four were
+bit-identical across B1's rescale flip, which moved the seam's momentum drift
+by 27x. For anything touching interp/average/ghosts, the instrument is
+`tools/analyze-amr-interface.js`'s conservation channel (plans/2D-backport.md
+B1, finding #1). A `*-amr-*` name in this suite does not by itself mean a run
+had an interface in it.
+
 `?f16=1|2` — real packed-half storage for `f` (`shaders/common_fpack.wgsl`,
 `f-pack.mjs`). Default 0 and byte-identical to the previous `array<f32>`
 layout. Measured NOT viable as a default; kept for re-measurement, not for

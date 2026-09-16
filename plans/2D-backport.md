@@ -312,6 +312,152 @@ reproducibility caveat honoured (same-build repeats, not a comparison against
 a number recorded in another session — dense stays bit-identical and is the
 strict check).
 
+### B1 — DONE (2026-09-15). The seam's momentum drift falls 27x.
+
+Two commits, staged the way B2-2b/c were: **B1-1** lands both factors behind
+`?dcpre=` with the default still on the legacy one (inert, and proved so),
+**B1-2** flips the default. A revert of the default does not take the
+mechanism, and the re-baselining change does not ride along with an inert one.
+
+**TWO SITES, ONE PER DIRECTION** — `shaders/common_interp.wgsl` and
+`common_average.wgsl`. This section was written against THREE files; B3-2
+collapsed the average pair into one body, so B1 turned out to be a two-line
+change where it was scoped as a sweep. That is B3 paying for itself in a stage
+that was planned before it.
+
+**THE MEASUREMENT, same build, one flag** (`tools/analyze-amr-interface.js`,
+N=128, tau=0.8, 512 steps):
+
+```
+                    ?dcpre=1 (legacy)      ?dcpre=0 (correct)
+  none  (no seam)   3.598e-5               3.598e-5   bit-identical
+  half  (real seam) 3.562e-1 = 3085x floor 1.302e-2 = 23.3x floor
+```
+
+**27.4x.** And `none` coming back BIT-IDENTICAL is what makes it evidence
+rather than a number: no interface, nothing to rescale, so the instrument is
+reading the seam and not the solver.
+
+**Three things worth carrying.**
+
+1. **THE ANALYTIC AMR GATES CANNOT SEE AN INTERFACE CHANGE, BECAUSE THEY DO
+   NOT REFINE.** `channel-poiseuille-amr-N2`, `channel-couette-amr-N2`,
+   `tgv-amr-N2` and `tgv-amr-N3` came back BIT-IDENTICAL across the flip
+   (9.0634e-4 / 8.0601e-4 / 3.0470e-4 / 1.3453e-4, and maxL2rel 1.3208e-3 on
+   both TGV rungs). Measured directly with `debugListActiveBlocks` after 2048
+   steps: **every one of them has ZERO active tiles at every level.** The
+   pages say so themselves and mean it — `main-channel-amr.js` defaults
+   `autoRefine` OFF (its header explains the Couette wall-seam trigger that
+   forced it), and `main-tgv-amr.js` keeps thresholds that deliberately never
+   fire at TGV's own vorticity scale. So `tgv-amr-N2 == tgv-amr-N3` exactly
+   because both are the same dense run.
+
+   This is not a defect in those pages; it is a defect in what the SUITE is
+   read to mean. **CLAUDE.md's "for any change to precision or storage layout
+   the analytic field checks are the gate" does NOT extend to a coarse/fine
+   COUPLING change** — there, the `*-amr-*` analytic configs are structurally
+   blind, and B0b's conservation channel is the only instrument in the tree
+   that is not. B6 needs to know this before it starts: its gate cannot be
+   these configs either.
+
+   **And it retro-invalidates one reading.** B2-2c cited
+   `channel-poiseuille-amr-N2` at "9.06e-4 against a 5.0e-3 tolerance" as the
+   analytic gate that stayed clean while Cd/St moved. That number is exactly
+   what a zero-tile dense run reads and has not changed through B1 either, so
+   it never had the power to say anything about a refinement-region change.
+   The CONCLUSION there still stands on the corner-balance and closure
+   evidence; the analytic corroboration does not.
+
+2. **NEAR tau = 0.5 THE TWO FACTORS AGREE TO ~2%, AND THAT IS WHY THIS
+   SHIPPED.** The difference is +0.6875 against -0.25 at tau = 0.8 — magnitude
+   and sign — but the card page runs tau ~ 0.5044 and the cylinder ~ 0.5256,
+   where they differ by a couple of percent. So the pages carrying a number
+   could barely see it, and the pages whose tau would have made it obvious
+   were the ones that do not refine. A defect can be simultaneously enormous
+   and invisible if the configurations that would show it are the ones nobody
+   scores.
+
+3. **MASS MOVED, THOUGH `fneq` HAS NO ZEROTH MOMENT.** B0b predicted this
+   rescale could not touch mass, and on the seam rung it did: -2.256e-8 per
+   cell/step (ratio -1.974 against the lattice-weight floor, WRONG-SIGNED)
+   under the legacy factor, 7.546e-9 (0.660) under the correct one. The
+   prediction is right about the direct route and incomplete: the seam has no
+   flux correction, so a corrupted stress changes the flow, and a different
+   flow leaks a different amount of mass through it. The channel separation
+   ("mass drifts -> weights, momentum drifts -> coupling") is a statement
+   about FIRST-ORDER routes, not an exclusion.
+
+   Related, and a caveat on the tool: the `all` rung is NOT a clean
+   no-interface control for this change. Its total is read off the dense L0
+   grid, whose content under full refinement IS the restriction this factor
+   scales — and its refined fraction itself moved (100% -> 98%), because the
+   criterion reads a field the factor changes. `none` is the control here.
+
+**TAU = 1 IS REFUSED.** At omega = 1 the post-collision populations ARE the
+equilibrium, so no post-collision transfer can recover the stress, and the
+closed form says so as 0/0. Level m is singular at `tau_0 = 1/2 + 2^-(m+1)`,
+which puts `?tau=1` and `?tau=0.75` on channel/TGV squarely on it and
+`tau_0 = 0.5625` — inside `index-amr.html`'s OWN slider range — on level 3.
+`amr2d.mjs`'s `tauChainSingularity` is the rule; the guard sits inside
+`updateLevelParams()`, the one place a per-level tau reaches the GPU, so init
+and every live TAU/RE control are covered by ONE check. Three call sites were
+reordered so it runs BEFORE the L0 tau write — otherwise a refused change
+still leaves L0 on the new tau with every finer level on the old one, which is
+the silent degradation the guard exists to prevent.
+
+**And the refusal is gated BOTH WAYS**, which B4-4's rule asks for and which
+one config cannot do: `refuse-tau-unity` (`?levels=2&tau=0.75`) requires it to
+fire, and `tau-unity-ok-under-dcpre` (the same URL plus `?dcpre=1`) requires
+the page to BOOT. The singularity belongs to the post-collision form alone, so
+without the negative half a guard that simply banned tau near 1 outright would
+look identical. Note also that the value the USER types is not the value that
+is singular — L0 at 0.75 is ordinary, level 1 is the problem — so a guard that
+checked only L0 would pass the gating config.
+
+**THE HOST STATEMENT, and the route that makes it evidence.** `amr2d.mjs`
+carries both pairs and `tools/test-amr2d.js` scores them against an
+INDEPENDENT ROUTE — compose BGK post-collision, the textbook pre-collision
+relation, and BGK again — rather than restating the algebra alongside them,
+which would have proved nothing about a closed form that had already survived
+for years. Five plausible slips are mutation-checked, including the historical
+one. Both WGSL forms are lifted out of the shader source and evaluated against
+the host's, because a host module that is right while the WGSL is wrong buys
+nothing; a failed extraction FAILS rather than skips. Both new gates were made
+to fail before being trusted.
+
+**THE RE-BASELINE.** Two full sweeps on the flipped default, reproducing each
+other EXACTLY on all five configs — the same-build repeat this plan's Risk #1
+demands, so these moves are real and not the free list:
+
+```
+                      legacy            post-collision     move
+  dense-reference     1.951 / 0.1260    1.951 / 0.1260     none (no transfer)
+  amr-N2-diffuse      1.642 / 0.1477    1.631 / 0.1466    -0.011 / -0.0011
+  amr-N2-bounceback   1.321 / 0.1617    1.343 / 0.1624    +0.022 / +0.0007
+  amr-N3-diffuse      1.425 / 0.1551    1.463 / 0.1565    +0.038 / +0.0014
+  amr-N3-bounceback   1.351 / 0.1616    1.348 / 0.1627    -0.003 / +0.0011
+```
+
+Verdicts unchanged: the same two standing red cells and no others, all seven
+invariant gates OK at every checkpoint, every boot smoke and every refusal
+config PASS. **St rose on all four AMR configs**, i.e. toward the literature
+0.165 in every case, while Cd moved both ways — consistent with a stress
+coupling that was wrong at the seam rather than a systematic bias. Do not read
+more into the Cd column than that: these are still time-averaged surface
+integrals, and finding #1 above is the reminder that the suite's analytic half
+was not watching.
+
+**`dense-reference` bit-identical across the flip** is the strict check doing
+its job — that page has no coarse/fine transfer at all, so a move there would
+have meant the change had escaped its blast radius.
+
+**One process note.** A mid-sweep `refuse-pool-exhausted` FAIL ("the page kept
+running (status "initializing...")") did not reproduce in isolation or on the
+repeat sweep, and is recorded here as a flake rather than quietly dropped.
+Separately, `pgrep -f "validate-all.js …"` matches ITS OWN shell's command
+line, so a waiter built on it never exits and reports a finished sweep as
+still running — use the log's mtime or a pid captured at launch.
+
 ### B2-1 — the before-number — DONE (2026-09-14)
 
 `debugCheckRefinementClosure` on all five AMR pages runs `cascade21` against
@@ -2168,6 +2314,16 @@ DESTINATION** — and every one of its hard-won details is 2D-applicable:
   whose result is discarded. 2D needs a pinned partially-refined control
   config, the way `amr-box-RB4` is pinned to `interp` in 3D — and it must stay
   pinned, because a control that tracks the default is not a control.
+- **AND NEITHER CAN A RUN THAT REFINES NOTHING, WHICH IS WHAT THE SUITE'S
+  ANALYTIC AMR CONFIGS ACTUALLY DO.** B1's finding #1: all four of
+  `channel-poiseuille-amr-N2`, `channel-couette-amr-N2`, `tgv-amr-N2` and
+  `tgv-amr-N3` hold ZERO active tiles at every level, by their pages' own
+  deliberate defaults. They were bit-identical across B1's flip for that
+  reason, not because the change was small. **Do not reach for them as B6's
+  gate.** Making them useful means turning refinement on there, which
+  `main-channel-amr.js`'s header says is currently unsafe for Couette — so
+  that is its own piece of work, and it is a prerequisite if B6 wants an
+  analytic answer rather than only a conservation one.
 - **A stage that measures as a no-op may be downstream of something bigger.**
   3D's linear explosion measured as noise against an interface that still had
   an O(1) edge inconsistency; with that fixed the same change was worth a
@@ -2428,7 +2584,10 @@ B2-2d delete the ?cascade=0 path (16 -> 14),       ◄── DONE; corner balanc
       corner balance GATES                              now gates, and B3's
                                                         manage pair is a
                                                         refactor not a rewrite
-B2   cascade21                                     ◄── needs B0
+B2   cascade21                                     ◄── DONE, via B2-1..B2-2d
+                                                        above; the per-pass
+                                                        path is deleted, not
+                                                        merely superseded
 B3-1 step1: one kernel, every level               ◄── DONE, bit-identical
 B3-2 average: one body, two parent fragments      ◄── DONE, bit-identical
 B3-3 interp: kernel + two parent fragments        ◄── DONE, bit-identical
@@ -2445,10 +2604,20 @@ B5   window = sponge translation                    ◄── DONE. One conventi
                                                         claim retired (B5-4);
                                                         lbm_force's DISPATCH is
                                                         the one named residual.
-B1   post-collision rescale                         ◄── needs B0b only; its
-                                                        channel is MOMENTUM, so
-                                                        it does not wait for B9
+B1   post-collision rescale                         ◄── DONE. Seam momentum
+                                                        drift 3085x floor ->
+                                                        23.3x, one flag, one
+                                                        build. tau=1 refused,
+                                                        gated both ways. And
+                                                        the analytic AMR gates
+                                                        turn out to refine
+                                                        NOTHING -- read B1's
+                                                        finding #1 before
+                                                        trusting them for B6.
 B6   explode/coalesce                               ◄── needs B0b, B1, B3, B4
+                                                        -- B1 is now done, so
+                                                        B6 is unblocked and is
+                                                        the only stage left
 ```
 
 B4, B7 and B8 are deliberately first among the real changes: each is small,

@@ -100,7 +100,7 @@ const F16 = urlParams.has('f16') ? (parseInt(urlParams.get('f16')) || 0) : 0;
 // reconstructed from a checkout -- the same reason ?ghostcopy= and ?f16= are
 // still here. It also has no tau = 1 singularity, so it is the escape hatch
 // the refusal names.
-const DC_PRE = urlParams.has('dcpre') ? (parseInt(urlParams.get('dcpre')) || 0) : 1;
+const DC_PRE = urlParams.has('dcpre') ? (parseInt(urlParams.get('dcpre')) || 0) : 0;
 
 // ── ?ghostcopy=1 -- legacy materialized same-level ghost cells ───────────────
 // Default 0: the fine step resolves a source cell that falls outside its tile

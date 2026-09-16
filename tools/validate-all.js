@@ -183,6 +183,27 @@ function defaultConfigs(baseUrl) {
       checkBoots: true,
       expectError: /geometry-forced refinement REFUSED/i,
     },
+    {
+      // tau = 1 makes the post-collision coarse<->fine transfer 0/0
+      // (plans/2D-backport.md B1). ?tau=0.75 puts LEVEL 1 exactly on it while
+      // L0 itself is perfectly ordinary -- which is the case worth gating,
+      // because the value the user typed is not the value that is singular,
+      // and a guard that only looked at L0 would pass this.
+      name: 'refuse-tau-unity',
+      url: `${baseUrl}/index-tgv-amr.html?levels=2&tau=0.75`,
+      checkBoots: true,
+      expectError: /at level 1 is within .* of 1/i,
+    },
+    {
+      // ...and the same config with the legacy factor selected must BOOT.
+      // The singularity belongs to the post-collision form alone, so refusing
+      // it under ?dcpre=1 would be refusing a configuration that works. This
+      // is the negative half of the gate above: without it, a guard that
+      // simply banned tau near 1 outright would look identical.
+      name: 'tau-unity-ok-under-dcpre',
+      url: `${baseUrl}/index-tgv-amr.html?levels=2&tau=0.75&dcpre=1`,
+      checkBoots: true,
+    },
     // index-amr.html under the structural-invariant sweep. This is the page
     // the project SHIPS, it defaults to levels=3, and until now the sweep
     // only ever drove window.__CYL -- so the falling-card page's own 2:1
