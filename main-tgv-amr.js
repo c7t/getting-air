@@ -59,6 +59,7 @@
 // to avoid.
 
 import { reportFatal, refuseConfig, reportNoWebGPU, reportNoAdapter } from './error-overlay.mjs';
+import { tauChainSingularity, tauSingularityMessage } from './amr2d.mjs';
 import { loadShader } from './shader-loader.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
 import { check21BalanceOnGPU, readConservedTotals, allocLevelPool, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState , checkRefinementClosureOnGPU , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU } from './amr2d-gpu.mjs';
@@ -83,6 +84,23 @@ const urlParams = new URLSearchParams(window.location.search);
 // covered ground it never touched, which is the kind of false confidence
 // this repo has been bitten by before.
 const F16 = urlParams.has('f16') ? (parseInt(urlParams.get('f16')) || 0) : 0;
+
+// ── ?dcpre=1 -- the legacy PRE-collision Dupuis-Chopard transfer factor ──────
+// The coarse<->fine transfers rescale the non-equilibrium part of f, and the
+// factor that shipped here until plans/2D-backport.md B1 was the textbook
+// PRE-collision one -- while every buffer this solver transfers holds f AFTER
+// collision, because amr_step.wgsl is a fused pull-stream + collide. At this
+// page's default tau = 0.8 the two differ in magnitude AND SIGN (+0.6875
+// against -0.25), which is why the analytic decay gate here -- not a Cd/St
+// average -- is the instrument that can see it. amr2d.mjs's
+// dcRescaleCoarseToFine carries the derivation and tools/test-amr2d.js gates
+// both forms.
+//
+// Both factors live in one build so the defect can be RE-MEASURED rather than
+// reconstructed from a checkout -- the same reason ?ghostcopy= and ?f16= are
+// still here. It also has no tau = 1 singularity, so it is the escape hatch
+// the refusal names.
+const DC_PRE = urlParams.has('dcpre') ? (parseInt(urlParams.get('dcpre')) || 0) : 1;
 
 // ── ?ghostcopy=1 -- legacy materialized same-level ghost cells ───────────────
 // Default 0: the fine step resolves a source cell that falls outside its tile
@@ -421,6 +439,11 @@ async function init() {
     device.queue.writeBuffer(pool.levelParamsBuf, 0, staticBuf);
   }
   function updateLevelParams() {
+    // tau = 1 IS A REAL SINGULARITY for the post-collision transfer -- refuse
+    // it, do not divide by it. See amr2d.mjs's tauChainSingularity. Reachable
+    // here by hand: ?tau=0.75 puts level 1 exactly on 1, and ?tau=1 level 0.
+    const sing = DC_PRE === 0 ? tauChainSingularity(TAU, N_LEVELS) : null;
+    if (sing) refuseConfig(statusEl, tauSingularityMessage(sing));
     for (let c = 1; c < N_LEVELS; c++) {
       device.queue.writeBuffer(pools[c].levelParamsBuf, 8, new Float32Array([tauAtLevel(c - 1)]));
     }
@@ -558,11 +581,11 @@ async function init() {
   const fineConstants = { W, H, RB };
   // Split from fineConstants, which also drives the render fragment --
   // render.wgsl has no F16 override and WebGPU rejects an undeclared one.
-  const avgConstants = { W, H, RB, F16 };
+  const avgConstants = { W, H, RB, F16, DC_PRE };
 
-  const interpConstants = { W, H, RB, GHOST_ONLY: 1, F16 };
-  const interpInitConstants = { W, H, RB, GHOST_ONLY: 0, F16 };
-  const interpFFConstants = { W, H, RB, GHOST_ONLY: 1, FINE_FINE_ONLY: 1, F16 };
+  const interpConstants = { W, H, RB, GHOST_ONLY: 1, F16, DC_PRE };
+  const interpInitConstants = { W, H, RB, GHOST_ONLY: 0, F16, DC_PRE };
+  const interpFFConstants = { W, H, RB, GHOST_ONLY: 1, FINE_FINE_ONLY: 1, F16, DC_PRE };
   const step1Constants = { ...stepConstants, RB, DIRECT_GHOST: GHOST_COPY ? 0 : 1 };
   const criterionConstants = { W, H };
   const manageConstants = { DIAG, W, H, REFINE_THRESH, COARSEN_THRESH, FORCE_REFINE_MARGIN, FORCE_REFINE_LOOKAHEAD, HAS_BODY: 0  };
@@ -594,9 +617,9 @@ async function init() {
     layout: device.createPipelineLayout({ bindGroupLayouts: [interpBGL] }),
     compute: { module: interpDenseSM, entryPoint: 'main', constants: interpFFConstants }
   });
-  const interpPoolConstants = { RB, GHOST_ONLY: 1, F16 };
-  const interpPoolInitConstants = { RB, GHOST_ONLY: 0, F16 };
-  const interpPoolFFConstants = { RB, GHOST_ONLY: 1, FINE_FINE_ONLY: 1, F16 };
+  const interpPoolConstants = { RB, GHOST_ONLY: 1, F16, DC_PRE };
+  const interpPoolInitConstants = { RB, GHOST_ONLY: 0, F16, DC_PRE };
+  const interpPoolFFConstants = { RB, GHOST_ONLY: 1, FINE_FINE_ONLY: 1, F16, DC_PRE };
   const interpPoolParentPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [interpPoolParentBGL] }),
     compute: { module: interpPoolSM, entryPoint: 'main', constants: interpPoolConstants }
@@ -615,7 +638,7 @@ async function init() {
   });
   const avgPoolPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [avgPoolBGL] }),
-    compute: { module: avgPoolSM, entryPoint: 'main', constants: { RB, F16 } }
+    compute: { module: avgPoolSM, entryPoint: 'main', constants: { RB, F16, DC_PRE } }
   });
   const criterionPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [criterionBGL] }),

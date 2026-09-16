@@ -33,7 +33,7 @@ import { check21BalanceOnGPU, allocLevelPool, readPoolIndirection as readPoolInd
 // loop is VACUOUS at the levels=2 default every one of them ships. See
 // plans/2D-backport.md B4.
 import { tauAtLevel as tauAtLevelOf } from './card-params.mjs';
-import { poolSlotsFor } from './amr2d.mjs';
+import { poolSlotsFor, tauChainSingularity, tauSingularityMessage } from './amr2d.mjs';
 import { EX, EY, WT } from './lattice-2d.mjs';
 import { makeCanvasFit } from './canvas-fit.mjs';
 
@@ -95,6 +95,22 @@ const SOLID_EQ = urlParams.has('solideq') ? (parseInt(urlParams.get('solideq')) 
 // records that this page's Cd/St is NOT the gate for a precision change -- the
 // analytic channel/tgv field checks are.
 const F16 = urlParams.has('f16') ? (parseInt(urlParams.get('f16')) || 0) : 0;
+
+// ── ?dcpre=1 -- the legacy PRE-collision Dupuis-Chopard transfer factor ──────
+// The coarse<->fine transfers rescale the non-equilibrium part of f, and the
+// factor that shipped here until plans/2D-backport.md B1 was the textbook
+// PRE-collision one -- while every buffer this solver transfers holds f AFTER
+// collision, because amr_step.wgsl is a fused pull-stream + collide. At
+// tau = 0.8 the two differ in magnitude AND SIGN. amr2d.mjs's
+// dcRescaleCoarseToFine carries the derivation and tools/test-amr2d.js gates
+// both forms; shaders/common_interp.wgsl and common_average.wgsl are the two
+// sites, one per direction.
+//
+// Both factors live in one build so the defect can be RE-MEASURED rather than
+// reconstructed from a checkout -- the same reason ?ghostcopy= and ?f16= are
+// still here. It also has no tau = 1 singularity, so it is the escape hatch
+// the refusal names.
+const DC_PRE = urlParams.has('dcpre') ? (parseInt(urlParams.get('dcpre')) || 0) : 1;
 
 // ── ?ghostcopy=1 -- legacy materialized same-level ghost cells ───────────────
 // Default 0: the fine step resolves a source cell that falls outside its tile
@@ -914,6 +930,13 @@ async function init() {
     device.queue.writeBuffer(pool.levelParamsBuf, 0, staticBuf);
   }
   function updateLevelParams() {
+    // tau = 1 IS A REAL SINGULARITY for the post-collision transfer -- refuse
+    // it, do not divide by it. See amr2d.mjs's tauChainSingularity. Here
+    // rather than at module scope because this is the one place a per-level
+    // tau reaches the GPU: init and every ?re= / setRe change funnel through
+    // it, so one guard covers both.
+    const sing = DC_PRE === 0 ? tauChainSingularity(TAU, N_LEVELS) : null;
+    if (sing) refuseConfig(statusEl, tauSingularityMessage(sing));
     for (let c = 1; c < N_LEVELS; c++) {
       device.queue.writeBuffer(pools[c].levelParamsBuf, 8, new Float32Array([tauAtLevel(c - 1)])); // level c's parent is level c-1
     }
@@ -927,8 +950,11 @@ async function init() {
   function setRe(re) {
     RE = re;
     TAU = tauFromRe(RE);
-    device.queue.writeBuffer(cardStateBuf, 19 * 4, new Float32Array([TAU]));
+    // BEFORE the L0 tau write, not after: the guard inside throws, and a
+    // half-applied change (L0 on the new tau, every finer level still on the
+    // old one) is exactly the silent degradation it exists to prevent.
     updateLevelParams(); // TAU changed -- every level's recursive tau shifts too
+    device.queue.writeBuffer(cardStateBuf, 19 * 4, new Float32Array([TAU]));
     return { RE, TAU };
   }
 
@@ -1183,14 +1209,14 @@ async function init() {
   // Split from fineConstants: that one also drives the render fragment,
   // whose module has no F16 override, and WebGPU makes passing an
   // undeclared override a pipeline-creation error.
-  const avgConstants = { W, H, RB, F16 };
+  const avgConstants = { W, H, RB, F16, DC_PRE };
   // GHOST_ONLY=1: steady-state ghost-only reinterpolation (every macro-step).
   // GHOST_ONLY=0: full-slot fill, used once on block activation (see debugActivateBlock).
-  const interpConstants = { W, H, RB, GHOST_ONLY: 1, F16 };
-  const interpInitConstants = { W, H, RB, GHOST_ONLY: 0, F16 };
+  const interpConstants = { W, H, RB, GHOST_ONLY: 1, F16, DC_PRE };
+  const interpInitConstants = { W, H, RB, GHOST_ONLY: 0, F16, DC_PRE };
   // Between-substep fine-fine-only ghost re-exchange (see amr_interp_c2f.wgsl's
   // FINE_FINE_ONLY note and the dispatch between f1a/f1b below).
-  const interpFFConstants = { W, H, RB, GHOST_ONLY: 1, FINE_FINE_ONLY: 1, F16 };
+  const interpFFConstants = { W, H, RB, GHOST_ONLY: 1, FINE_FINE_ONLY: 1, F16, DC_PRE };
   // Fine step(s) also need the freestream sponge target (see amr_step1*.wgsl's
   // SPONGE_UX/UY -- both L1's dedicated file and the level>=2 shared one have
   // their own copy of the sponge, not shared with the coarse kernel).
@@ -1240,9 +1266,9 @@ async function init() {
   // runtime uniform (levelParams), not baked into the pipeline, precisely
   // so ONE compiled pipeline object is reusable across every L(m)->L(m+1)
   // pair (see shaders/amr_interp_pool_parent.wgsl's header).
-  const interpPoolConstants = { RB, GHOST_ONLY: 1, F16 };
-  const interpPoolInitConstants = { RB, GHOST_ONLY: 0, F16 };
-  const interpPoolFFConstants = { RB, GHOST_ONLY: 1, FINE_FINE_ONLY: 1, F16 };
+  const interpPoolConstants = { RB, GHOST_ONLY: 1, F16, DC_PRE };
+  const interpPoolInitConstants = { RB, GHOST_ONLY: 0, F16, DC_PRE };
+  const interpPoolFFConstants = { RB, GHOST_ONLY: 1, FINE_FINE_ONLY: 1, F16, DC_PRE };
   const interpPoolParentPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [interpPoolParentBGL] }),
     compute: { module: interpPoolSM, entryPoint: 'main', constants: interpPoolConstants }
@@ -1270,7 +1296,7 @@ async function init() {
   });
   const avgPoolPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [avgPoolBGL] }),
-    compute: { module: avgPoolSM, entryPoint: 'main', constants: { RB, F16 } }
+    compute: { module: avgPoolSM, entryPoint: 'main', constants: { RB, F16, DC_PRE } }
   });
   // Milestone 8: level 1's own force pass. HAS_CHILD is baked in at
   // pipeline-creation time -- level 1 has exactly one dedicated pipeline

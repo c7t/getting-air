@@ -5,7 +5,7 @@
 // plans/2D-backport.md B3-3.
 //
 // NOT TO BE CONFUSED WITH common_interp.wgsl, which is the BLEND
-// (`CoarseSample`, `dupuisChopardRescale`, `interpCoarseToFine`) and is shared
+// (`CoarseSample`, `dcRescaleCoarseToFine`, `interpCoarseToFine`) and is shared
 // more widely than this pair -- the ghost-free work (plans/ghost-free.md)
 // needs the STEP kernels to run that same reconstruction inline. This file is
 // the kernel around it; that one is the math inside it. Hence the two names.

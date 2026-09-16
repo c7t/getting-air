@@ -38,10 +38,32 @@
 //
 // rho: simple arithmetic mean of the 4 children (exactly mass-conservative).
 // Velocity: mass-weighted average (momentum-conservative). Non-equilibrium
-// part: inverse-Dupuis-Chopard-rescaled by tau_coarse/tau_fine (see
-// common_interp.wgsl's `dupuisChopardRescale` for the forward direction).
+// part: inverse-Dupuis-Chopard-rescaled by dcRescaleFineToCoarse below (see
+// common_interp.wgsl's `dcRescaleCoarseToFine` for the forward direction).
 
 override RB : u32;
+
+// ── ?dcpre=1 -- the legacy PRE-collision Dupuis-Chopard factor ──────────────
+// See common_interp.wgsl's DC_PRE for the derivation; this is the same switch
+// on the fine->coarse (restriction) side, and the two forms below are EXACT
+// inverses of the two there. Default 0 = post-collision = correct.
+override DC_PRE : u32 = 0u;
+
+// Inverse of common_interp.wgsl's dcRescaleCoarseToFine.
+//
+// The PRE-collision form is (tau_coarse/tau_fine) * (dx_coarse/dx_fine) =
+// (tau_coarse/tau_fine) * n with n=2 -- the per-cell velocity gradient
+// doubles going to the coarser grid, so fneq is scaled up by n. The
+// POST-collision form is what this solver actually needs, because both sides
+// of this transfer hold f after collision (amr_step.wgsl is a fused
+// pull-stream + collide). amr2d.mjs's dcRescaleFineToCoarse is the host
+// statement; tools/test-amr2d.js asserts the two directions multiply to 1 to
+// within one ulp, which is the property that makes a round trip through the
+// interface inert.
+fn dcRescaleFineToCoarse(tauCoarse: f32, tauFine: f32) -> f32 {
+  if (DC_PRE != 0u) { return 2.0f * tauCoarse / tauFine; }
+  return 2.0f * (tauCoarse - 1.0f) / (tauFine - 1.0f);
+}
 // ── Measurement instrument: ?benchSkip=<group>-noop ──────────────────────────
 // Returns before touching any buffer, so the pass is still encoded and
 // dispatched at full width but does no work. Skipping the pass ENTIRELY vs.
@@ -120,14 +142,10 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wgi
 
   // The parent's own tau, which is NOT L0's at every level -- see the
   // accessor note in this file's header, and common_interp.wgsl's
-  // dupuisChopardRescale for the same point in the forward direction.
+  // dcRescaleCoarseToFine for the same point in the forward direction.
   let tau_coarse = parentTau();
   let tau_fine = 2.0f * tau_coarse - 0.5f;
-  // Inverse of the coarse->fine rescale: the fine->coarse factor is
-  // (tau_coarse/tau_fine) * (dx_coarse/dx_fine) = (tau_coarse/tau_fine) * n,
-  // with refinement ratio n=2. The per-cell velocity gradient doubles going to
-  // the coarser grid, so fneq must be scaled up by n.
-  let rescale = 2.0f * tau_coarse / tau_fine;
+  let rescale = dcRescaleFineToCoarse(tau_coarse, tau_fine);
 
   var fneq_avg: array<f32, 9>;
   for (var i = 0u; i < 9u; i++) {

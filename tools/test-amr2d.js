@@ -76,6 +76,9 @@ const sorted = (s) => [...s].sort();
     resolveSource, toGlobalFine, fromGlobalFine, storageRatio,
     check21Balance, checkRingParentCoverage, checkGeometryCoverage, cascade21,
     SQRT2_UP, BLOCK_BB_DEPTH, quadrantOfSlot,
+    dcRescaleCoarseToFine, dcRescaleFineToCoarse,
+    dcRescaleCoarseToFinePre, dcRescaleFineToCoarsePre,
+    tauChainSingularity, tauSingularityMessage, TAU_UNITY_BAND,
   } = A;
 
   // ── pool geometry ────────────────────────────────────────────────────────
@@ -1143,6 +1146,173 @@ const sorted = (s) => [...s].sort();
     const centreR = checkGeometryCoverage(BASE, sets, nearBodyWantCentre(sdf, margin), { levels });
     assert.ok(centreR.required <= r.required,
       'the centre predicate demanded MORE tiles than the box predicate -- impossible');
+  });
+
+  // ── the Dupuis-Chopard transfer factor (plans/2D-backport.md B1) ──────────
+  //
+  // Rule 1, THE INDEPENDENT ROUTE, matters more here than anywhere else in
+  // this file, because the defect being fixed was a plausible-looking closed
+  // form that had survived for years. Re-deriving the same algebra alongside
+  // it would prove nothing. So the route below COMPOSES THREE ELEMENTARY
+  // FACTS instead -- BGK post-collision, the textbook PRE-collision
+  // Dupuis-Chopard relation, and BGK again at the finer level -- and never
+  // writes the answer down:
+  //
+  //   fneq*_c  = (1 - 1/tau_c) * q         decollide is its inverse
+  //   q_f      = (1/2)(tau_f/tau_c) * q    the relation, PRE-collision
+  //   fneq*_f  = (1 - 1/tau_f) * q_f
+  //
+  // The claimed factor is fneq*_f / fneq*_c, for an arbitrary pre-collision
+  // q. Agreement is then evidence, not a tautology.
+  const routePost = (tauC, tauF, q = 0.137) => {
+    const fneqPostC = (1 - 1 / tauC) * q;          // BGK at the coarse level
+    const qF = 0.5 * (tauF / tauC) * q;            // Dupuis-Chopard, PRE
+    const fneqPostF = (1 - 1 / tauF) * qF;         // BGK at the fine level
+    return fneqPostF / fneqPostC;
+  };
+  const TAU_CASES = [0.51, 0.55, 0.6, 0.7, 0.8, 0.9, 1.2, 1.7, 2.5];
+  const tauPair = (tauC) => [tauC, 2 * tauC - 0.5];
+
+  ok('dcRescaleCoarseToFine matches decollide -> PRE -> recollide', () => {
+    for (const tauC of TAU_CASES) {
+      const [c, f] = tauPair(tauC);
+      close(dcRescaleCoarseToFine(c, f), routePost(c, f), 1e-12, `tau_c=${c}`);
+      // and it does not depend on the q the route was probed with.
+      close(routePost(c, f, 1), routePost(c, f, -7.25), 1e-12, `q-dependence at tau_c=${c}`);
+    }
+  });
+
+  ok('dcRescaleFineToCoarse is the exact inverse', () => {
+    for (const tauC of TAU_CASES) {
+      const [c, f] = tauPair(tauC);
+      const p = dcRescaleCoarseToFine(c, f) * dcRescaleFineToCoarse(c, f);
+      // One ulp, not zero: the two are algebraically reciprocal but each is
+      // evaluated as its own division. A round trip through the interface is
+      // inert to that, which is the property being claimed.
+      assert.ok(Math.abs(p - 1) <= 2 * Number.EPSILON,
+        `round trip at tau_c=${c} came back ${p}`);
+    }
+  });
+
+  ok('the legacy pair is the PRE-collision relation, and is also an inverse pair', () => {
+    for (const tauC of TAU_CASES) {
+      const [c, f] = tauPair(tauC);
+      close(dcRescaleCoarseToFinePre(c, f), 0.5 * f / c, 1e-15, `pre c2f at tau_c=${c}`);
+      const p = dcRescaleCoarseToFinePre(c, f) * dcRescaleFineToCoarsePre(c, f);
+      assert.ok(Math.abs(p - 1) <= 2 * Number.EPSILON, `pre round trip at tau_c=${c}`);
+    }
+  });
+
+  ok('the two factors differ in MAGNITUDE AND SIGN at tau = 0.8', () => {
+    // The number plans/2D-backport.md B1 quotes, and the reason this is not a
+    // refinement of the old factor: at the channel/TGV default they do not
+    // even agree on which way the non-equilibrium stress points.
+    close(dcRescaleCoarseToFine(0.8, 1.1), -0.25, 1e-12, 'post at tau=0.8');
+    close(dcRescaleCoarseToFinePre(0.8, 1.1), 0.6875, 1e-12, 'pre at tau=0.8');
+    // ...and near tau = 0.5, where the card and cylinder pages live, they
+    // very nearly agree. That is WHY this shipped: the pages with a Cd/St
+    // number could barely see it.
+    const [c, f] = tauPair(0.5044);
+    assert.ok(Math.abs(dcRescaleCoarseToFine(c, f) / dcRescaleCoarseToFinePre(c, f) - 1) < 0.02,
+      'the two factors were expected to agree to ~2% near tau=0.5');
+  });
+
+  // Rule 2, MUTATION-CHECK. Each of these is a slip someone could plausibly
+  // make (or did): dropping the 1/n, the direction reversed, the historical
+  // pre-collision form, and a sign slip on the shift.
+  ok('plausible slips in the factor are all caught by the independent route', () => {
+    const mutants = {
+      'dropped the 1/n': (c, f) => (f - 1) / (c - 1),
+      'direction reversed': (c, f) => 0.5 * (c - 1) / (f - 1),
+      'the historical PRE-collision form': (c, f) => 0.5 * f / c,
+      'shift sign slipped': (c, f) => 0.5 * (f + 1) / (c + 1),
+      'shifted only the numerator': (c, f) => 0.5 * (f - 1) / c,
+    };
+    for (const [name, m] of Object.entries(mutants)) {
+      const caught = TAU_CASES.some((tauC) => {
+        const [c, f] = tauPair(tauC);
+        return Math.abs(m(c, f) - routePost(c, f)) > 1e-9;
+      });
+      assert.ok(caught, `mutant "${name}" was NOT caught at any tau in the sweep`);
+    }
+  });
+
+  // AGREEMENT WITH THE SHADER, which is the thing actually at risk -- the
+  // same reason tools/test-f-pack.js re-implements common_fpack.wgsl's
+  // addressing rather than only checking the host against itself. A host
+  // module that is right while the WGSL is wrong buys nothing: the GPU does
+  // every transfer. So both WGSL forms are lifted out of the shader source
+  // and evaluated against the host's.
+  //
+  // A FAILED EXTRACTION IS A FAILURE, NOT A SKIP. This project has collected
+  // four gates that silently became vacuous; a regex that stops matching
+  // after an innocuous edit is exactly that shape, so it fails loudly and
+  // the next person re-points it.
+  const wgslReturns = (file, fnName) => {
+    const src = require('fs').readFileSync(path.join(__dirname, '..', 'shaders', file), 'utf8');
+    const fn = new RegExp(`fn ${fnName}\\([^)]*\\)\\s*->\\s*f32\\s*\\{([\\s\\S]*?)\\n\\}`).exec(src);
+    assert.ok(fn, `could not find fn ${fnName} in shaders/${file} -- re-point this extraction`);
+    const rets = [...fn[1].matchAll(/return ([^;]+);/g)].map((m) => m[1]);
+    assert.strictEqual(rets.length, 2,
+      `expected exactly 2 returns in ${fnName} (DC_PRE branch, then default), got ${rets.length}`);
+    // WGSL f32 literals (0.5f, 1.0f) -> JS numbers. Nothing else in these
+    // expressions differs from JS.
+    return rets.map((e) => new Function('tauCoarse', 'tauFine',
+      `return ${e.replace(/(\d)f\b/g, '$1')};`));
+  };
+
+  ok('shaders/common_interp.wgsl states the same two coarse->fine factors', () => {
+    const [pre, post] = wgslReturns('common_interp.wgsl', 'dcRescaleCoarseToFine');
+    for (const tauC of TAU_CASES) {
+      const [c, f] = tauPair(tauC);
+      close(post(c, f), dcRescaleCoarseToFine(c, f), 1e-12, `WGSL post at tau_c=${c}`);
+      close(pre(c, f), dcRescaleCoarseToFinePre(c, f), 1e-12, `WGSL pre at tau_c=${c}`);
+    }
+  });
+
+  ok('shaders/common_average.wgsl states the same two fine->coarse factors', () => {
+    const [pre, post] = wgslReturns('common_average.wgsl', 'dcRescaleFineToCoarse');
+    for (const tauC of TAU_CASES) {
+      const [c, f] = tauPair(tauC);
+      close(post(c, f), dcRescaleFineToCoarse(c, f), 1e-12, `WGSL post at tau_c=${c}`);
+      close(pre(c, f), dcRescaleFineToCoarsePre(c, f), 1e-12, `WGSL pre at tau_c=${c}`);
+    }
+  });
+
+  // Rule 3, RUN THE CHECKER ON INPUTS THAT VIOLATE THE INVARIANT.
+  ok('tauChainSingularity finds the singular level, and only when there is one', () => {
+    // tau_m = 1 exactly when tau_0 = 1/2 + 2^-(m+1). Every one of these is a
+    // value a user can type, and the last is inside index-amr.html's own
+    // slider range.
+    for (const [tau0, level] of [[1.0, 0], [0.75, 1], [0.625, 2], [0.5625, 3]]) {
+      const hit = tauChainSingularity(tau0, level + 1);
+      assert.ok(hit, `tau0=${tau0} should be singular at level ${level}`);
+      assert.strictEqual(hit.level, level);
+      close(hit.tau, 1, 1e-12, `level ${level} tau`);
+      // ...and a hierarchy that stops ABOVE it is clean, which is what makes
+      // this a per-config answer rather than a blanket ban on a tau.
+      assert.strictEqual(tauChainSingularity(tau0, level), null,
+        `tau0=${tau0} at ${level} level(s) has no singular level and was flagged`);
+      // The message has to name the level -- a refusal that says only "bad
+      // tau" sends the reader to the wrong knob on a four-level hierarchy.
+      assert.ok(tauSingularityMessage(hit).includes(`level ${level}`),
+        'the refusal text does not name the level it found');
+    }
+    // The shipped defaults are clear of it at every depth this project runs.
+    for (const tau0 of [0.5044, 0.5087, 0.5256, 0.8]) {
+      assert.strictEqual(tauChainSingularity(tau0, 5), null,
+        `tau0=${tau0} was flagged singular and should not be`);
+    }
+  });
+
+  ok('the singularity band is a band, not an equality test', () => {
+    // Exact equality would never fire on a float chain: what poisons the
+    // transfer is the neighbourhood, where the factor is finite but enormous.
+    const justInside = 0.75 + 0.4 * TAU_UNITY_BAND / 2;   // level 1 lands inside
+    assert.ok(tauChainSingularity(justInside, 2), 'a tau just inside the band was not caught');
+    const wellOutside = 0.75 + 4 * TAU_UNITY_BAND;
+    assert.strictEqual(tauChainSingularity(wellOutside, 2), null,
+      'a tau well outside the band was refused');
   });
 
   if (!process.exitCode) console.log(`\n${pass} check(s) passed`);

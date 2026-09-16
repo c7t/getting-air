@@ -44,6 +44,8 @@
 //               SDF, the sponge and the interpolation stencil work in. Cell
 //               CENTRES sit at integers.
 
+import { tauAtLevel } from './card-params.mjs';
+
 export const GHOST = 2;
 
 // The 2D solver's block size, shaders/amr_step.wgsl's `cellIndex` BLOCK and
@@ -77,6 +79,115 @@ export function coarseUnitToFine(p, origin, dx = 0.5) {
 // tested there. It is not restated here: one rule, one home.)
 export function cellSizeL0AtLevel(m) {
   return 2 ** -m;
+}
+
+// --- the Dupuis-Chopard non-equilibrium rescale ----------------------------
+//
+// THE HOST STATEMENT OF THE COARSE<->FINE TRANSFER FACTOR, and the reason it
+// is not the textbook one (plans/2D-backport.md B1).
+//
+// Dupuis-Chopard is derived for the PRE-collision non-equilibrium part. With
+// refinement ratio n=2, fneq scales as tau * (velocity gradient per lattice
+// cell), and the same physical shear spans twice as many fine cells:
+//
+//   fneq_pre,fine = (1/n) * (tau_f / tau_c) * fneq_pre,coarse          (PRE)
+//
+// 2D's step kernels are FUSED pull-stream + collide (shaders/amr_step.wgsl's
+// own title), so every buffer this solver transfers holds f AFTER collision.
+// BGK post-collision is f* = f - (f - feq)/tau, hence
+//
+//   fneq* = ((tau - 1) / tau) * fneq_pre
+//
+// at whichever level it is evaluated. Composing decollide -> PRE -> recollide
+// cancels both tau's in the middle and leaves
+//
+//   fneq*_fine = (1/2) * (tau_f - 1) / (tau_c - 1) * fneq*_coarse     (POST)
+//
+// and its EXACT inverse going the other way. These are not a small
+// correction to each other: at tau_c = 0.8 (the channel/TGV default, so
+// tau_f = 1.1) PRE gives +0.6875 and POST gives -0.25 -- different magnitude
+// AND different sign. Near tau = 0.5, where the card and cylinder pages
+// live, they agree to a few percent, which is why the wrong factor shipped
+// for as long as it did: the pages carrying a Cd/St number could barely see
+// it, and the pages with an analytic answer were not being read.
+//
+// This was the large half of the 3D fork's M3 seam error.
+export function dcRescaleCoarseToFine(tauCoarse, tauFine) {
+  return 0.5 * (tauFine - 1) / (tauCoarse - 1);
+}
+
+export function dcRescaleFineToCoarse(tauCoarse, tauFine) {
+  return 2 * (tauCoarse - 1) / (tauFine - 1);
+}
+
+// The legacy PRE-collision pair, kept as a live path (`?dcpre=1`) rather than
+// as a deleted branch in the history, so the defect can be RE-MEASURED in one
+// build instead of reconstructed from a checkout. Same reason ?ghostcopy=1
+// and ?f16=0 are still here.
+export function dcRescaleCoarseToFinePre(tauCoarse, tauFine) {
+  return 0.5 * tauFine / tauCoarse;
+}
+
+export function dcRescaleFineToCoarsePre(tauCoarse, tauFine) {
+  return 2 * tauCoarse / tauFine;
+}
+
+// TAU = 1 IS A REAL SINGULARITY, NOT A FORMULA ARTIFACT, and it has to be
+// refused rather than divided by.
+//
+// At omega = 1 the post-collision populations ARE the equilibrium: fneq* is
+// identically zero at that level, so it carries no stress for a
+// post-collision transfer to move. The closed forms above say the same thing
+// as 0/0 -- (tau_c - 1) is the coarse->fine denominator and (tau_f - 1) the
+// fine->coarse one, so a level sitting at tau = 1 poisons the transfer on
+// whichever side it appears.
+//
+// It is REACHABLE, which is why this is a guard and not a footnote. Level m's
+// tau is 2^m (tau_0 - 1/2) + 1/2, so tau_m = 1 exactly when
+// tau_0 = 1/2 + 2^-(m+1):
+//
+//   tau_0 = 1.0     singular at level 0   (a classic BGK choice)
+//   tau_0 = 0.75    singular at level 1   (?tau=0.75 on channel/TGV)
+//   tau_0 = 0.625   singular at level 2
+//   tau_0 = 0.5625  singular at level 3   (inside index-amr.html's OWN
+//                                          tau slider range, 0.5005..0.6)
+//
+// Every level in [0, levels) is a denominator somewhere -- level 0 only as a
+// coarse side, the finest only as a fine side, the rest as both -- so the
+// whole chain is checked, not its interior.
+//
+// BAND, and what it costs. Exact equality is the singularity; the
+// neighbourhood is merely ill-conditioned, and because the two directions are
+// exact inverses one blows up precisely as far as the other collapses. At
+// |tau - 1| = TAU_UNITY_BAND one direction still rescales fneq by ~50x. That
+// is deliberately left to the user: it is finite, the sign is right, and
+// refusing it would refuse configurations that are only unwise. What is
+// refused is the part where the answer is not a number.
+export const TAU_UNITY_BAND = 0.01;
+
+export function tauChainSingularity(tau0, levels, band = TAU_UNITY_BAND) {
+  for (let m = 0; m < levels; m++) {
+    const tau = tauAtLevel(tau0, m);
+    if (Math.abs(tau - 1) < band) return { level: m, tau, tau0, band };
+  }
+  return null;
+}
+
+// The refusal's own text, here rather than in five pages, so what the user is
+// told about a singular chain cannot drift between them -- and so a test can
+// assert it names the level it found (a refusal that says only "bad tau" sends
+// the reader to the wrong knob on a four-level hierarchy).
+export function tauSingularityMessage({ level, tau, tau0, band }) {
+  const nearest = 0.5 + 2 ** -(level + 1);
+  return `tau = ${tau.toFixed(6)} at level ${level} is within ${band} of 1, where the ` +
+    `post-collision coarse<->fine transfer is 0/0 -- at omega = 1 the post-collision ` +
+    `populations ARE the equilibrium and carry no stress to transfer. This is a real ` +
+    `singularity, not a formula artifact, so it is refused rather than divided by. ` +
+    `L0 tau is ${tau0}, and level ${level} is exactly singular at L0 tau = ${nearest} ` +
+    `(level m's tau is 2^m (tau_0 - 1/2) + 1/2). Fix: move tau (or Re, or ?levels=) ` +
+    `off it. ?dcpre=1 restores the legacy pre-collision factor, which has no ` +
+    `singularity here -- but it is the defect plans/2D-backport.md B1 removed, so use ` +
+    `it to measure, not to run.`;
 }
 
 // --- the pool, and why one pool description serves every level -------------
