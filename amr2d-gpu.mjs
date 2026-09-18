@@ -661,6 +661,164 @@ export async function readCardState(device, cardStateBuf) {
 // unconditionally (tools/lib/amr-invariants.js), which is a stronger check
 // than this trip-wire and already fails loudly. A second implicit latch there
 // would change what existing tooling means without adding coverage.
+// --- THE REFINEMENT ROUND, ONCE (plans/uniform-levels.md U7-3) --------------
+//
+// Everything one `?refineEvery=` round encodes, in order. Measured 2026-09-18,
+// comments and whitespace stripped: BYTE-IDENTICAL across the cylinder,
+// reentry, TGV and channel pages -- all four -- with main-amr.js differing only
+// by its measurement decoration and by the root having become a parent level
+// (U5-4). 344 lines across the five pages of an ordering that is subtle in
+// three separate places.
+//
+// ── THE ORDER, AND WHY EACH PART OF IT IS WHERE IT IS ──────────────────────
+//
+// CRITERION FIRST, ONCE. A block's own vorticity does not change because a
+// neighbour got (de)activated this round, so re-evaluating it per iteration
+// would be wasted work. Level 1's comes from the dense criterion (or, once the
+// root manages it, from the pool criterion at parent level 0); every deeper
+// level's comes from its own parent's pool criterion.
+//
+// THE WANT BUFFERS ARE CLEARED, NOT OVERWRITTEN. `decide()` at level >= 2 is
+// dispatched over PARENT slots and never visits a block whose parent is
+// inactive, so a stale want would survive there and resurrect a tile the
+// criterion has stopped asking for.
+//
+// ONE SWEEP, NO FIXED POINT (plans/2D-backport.md B2): decide every level from
+// its own reason only, close the want set under the 2:1 rule
+// (shaders/amr_cascade.wgsl), coarsen, refine. Once. The closure is
+// TRANSITIVE, so after it runs `want[m]` already contains everything
+// `want[m+1]` will need a parent for; the loop this replaced iterated because
+// its per-pass tests only ever saw one hop at a time.
+//
+// THE TWO ORDERS STILL MATTER, but for the ALLOCATOR, not for balance.
+// Coarsen runs FINEST-FIRST because a child's slots must return to the free
+// list before its parent's tile does. Refine runs COARSEST-FIRST because a
+// level-(m+1) quad can only be carved from an ACTIVE level-m parent slot.
+// Neither is about 2:1 any more.
+//
+// INIT FILL LAST, so anything refined this round gets its one-time full-slot
+// fill before anything else this macro-step reads its pool slot.
+//
+// `firstParentLevel` is 0 once the root manages level 1, in which case the
+// dense manager is not dispatched at all and the pool loops cover every level.
+// It disappears at U7-5.
+export function makeRefineRound({ nLevels, pools, cascade, encodeCascade, firstParentLevel = 1, passes }) {
+  const useDenseManage = firstParentLevel > 0;
+  return function encodeRefineRound(enc) {
+    for (let m = 1; m < nLevels; m++) {
+      // GPU-recorded, not queue.writeBuffer -- a JS-side write would not
+      // interleave correctly with commands already recorded into this same
+      // not-yet-submitted encoder (plans/AMR.md Milestone 4b).
+      enc.clearBuffer(pools[m].newlyActivatedBuf);
+    }
+
+    passes.denseCriterion(enc);
+    for (let m = firstParentLevel; m < nLevels - 1; m++) passes.poolCriterion(enc, m);
+
+    for (let m = 1; m < nLevels; m++) enc.clearBuffer(pools[m].wantBuf);
+
+    if (useDenseManage) passes.denseDecide(enc);
+    for (let m = firstParentLevel; m < nLevels - 1; m++) passes.poolDecide(enc, m);
+
+    encodeCascade(enc, cascade, nLevels);
+
+    for (let m = nLevels - 1; m >= 1; m--) {
+      if (m === 1 && useDenseManage) passes.denseCoarsen(enc);
+      else passes.poolCoarsen(enc, m);
+    }
+    for (let m = 1; m < nLevels; m++) {
+      if (m === 1 && useDenseManage) passes.denseRefine(enc);
+      else passes.poolRefine(enc, m);
+    }
+
+    passes.l1InitFill(enc);
+    for (let m = 2; m < nLevels; m++) passes.poolInitFill(enc, m);
+  };
+}
+
+// --- THE MULTI-RATE SCHEDULER, ONCE (plans/uniform-levels.md U7-3) ----------
+//
+// `S_Advance`: AGAL's own recursive advance order
+// (AGAL/src/solver_lbm/solver_lbm_advance.cu), traced precisely rather than
+// re-derived from a one-line summary.
+//
+//   ROOT (level 0, no parent): interpolate INTO level 1 once from L0's CURRENT
+//   state, L0's own ONE step, recurse into level 1 ONCE, average level 1 back
+//   into L0 once. The root never does a "second substep" -- its own dt IS the
+//   reference macro-step unit, so there is nothing to catch up to.
+//
+//   NON-ROOT (level >= 1, always has an implicit parent -- whoever called it):
+//   interpolate INTO level+1 from THIS level's current state, this level's OWN
+//   substep A, then -- if level+1 exists -- recurse into it ONCE, average it
+//   back, and RE-interpolate into it so its next cycle sees fresh ghosts. Then,
+//   under ?ghostcopy=1 only, this level's own same-level fine-fine refresh.
+//   Then substep B, and again if level+1 exists, recurse a SECOND time and
+//   average again.
+//
+// Every non-root level therefore does exactly 2 of its own substeps per call
+// and drives its child through exactly 2 full cycles, which is what makes level
+// L+k run 2^k times more often than L0 -- the correct refinement-ratio-2
+// temporal scaling.
+//
+// "Current buffer" bookkeeping: L0 ping-pongs via the page's persistent `useB`,
+// passed in. Every level >= 1 instead starts EVERY call at its own _a buffer
+// and ends back at _a (substep A: a->b, substep B: b->a) -- a purely LOCAL,
+// per-call invariant needing no persistent state. `cur` tracks it within a call.
+//
+// ── WHY THIS IS THE RUNG THE LADDER WAS BUILT FOR ──────────────────────────
+//
+// Measured 2026-09-18: this function was BYTE-IDENTICAL across the cylinder,
+// reentry, TGV and channel pages, and main-amr.js's differed only by the root
+// pool and its measurement instrumentation. Five copies of the subtlest
+// ordering in the project, where a mistake is a physics bug rather than a
+// crash -- a pass in the wrong place still runs, still produces a field, and
+// still looks like a simulation.
+//
+// THE SEAM IS ORDER vs. CONTENT. This function owns WHEN each pass is encoded
+// and the recursion that gets there. The `passes` object owns WHAT a pass is:
+// which pipeline, which bind group, which dispatch size, and whatever
+// profiling or ?benchSkip= decoration the page wants around it. The order was
+// identical five times over; the content legitimately differs, because
+// main-amr.js carries measurement twins the shipped pages do not.
+export function makeScheduler({ nLevels, ghostCopy, passes }) {
+  function S_Advance(level, enc, useB) {
+    const hasChild = (level + 1) < nLevels;
+
+    if (level === 0) {
+      if (hasChild) passes.l0InterpIntoL1(enc, useB);
+      passes.l0Step(enc, useB);
+      if (hasChild) {
+        S_Advance(1, enc, useB);
+        passes.l1AverageIntoL0(enc, useB);
+      }
+      return;
+    }
+
+    let cur = 'a'; // THIS level's own current buffer, local to this call
+    if (hasChild) passes.interpIntoChild(enc, level, cur);
+    passes.substep(enc, level, cur);   // reads 'a', writes 'b'
+    cur = 'b';
+    if (hasChild) {
+      S_Advance(level + 1, enc, useB);
+      passes.averageFromChild(enc, level, cur); // child's cycle #1 lands in 'b'
+      passes.interpIntoChild(enc, level, cur);  // fresh ghosts from the just-updated state
+    }
+    // Legacy same-level fine-fine refresh (?ghostcopy=1 only). The default path
+    // needs no pass here: substep B's own gather reaches into the neighbour
+    // tile directly, so it reads the neighbour's POST-average interior rather
+    // than a copy taken before that average landed. See the DIRECT_GHOST
+    // override in shaders/amr_step1.wgsl.
+    if (ghostCopy()) passes.fineFineRefresh(enc, level);
+    passes.substep(enc, level, cur);   // reads 'b', writes 'a'
+    cur = 'a';
+    if (hasChild) {
+      S_Advance(level + 1, enc, useB);
+      passes.averageFromChild(enc, level, cur); // child's cycle #2 lands in 'a'
+    }
+  }
+  return { S_Advance };
+}
+
 // --- THE CRITERION/MANAGE BIND GROUPS, ONCE (plans/uniform-levels.md U7-2) --
 //
 // One pair per PARENT level, deciding the child level below it. Measured

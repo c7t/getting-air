@@ -53,7 +53,7 @@ import { reportFatal, refuseConfig, reportNoWebGPU, reportNoAdapter } from './er
 import { tauChainSingularity, tauSingularityMessage } from './amr2d.mjs';
 import { loadShader } from './shader-loader.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
-import { check21BalanceOnGPU, allocLevelPool, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState , checkRefinementClosureOnGPU , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU, makeRenderBindGroup, renderPoolLevels, MAX_RENDER_POOL_LEVELS, makeAMRLayouts, makeCouplingPipelines, makeLevelBindGroups, makeManageBindGroups } from './amr2d-gpu.mjs';
+import { check21BalanceOnGPU, allocLevelPool, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState , checkRefinementClosureOnGPU , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU, makeRenderBindGroup, renderPoolLevels, MAX_RENDER_POOL_LEVELS, makeAMRLayouts, makeCouplingPipelines, makeLevelBindGroups, makeManageBindGroups, makeScheduler, makeRefineRound } from './amr2d-gpu.mjs';
 // tauAtLevel: extracted to card-params.mjs by B3a-1, which landed the CALL
 // in all five AMR pages and this IMPORT in only main-amr.js. The other four
 // threw `ReferenceError: tauAtLevelOf is not defined` at init -- but only at
@@ -657,145 +657,85 @@ async function init() {
   let autoRefine = urlParams.get('autoRefine') === '1';
   let macroStepCounter = 0;
 
-  // ── Recursive multi-level advance -- byte-for-byte identical dispatch
-  // sequence to main-amr.js's own S_Advance (see that file for the design
-  // rationale: interp-before-step commutativity, fine-fine refresh timing,
-  // etc.) with only the force/torque integration removed (no body here).
-  function S_Advance(level, enc) {
-    const hasChild = (level + 1) < N_LEVELS;
-
-    if (level === 0) {
-      const stepBG = useB ? stepBG_ba : stepBG_ab;
-      if (hasChild) {
-        const readBG = useB ? interpBG_readB : interpBG_readA;
-        const p = enc.beginComputePass(); p.setPipeline(interpPL); p.setBindGroup(0, readBG); p.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); p.end();
-      }
-      const s = enc.beginComputePass(); s.setPipeline(stepPL); s.setBindGroup(0, stepBG); s.dispatchWorkgroups(WGX, WGY); s.end();
-      if (hasChild) {
-        S_Advance(1, enc);
-        const avgBG = useB ? avgBG_targetA : avgBG_targetB;
-        const a = enc.beginComputePass(); a.setPipeline(avgPL); a.setBindGroup(0, avgBG); a.dispatchWorkgroups(1, 1, MAX_FINE_BLOCKS); a.end();
-      }
-      return;
-    }
-
-    const pool = pools[level];
-    const isL1 = level === 1;
-    let cur = 'a';
-
-    const interpIntoChild = (readCur) => {
-      if (!hasChild) return;
+  // U7-3: WHAT each pass is. The ORDER is amr2d-gpu.mjs's makeScheduler, which
+  // was byte-identical across four pages and differed on the fifth only by the
+  // root pool -- see its header for why the seam is order vs. content.
+  const passes = {
+    l0InterpIntoL1: (enc, useB) => {
+      const p = enc.beginComputePass();
+      p.setPipeline(interpPL);
+      p.setBindGroup(0, useB ? interpBG_readB : interpBG_readA);
+      p.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); p.end();
+    },
+    l0Step: (enc, useB) => {
+      const s = enc.beginComputePass();
+      s.setPipeline(stepPL);
+      s.setBindGroup(0, useB ? stepBG_ba : stepBG_ab);
+      s.dispatchWorkgroups(WGX, WGY); s.end();
+    },
+    l1AverageIntoL0: (enc, useB) => {
+      const a = enc.beginComputePass();
+      a.setPipeline(avgPL);
+      a.setBindGroup(0, useB ? avgBG_targetA : avgBG_targetB);
+      a.dispatchWorkgroups(1, 1, MAX_FINE_BLOCKS); a.end();
+    },
+    interpIntoChild: (enc, level, readCur) => {
       const childPool = pools[level + 1];
       const bg = readCur === 'a' ? childPool.interpPoolParentBG_readA : childPool.interpPoolParentBG_readB;
-      const p = enc.beginComputePass(); p.setPipeline(interpPoolParentPL); p.setBindGroup(0, bg); p.dispatchWorkgroups(WGX1, WGY1, childPool.MAX_FINE_BLOCKS); p.end();
-    };
-    const averageFromChild = (writeCur) => {
-      if (!hasChild) return;
+      const p = enc.beginComputePass();
+      p.setPipeline(interpPoolParentPL); p.setBindGroup(0, bg);
+      p.dispatchWorkgroups(WGX1, WGY1, childPool.MAX_FINE_BLOCKS); p.end();
+    },
+    averageFromChild: (enc, level, writeCur) => {
       const childPool = pools[level + 1];
       const bg = writeCur === 'a' ? childPool.avgPoolBG_targetA : childPool.avgPoolBG_targetB;
-      const p = enc.beginComputePass(); p.setPipeline(avgPoolPL); p.setBindGroup(0, bg); p.dispatchWorkgroups(1, 1, childPool.MAX_FINE_BLOCKS); p.end();
-    };
-    const substep = (readCur) => {
-      // NO LEVEL SPLIT SINCE B3-1: one kernel, one pipeline, every level.
+      const p = enc.beginComputePass();
+      p.setPipeline(avgPoolPL); p.setBindGroup(0, bg);
+      p.dispatchWorkgroups(1, 1, childPool.MAX_FINE_BLOCKS); p.end();
+    },
+    // NO LEVEL SPLIT SINCE B3-1: one kernel, one pipeline, every level.
+    substep: (enc, level, readCur) => {
+      const pool = pools[level];
       const bg = readCur === 'a' ? pool.step1BG_ab : pool.step1BG_ba;
-      const p = enc.beginComputePass(); p.setPipeline(step1PL); p.setBindGroup(0, bg); p.dispatchWorkgroups(WGX1, WGY1, pool.MAX_FINE_BLOCKS); p.end();
-    };
-    const fineFineRefresh = () => {
-      if (isL1) {
-        const p = enc.beginComputePass(); p.setPipeline(interpFFPL); p.setBindGroup(0, interpFFBG_b); p.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); p.end();
-      } else {
-        const p = enc.beginComputePass(); p.setPipeline(interpPoolParentFFPL); p.setBindGroup(0, pool.interpPoolParentFFBG_b); p.dispatchWorkgroups(WGX1, WGY1, pool.MAX_FINE_BLOCKS); p.end();
-      }
-    };
-
-    interpIntoChild(cur);
-    substep(cur);
-    cur = 'b';
-    if (hasChild) {
-      S_Advance(level + 1, enc);
-      averageFromChild(cur);
-      interpIntoChild(cur);
-    }
-    // Legacy same-level fine-fine refresh (?ghostcopy=1 only). The default
-    // path needs no pass here: substep B's own gather reaches into the
-    // neighbour tile directly, so it reads the neighbour's post-`average`
-    // interior rather than a copy taken before that average landed. See the
-    // DIRECT_GHOST override in shaders/amr_step1.wgsl.
-    if (GHOST_COPY) fineFineRefresh();
-    substep(cur);
-    cur = 'a';
-    if (hasChild) {
-      S_Advance(level + 1, enc);
-      averageFromChild(cur);
-    }
-  }
+      const p = enc.beginComputePass();
+      p.setPipeline(step1PL); p.setBindGroup(0, bg);
+      p.dispatchWorkgroups(WGX1, WGY1, pool.MAX_FINE_BLOCKS); p.end();
+    },
+    fineFineRefresh: (enc, level) => {
+      const pool = pools[level];
+      const p = enc.beginComputePass();
+      if (level === 1) { p.setPipeline(interpFFPL); p.setBindGroup(0, interpFFBG_b); p.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); }
+      else { p.setPipeline(interpPoolParentFFPL); p.setBindGroup(0, pool.interpPoolParentFFBG_b); p.dispatchWorkgroups(WGX1, WGY1, pool.MAX_FINE_BLOCKS); }
+      p.end();
+    },
+  };
+  const { S_Advance: S_AdvanceShared } = makeScheduler({
+    nLevels: N_LEVELS, ghostCopy: () => !!GHOST_COPY, passes,
+  });
+  const S_Advance = (level, enc) => S_AdvanceShared(level, enc, useB);
 
   // Factored out of frame()'s loop so debugStepSync can reuse it exactly --
   // same rationale as main-amr.js's identical comment.
   function dispatchMacroStep(enc) {
     const interpInitBG = useB ? interpInitBG_readB : interpInitBG_readA;
 
+    // U7-3: WHAT each pass of the refinement round is. The ORDER -- and the
+    // three separate places it is subtle -- is amr2d-gpu.mjs's
+    // makeRefineRound, byte-identical across four pages before this.
+    const refinePasses = {
+      denseCriterion: (enc) => { const p = enc.beginComputePass(); p.setPipeline(criterionPL); p.setBindGroup(0, criterionBG); p.dispatchWorkgroups(WGX, WGY); p.end(); },
+      poolCriterion: (enc, m) => { const p = enc.beginComputePass(); p.setPipeline(criterionPoolPLs[m]); p.setBindGroup(0, criterionPoolBGs[m]); p.dispatchWorkgroups(2, 2, pools[m].MAX_FINE_BLOCKS); p.end(); },
+      denseDecide: (enc) => { const p = enc.beginComputePass(); p.setPipeline(manageDecidePL); p.setBindGroup(0, manageBG); p.dispatchWorkgroups(WG_MANAGE); p.end(); },
+      poolDecide: (enc, m) => { const p = enc.beginComputePass(); p.setPipeline(managePoolDecidePLs[m]); p.setBindGroup(0, managePoolBGs[m]); p.dispatchWorkgroups(Math.ceil(pools[m].MAX_FINE_BLOCKS / 64)); p.end(); },
+      denseCoarsen: (enc) => { const p = enc.beginComputePass(); p.setPipeline(manageCoarsenPL); p.setBindGroup(0, manageBG); p.dispatchWorkgroups(WG_MANAGE); p.end(); },
+      poolCoarsen: (enc, m) => { const p = enc.beginComputePass(); p.setPipeline(managePoolCoarsenPLs[m - 1]); p.setBindGroup(0, managePoolBGs[m - 1]); p.dispatchWorkgroups(Math.ceil(pools[m].MAX_FINE_BLOCKS / 64)); p.end(); },
+      denseRefine: (enc) => { const p = enc.beginComputePass(); p.setPipeline(manageRefinePL); p.setBindGroup(0, manageBG); p.dispatchWorkgroups(WG_MANAGE); p.end(); },
+      poolRefine: (enc, m) => { const p = enc.beginComputePass(); p.setPipeline(managePoolRefinePLs[m - 1]); p.setBindGroup(0, managePoolBGs[m - 1]); p.dispatchWorkgroups(Math.ceil(pools[m - 1].MAX_FINE_BLOCKS / 64)); p.end(); },
+      l1InitFill: (enc) => { const p = enc.beginComputePass(); p.setPipeline(interpInitPL); p.setBindGroup(0, interpInitBG); p.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); p.end(); },
+      poolInitFill: (enc, m) => { const p = enc.beginComputePass(); p.setPipeline(interpPoolParentInitPL); p.setBindGroup(0, pools[m].interpPoolParentBG_readA); p.dispatchWorkgroups(WGX1, WGY1, pools[m].MAX_FINE_BLOCKS); p.end(); },
+    };
     if (autoRefine && macroStepCounter % REFINE_EVERY === 0) {
-      for (let m = 1; m < N_LEVELS; m++) {
-        enc.clearBuffer(pools[m].newlyActivatedBuf);
-      }
-
-      const crit = enc.beginComputePass(); crit.setPipeline(criterionPL); crit.setBindGroup(0, criterionBG); crit.dispatchWorkgroups(WGX, WGY); crit.end();
-      for (let m = 1; m < N_LEVELS - 1; m++) {
-        const c = enc.beginComputePass(); c.setPipeline(criterionPoolPLs[m]); c.setBindGroup(0, criterionPoolBGs[m]); c.dispatchWorkgroups(2, 2, pools[m].MAX_FINE_BLOCKS); c.end();
-      }
-
-      // ── B2: ONE SWEEP, NO FIXED POINT ────────────────────────────────────
-      //
-      // decide (every level, own reason only) -> close under the 2:1 rule ->
-      // coarsen finest-first -> refine coarsest-first. Once.
-      //
-      // WHY ONE PASS IS ENOUGH: the closure is transitive, so after it runs
-      // want[m] already contains everything want[m+1] will need a parent for.
-      // The legacy loop below iterates because its per-pass tests only ever
-      // see one hop at a time.
-      //
-      // THE ORDERS STILL MATTER, but for the ALLOCATOR, not for balance.
-      // Coarsen runs finest-first because a child's slots must return to the
-      // free list before its parent's tile does; refine runs coarsest-first
-      // because a level-(m+1) quad can only be carved from an ACTIVE level-m
-      // parent slot. Neither is about 2:1 any more.
-      // The want buffers must be CLEARED, not just overwritten: decide() at
-      // level >= 2 is dispatched over PARENT slots and never visits a block
-      // whose parent is inactive, so a stale want would survive there and
-      // resurrect a tile the criterion has stopped asking for.
-      for (let m = 1; m < N_LEVELS; m++) enc.clearBuffer(pools[m].wantBuf);
-
-      { const p = enc.beginComputePass(); p.setPipeline(manageDecidePL); p.setBindGroup(0, manageBG); p.dispatchWorkgroups(WG_MANAGE); p.end(); }
-      for (let m = 1; m < N_LEVELS - 1; m++) {
-        const wg = Math.ceil(pools[m].MAX_FINE_BLOCKS / 64);
-        const p = enc.beginComputePass(); p.setPipeline(managePoolDecidePLs[m]); p.setBindGroup(0, managePoolBGs[m]); p.dispatchWorkgroups(wg); p.end();
-      }
-
-      encodeCascade(enc, cascade, N_LEVELS);
-
-      for (let m = N_LEVELS - 1; m >= 1; m--) {
-        if (m === 1) {
-          const p = enc.beginComputePass(); p.setPipeline(manageCoarsenPL); p.setBindGroup(0, manageBG); p.dispatchWorkgroups(WG_MANAGE); p.end();
-        } else {
-          const wg = Math.ceil(pools[m].MAX_FINE_BLOCKS / 64);
-          const p = enc.beginComputePass(); p.setPipeline(managePoolCoarsenPLs[m - 1]); p.setBindGroup(0, managePoolBGs[m - 1]); p.dispatchWorkgroups(wg); p.end();
-        }
-      }
-      for (let m = 1; m < N_LEVELS; m++) {
-        if (m === 1) {
-          const p = enc.beginComputePass(); p.setPipeline(manageRefinePL); p.setBindGroup(0, manageBG); p.dispatchWorkgroups(WG_MANAGE); p.end();
-        } else {
-          const wg = Math.ceil(pools[m - 1].MAX_FINE_BLOCKS / 64);
-          const p = enc.beginComputePass(); p.setPipeline(managePoolRefinePLs[m - 1]); p.setBindGroup(0, managePoolBGs[m - 1]); p.dispatchWorkgroups(wg); p.end();
-        }
-      }
-
-      const init = enc.beginComputePass(); init.setPipeline(interpInitPL); init.setBindGroup(0, interpInitBG); init.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); init.end();
-      for (let m = 2; m < N_LEVELS; m++) {
-        const pool = pools[m];
-        const p = enc.beginComputePass(); p.setPipeline(interpPoolParentInitPL); p.setBindGroup(0, pool.interpPoolParentBG_readA); p.dispatchWorkgroups(WGX1, WGY1, pool.MAX_FINE_BLOCKS); p.end();
-      }
+      makeRefineRound({ nLevels: N_LEVELS, pools, cascade, encodeCascade, passes: refinePasses })(enc);
     }
     macroStepCounter++;
 

@@ -28,7 +28,7 @@ it runs on.
 | U4 | criterion, force, digest, conserved totals | **DONE** — all four consumers on the root. Exact on the criterion, digest max and conserved totals; the force to the truncation floor | `tools/validate-root-kernels.js`, 8 rungs + 2 controls |
 | U5 | L1 becomes a quad child of the root | **U5-0…U5-4 DONE under `?rootpool=1`** — both hops of the coupling and the manager. Level 1 is quad-allocated and quad-managed; tiles +28-32%; new fingerprints, default unmoved. `amr_manage.wgsl` cannot retire until the other four AMR pages get a root pool, and Cd/St is unmeasurable until then | `validate-root-kernels.js` (11 rungs, 4 controls); `validate-all.js` invariants ± starved pool; `measure-determinism.js` |
 | U6 | The renderer walks levels | **DONE** — and it found that three of the five pages never drew level 2 either. Level 1 bit-identical to before; gate green on two pages and in the default sweep | `tools/validate-render-levels.js`, `tools/lib/render-levels.js` |
-| U7 | One implementation across the five pages, then delete the dense path | **U7-0…U7-2 DONE** (layouts, the twelve coupling pipelines and the per-level bind groups shared — net −1194 lines, every gate unmoved); U7-3…U7-6 remain. **Split into U7-0…U7-6** — U1–U5 all landed on `main-amr.js` alone, so the remaining work is propagation before deletion. Measured: all 14 bind group layouts are byte-identical across five pages, and `S_Advance` is byte-identical across the other four | each rung byte-identical on the default path (`measure-determinism.js`), except U7-5 which is the one that moves numbers |
+| U7 | One implementation across the five pages, then delete the dense path | **U7-0…U7-3 DONE** (layouts, coupling pipelines, per-level bind groups, and both orderings shared — net −1559 lines, every gate unmoved); U7-4…U7-6 remain. **Split into U7-0…U7-6** — U1–U5 all landed on `main-amr.js` alone, so the remaining work is propagation before deletion. Measured: all 14 bind group layouts are byte-identical across five pages, and `S_Advance` is byte-identical across the other four | each rung byte-identical on the default path (`measure-determinism.js`), except U7-5 which is the one that moves numbers |
 
 **Where the risk actually sits.** U0–U2 went in clean and each found something
 (a half-cell convention, an f16 stride, a window-convention split between L0 and
@@ -2403,22 +2403,48 @@ TIMES** (2026-09-18). `makeRenderBindGroup` is in `amr2d-gpu.mjs` and every page
 calls it; fold it into this rung's shared builder when that exists, rather than
 leaving two homes for the same wiring.
 
-#### U7-3 — the scheduler
+#### U7-3 — DONE (2026-09-18). The two orderings are one function each.
 
-`S_Advance` and `dispatchMacroStep` into shared code, parameterised by the
-bundle U7-1 and U7-2 produce. Four byte-identical copies collapse to one, and
-`main-amr.js`'s root-pool version becomes THE version, with the root path
-behind the flags it already has.
+**922 lines removed, 557 added, a net −365.** Two functions, and both were
+byte-identical across four pages before it:
 
-**This is the load-bearing rung: after it the root pool reaches every page by
-construction rather than by four more ports.** It is also the one with real
-risk, because it is the hot loop and the one place where a mis-ordered pass is
-a physics bug rather than a crash.
+- **`makeScheduler`** — `S_Advance`, AGAL's recursive multi-rate advance order.
+  Byte-identical on cylinder / reentry / TGV / channel; `main-amr.js`'s differed
+  only by the root pool and its measurement decoration.
+- **`makeRefineRound`** — everything one `?refineEvery=` round encodes.
+  Byte-identical on **all four** of those pages too.
 
-*Gate:* every previous gate, plus the cylinder Cd/St unmoved to four digits on
-`amr-N2-diffuse` AND `amr-N3-diffuse` (with `?rootpool=0`, which is still the
-default at this rung -- so bit-identity is the honest bar and a Cd move is a
-failure, not a re-baseline).
+**THE SEAM IS ORDER vs. CONTENT, and that is the whole design.** The shared
+functions own WHEN each pass is encoded and the recursion or the loops that get
+there. A `passes` object owns WHAT a pass is: which pipeline, which bind group,
+which dispatch size, and whatever profiling or `?benchSkip=` decoration the page
+wants around it. The order was identical five times over; the content
+legitimately differs, because `main-amr.js` carries measurement twins, D0's
+scan/link passes and the root's parallel passes that no shipped page has.
+
+That split is why this rung was worth the risk. A mis-ordered pass here is a
+physics bug, not a crash -- it still runs, still produces a field, and still
+looks like a simulation -- and three separate parts of the refinement round are
+subtle for three different reasons (criterion evaluated once before the sweep;
+want buffers CLEARED not overwritten; coarsen finest-first but refine
+coarsest-first, for the ALLOCATOR rather than for balance). All of that now has
+one home, with the reasoning attached to it.
+
+*Gate, everything, all green:* `make check`; boot smoke on seven configs plus
+both render configs; `measure-determinism.js` unmoved at `7ac54e170f903ac3` /
+`ce1bd4d8a3a1055c` -- which also covers `?detslots=1`, so the dev page's D0
+scan/link ordering inside `denseCoarsen`/`denseRefine` is proven unchanged;
+all four analytic AMR configs PASS; `amr-N2-diffuse` Cd 1.631 / St 0.1466 and
+`amr-N3-diffuse` Cd 1.463 / St 0.1565, both unmoved with invariants green;
+`validate-root-kernels.js` green on all eleven rungs; `amr-dev-invariants`
+seven-of-seven with `?rootpool=1`.
+
+**`dispatchMacroStep` ITSELF IS NOT SHARED, and the measurement says not to.**
+It has three variants (amr / cylinder+reentry / tgv+channel), because what
+surrounds the refinement round -- the force pass, the physics integrator, the
+snapshot bookkeeping -- is scenario. The byte-identical part of it WAS the
+refinement round, and that is what moved. This is the same line U7-2 drew:
+share what is already identical, and leave what genuinely differs.
 
 #### U7-4 — the root pool on every page
 

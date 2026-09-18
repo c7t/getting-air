@@ -25,7 +25,7 @@
 import { reportFatal, refuseConfig, setStatus, reportNoWebGPU, reportNoAdapter } from './error-overlay.mjs';
 import { loadShader } from './shader-loader.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
-import { check21BalanceOnGPU, allocLevelPool, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState, checkGeometryCoverageOnGPU, makeRefusalWatch , checkRefinementClosureOnGPU , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU, makeRenderBindGroup, renderPoolLevels, MAX_RENDER_POOL_LEVELS, makeAMRLayouts, makeCouplingPipelines, makeLevelBindGroups, makeManageBindGroups } from './amr2d-gpu.mjs';
+import { check21BalanceOnGPU, allocLevelPool, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState, checkGeometryCoverageOnGPU, makeRefusalWatch , checkRefinementClosureOnGPU , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU, makeRenderBindGroup, renderPoolLevels, MAX_RENDER_POOL_LEVELS, makeAMRLayouts, makeCouplingPipelines, makeLevelBindGroups, makeManageBindGroups, makeScheduler, makeRefineRound } from './amr2d-gpu.mjs';
 // tauAtLevel: extracted to card-params.mjs by B3a-1, which landed the CALL
 // in all five AMR pages and this IMPORT in only main-amr.js. The other four
 // threw `ReferenceError: tauAtLevelOf is not defined` at init -- but only at
@@ -1536,134 +1536,62 @@ async function init() {
     return { step };
   }
 
-  // Milestone 2 macro-step (plans/AMR.md): 1 coarse step + 2 fine substeps,
-  // ordered per AGAL's Fig. 13 recursive routine -- interpolate ghosts from
-  // the CURRENT (pre-step) coarse state, then coarse-step and fine-step-x2
-  // independently (both read only pre-step data, so their relative order
-  // doesn't matter), then average the now-twice-advanced fine interior back
-  // onto the coarse cells the coarse step just (less accurately) computed.
-  // Factored out of frame()'s loop so debugStepSync can reuse it exactly --
-  // duplicating this 7-pass sequence would risk the two silently drifting
-  // apart.
-  // Milestone 7 (plans/AMR-multilevel.md): generic recursive dispatch,
-  // replacing the old flat 7-pass sequence -- walks levels top-down in
-  // AGAL's own S_Advance order (AGAL/src/solver_lbm/solver_lbm_advance.cu),
-  // traced precisely rather than re-derived from the master plan's one-line
-  // summary alone:
-  //
-  //   ROOT (level 0, no parent): interpolate INTO level 1 once (from L0's
-  //   CURRENT state), L0's own ONE step, recurse into level 1 ONCE, average
-  //   level 1 back into L0 once. Root never does a "second substep" -- its
-  //   own dt IS the reference macro-step unit, nothing to catch up to.
-  //
-  //   NON-ROOT (level >= 1, always has an implicit parent -- whoever called
-  //   it): interpolate INTO level+1 (if it exists) from THIS level's
-  //   CURRENT state, this level's OWN substep A, then -- if level+1 exists
-  //   -- recurse into level+1 ONCE, average level+1 back into THIS level,
-  //   and re-interpolate INTO level+1 (using this level's just-averaged-
-  //   into state) so level+1's NEXT cycle sees fresh ghosts. Then, under
-  //   ?ghostcopy=1 ONLY, this level's own same-level fine-fine ghost
-  //   refresh -- the pass this project used to need in place of AGAL's own
-  //   neighbor-aware streaming. The default build now does what AGAL does
-  //   (addresses neighbor blocks directly during streaming rather than
-  //   materializing same-level ghost cells), so there is no pass here at
-  //   all: see DIRECT_GHOST in shaders/amr_step1.wgsl, and
-  //   plans/perf-characterization.md for what removing it measured.
-  //   Then this level's OWN substep B, and -- again if level+1
-  //   exists -- recurse into level+1 a SECOND time and average again.
-  //   Every non-root level therefore does exactly 2 of its own substeps
-  //   per call, and drives its child through exactly 2 full cycles (one
-  //   per own substep) -- this is what makes level L+k run 2^k times more
-  //   often than L0 per macro-step, the correct LBM refinement-ratio-2
-  //   temporal scaling.
-  //
-  // "Current buffer" bookkeeping: L0 ping-pongs via the GLOBAL, persistent
-  // `useB` flag (toggled once per macro-step, unchanged from before this
-  // milestone). Every level >=1 instead starts EVERY call at its own _a
-  // buffer and ends back at _a (substep A: a->b, substep B: b->a) -- a
-  // purely LOCAL, per-call invariant needing no persistent state, and
-  // exactly what today's pre-M7 code already did for level 1 alone (see
-  // its own "fixed 2-call sequence, not a persistent toggle" comment,
-  // preserved verbatim below). `cur` tracks it within one call.
-  //
-  // Level 1 is still special in one narrower way than it used to be. Its
-  // fine-fine refresh uses the DENSE-shader pipeline (interpFFPL), because
-  // its parent is L0 -- but its SUBSTEP no longer does: B3-1 deleted the
-  // level-1-only step kernel, so every level runs step1PL. Every level's
-  // role as PARENT of level+1 (>=2) always
-  // uses the POOL-shader pipelines (interpPoolParentPL/avgPoolPL), keyed by
-  // the CHILD level's own bind groups -- this includes level 1 acting as
-  // level 2's parent, which is why interpPoolParent* bind groups are built
-  // per CHILD level (main-amr.js's per-level bind-group loop), not per
-  // "is level 1" special case.
-  function S_Advance(level, enc) {
-    const hasChild = (level + 1) < N_LEVELS;
-
-    if (level === 0) {
-      const stepBG = useB ? stepBG_ba : stepBG_ab;
-      if (hasChild) {
-        const readBG = useB ? interpBG_readB : interpBG_readA;
-        const p = enc.beginComputePass(); p.setPipeline(interpPL); p.setBindGroup(0, readBG); p.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); p.end();
-      }
-      const s = enc.beginComputePass(); s.setPipeline(stepPL); s.setBindGroup(0, stepBG); s.dispatchWorkgroups(WGX, WGY); s.end();
-      if (hasChild) {
-        S_Advance(1, enc);
-        const avgBG = useB ? avgBG_targetA : avgBG_targetB;
-        const a = enc.beginComputePass(); a.setPipeline(avgPL); a.setBindGroup(0, avgBG); a.dispatchWorkgroups(1, 1, MAX_FINE_BLOCKS); a.end();
-      }
-      return;
-    }
-
-    const pool = pools[level];
-    const isL1 = level === 1;
-    let cur = 'a'; // THIS level's own current buffer, local to this call (see header)
-
-    const interpIntoChild = (readCur) => {
-      if (!hasChild) return;
+  // U7-3: WHAT each pass is. The ORDER is amr2d-gpu.mjs's makeScheduler, which
+  // was byte-identical across four pages and differed on the fifth only by the
+  // root pool -- see its header for why the seam is order vs. content.
+  const passes = {
+    l0InterpIntoL1: (enc, useB) => {
+      const p = enc.beginComputePass();
+      p.setPipeline(interpPL);
+      p.setBindGroup(0, useB ? interpBG_readB : interpBG_readA);
+      p.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); p.end();
+    },
+    l0Step: (enc, useB) => {
+      const s = enc.beginComputePass();
+      s.setPipeline(stepPL);
+      s.setBindGroup(0, useB ? stepBG_ba : stepBG_ab);
+      s.dispatchWorkgroups(WGX, WGY); s.end();
+    },
+    l1AverageIntoL0: (enc, useB) => {
+      const a = enc.beginComputePass();
+      a.setPipeline(avgPL);
+      a.setBindGroup(0, useB ? avgBG_targetA : avgBG_targetB);
+      a.dispatchWorkgroups(1, 1, MAX_FINE_BLOCKS); a.end();
+    },
+    interpIntoChild: (enc, level, readCur) => {
       const childPool = pools[level + 1];
       const bg = readCur === 'a' ? childPool.interpPoolParentBG_readA : childPool.interpPoolParentBG_readB;
-      const p = enc.beginComputePass(); p.setPipeline(interpPoolParentPL); p.setBindGroup(0, bg); p.dispatchWorkgroups(WGX1, WGY1, childPool.MAX_FINE_BLOCKS); p.end();
-    };
-    const averageFromChild = (writeCur) => {
-      if (!hasChild) return;
+      const p = enc.beginComputePass();
+      p.setPipeline(interpPoolParentPL); p.setBindGroup(0, bg);
+      p.dispatchWorkgroups(WGX1, WGY1, childPool.MAX_FINE_BLOCKS); p.end();
+    },
+    averageFromChild: (enc, level, writeCur) => {
       const childPool = pools[level + 1];
       const bg = writeCur === 'a' ? childPool.avgPoolBG_targetA : childPool.avgPoolBG_targetB;
-      const p = enc.beginComputePass(); p.setPipeline(avgPoolPL); p.setBindGroup(0, bg); p.dispatchWorkgroups(1, 1, childPool.MAX_FINE_BLOCKS); p.end();
-    };
-    const substep = (readCur) => {
-      // NO LEVEL SPLIT SINCE B3-1: one kernel, one pipeline, every level.
+      const p = enc.beginComputePass();
+      p.setPipeline(avgPoolPL); p.setBindGroup(0, bg);
+      p.dispatchWorkgroups(1, 1, childPool.MAX_FINE_BLOCKS); p.end();
+    },
+    // NO LEVEL SPLIT SINCE B3-1: one kernel, one pipeline, every level.
+    substep: (enc, level, readCur) => {
+      const pool = pools[level];
       const bg = readCur === 'a' ? pool.step1BG_ab : pool.step1BG_ba;
-      const p = enc.beginComputePass(); p.setPipeline(step1PL); p.setBindGroup(0, bg); p.dispatchWorkgroups(WGX1, WGY1, pool.MAX_FINE_BLOCKS); p.end();
-    };
-    const fineFineRefresh = () => {
-      if (isL1) {
-        const p = enc.beginComputePass(); p.setPipeline(interpFFPL); p.setBindGroup(0, interpFFBG_b); p.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); p.end();
-      } else {
-        const p = enc.beginComputePass(); p.setPipeline(interpPoolParentFFPL); p.setBindGroup(0, pool.interpPoolParentFFBG_b); p.dispatchWorkgroups(WGX1, WGY1, pool.MAX_FINE_BLOCKS); p.end();
-      }
-    };
-
-    interpIntoChild(cur);
-    substep(cur);           // reads 'a', writes 'b'
-    cur = 'b';
-    if (hasChild) {
-      S_Advance(level + 1, enc);
-      averageFromChild(cur);  // level+1's full cycle #1 lands in level's CURRENT ('b')
-      interpIntoChild(cur);   // re-interpolate level+1's ghosts from level's just-updated state
-    }
-    // Legacy same-level fine-fine refresh (?ghostcopy=1 only). The default
-    // path needs no pass here: substep B's own gather reaches into the
-    // neighbour tile directly, so it reads the neighbour's post-`average`
-    // interior rather than a copy taken before that average landed. See the
-    // DIRECT_GHOST override in shaders/amr_step1.wgsl.
-    if (GHOST_COPY) fineFineRefresh();
-    substep(cur);           // reads 'b', writes 'a'
-    cur = 'a';
-    if (hasChild) {
-      S_Advance(level + 1, enc);
-      averageFromChild(cur);  // level+1's full cycle #2 lands in level's CURRENT ('a')
-    }
-  }
+      const p = enc.beginComputePass();
+      p.setPipeline(step1PL); p.setBindGroup(0, bg);
+      p.dispatchWorkgroups(WGX1, WGY1, pool.MAX_FINE_BLOCKS); p.end();
+    },
+    fineFineRefresh: (enc, level) => {
+      const pool = pools[level];
+      const p = enc.beginComputePass();
+      if (level === 1) { p.setPipeline(interpFFPL); p.setBindGroup(0, interpFFBG_b); p.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); }
+      else { p.setPipeline(interpPoolParentFFPL); p.setBindGroup(0, pool.interpPoolParentFFBG_b); p.dispatchWorkgroups(WGX1, WGY1, pool.MAX_FINE_BLOCKS); }
+      p.end();
+    },
+  };
+  const { S_Advance: S_AdvanceShared } = makeScheduler({
+    nLevels: N_LEVELS, ghostCopy: () => !!GHOST_COPY, passes,
+  });
+  const S_Advance = (level, enc) => S_AdvanceShared(level, enc, useB);
 
   // Factored out of frame()'s loop so debugStepSync can reuse it exactly --
   // duplicating this dispatch sequence would risk the two silently drifting
@@ -1679,91 +1607,23 @@ async function init() {
     // each level's own velocity field as populated by the PREVIOUS macro-
     // step (level 1's finePoolVel, level>=2's own), i.e. the same
     // "current, pre-step" data the force passes also read.
+    // U7-3: WHAT each pass of the refinement round is. The ORDER -- and the
+    // three separate places it is subtle -- is amr2d-gpu.mjs's
+    // makeRefineRound, byte-identical across four pages before this.
+    const refinePasses = {
+      denseCriterion: (enc) => { const p = enc.beginComputePass(); p.setPipeline(criterionPL); p.setBindGroup(0, criterionBG); p.dispatchWorkgroups(WGX, WGY); p.end(); },
+      poolCriterion: (enc, m) => { const p = enc.beginComputePass(); p.setPipeline(criterionPoolPLs[m]); p.setBindGroup(0, criterionPoolBGs[m]); p.dispatchWorkgroups(2, 2, pools[m].MAX_FINE_BLOCKS); p.end(); },
+      denseDecide: (enc) => { const p = enc.beginComputePass(); p.setPipeline(manageDecidePL); p.setBindGroup(0, manageBG); p.dispatchWorkgroups(WG_MANAGE); p.end(); },
+      poolDecide: (enc, m) => { const p = enc.beginComputePass(); p.setPipeline(managePoolDecidePLs[m]); p.setBindGroup(0, managePoolBGs[m]); p.dispatchWorkgroups(Math.ceil(pools[m].MAX_FINE_BLOCKS / 64)); p.end(); },
+      denseCoarsen: (enc) => { const p = enc.beginComputePass(); p.setPipeline(manageCoarsenPL); p.setBindGroup(0, manageBG); p.dispatchWorkgroups(WG_MANAGE); p.end(); },
+      poolCoarsen: (enc, m) => { const p = enc.beginComputePass(); p.setPipeline(managePoolCoarsenPLs[m - 1]); p.setBindGroup(0, managePoolBGs[m - 1]); p.dispatchWorkgroups(Math.ceil(pools[m].MAX_FINE_BLOCKS / 64)); p.end(); },
+      denseRefine: (enc) => { const p = enc.beginComputePass(); p.setPipeline(manageRefinePL); p.setBindGroup(0, manageBG); p.dispatchWorkgroups(WG_MANAGE); p.end(); },
+      poolRefine: (enc, m) => { const p = enc.beginComputePass(); p.setPipeline(managePoolRefinePLs[m - 1]); p.setBindGroup(0, managePoolBGs[m - 1]); p.dispatchWorkgroups(Math.ceil(pools[m - 1].MAX_FINE_BLOCKS / 64)); p.end(); },
+      l1InitFill: (enc) => { const p = enc.beginComputePass(); p.setPipeline(interpInitPL); p.setBindGroup(0, interpInitBG); p.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); p.end(); },
+      poolInitFill: (enc, m) => { const p = enc.beginComputePass(); p.setPipeline(interpPoolParentInitPL); p.setBindGroup(0, pools[m].interpPoolParentBG_readA); p.dispatchWorkgroups(WGX1, WGY1, pools[m].MAX_FINE_BLOCKS); p.end(); },
+    };
     if (autoRefine && macroStepCounter % REFINE_EVERY === 0) {
-      for (let m = 1; m < N_LEVELS; m++) {
-        enc.clearBuffer(pools[m].newlyActivatedBuf); // GPU-recorded, not queue.writeBuffer --
-        // see plans/AMR.md's Milestone 4b note on why a JS-side writeBuffer
-        // wouldn't interleave correctly with commands already recorded into
-        // this same not-yet-submitted encoder.
-      }
-
-      // Criterion: level 1's own (dense, from velBuf, unchanged) plus every
-      // parent level's own pool criterion (deciding levels 2..N_LEVELS-1).
-      // Evaluated ONCE, before the fixed-point loop below -- a block's own
-      // vorticity doesn't change just because a neighbor gets (de)activated
-      // this round, so re-evaluating per iteration would be wasted work.
-      const crit = enc.beginComputePass(); crit.setPipeline(criterionPL); crit.setBindGroup(0, criterionBG); crit.dispatchWorkgroups(WGX, WGY); crit.end();
-      for (let m = 1; m < N_LEVELS - 1; m++) {
-        const c = enc.beginComputePass(); c.setPipeline(criterionPoolPLs[m]); c.setBindGroup(0, criterionPoolBGs[m]); c.dispatchWorkgroups(2, 2, pools[m].MAX_FINE_BLOCKS); c.end();
-      }
-
-      // Milestone 9: 2:1-balance fixed-point loop -- coarsen finest-to-
-      // coarsest (a level can't release while it's still a parent, or
-      // while releasing would strand a neighbor's deeper child -- see
-      // amr_manage.wgsl's header), then refine coarsest-to-finest (so a
-      // neighbor cascade-forced active THIS iteration, at a shallower
-      // level, is already reflected in blockSlot before a deeper level's
-      // refine pass checks for it THIS SAME iteration). A handful of
-      // iterations is enough to converge at this plan's validated depth
-      // (N<=3, plans/AMR-multilevel.md's Milestone 9 text) -- see
-      // amr_manage_pool.wgsl's header for why cascades don't chain deeper
-      // than one hop there.
-      // ── B2: ONE SWEEP, NO FIXED POINT ────────────────────────────────────
-      //
-      // decide (every level, own reason only) -> close under the 2:1 rule ->
-      // coarsen finest-first -> refine coarsest-first. Once.
-      //
-      // WHY ONE PASS IS ENOUGH: the closure is transitive, so after it runs
-      // want[m] already contains everything want[m+1] will need a parent for.
-      // The legacy loop below iterates because its per-pass tests only ever
-      // see one hop at a time.
-      //
-      // THE ORDERS STILL MATTER, but for the ALLOCATOR, not for balance.
-      // Coarsen runs finest-first because a child's slots must return to the
-      // free list before its parent's tile does; refine runs coarsest-first
-      // because a level-(m+1) quad can only be carved from an ACTIVE level-m
-      // parent slot. Neither is about 2:1 any more.
-      // The want buffers must be CLEARED, not just overwritten: decide() at
-      // level >= 2 is dispatched over PARENT slots and never visits a block
-      // whose parent is inactive, so a stale want would survive there and
-      // resurrect a tile the criterion has stopped asking for.
-      for (let m = 1; m < N_LEVELS; m++) enc.clearBuffer(pools[m].wantBuf);
-
-      { const p = enc.beginComputePass(); p.setPipeline(manageDecidePL); p.setBindGroup(0, manageBG); p.dispatchWorkgroups(WG_MANAGE); p.end(); }
-      for (let m = 1; m < N_LEVELS - 1; m++) {
-        const wg = Math.ceil(pools[m].MAX_FINE_BLOCKS / 64);
-        const p = enc.beginComputePass(); p.setPipeline(managePoolDecidePLs[m]); p.setBindGroup(0, managePoolBGs[m]); p.dispatchWorkgroups(wg); p.end();
-      }
-
-      encodeCascade(enc, cascade, N_LEVELS);
-
-      for (let m = N_LEVELS - 1; m >= 1; m--) {
-        if (m === 1) {
-          const p = enc.beginComputePass(); p.setPipeline(manageCoarsenPL); p.setBindGroup(0, manageBG); p.dispatchWorkgroups(WG_MANAGE); p.end();
-        } else {
-          const wg = Math.ceil(pools[m].MAX_FINE_BLOCKS / 64);
-          const p = enc.beginComputePass(); p.setPipeline(managePoolCoarsenPLs[m - 1]); p.setBindGroup(0, managePoolBGs[m - 1]); p.dispatchWorkgroups(wg); p.end();
-        }
-      }
-      for (let m = 1; m < N_LEVELS; m++) {
-        if (m === 1) {
-          const p = enc.beginComputePass(); p.setPipeline(manageRefinePL); p.setBindGroup(0, manageBG); p.dispatchWorkgroups(WG_MANAGE); p.end();
-        } else {
-          const wg = Math.ceil(pools[m - 1].MAX_FINE_BLOCKS / 64);
-          const p = enc.beginComputePass(); p.setPipeline(managePoolRefinePLs[m - 1]); p.setBindGroup(0, managePoolBGs[m - 1]); p.dispatchWorkgroups(wg); p.end();
-        }
-      }
-
-      // One-time full-slot fill for everything newly activated this round,
-      // every level (level 1: dense-parent init pipeline, unchanged;
-      // level>=2: pool-parent init pipeline, reading readA since a
-      // level's own buffer is always "current" at a macro-step boundary --
-      // same invariant debugActivateBlock already relies on).
-      const init = enc.beginComputePass(); init.setPipeline(interpInitPL); init.setBindGroup(0, interpInitBG); init.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); init.end();
-      for (let m = 2; m < N_LEVELS; m++) {
-        const pool = pools[m];
-        const p = enc.beginComputePass(); p.setPipeline(interpPoolParentInitPL); p.setBindGroup(0, pool.interpPoolParentBG_readA); p.dispatchWorkgroups(WGX1, WGY1, pool.MAX_FINE_BLOCKS); p.end();
-      }
+      makeRefineRound({ nLevels: N_LEVELS, pools, cascade, encodeCascade, passes: refinePasses })(enc);
     }
     macroStepCounter++;
 
