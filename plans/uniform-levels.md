@@ -2448,9 +2448,50 @@ share what is already identical, and leave what genuinely differs.
 
 #### U7-4 — the root pool on every page
 
-Allocate, seed, and expose the flags. Everything else is already shared.
+Allocate, seed, and expose the flags. **But NOT quite "everything else is
+already shared" — U7-3 changed that, and the itemisation below now applies only
+after a step U7-4 has to take first.**
 
-**"~60 LINES PER PAGE" WAS AN ESTIMATE AND IT WAS ABOUT 3x HIGH.** Itemised
+**WHAT U7-3 ACTUALLY LEFT.** This rung was scoped on the assumption that
+sharing the scheduler would carry the root pool to every page "by
+construction". It did not, and the reason is the seam U7-3 chose: the shared
+scheduler owns the ORDER, and a `passes` object owns the CONTENT. **The root's
+step and the root's restriction are content.** So they live in `main-amr.js`'s
+`passes` and nowhere else, and four pages still have no way to encode them.
+
+Measured 2026-09-18, `main-amr.js`'s root-pool construction block is **372
+lines**, and it splits cleanly:
+
+```
+  SOLVER      ~200   the mirror, the root step, the root criterion, and U5-3's
+                     live interp/average pipelines and bind groups.
+                     Needed by every page.
+  INSTRUMENT  ~170   the root force pass, the full digest, and U5-1/U5-2's
+                     inert scratch legs. Dev page only.
+```
+plus roughly 280 lines of `debugCheckRoot*` comparators, which stay on the dev
+page for the reason already given.
+
+**So U7-4 is two steps, not one:**
+
+- **U7-4a — extract the SOLVER half** into `amr2d-gpu.mjs` as a
+  `makeRootPool(...)` returning the mirror, the step, the criterion and the
+  live coupling's pipelines and bind groups, plus the two `passes` entries the
+  scheduler needs. `main-amr.js` becomes its first caller and keeps only the
+  instrument and the comparators. *Gate:* `measure-determinism.js` unmoved BOTH
+  with and without `?rootpool=1` (the second is what covers the live coupling),
+  and `validate-root-kernels.js` green on all eleven rungs.
+  **The interleaving is the work.** The instrument and the solver currently sit
+  inside one `if (ROOT_POOL)` block with shared locals (the sentinel buffer,
+  the scratch allocator), so the extraction is an untangle rather than a move.
+- **U7-4b — the four pages call it**, which is then the itemisation below.
+
+**The `~20 new lines and 7 single-token edits` figure is U7-4b's, and it holds
+only once U7-4a is done.** It was written before U7-3 fixed the seam, and it
+assumed a sharing that U7-3 deliberately did not do.
+
+**"~60 LINES PER PAGE" WAS AN ESTIMATE AND IT WAS ABOUT 3x HIGH — for U7-4b.**
+Itemised
 against the real sites in `main-amr.js` (2026-09-18), what a page actually
 grows once U7-0…U7-3 are done is roughly **20 new lines and 7 single-token
 edits**:
