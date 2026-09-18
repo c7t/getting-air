@@ -12,9 +12,14 @@
 // @include "common_fpack.wgsl"
 
 struct LevelParams {
-  nbx: u32,        // unused here (destination is parentSlot+quadrant, not a
-  nby: u32,        // cellIndex() lookup) -- shared verbatim with the interp/
-                   // step1 pool-parent shaders' uniform, not a near-duplicate.
+  nbx: u32,        // READ ON THE ROOT-PARENT PATH ONLY (PARENT_GHOST = 0),
+  nby: u32,        // where parentSlot/quadrant are derived from this level's
+                   // own block index instead of read -- see
+                   // common_avg_parent_pool.wgsl. Unused on every ringed
+                   // parent, where the destination is parentSlot+quadrant and
+                   // not a block-index lookup. Shared verbatim with the
+                   // interp/step1 pool-parent shaders' uniform, not a
+                   // near-duplicate. `nby` genuinely is unused here.
   parentTau: f32,
   dxL: f32,        // also unused here -- see amr_interp_pool_parent.wgsl's
                    // comment; real field, not padding (amr_force1_pool.wgsl
@@ -25,6 +30,12 @@ struct LevelParams {
 @group(0) @binding(1) var<storage, read>       f_pool        : array<u32>;
 @group(0) @binding(2) var<storage, read_write> f_parent_pool : array<u32>;
 @group(0) @binding(3) var<storage, read>       slotToBlock   : array<i32>;
+// UNREAD ON THE ROOT-PARENT PIPELINE (PARENT_GHOST = 0), where both are
+// derived from the child's own block index instead. They stay DECLARED because
+// WGSL module scope has no conditional bindings and this entry file serves both
+// pipelines; main-amr.js binds a sentinel buffer there rather than a plausible
+// one, so a read that should not happen cannot return a number that looks like
+// data (plans/2D-backport.md B6-9c). Same treatment as the interp entry's.
 @group(0) @binding(4) var<storage, read>       parentSlot    : array<i32>;
 @group(0) @binding(5) var<storage, read>       quadrant      : array<u32>;
 

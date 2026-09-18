@@ -1781,6 +1781,60 @@ it. That is the same sentence U3 used to justify pinning `DIRECT_GHOST` on the
 root step and U4-1 used for the criterion's stencil -- the fourth application
 of one rule, not a fourth special case.
 
+### U5-2 — DONE (2026-09-17), BIT-IDENTICAL on 8 rungs. The restriction, and why it was the easy half.
+
+The reverse hop of U5-1, built the same way: `PARENT_GHOST` on
+`common_avg_parent_pool.wgsl`, default 2 (every ringed pipeline byte-identical)
+and 0 on the root-parent pipeline, with `parentSlot`/`quadrant` derived from
+the child's own blockID rather than read.
+
+**STRUCTURALLY EASIER THAN THE FORWARD DIRECTION, and the asymmetry is the
+result worth carrying.** Restriction writes ONE parent cell per child cell and
+the destination is always inside the parent's own interior -- there is no
+stencil, so nothing ever reaches past the parent tile. U5-1 had to resolve an
+out-of-tile index against the neighbouring ROOT TILE; this direction has no
+out-of-tile index to resolve at all. **A ring-free parent costs prolongation a
+neighbour lookup and costs restriction nothing but an offset and a stride.**
+That is a statement about which direction the ring is FOR, and it is the same
+statement B6's mailbox makes: the ring is an inbox inward and an accumulator
+outward, and only the inward half needs to reach.
+
+    rung (512 macro-steps, index-amr.html)     written words   differ
+    levels=2                                          23616        0
+    levels=3                                          27648        0
+    levels=4                                          29376        0
+    levels=2 f16=1                                    13120        0
+    levels=2 f16=2                                    13120        0
+    levels=2 res=9                                    41472        0
+    levels=2 ghostcopy=1                              23616        0
+    levels=2 dcpre=1                                  23616        0
+
+Scored over the cells the restriction actually WRITES -- the L0 footprint of
+the ACTIVE level-1 blocks, exactly `RB*RB` per active slot. Two mutants, on the
+`levels=2` rung: quadrant 0 for every child **20544/23616**, `PARENT_GHOST`
+left at 2 **23616/23616**.
+
+**AND `?rootstep=0` CANNOT DISCRIMINATE THIS COLUMN, WHICH IS A FACT ABOUT
+RESTRICTION AND NOT A HOLE IN THE CONTROL.** The tool's control rung makes the
+root pool stale, which moves every row that READS it. The average reads only
+the CHILD and writes only the parent -- the parent's prior contents never enter
+the arithmetic -- so a stale parent produces a bit-identical result. That
+column reads clean on the control while the other five go dirty, and it is
+excluded from the control's assertion with the reason written down. Its own
+liveness control lives in the page hook and changes the child instead. **A
+control that provably cannot discriminate a row should say so rather than be
+quietly weakened until it appears to** -- the same discipline as the
+starved-pool sweep's `field`/`quadrants` abstention.
+
+**THE PLAN WAS WRONG ABOUT WHAT L1 NEEDS, and U5-1 is why.** The umbrella
+below says "L1 gains `parentSlot`/`quadrant`". It does not: the root is always
+full, so its slot IS its block index, and both fields fall out of the child's
+own block coordinates in three lines of arithmetic. **Two buffers per level and
+two allocator writes were budgeted for and are not needed** -- the same shape
+as B2-2b0's `childQuadrant` and B3-5's origin buffers, found a third time. The
+bindings stay declared (WGSL has no conditional bindings, and one entry file
+serves both pipelines) but are bound to a sentinel on the root pipeline.
+
 ### U5 — L1 becomes a quad child of the root
 
 The load-bearing stage. `amr_manage.wgsl` retires; `amr_manage_pool.wgsl`

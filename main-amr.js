@@ -1751,6 +1751,8 @@ async function init() {
   // the wrong-parent leg is not optional.
   let rootInterpPL = null, rootInterpBG = null, rootInterpStaleBG = null,
       denseInterpScratchBG = null, interpScratchDense = null, interpScratchRoot = null;
+  let rootAvgPL = null, rootAvgBG_live = null, rootAvgBG_stale = null,
+      denseAvgScratchBG = null, avgScratchDense = null, avgScratchRoot = null;
   if (ROOT_POOL) {
     const mkScratch = () => device.createBuffer({
       size: pools[1].fSizePool, usage: U.STORAGE | U.COPY_SRC | U.COPY_DST,
@@ -1799,6 +1801,51 @@ async function init() {
       { binding: 3, resource: { buffer: pools[1].slotToBlockBuf } },
       { binding: 4, resource: { buffer: pools[1].newlyActivatedBuf } },
       { binding: 5, resource: { buffer: pools[1].blockSlotBuf } },
+    ]});
+
+    // ── U5-2: the RESTRICTION, level 1 -> the ROOT POOL ──────────────────
+    //
+    // The reverse hop of U5-1 and the other half of the coupling, built the
+    // same way: amr_average_pool_parent.wgsl with PARENT_GHOST 0, both legs
+    // writing scratch so the page's own buffers are never touched.
+    //
+    // STRUCTURALLY EASIER THAN U5-1, and the asymmetry is the interesting
+    // part: restriction writes one parent cell per child cell and the
+    // destination is always inside the parent's own interior, so there is no
+    // stencil and nothing to resolve against a neighbouring root tile. The
+    // ring-free root costs this direction only the offset and the stride.
+    //
+    // The two scratches are the SAME SIZE, which is U1's identity showing up
+    // as a line of code: the root pool has no ring, so tiling the domain costs
+    // no padding and `spec.cells === W * H` exactly.
+    avgScratchDense = device.createBuffer({ size: fSize, usage: U.STORAGE | U.COPY_SRC | U.COPY_DST });
+    avgScratchRoot = device.createBuffer({ size: pools[0].fSizePool, usage: U.STORAGE | U.COPY_SRC | U.COPY_DST });
+    if (pools[0].fSizePool !== fSize) {
+      throw new Error(`root pool f is ${pools[0].fSizePool} bytes, dense f ${fSize} -- U1's identity is broken`);
+    }
+    rootAvgPL = device.createComputePipeline({
+      layout: device.createPipelineLayout({ bindGroupLayouts: [avgPoolBGL] }),
+      compute: { module: avgPoolSM, entryPoint: 'main',
+                 constants: { RB, F16, DC_PRE, PARENT_GHOST: 0 } },
+    });
+    const rootAvgBG = (childF) => device.createBindGroup({ layout: avgPoolBGL, entries: [
+      { binding: 0, resource: { buffer: pools[1].levelParamsBuf } },
+      { binding: 1, resource: { buffer: childF } },
+      { binding: 2, resource: { buffer: avgScratchRoot } },
+      { binding: 3, resource: { buffer: pools[1].slotToBlockBuf } },
+      { binding: 4, resource: { buffer: unread } },
+      { binding: 5, resource: { buffer: unread } },
+    ]});
+    rootAvgBG_live = rootAvgBG(pools[1].finePoolF_a);
+    // The stale-CHILD control. `?rootstep=0` cannot discriminate this column
+    // -- see debugCheckRootAverage -- so the liveness control has to change
+    // the one input the restriction actually reads.
+    rootAvgBG_stale = rootAvgBG(pools[1].finePoolF_b);
+    denseAvgScratchBG = device.createBindGroup({ layout: avgBGL, entries: [
+      { binding: 0, resource: { buffer: cardStateBuf } },
+      { binding: 1, resource: { buffer: pools[1].finePoolF_a } },
+      { binding: 2, resource: { buffer: avgScratchDense } },
+      { binding: 3, resource: { buffer: pools[1].slotToBlockBuf } },
     ]});
   }
 
@@ -2291,6 +2338,21 @@ async function init() {
   // derives it from slotToBlock and its own overrides. Neither consults the
   // other -- though see plans/uniform-levels.md U2 for why that is necessary
   // and not sufficient, and what it cost when the two shared a premise.
+  // Raw words out of any COPY_SRC buffer, on demand. One dedicated staging
+  // buffer per call rather than a cached one: these run on a paused page from
+  // a debug hook, never per frame, and a shared stage would have to be sized
+  // for the largest caller and guarded against overlapping awaits.
+  const readBuf = async (buf, bytes) => {
+    const stage = device.createBuffer({ size: bytes, usage: U.MAP_READ | U.COPY_DST });
+    const enc = device.createCommandEncoder();
+    enc.copyBufferToBuffer(buf, 0, stage, 0, bytes);
+    device.queue.submit([enc.finish()]);
+    await stage.mapAsync(GPUMapMode.READ);
+    const out = new Uint32Array(stage.getMappedRange()).slice();
+    stage.unmap(); stage.destroy();
+    return out;
+  };
+
   async function compareRootToDense({ denseBuf, poolBuf, comps, interleaved, asFloat, maxReport = 8 }) {
     if (!pools[0]) return { ok: null, skipped: 'no root pool (?rootpool=1)' };
     const spec = rootPoolSpec({ dims: { W, H }, rb: RB });
@@ -2593,16 +2655,6 @@ async function init() {
     const planeStride = pool.MAX_FINE_BLOCKS * NCELLS1;
     const nw = fWords(F16);
 
-    const readBuf = async (buf, bytes) => {
-      const stage = device.createBuffer({ size: bytes, usage: U.MAP_READ | U.COPY_DST });
-      const enc = device.createCommandEncoder();
-      enc.copyBufferToBuffer(buf, 0, stage, 0, bytes);
-      device.queue.submit([enc.finish()]);
-      await stage.mapAsync(GPUMapMode.READ);
-      const out = new Uint32Array(stage.getMappedRange()).slice();
-      stage.unmap(); stage.destroy();
-      return out;
-    };
     // Seed a scratch from the live pool and run one leg into it. The seed is
     // what makes the legs comparable: the fine-fine branch reads this buffer.
     const leg = (dst, pl, bg) => {
@@ -2652,6 +2704,93 @@ async function init() {
     return {
       ok: mismatched === 0 && activeSlots > 0 && wrote > 0 && staleDiff > 0,
       checked, mismatched, wrote, staleDiff, activeSlots, first,
+    };
+  }
+
+  // U5-2: level 1 restricted into the ROOT POOL, against level 1 restricted
+  // into the dense grid. EXACTLY.
+  //
+  // The reverse hop of debugCheckRootInterp, same three-leg shape, one
+  // structural difference worth reading before the numbers.
+  //
+  // `?rootstep=0` CANNOT DISCRIMINATE THIS COLUMN, and that is a property of
+  // restriction rather than a gap in the control. The average reads ONLY the
+  // CHILD's populations and writes ONLY the parent -- the parent's prior
+  // contents never enter the arithmetic -- so a stale root pool produces a
+  // bit-identical result, and `validate-root-kernels.js`'s control rung reads
+  // clean here while going dirty on all five of the others. That is the same
+  // kind of abstention the starved-pool sweep gets from `field` and
+  // `quadrants`: a control that reddens everything has not been shown to test
+  // anything, and one that provably cannot redden a particular row should say
+  // so rather than be quietly weakened until it does.
+  //
+  // So the liveness control changes the one input the restriction reads: the
+  // third leg runs the root pipeline against level 1's OTHER ping-pong buffer,
+  // which at rest holds the mid-macro-step state.
+  //
+  // Scored over the cells the restriction actually WRITES -- the L0 footprint
+  // of the ACTIVE level-1 blocks, which is exactly RB*RB per active slot. The
+  // rest of the domain is untouched by both legs and would agree by
+  // construction.
+  async function debugCheckRootAverage(maxReport = 8) {
+    if (!rootAvgPL) return { ok: null, skipped: 'no root pool (?rootpool=1)' };
+    const spec = rootPoolSpec({ dims: { W, H }, rb: RB });
+    const nw = fWords(F16);
+    const rootCells = spec.slots * spec.cellsPerSlot;
+
+    const leg = (dst, src, pl, bg) => {
+      const enc = device.createCommandEncoder();
+      enc.copyBufferToBuffer(src, 0, dst, 0, fSize);
+      const p = enc.beginComputePass();
+      p.setPipeline(pl); p.setBindGroup(0, bg);
+      p.dispatchWorkgroups(1, 1, pools[1].MAX_FINE_BLOCKS);
+      p.end();
+      device.queue.submit([enc.finish()]);
+      return device.queue.onSubmittedWorkDone();
+    };
+
+    await leg(avgScratchDense, f_a, avgPL, denseAvgScratchBG);
+    await leg(avgScratchRoot, pools[0].finePoolF_a, rootAvgPL, rootAvgBG_live);
+    const seed = await readBuf(f_a, fSize);
+    const denseW = await readBuf(avgScratchDense, fSize);
+    const rootW = await readBuf(avgScratchRoot, fSize);
+    await leg(avgScratchRoot, pools[0].finePoolF_a, rootAvgPL, rootAvgBG_stale);
+    const staleW = await readBuf(avgScratchRoot, fSize);
+    const blockSlot = new Int32Array((await readBuf(pools[1].blockSlotBuf, NBLOCKS * 4)).buffer);
+
+    let checked = 0, mismatched = 0, wrote = 0, staleDiff = 0, activeBlocks = 0;
+    for (let i = 0; i < NBLOCKS; i++) if (blockSlot[i] >= 0) activeBlocks++;
+    const first = [];
+    for (let slot = 0; slot < spec.slots; slot++) {
+      for (let ly = 0; ly < spec.side; ly++) {
+        for (let lx = 0; lx < spec.side; lx++) {
+          // This root cell's own spatial position, hence which level-1 block
+          // covers it. A root tile is 2*RB cells, i.e. exactly 2x2 level-1
+          // blocks -- the quadrant relation U5 is built on, read here in the
+          // direction that names the block.
+          const gx = (slot % spec.nbx) * spec.side + lx;
+          const gy = Math.floor(slot / spec.nbx) * spec.side + ly;
+          if (blockSlot[Math.floor(gy / RB) * NBX + Math.floor(gx / RB)] < 0) continue;
+          const denseCell = rootCellToDense({ dims: { W, H }, rb: RB }, slot, lx, ly);
+          const rootCell = slot * spec.cellsPerSlot + ly * spec.side + lx;
+          for (let wi = 0; wi < nw; wi++) {
+            const d = wi * NCELLS + denseCell;
+            const r = wi * rootCells + rootCell;
+            checked++;
+            if (denseW[d] !== seed[d]) wrote++;
+            if (denseW[d] !== staleW[r]) staleDiff++;
+            if (denseW[d] === rootW[r]) continue;
+            mismatched++;
+            if (first.length < maxReport) {
+              first.push({ slot, lx, ly, gx, gy, word: wi, dense: denseW[d], root: rootW[r] });
+            }
+          }
+        }
+      }
+    }
+    return {
+      ok: mismatched === 0 && activeBlocks > 0 && wrote > 0 && staleDiff > 0,
+      checked, mismatched, wrote, staleDiff, activeBlocks, first,
     };
   }
 
@@ -4309,6 +4448,7 @@ async function init() {
     debugCheckRootDigest,
     debugCheckRootConserved,
     debugCheckRootInterp,
+    debugCheckRootAverage,
     getRootPool: () => (ROOT_POOL ? { ...rootPoolSpec({ dims: { W, H }, rb: RB }), stepped: !!ROOT_STEP } : null),
     debugRenderOnce,
     debugPerturbLevelVel,

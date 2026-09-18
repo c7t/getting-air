@@ -15,17 +15,29 @@
 //   cons  mass/momentum/rho totals      readConservedTotals on the root pool
 //   interp level 1's ghost ring         amr_interp_pool_parent (PARENT_GHOST 0)
 //                                       vs amr_interp_dense_parent
+//   avg   level 1's restriction         amr_average_pool_parent (PARENT_GHOST 0)
+//                                       vs amr_average_f2c
 //
-// `interp` is the ONE ROW THAT IS NOT A KERNEL ON THE ROOT, and it is here
-// anyway. Every other row asks "does this kernel, dispatched over the root
-// pool, reproduce the dense kernel?"; this one asks whether level 1's ghost
-// ring, interpolated FROM the root pool, reproduces the ring interpolated from
-// the dense grid (plans/uniform-levels.md U5-1). It belongs with them because
-// it is the same differential protocol against the same reference and it wants
-// the same rungs -- and specifically because it wants `ghostcopy`, which is
-// the rung that caught U3's one real defect. The alternative was a second tool
-// that duplicates this one's lifecycle and rung table, which is how a project
-// ends up with two rung tables that disagree.
+// `interp` and `avg` are THE TWO ROWS THAT ARE NOT KERNELS ON THE ROOT, and
+// they are here anyway. Every other row asks "does this kernel, dispatched over
+// the root pool, reproduce the dense kernel?"; these two ask whether level 1's
+// COUPLING to the root -- its ghost ring in, its restriction out -- reproduces
+// the same coupling to the dense grid (plans/uniform-levels.md U5-1, U5-2).
+// They belong with the others because it is the same differential protocol
+// against the same reference and they want the same rungs -- and specifically
+// because they want `ghostcopy`, which is the rung that caught U3's one real
+// defect. The alternative was a second tool that duplicates this one's
+// lifecycle and rung table, which is how a project ends up with two rung
+// tables that disagree.
+//
+// AND THE CONTROL RUNG DOES NOT REACH `avg`, WHICH IS A FACT ABOUT
+// RESTRICTION, NOT A HOLE. `?rootstep=0` makes the root pool stale, which
+// moves every row that READS it. The average reads only the CHILD and writes
+// only the parent, so a stale parent cannot perturb it: that column comes back
+// clean on the control and is deliberately excluded from the control's
+// assertion below. Its own liveness control lives in the page hook and changes
+// the child instead. A control that provably cannot discriminate a row should
+// say so rather than be quietly weakened until it appears to.
 //
 // THREE DIFFERENT ANSWERS TO "CAN THIS BE EXACT", AND EACH HAS A REASON. The
 // step and the criterion are bit-identical because the per-cell arithmetic is
@@ -235,7 +247,8 @@ async function runCase(Runtime, Page, o, q) {
   const dig = JSON.parse(await ev(Runtime, 'window.__AMR.debugCheckRootDigest().then(r => JSON.stringify(r))'));
   const cons = JSON.parse(await ev(Runtime, 'window.__AMR.debugCheckRootConserved().then(r => JSON.stringify(r))'));
   const interp = JSON.parse(await ev(Runtime, 'window.__AMR.debugCheckRootInterp().then(r => JSON.stringify(r))'));
-  return { q, seeded, after, vel, crit, force, dig, cons, interp, health };
+  const avg = JSON.parse(await ev(Runtime, 'window.__AMR.debugCheckRootAverage().then(r => JSON.stringify(r))'));
+  return { q, seeded, after, vel, crit, force, dig, cons, interp, avg, health };
 }
 
 function fmt(r) {
@@ -250,6 +263,7 @@ function fmt(r) {
     `   force ${r.force.exact ? '  exact' : '|d|<=' + String(r.force.maxDiff).padStart(2)}` +
     `   dig ${r.dig.maxExact ? 'exact' : ' DIFF'}   cons ${r.cons.exact ? 'exact' : ' DIFF'}` +
     `   interp ${String(r.interp.mismatched).padStart(6)}/${r.interp.checked} (hop ${r.interp.staleDiff})` +
+    `   avg ${String(r.avg.mismatched).padStart(6)}/${r.avg.checked}` +
     `   seeded ${r.seeded.mismatched}   ${h}`;
 }
 
@@ -279,7 +293,7 @@ async function main() {
         && r.crit.mismatched === 0 && r.crit.nonZero > 0
         && r.force.nonZero && r.force.maxDiff <= FORCE_TOL
         && r.dig.maxExact && r.dig.cellsMatch && r.cons.exact && r.cons.live
-        && r.interp.ok
+        && r.interp.ok && r.avg.ok
         && r.seeded.mismatched === 0 && r.health.nonFinite === 0;
       if (!ok) fails.push(q);
       console.log(`${ok ? '  ok  ' : ' FAIL '} ${q.padEnd(46)} ${fmt(r)}`);
@@ -291,6 +305,8 @@ async function main() {
         && r.crit.mismatched > 0 && r.force.maxDiff > FORCE_TOL
         && !r.dig.maxExact && !r.cons.exact
         && r.interp.mismatched > 0
+        // NOT r.avg -- see the header. Restriction cannot see a stale parent.
+        && r.avg.ok
         && r.health.nonFinite === 0;
       if (!ok) fails.push(`${q} (control came back clean)`);
       console.log(`${ok ? '  ok  ' : ' FAIL '} ${q.padEnd(46)} ${fmt(r)}`);
@@ -311,9 +327,9 @@ async function main() {
     process.exit(1);
   }
   console.log('PASS: every root-pool consumer reproduces its dense counterpart. Exact on\n'
-    + '      f, vel, the criterion, the digest max, the conserved totals and level 1\'s\n'
-    + '      root-parent ghost ring; the force integral to the per-workgroup truncation\n'
-    + '      floor (see FORCE_TOL).');
+    + '      f, vel, the criterion, the digest max, the conserved totals and both\n'
+    + '      directions of level 1\'s coupling to the root; the force integral to the\n'
+    + '      per-workgroup truncation floor (see FORCE_TOL).');
   process.exit(0);
 }
 
