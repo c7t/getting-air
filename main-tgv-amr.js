@@ -62,7 +62,7 @@ import { reportFatal, refuseConfig, reportNoWebGPU, reportNoAdapter } from './er
 import { tauChainSingularity, tauSingularityMessage } from './amr2d.mjs';
 import { loadShader } from './shader-loader.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
-import { check21BalanceOnGPU, readConservedTotals, allocLevelPool, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState , checkRefinementClosureOnGPU , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU, makeRenderBindGroup, renderPoolLevels, MAX_RENDER_POOL_LEVELS, makeAMRLayouts } from './amr2d-gpu.mjs';
+import { check21BalanceOnGPU, readConservedTotals, allocLevelPool, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState , checkRefinementClosureOnGPU , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU, makeRenderBindGroup, renderPoolLevels, MAX_RENDER_POOL_LEVELS, makeAMRLayouts, makeCouplingPipelines } from './amr2d-gpu.mjs';
 // tauAtLevel: extracted to card-params.mjs by B3a-1, which landed the CALL
 // in all five AMR pages and this IMPORT in only main-amr.js. The other four
 // threw `ReferenceError: tauAtLevelOf is not defined` at init -- but only at
@@ -478,6 +478,9 @@ async function init() {
     loadShader(device, 'shaders/amr_manage_pool.wgsl'),
   ]);
 
+  // The six modules the shared coupling pipelines need, as one object.
+  const modules = { interpDenseSM, interpPoolSM, avgSM, avgPoolSM, criterionSM, manageSM };
+
   // U7-0: the fourteen bind group layouts, from ONE place. They were spelled
   // out inline here and in four other pages, byte-identical in all of them --
   // see makeAMRLayouts for why that mattered more than the line count.
@@ -487,27 +490,35 @@ async function init() {
   // -- a layout nobody binds costs nothing, and selecting a subset there would
   // reintroduce the per-page variation this removes -- but naming only the
   // consumed ones here keeps "what this page needs" readable.
+  const layouts = makeAMRLayouts(device);
   const {
     stepBGL, renBGL, interpBGL, interpPoolParentBGL,
     avgBGL, avgPoolBGL, criterionBGL, criterionPoolBGL, manageBGL,
     managePoolBGL, step1BGL,
-  } = makeAMRLayouts(device);
+  } = layouts;
 
   const constants = { W, H };
 
   // Fully periodic, no body, no walls, no force -- see this file's header.
   const stepConstants = { W, H, HAS_BODY: 0, SPONGE_W: 0, F16 };
   const fineConstants = { W, H, RB };
-  // Split from fineConstants, which also drives the render fragment --
-  // render.wgsl has no F16 override and WebGPU rejects an undeclared one.
-  const avgConstants = { W, H, RB, F16, DC_PRE };
 
-  const interpConstants = { W, H, RB, GHOST_ONLY: 1, F16, DC_PRE };
-  const interpInitConstants = { W, H, RB, GHOST_ONLY: 0, F16, DC_PRE };
-  const interpFFConstants = { W, H, RB, GHOST_ONLY: 1, FINE_FINE_ONLY: 1, F16, DC_PRE };
   const step1Constants = { ...stepConstants, RB, DIRECT_GHOST: GHOST_COPY ? 0 : 1 };
-  const criterionConstants = { W, H };
   const manageConstants = { DIAG, W, H, REFINE_THRESH, COARSEN_THRESH, FORCE_REFINE_MARGIN, FORCE_REFINE_LOOKAHEAD, HAS_BODY: 0  };
+
+  // U7-1: the twelve coupling pipelines, from ONE place. Every page built
+  // these identically; see makeCouplingPipelines for what stays per page and
+  // why. `couplingConstants` carries the bundles it derived, so the
+  // measurement twins and the root-parent variants below are built from the
+  // SAME literal the real pipeline used rather than a second copy of it.
+  const {
+    constants: couplingConstants,
+    interpPL, interpInitPL, interpFFPL,
+    interpPoolParentPL, interpPoolParentInitPL, interpPoolParentFFPL,
+    avgPL, avgPoolPL, criterionPL,
+    manageDecidePL, manageCoarsenPL, manageRefinePL,
+  } = makeCouplingPipelines(device, layouts, modules,
+      { W, H, RB, F16, DC_PRE, manage: manageConstants });
 
   const stepPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [stepBGL] }),
@@ -528,64 +539,11 @@ async function init() {
       constants: { ...fineConstants, N_POOL_LEVELS: renderPoolLevels(N_LEVELS) } },
     primitive: { topology: 'triangle-list' },
   });
-  const interpPL = device.createComputePipeline({
-    layout: device.createPipelineLayout({ bindGroupLayouts: [interpBGL] }),
-    compute: { module: interpDenseSM, entryPoint: 'main', constants: interpConstants }
-  });
-  const interpInitPL = device.createComputePipeline({
-    layout: device.createPipelineLayout({ bindGroupLayouts: [interpBGL] }),
-    compute: { module: interpDenseSM, entryPoint: 'main', constants: interpInitConstants }
-  });
-  const interpFFPL = device.createComputePipeline({
-    layout: device.createPipelineLayout({ bindGroupLayouts: [interpBGL] }),
-    compute: { module: interpDenseSM, entryPoint: 'main', constants: interpFFConstants }
-  });
-  const interpPoolConstants = { RB, GHOST_ONLY: 1, F16, DC_PRE };
-  const interpPoolInitConstants = { RB, GHOST_ONLY: 0, F16, DC_PRE };
-  const interpPoolFFConstants = { RB, GHOST_ONLY: 1, FINE_FINE_ONLY: 1, F16, DC_PRE };
-  const interpPoolParentPL = device.createComputePipeline({
-    layout: device.createPipelineLayout({ bindGroupLayouts: [interpPoolParentBGL] }),
-    compute: { module: interpPoolSM, entryPoint: 'main', constants: interpPoolConstants }
-  });
-  const interpPoolParentInitPL = device.createComputePipeline({
-    layout: device.createPipelineLayout({ bindGroupLayouts: [interpPoolParentBGL] }),
-    compute: { module: interpPoolSM, entryPoint: 'main', constants: interpPoolInitConstants }
-  });
-  const interpPoolParentFFPL = device.createComputePipeline({
-    layout: device.createPipelineLayout({ bindGroupLayouts: [interpPoolParentBGL] }),
-    compute: { module: interpPoolSM, entryPoint: 'main', constants: interpPoolFFConstants }
-  });
-  const avgPL = device.createComputePipeline({
-    layout: device.createPipelineLayout({ bindGroupLayouts: [avgBGL] }),
-    compute: { module: avgSM, entryPoint: 'main', constants: avgConstants }
-  });
-  const avgPoolPL = device.createComputePipeline({
-    layout: device.createPipelineLayout({ bindGroupLayouts: [avgPoolBGL] }),
-    compute: { module: avgPoolSM, entryPoint: 'main', constants: { RB, F16, DC_PRE } }
-  });
-  const criterionPL = device.createComputePipeline({
-    layout: device.createPipelineLayout({ bindGroupLayouts: [criterionBGL] }),
-    compute: { module: criterionSM, entryPoint: 'main', constants: criterionConstants }
-  });
   // plans/2D-backport.md B2: the 2:1 closure's own pipelines. Built but
   // NOT yet in dispatchMacroStep -- see debugCascadeRoundTrip.
   const cascadeSM = await loadShader(device, 'shaders/amr_cascade.wgsl');
   const cascade = makeCascadePipelines(device, cascadeSM, pools, N_LEVELS);
 
-  // B2: the want-set producers. Same bind group and constants as
-  // coarsen/refine -- they are the same decision, minus the neighbours.
-  const manageDecidePL = device.createComputePipeline({
-    layout: device.createPipelineLayout({ bindGroupLayouts: [manageBGL] }),
-    compute: { module: manageSM, entryPoint: 'decide', constants: manageConstants }
-  });
-  const manageCoarsenPL = device.createComputePipeline({
-    layout: device.createPipelineLayout({ bindGroupLayouts: [manageBGL] }),
-    compute: { module: manageSM, entryPoint: 'coarsen', constants: manageConstants }
-  });
-  const manageRefinePL = device.createComputePipeline({
-    layout: device.createPipelineLayout({ bindGroupLayouts: [manageBGL] }),
-    compute: { module: manageSM, entryPoint: 'refine', constants: manageConstants }
-  });
 
   const criterionPoolPLs = {};
   const managePoolDecidePLs = {};

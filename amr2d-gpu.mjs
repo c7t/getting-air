@@ -661,6 +661,76 @@ export async function readCardState(device, cardStateBuf) {
 // unconditionally (tools/lib/amr-invariants.js), which is a stronger check
 // than this trip-wire and already fails loudly. A second implicit latch there
 // would change what existing tooling means without adding coverage.
+// --- THE COUPLING PIPELINES, ONCE (plans/uniform-levels.md U7-1) ------------
+//
+// The twelve pipelines every AMR page builds identically: the six interp
+// variants (dense parent and pool parent, each in steady-state / init /
+// fine-fine-only form), the two averages, the criterion, and manage's three
+// entry points. Measured 2026-09-18, comments and whitespace stripped: eleven
+// of the twelve were byte-identical across all five pages, and the twelfth
+// (`avgPL`) differed only in the NAME of the constants object -- `fineConstants`
+// on two pages, `avgConstants` on three, with the same five fields in both.
+//
+// NOT EVERY PIPELINE, AND THE LINE IS THE SCENARIO. The step, the force, the
+// physics integrator and the render fragment stay per page, because their
+// override sets are genuinely different things (measured: `step1Constants`
+// differs on every single page -- bounce-back and a sponge on the cylinder, a
+// card SDF on the dev page, neither on TGV). Those are SCENARIO overrides and
+// they are data. WHICH PIPELINES EXIST, and which override selects which mode
+// of a kernel, is not.
+//
+// THE THREE MODES BELONG TO THE KERNEL, NOT TO THE PAGE, which is why this
+// takes five scalars rather than ten prebuilt bundles. GHOST_ONLY and
+// FINE_FINE_ONLY name states of `common_interp_kernel.wgsl` -- steady-state
+// ghost refresh, one-time full-slot fill on activation, and the between-substep
+// fine-fine re-exchange. Five pages were each spelling that triple out, so
+// five pages could each get it wrong.
+//
+// Returns the derived constant bundles alongside the pipelines. A page that
+// needs a VARIANT -- the ?benchSkip= no-op twins, the SKIP_GHOST ring twin, the
+// root-parent twins of U5 -- must build it from these rather than from its own
+// second copy of the same literal, which is how a measurement twin drifts from
+// the thing it is measuring.
+export function makeCouplingPipelines(device, layouts, modules, { W, H, RB, F16, DC_PRE, manage }) {
+  const c = {
+    interp:         { W, H, RB, GHOST_ONLY: 1, F16, DC_PRE },
+    interpInit:     { W, H, RB, GHOST_ONLY: 0, F16, DC_PRE },
+    interpFF:       { W, H, RB, GHOST_ONLY: 1, FINE_FINE_ONLY: 1, F16, DC_PRE },
+    // No W/H on the pool-parent side: unlike the dense case, a level's own grid
+    // extent is a runtime uniform (levelParams), not baked into the pipeline,
+    // precisely so ONE compiled pipeline serves every L(m)->L(m+1) pair.
+    interpPool:     { RB, GHOST_ONLY: 1, F16, DC_PRE },
+    interpPoolInit: { RB, GHOST_ONLY: 0, F16, DC_PRE },
+    interpPoolFF:   { RB, GHOST_ONLY: 1, FINE_FINE_ONLY: 1, F16, DC_PRE },
+    avg:            { W, H, RB, F16, DC_PRE },
+    avgPool:        { RB, F16, DC_PRE },
+    // amr_criterion.wgsl declares only W/H -- passing an override a shader does
+    // not declare is a pipeline-creation error, not a warning.
+    criterion:      { W, H },
+  };
+  const compute = (layout, module, entryPoint, constants) => device.createComputePipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [layout] }),
+    compute: { module, entryPoint, constants },
+  });
+  return {
+    constants: c,
+    interpPL:               compute(layouts.interpBGL, modules.interpDenseSM, 'main', c.interp),
+    interpInitPL:           compute(layouts.interpBGL, modules.interpDenseSM, 'main', c.interpInit),
+    interpFFPL:             compute(layouts.interpBGL, modules.interpDenseSM, 'main', c.interpFF),
+    interpPoolParentPL:     compute(layouts.interpPoolParentBGL, modules.interpPoolSM, 'main', c.interpPool),
+    interpPoolParentInitPL: compute(layouts.interpPoolParentBGL, modules.interpPoolSM, 'main', c.interpPoolInit),
+    interpPoolParentFFPL:   compute(layouts.interpPoolParentBGL, modules.interpPoolSM, 'main', c.interpPoolFF),
+    avgPL:                  compute(layouts.avgBGL, modules.avgSM, 'main', c.avg),
+    avgPoolPL:              compute(layouts.avgPoolBGL, modules.avgPoolSM, 'main', c.avgPool),
+    criterionPL:            compute(layouts.criterionBGL, modules.criterionSM, 'main', c.criterion),
+    // manage's three entry points share one module and one constants bundle;
+    // the bundle is the page's, because thresholds and geometry are scenario.
+    manageDecidePL:         compute(layouts.manageBGL, modules.manageSM, 'decide', manage),
+    manageCoarsenPL:        compute(layouts.manageBGL, modules.manageSM, 'coarsen', manage),
+    manageRefinePL:         compute(layouts.manageBGL, modules.manageSM, 'refine', manage),
+  };
+}
+
 // --- THE BIND GROUP LAYOUTS, ONCE (plans/uniform-levels.md U7-0) ------------
 //
 // Fourteen layouts, and before this they were spelled out inline in FIVE

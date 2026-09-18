@@ -39,7 +39,7 @@ import { tauChainSingularity, tauSingularityMessage } from './amr2d.mjs';
 import { createTotalUnwrapper } from './card-total.mjs';
 import { loadShader } from './shader-loader.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
-import { check21BalanceOnGPU, allocLevelPool, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState, checkGeometryCoverageOnGPU, makeRefusalWatch , checkRefinementClosureOnGPU , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU, makeRenderBindGroup, renderPoolLevels, MAX_RENDER_POOL_LEVELS, makeAMRLayouts } from './amr2d-gpu.mjs';
+import { check21BalanceOnGPU, allocLevelPool, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState, checkGeometryCoverageOnGPU, makeRefusalWatch , checkRefinementClosureOnGPU , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU, makeRenderBindGroup, renderPoolLevels, MAX_RENDER_POOL_LEVELS, makeAMRLayouts, makeCouplingPipelines } from './amr2d-gpu.mjs';
 // tauAtLevel: extracted to card-params.mjs by B3a-1, which landed the CALL
 // in all five AMR pages and this IMPORT in only main-amr.js. The other four
 // threw `ReferenceError: tauAtLevelOf is not defined` at init -- but only at
@@ -784,40 +784,42 @@ async function init() {
     loadShader(device, 'shaders/amr_manage_pool.wgsl'),
   ]);
 
+  // The six modules the shared coupling pipelines need, as one object.
+  const modules = { interpDenseSM, interpPoolSM, avgSM, avgPoolSM, criterionSM, manageSM };
+
   // U7-0: the fourteen bind group layouts, from ONE place. They were spelled
   // out inline here and in four other pages, byte-identical in all of them --
   // see makeAMRLayouts for why that mattered more than the line count.
+  const layouts = makeAMRLayouts(device);
   const {
     stepBGL, frcBGL, phyBGL, renBGL, interpBGL, interpPoolParentBGL,
     avgBGL, avgPoolBGL, criterionBGL, criterionPoolBGL, manageBGL,
     managePoolBGL, step1BGL, force1BGL,
-  } = makeAMRLayouts(device);
+  } = layouts;
 
   const constants = { W, H };
   // See main.js: only the f-touching pipelines may be given F16.
   const fConstants = { W, H, F16, K_EPS };
-  // NO K_EPS here: on this page fineConstants drives the AVERAGE pipeline,
-  // and amr_average_f2c.wgsl declares no such override -- passing one a
-  // shader does not declare is a pipeline-creation error. The render
-  // fragment gets it via renderConstants instead.
-  const fineConstants = { W, H, RB, F16, DC_PRE };
-  // Render fragment needs HAS_LEVEL2 to gate the level-2 override; keep it
-  // separate from fineConstants, which is also fed to the avg compute
-  // pipeline (whose shader has no HAS_LEVEL2 override).
   // U6: how many pool levels the renderer walks. renderPoolLevels() REFUSES a
   // configuration deeper than the shader binds, rather than drawing it without
   // its finest level -- which is what this override replaced HAS_LEVEL2 for.
   const renderConstants = { W, H, RB, N_POOL_LEVELS: renderPoolLevels(N_LEVELS), K_EPS };
-  // GHOST_ONLY=1: steady-state ghost-only reinterpolation (every macro-step).
-  // GHOST_ONLY=0: full-slot fill, used once on block activation (see debugActivateBlock).
-  const interpConstants = { W, H, RB, GHOST_ONLY: 1, F16, DC_PRE };
-  const interpInitConstants = { W, H, RB, GHOST_ONLY: 0, F16, DC_PRE };
-  // Between-substep fine-fine-only ghost re-exchange (see amr_interp_c2f.wgsl's
-  // FINE_FINE_ONLY note and the dispatch between f1a/f1b below).
-  const interpFFConstants = { W, H, RB, GHOST_ONLY: 1, FINE_FINE_ONLY: 1, F16, DC_PRE };
   const step1Constants = { W, H, RB, F16, DIRECT_GHOST: GHOST_COPY ? 0 : 1 };
-  const criterionConstants = { W, H };
   const manageConstants = { DIAG, W, H, REFINE_THRESH, COARSEN_THRESH, FORCE_REFINE_MARGIN, FORCE_REFINE_LOOKAHEAD, SPONGE_EXCLUDE_W, BOX_REFINE };
+
+  // U7-1: the twelve coupling pipelines, from ONE place. Every page built
+  // these identically; see makeCouplingPipelines for what stays per page and
+  // why. `couplingConstants` carries the bundles it derived, so the
+  // measurement twins and the root-parent variants below are built from the
+  // SAME literal the real pipeline used rather than a second copy of it.
+  const {
+    constants: couplingConstants,
+    interpPL, interpInitPL, interpFFPL,
+    interpPoolParentPL, interpPoolParentInitPL, interpPoolParentFFPL,
+    avgPL, avgPoolPL, criterionPL,
+    manageDecidePL, manageCoarsenPL, manageRefinePL,
+  } = makeCouplingPipelines(device, layouts, modules,
+      { W, H, RB, F16, DC_PRE, manage: manageConstants });
 
   const stepPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [stepBGL] }),
@@ -848,49 +850,6 @@ async function init() {
     fragment: { module: renSM, entryPoint: 'fs_main', targets: [{ format: fmt }], constants: renderConstants },
     primitive: { topology: 'triangle-list' },
   });
-  const interpPL = device.createComputePipeline({
-    layout: device.createPipelineLayout({ bindGroupLayouts: [interpBGL] }),
-    compute: { module: interpDenseSM, entryPoint: 'main', constants: interpConstants }
-  });
-  // Same module/entry point as interpPL, different override constant --
-  // WGSL/WebGPU compiles this as a separate pipeline. Used once per newly-
-  // activated slot to fill the whole region (no prior fine-level state to
-  // evolve from), vs. interpPL's steady-state ghost-only reinterpolation.
-  const interpInitPL = device.createComputePipeline({
-    layout: device.createPipelineLayout({ bindGroupLayouts: [interpBGL] }),
-    compute: { module: interpDenseSM, entryPoint: 'main', constants: interpInitConstants }
-  });
-  // Fine-fine-only ghost re-exchange pipeline (same module, FINE_FINE_ONLY=1).
-  const interpFFPL = device.createComputePipeline({
-    layout: device.createPipelineLayout({ bindGroupLayouts: [interpBGL] }),
-    compute: { module: interpDenseSM, entryPoint: 'main', constants: interpFFConstants }
-  });
-  // Milestone 6: pool-parent interp pipelines, mirroring the dense trio
-  // above one-for-one (steady-state ghost-only / one-time full-slot-init /
-  // fine-fine-only refresh) but from interpPoolSM. No W/H/NBX/NBY override
-  // here -- unlike the dense case, this level's own grid extent is a
-  // runtime uniform (levelParams), not baked into the pipeline, precisely
-  // so ONE compiled pipeline object is reusable across every L(m)->L(m+1)
-  // pair (see shaders/amr_interp_pool_parent.wgsl's header).
-  const interpPoolConstants = { RB, GHOST_ONLY: 1, F16, DC_PRE };
-  const interpPoolInitConstants = { RB, GHOST_ONLY: 0, F16, DC_PRE };
-  const interpPoolFFConstants = { RB, GHOST_ONLY: 1, FINE_FINE_ONLY: 1, F16, DC_PRE };
-  const interpPoolParentPL = device.createComputePipeline({
-    layout: device.createPipelineLayout({ bindGroupLayouts: [interpPoolParentBGL] }),
-    compute: { module: interpPoolSM, entryPoint: 'main', constants: interpPoolConstants }
-  });
-  const interpPoolParentInitPL = device.createComputePipeline({
-    layout: device.createPipelineLayout({ bindGroupLayouts: [interpPoolParentBGL] }),
-    compute: { module: interpPoolSM, entryPoint: 'main', constants: interpPoolInitConstants }
-  });
-  const interpPoolParentFFPL = device.createComputePipeline({
-    layout: device.createPipelineLayout({ bindGroupLayouts: [interpPoolParentBGL] }),
-    compute: { module: interpPoolSM, entryPoint: 'main', constants: interpPoolFFConstants }
-  });
-  const avgPL = device.createComputePipeline({
-    layout: device.createPipelineLayout({ bindGroupLayouts: [avgBGL] }),
-    compute: { module: avgSM, entryPoint: 'main', constants: fineConstants }
-  });
   // Milestone 7: level>=2 fine step / average -- one pipeline object each,
   // reused across every level pair (no per-level overrides needed; NBX/NBY/
   // parentTau are runtime uniform reads, not compile-time constants -- see
@@ -899,10 +858,6 @@ async function init() {
   const step1PL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [step1BGL] }),
     compute: { module: step1SM, entryPoint: 'main', constants: step1Constants }
-  });
-  const avgPoolPL = device.createComputePipeline({
-    layout: device.createPipelineLayout({ bindGroupLayouts: [avgPoolBGL] }),
-    compute: { module: avgPoolSM, entryPoint: 'main', constants: { RB, F16, DC_PRE } }
   });
   // Milestone 8: level 1's own force pass. HAS_CHILD is baked in at
   // pipeline-creation time -- level 1 has exactly one dedicated pipeline
@@ -915,10 +870,6 @@ async function init() {
     layout: device.createPipelineLayout({ bindGroupLayouts: [force1BGL] }),
     compute: { module: force1SM, entryPoint: 'main', constants: { W, H, RB, F16 } }
   });
-  const criterionPL = device.createComputePipeline({
-    layout: device.createPipelineLayout({ bindGroupLayouts: [criterionBGL] }),
-    compute: { module: criterionSM, entryPoint: 'main', constants: criterionConstants }
-  });
   // Two pipelines, same module, different entry points -- dispatched as two
   // SEPARATE passes (coarsen fully completing before refine starts) to
   // avoid a same-dispatch free-list race. See amr_manage.wgsl's header for
@@ -928,20 +879,6 @@ async function init() {
   const cascadeSM = await loadShader(device, 'shaders/amr_cascade.wgsl');
   const cascade = makeCascadePipelines(device, cascadeSM, pools, N_LEVELS);
 
-  // B2: the want-set producers. Same bind group and constants as
-  // coarsen/refine -- they are the same decision, minus the neighbours.
-  const manageDecidePL = device.createComputePipeline({
-    layout: device.createPipelineLayout({ bindGroupLayouts: [manageBGL] }),
-    compute: { module: manageSM, entryPoint: 'decide', constants: manageConstants }
-  });
-  const manageCoarsenPL = device.createComputePipeline({
-    layout: device.createPipelineLayout({ bindGroupLayouts: [manageBGL] }),
-    compute: { module: manageSM, entryPoint: 'coarsen', constants: manageConstants }
-  });
-  const manageRefinePL = device.createComputePipeline({
-    layout: device.createPipelineLayout({ bindGroupLayouts: [manageBGL] }),
-    compute: { module: manageSM, entryPoint: 'refine', constants: manageConstants }
-  });
 
   // Milestone 9: one criterion/manage pipeline PAIR per PARENT level
   // (1..N_LEVELS-2, i.e. every level that can itself have a child) --

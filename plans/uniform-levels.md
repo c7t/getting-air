@@ -28,7 +28,7 @@ it runs on.
 | U4 | criterion, force, digest, conserved totals | **DONE** — all four consumers on the root. Exact on the criterion, digest max and conserved totals; the force to the truncation floor | `tools/validate-root-kernels.js`, 8 rungs + 2 controls |
 | U5 | L1 becomes a quad child of the root | **U5-0…U5-4 DONE under `?rootpool=1`** — both hops of the coupling and the manager. Level 1 is quad-allocated and quad-managed; tiles +28-32%; new fingerprints, default unmoved. `amr_manage.wgsl` cannot retire until the other four AMR pages get a root pool, and Cd/St is unmeasurable until then | `validate-root-kernels.js` (11 rungs, 4 controls); `validate-all.js` invariants ± starved pool; `measure-determinism.js` |
 | U6 | The renderer walks levels | **DONE** — and it found that three of the five pages never drew level 2 either. Level 1 bit-identical to before; gate green on two pages and in the default sweep | `tools/validate-render-levels.js`, `tools/lib/render-levels.js` |
-| U7 | One implementation across the five pages, then delete the dense path | **U7-0 DONE** (layouts shared, net −590 lines, every gate unmoved); U7-1…U7-6 remain. **Split into U7-0…U7-6** — U1–U5 all landed on `main-amr.js` alone, so the remaining work is propagation before deletion. Measured: all 14 bind group layouts are byte-identical across five pages, and `S_Advance` is byte-identical across the other four | each rung byte-identical on the default path (`measure-determinism.js`), except U7-5 which is the one that moves numbers |
+| U7 | One implementation across the five pages, then delete the dense path | **U7-0 and U7-1 DONE** (layouts and the twelve coupling pipelines shared, net −789 lines, every gate unmoved); U7-2…U7-6 remain. **Split into U7-0…U7-6** — U1–U5 all landed on `main-amr.js` alone, so the remaining work is propagation before deletion. Measured: all 14 bind group layouts are byte-identical across five pages, and `S_Advance` is byte-identical across the other four | each rung byte-identical on the default path (`measure-determinism.js`), except U7-5 which is the one that moves numbers |
 
 **Where the risk actually sits.** U0–U2 went in clean and each found something
 (a half-cell convention, an f16 stride, a window-convention split between L0 and
@@ -2280,10 +2280,37 @@ which matters because U5-4 recorded a case where four runs DID all agree, and
 the two look identical at `--runs=2`. The tool's header now says to read that
 rung at `--runs=4`.
 
-#### U7-1 — the pipelines
+#### U7-1 — DONE (2026-09-18). The coupling pipelines are one function.
 
-`makeAMRPipelines(device, layouts, modules, constants)`. The pages genuinely
-differ here and the shared builder must not pretend otherwise -- measured,
+`makeCouplingPipelines(device, layouts, modules, {W, H, RB, F16, DC_PRE, manage})`
+builds the twelve every AMR page built identically: the six interp variants
+(dense parent and pool parent, each steady-state / init / fine-fine-only), the
+two averages, the criterion, and manage's three entry points. **377 lines
+removed, 178 added, a net −199.**
+
+Measured before touching anything, comments and whitespace stripped: eleven of
+the twelve were byte-identical across all five pages, and the twelfth (`avgPL`)
+differed only in the NAME of its constants object -- `fineConstants` on two
+pages, `avgConstants` on three, with the same five fields in both.
+
+**IT TAKES FIVE SCALARS, NOT TEN PREBUILT BUNDLES, AND THAT IS THE POINT.**
+`GHOST_ONLY` and `FINE_FINE_ONLY` name MODES OF THE KERNEL -- steady-state ghost
+refresh, one-time full-slot fill on activation, the between-substep fine-fine
+re-exchange. Five pages were each spelling that triple out from `W, H, RB, F16,
+DC_PRE`, so five pages could each get it wrong. The modes now belong to the
+shared code and the scenario stays with the page.
+
+**And it returns the bundles it derived.** A page needing a VARIANT -- the
+`?benchSkip=` no-op twins, the `SKIP_GHOST` ring twin, U5's root-parent twins --
+now builds it from `couplingConstants.*` rather than from its own second copy of
+the same literal. `main-amr.js` had exactly that: its no-op measurement twins
+were spread from separately-declared objects, so a twin could drift from the
+thing it measures. Eight now-dead bundle declarations went with the change.
+
+#### What stays per page, and the line is the scenario
+
+The step, the force, the physics integrator and the render fragment stay per
+page, because their override sets are genuinely different things -- measured,
 `step1Constants` differs on every single page:
 
 ```
@@ -2294,12 +2321,21 @@ differ here and the shared builder must not pretend otherwise -- measured,
   channel    (built inline, no named bundle)
 ```
 
-So the page supplies the constants bundle and the shared code supplies the
-pipeline *set*. Scenario overrides are data; which pipelines exist is not.
+Scenario overrides are data; which pipelines exist, and which override selects
+which mode of a kernel, is not. `manageConstants` is the one bundle the shared
+function takes whole, because thresholds and geometry are scenario.
 
-*Gate:* as U7-0, plus the four analytic configs (`channel-*`, `tgv-*`)
-bit-identical -- they hold zero active tiles, so they gate the solver rather
-than the seam, which is exactly what a pipeline refactor wants.
+D0's deterministic-handout pipelines (`manageScan*`, `manageLink*`) and the
+`?benchSkip=` twins stay on `main-amr.js` -- they exist on one page and will
+move when they reach the others.
+
+*Gate, all five green:* `make check`; boot smoke on seven configs plus both
+render-reachability configs; `measure-determinism.js` unmoved at
+`7ac54e170f903ac3` / `ce1bd4d8a3a1055c`; **the four analytic AMR configs
+(`channel-poiseuille-amr-N2`, `channel-couette-amr-N2`, `tgv-amr-N2`,
+`tgv-amr-N3`) all PASS** -- they hold zero active tiles, so they gate the solver
+rather than the seam, which is exactly what a pipeline refactor wants;
+`amr-N2-diffuse` unmoved at Cd 1.631 / St 0.1466.
 
 #### U7-2 — the per-level bind groups
 
