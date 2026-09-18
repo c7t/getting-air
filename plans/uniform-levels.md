@@ -28,7 +28,7 @@ it runs on.
 | U4 | criterion, force, digest, conserved totals | **DONE** — all four consumers on the root. Exact on the criterion, digest max and conserved totals; the force to the truncation floor | `tools/validate-root-kernels.js`, 8 rungs + 2 controls |
 | U5 | L1 becomes a quad child of the root | **U5-0…U5-4 DONE under `?rootpool=1`** — both hops of the coupling and the manager. Level 1 is quad-allocated and quad-managed; tiles +28-32%; new fingerprints, default unmoved. `amr_manage.wgsl` cannot retire until the other four AMR pages get a root pool, and Cd/St is unmeasurable until then | `validate-root-kernels.js` (11 rungs, 4 controls); `validate-all.js` invariants ± starved pool; `measure-determinism.js` |
 | U6 | The renderer walks levels | not started; **its gate already exists and already fails** | `tools/validate-render-levels.js` |
-| U7 | Delete the dense path | not started | — |
+| U7 | One implementation across the five pages, then delete the dense path | not started, **split into U7-0…U7-6** — U1–U5 all landed on `main-amr.js` alone, so the remaining work is propagation before deletion. Measured: all 14 bind group layouts are byte-identical across five pages, and `S_Advance` is byte-identical across the other four | each rung byte-identical on the default path (`measure-determinism.js`), except U7-5 which is the one that moves numbers |
 
 **Where the risk actually sits.** U0–U2 went in clean and each found something
 (a half-cell convention, an f16 stride, a window-convention split between L0 and
@@ -81,7 +81,10 @@ at the end.
 
     D0   deterministic slot handout                    <- in progress
     U0   host model + B6's claimant rule
-    U1..U7  uniform levels
+    U1..U5  uniform levels, on index-amr.html
+    U7-0..3   share the layouts, pipelines, bind groups and scheduler
+    U6        the renderer walks levels -- ride it on U7-2
+    U7-4..6   the root pool everywhere, flip the default, delete the dense path
     --   the sponge seam INVARIANT (gate only)
     B6   explode/coalesce
     --   sponge refinement policy, then section 8's ladders
@@ -2091,12 +2094,184 @@ cell. A change to what explode writes into the ring reaches the picture and
 nothing else. Score it with screenshots, deliberately, rather than assuming a
 green sweep covers it.
 
-### U7 — delete the dense path
+### U7 — one implementation, five pages, then delete the dense path
+
+**U7 AS ORIGINALLY WRITTEN IS ONE TASK WITH A TEN-ITEM LIST AND NO GATE UNTIL
+THE END, AND IT IS TOO BIG.** U5 found out why: every stage from U1 to U5-4
+landed on `main-amr.js` alone, so the root pool exists on the dev page and
+nowhere else. `amr_manage.wgsl` cannot retire while four other pages dispatch
+it, and U5-4's own Cd/St consequence cannot be measured at all, because the
+cylinder harness has no root pool to measure. The missing work is not
+*deletion*, it is **propagation** -- and propagation done by copying would put
+five copies of the root pool in the tree, which is the exact shape this project
+keeps paying for.
+
+So U7 splits into seven sub-stages. The first six SHARE the implementation, and
+each one is byte-identical on the default path and provable by fingerprint. The
+seventh is the deletion, which becomes small once there is one copy of
+everything to delete.
+
+#### The measurement that shapes the split (2026-09-18)
+
+```
+  bind group layouts     14 kinds across 5 pages, and every one of them is
+                         BYTE-IDENTICAL (compared with comments and whitespace
+                         stripped). 658 lines of them in total.
+  S_Advance              byte-identical across cylinder / reentry / tgv /
+                         channel. main-amr.js's differs ONLY by the root pool,
+                         and differed before this session too.
+  dispatchMacroStep      three variants: amr / (cylinder, reentry) /
+                         (tgv, channel). The last pair is shorter for one
+                         reason -- no body.
+  resetSim, snapshots    genuinely per-page: four and three variants. These
+                         stay per-page.
+  the root-pool work     ~1290 added lines in main-amr.js across U1..U5, of
+                         which the COMPARATORS (debugCheckRoot*, the mirror
+                         checker, compareRootToDense) are roughly 500 and
+                         belong on the dev page, not on the other four.
+```
+
+**That last line is the whole argument for the order.** Everything above the
+line is measured; this next figure is an ESTIMATE and is marked as one. The
+part of U1-U5 the other pages actually need -- allocate the pool, seed it, step
+it, couple level 1 to it, manage level 1 from it -- looks like roughly 270
+lines of solver once the comparators, the flag headers and the inert twins are
+set aside. Copied into four pages that is ~1100 lines of new duplication.
+Shared first it is close to zero, because the four pages already run a
+byte-identical scheduler. The estimate does not have to be right for the
+ordering to be: the measured half (14 identical layouts, one identical
+`S_Advance`) already says the sharing is free and the copying is not.
+
+#### U7-0 — the bind group layouts become one function
+
+`makeAMRLayouts(device)` in `amr2d-gpu.mjs`, returning the fourteen layouts;
+five pages call it and delete their own. ~520 lines of pure duplication go.
+
+**THIS IS THE RUNG THAT PERMANENTLY KILLS THE BINDING-MIRROR TRAP**, and that
+is worth more than the line count. CLAUDE.md records it producing 238e48c; U4-1
+and U4-2 walked into it again in the other direction and stopped four pages
+booting; U5-4 walked it a third time deliberately, with the boot smoke as the
+net. After this rung a binding added to a shared shader has exactly one layout
+to reach.
+
+**The one thing to watch:** the layouts are identical TODAY. If the shared
+function grows per-page parameters it becomes five copies with extra steps. If
+a page ever genuinely needs a different layout, that is a signal the SHADER
+should not be shared either -- take that conversation rather than adding a flag.
+
+*Gate:* `make check`; boot smoke on all seven configs; `measure-determinism.js`
+returns `7ac54e170f903ac3` / `ce1bd4d8a3a1055c` on the default; one cylinder
+config (`amr-N2-diffuse`) unmoved to four digits. All four are cheap and the
+last one is the only one that takes ten minutes.
+
+#### U7-1 — the pipelines
+
+`makeAMRPipelines(device, layouts, modules, constants)`. The pages genuinely
+differ here and the shared builder must not pretend otherwise -- measured,
+`step1Constants` differs on every single page:
+
+```
+  amr        W, H, RB, SDF_FAR, F16, DIRECT_GHOST
+  cylinder   + SPONGE_UX/UY, USE_BOUNCEBACK, SOLID_EQ
+  reentry    W, H, RB, F16, DIRECT_GHOST
+  tgv        ...stepConstants, RB, DIRECT_GHOST
+  channel    (built inline, no named bundle)
+```
+
+So the page supplies the constants bundle and the shared code supplies the
+pipeline *set*. Scenario overrides are data; which pipelines exist is not.
+
+*Gate:* as U7-0, plus the four analytic configs (`channel-*`, `tgv-*`)
+bit-identical -- they hold zero active tiles, so they gate the solver rather
+than the seam, which is exactly what a pipeline refactor wants.
+
+#### U7-2 — the per-level bind groups
+
+The `for (c = 2; c < N_LEVELS; c++)` loop that builds every level's interp /
+average / step1 / force / criterion / manage bind groups. Same shape on every
+page; the buffers it names all come from `allocLevelPool`, which is already
+shared.
+
+*Gate:* as U7-1.
+
+**U6 SHOULD RIDE ON THIS RUNG RATHER THAN BE DONE FIVE TIMES.** The renderer
+change -- replacing `renBG`'s fixed `vel_pool`/`vel_pool2` wiring with a
+per-level walk -- is a per-page bind group today, and its gate
+(`tools/validate-render-levels.js`) already exists and already fails on level 3.
+Doing it before U7-2 means writing it five times; doing it as part of U7-2
+means writing it once. If U6 is already done by the time this is read, fold its
+bind group into this rung anyway.
+
+#### U7-3 — the scheduler
+
+`S_Advance` and `dispatchMacroStep` into shared code, parameterised by the
+bundle U7-1 and U7-2 produce. Four byte-identical copies collapse to one, and
+`main-amr.js`'s root-pool version becomes THE version, with the root path
+behind the flags it already has.
+
+**This is the load-bearing rung: after it the root pool reaches every page by
+construction rather than by four more ports.** It is also the one with real
+risk, because it is the hot loop and the one place where a mis-ordered pass is
+a physics bug rather than a crash.
+
+*Gate:* every previous gate, plus the cylinder Cd/St unmoved to four digits on
+`amr-N2-diffuse` AND `amr-N3-diffuse` (with `?rootpool=0`, which is still the
+default at this rung -- so bit-identity is the honest bar and a Cd move is a
+failure, not a re-baseline).
+
+#### U7-4 — the root pool on every page
+
+Now ~60 lines per page: allocate, seed, and expose the flags. Everything else
+is already shared. The COMPARATORS stay on `index-amr.html` -- they are the
+dev page's instrument and five copies of them would be five copies of a
+checker, which is how this project collected its vacuous gates in the first
+place.
+
+Two things this rung finally makes possible, both of which U5 had to leave
+open:
+
+- **`validate-root-kernels.js` gains `--page=` and runs against the cylinder
+  page.** That is the first time U5's coupling is scored on a harness with
+  literature values attached.
+- **`POOL_PEAKS` re-measured at quad granularity**, 40k steps, both pages, all
+  level counts. U5-4 measured +28-32% tiles at 4096 steps and explicitly left
+  the peak table outstanding; the refusal watch (restored to the pool manager
+  in U5-4) is the instrument that reports a wrong guess.
+
+*Gate:* `validate-root-kernels.js` green on `index-amr.html` AND
+`index-cylinder-amr.html`; the invariant sweep plus its starved-pool control on
+both; no refusal at the new defaults over 40k steps.
+
+#### U7-5 — flip the default
+
+`?rootpool=1` becomes the default; `?rootcouple` and `?rootmanage` collapse
+into it or go. **This is where the published numbers move for real, and it is
+the first point at which they CAN be measured** -- U5-4 moved them on the dev
+page only, where no literature value lives.
+
+*Gate:* the full `validate-all.js` sweep, re-baselined against measured numbers
+and not against a memory of them, with **same-build repeats on both sides** for
+every AMR config (CLAUDE.md's reproducibility note is the calibration, and
+`?detslots=1` now makes the repeat exact rather than statistical). The analytic
+configs must be bit-identical. The invariant sweep and its starved-pool control
+must still discriminate five-of-seven.
+
+Remember the default sweep is **not** all-green on `main` today
+(`dense-reference` and `amr-N2-diffuse` fail at Re=100, the diffuse-band-width
+issue), and that this branch's own `amr-N2-diffuse` baseline is **Cd 1.631 /
+St 0.1466**, not CLAUDE.md's 1.642 -- D0 moved slot assignment. Re-baseline
+against a pristine reading of the branch, not against the file.
+
+#### U7-6 — delete the dense path
 
 `amr_step.wgsl`, `amr_criterion.wgsl`, `amr_manage.wgsl`, `amr_force.wgsl`,
 `amr_interp_dense_parent.wgsl`, `amr_average_f2c.wgsl`,
 `common_interp_parent_dense.wgsl`, `common_avg_parent_dense.wgsl`, the `f_a` /
 `f_b` / `velBuf` dense buffers and their bind groups.
+
+By this point they are named in ONE place each, which is what makes this rung
+small. It is also the rung that pays back U7-0 through U7-3: a deletion spread
+over five copies is five chances to leave one behind.
 
 **Retire the dense-only checkers in the same commit as their subject.** That is
 B3-5's lesson (`debugCheckTileOrigins` went with the buffers it scored) and its
@@ -2122,6 +2297,27 @@ against the numbers in CLAUDE.md, not against a memory of them — and remember
 the default sweep is **not** all-green on `main` today (`dense-reference` and
 `amr-N2-diffuse` fail at Re=100, which is the diffuse-band-width issue and not
 a regression).
+
+#### What deliberately stays per-page
+
+Sharing is not the goal; ONE STATEMENT OF EACH RULE is. Three things are
+genuinely different per page and sharing them would be sharing a coincidence:
+
+- **`resetSim`** — four variants, because the initial field is the page's
+  subject (a card at rest, a cylinder in crossflow, a Taylor-Green vortex, a
+  channel profile).
+- **`debugSnapshotSave` / `debugSnapshotLoad`** — three variants, and only
+  three pages have them at all. They serialise whatever state that page owns.
+- **The root COMPARATORS** — `debugCheckRoot*`, `compareRootToDense`, the
+  mirror checker. Roughly 500 lines that exist to score one representation
+  against another, and the dev page is where that scoring happens. Copying
+  them to five pages would be copying a checker, which is how three gates went
+  vacuous here before.
+
+The test for whether something belongs in the shared half: **does every page
+have to agree about it for the solver to be correct?** A bind group layout,
+yes. A pipeline set, yes. The dispatch order, emphatically yes. An initial
+condition, no.
 
 ---
 
