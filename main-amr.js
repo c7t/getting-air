@@ -3694,6 +3694,62 @@ async function init() {
     };
   }
 
+  // ── The scene render, as ONE encoder path ────────────────────────────────
+  // frame() and debugRenderOnce() both go through this. A second copy of the
+  // pass descriptor is exactly the kind of duplication that lets a render
+  // change land in the live path and not in the verification path -- which is
+  // the failure mode tools/validate-render-levels.js exists to catch, so it
+  // would be perverse for the gate to run against its own copy of the render.
+  //
+  // The TRAIL overlay is deliberately NOT here. It is a separate canvas with
+  // its own submit and its own state, it advances with the card rather than
+  // with the field, and including it would put a second moving part into a
+  // screenshot the gate compares for exact equality.
+  function encodeSceneRender(enc) {
+    const rp = enc.beginRenderPass({ colorAttachments: [{ view: ctx.getCurrentTexture().createView(), clearValue: { r:0.07, g:0.07, b:0.1, a:1 }, loadOp: 'clear', storeOp: 'store' }]});
+    rp.setPipeline(renPL); rp.setBindGroup(0, renBG); rp.draw(6); rp.end();
+  }
+
+  // Render one frame on demand, without stepping the simulation.
+  //
+  // frame() returns before the render pass whenever liveMode is false (see its
+  // own early return), so a PAUSED page never redraws -- which means anything
+  // that changes a buffer the renderer reads and then wants to see the result
+  // has no way to ask for it. That is not a niche need: it is the only way to
+  // score "does this level's data reach the picture at all" without letting
+  // the solver overwrite the thing under test between the write and the draw.
+  async function debugRenderOnce() {
+    const enc = device.createCommandEncoder();
+    encodeSceneRender(enc);
+    device.queue.submit([enc.finish()]);
+    await device.queue.onSubmittedWorkDone();
+  }
+
+  // Overwrite EVERY cell of one level's velocity pool with a constant.
+  //
+  // The instrument for tools/validate-render-levels.js. The value is meant to
+  // be far outside any physical velocity this solver produces, so that a
+  // renderer which samples this level cannot fail to change colour -- the test
+  // is "is there a path from this buffer to the picture", and a perturbation
+  // small enough to be swallowed by the colour map would answer the wrong
+  // question.
+  //
+  // Whole pool, not just the active slots: an inactive slot is not drawn, so
+  // including it cannot create a false positive, and excluding it would need a
+  // readback of the indirection this hook has no other reason to do.
+  //
+  // Restore by debugSnapshotLoad -- finePoolVel carries COPY_DST for exactly
+  // that path (see allocLevelPool), and the gate takes its snapshot first.
+  function debugPerturbLevelVel(level, ux, uy) {
+    const pool = pools[level];
+    if (!pool) throw new Error(`debugPerturbLevelVel: no pool at level ${level} (N_LEVELS=${N_LEVELS}, pools 1..${N_LEVELS - 1})`);
+    const cells = pool.MAX_FINE_BLOCKS * NCELLS1;
+    const a = new Float32Array(cells * 2);
+    for (let i = 0; i < cells; i++) { a[2 * i] = ux; a[2 * i + 1] = uy; }
+    device.queue.writeBuffer(pool.finePoolVel, 0, a.buffer, a.byteOffset, a.byteLength);
+    return { level, cells };
+  }
+
   window.__AMR = {
     debugReadDiag,
     runBenchSweep,
@@ -3719,6 +3775,8 @@ async function init() {
     debugMirrorRoot,
     debugCheckRootMirror,
     getRootPool: () => (ROOT_POOL ? { ...rootPoolSpec({ dims: { W, H }, rb: RB }), stepped: !!ROOT_STEP } : null),
+    debugRenderOnce,
+    debugPerturbLevelVel,
     debugCheck21Balance,
     debugCheckRefinementClosure,
     debugCheckSlotQuadrants,
@@ -3820,8 +3878,7 @@ async function init() {
         enc.copyBufferToBuffer(queryResolveBuffer, 0, stage.query, 0, 16);
       }
 
-      const rp = enc.beginRenderPass({ colorAttachments: [{ view: ctx.getCurrentTexture().createView(), clearValue: { r:0.07, g:0.07, b:0.1, a:1 }, loadOp: 'clear', storeOp: 'store' }]});
-      rp.setPipeline(renPL); rp.setBindGroup(0, renBG); rp.draw(6); rp.end();
+      encodeSceneRender(enc);
       trail.draw(2 * A, trailOpacity);
 
       // Only run when telemetry is on. It exists to answer a diagnostic
