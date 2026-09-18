@@ -53,7 +53,7 @@ import { reportFatal, refuseConfig, reportNoWebGPU, reportNoAdapter } from './er
 import { tauChainSingularity, tauSingularityMessage } from './amr2d.mjs';
 import { loadShader } from './shader-loader.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
-import { check21BalanceOnGPU, allocLevelPool, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState , checkRefinementClosureOnGPU , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU } from './amr2d-gpu.mjs';
+import { check21BalanceOnGPU, allocLevelPool, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState , checkRefinementClosureOnGPU , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU, makeRenderBindGroup, renderPoolLevels, MAX_RENDER_POOL_LEVELS } from './amr2d-gpu.mjs';
 // tauAtLevel: extracted to card-params.mjs by B3a-1, which landed the CALL
 // in all five AMR pages and this IMPORT in only main-amr.js. The other four
 // threw `ReferenceError: tauAtLevelOf is not defined` at init -- but only at
@@ -185,6 +185,17 @@ const N_LEVELS = urlParams.has('levels') ? parseInt(urlParams.get('levels')) : 2
 // refuseConfig, not throw: this runs at module scope, where
 // init().catch(handleErr) can never see it -- see error-overlay.mjs.
 if (N_LEVELS < 2) refuseConfig(statusEl, `?levels=${N_LEVELS} invalid -- must be >= 2 (L0 + at least one fine level)`);
+// U6: and the renderer's own ceiling, refused BEFORE anything is allocated for
+// a configuration that cannot be drawn. A cap that silently drops the finest
+// level is the defect U6 exists to fix -- at ?levels=4 a level-3 tile used to
+// be refined, solved, force-reduced and then drawn as its level-2 parent, and
+// `tools/validate-render-levels.js` measured the picture as BYTE-IDENTICAL
+// after perturbing that level's whole velocity pool.
+if (N_LEVELS - 1 > MAX_RENDER_POOL_LEVELS) {
+  refuseConfig(statusEl, `?levels=${N_LEVELS} needs ${N_LEVELS - 1} pool levels in the renderer, `
+    + `which binds ${MAX_RENDER_POOL_LEVELS} (shaders/amr_render.wgsl's walk). Raising it means one `
+    + `more binding pair there, in amr2d-gpu.mjs's RENDER_LEVEL_BINDINGS, and in every page's renBGL.`);
+}
 
 // Vorticity-driven refinement -- same defaults as main-amr.js's falling-
 // card build (calibrated for that scenario's much sharper vorticity, not
@@ -451,7 +462,15 @@ async function init() {
     { binding: 4, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
     { binding: 5, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
     { binding: 6, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
-    { binding: 7, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } }
+    { binding: 7, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
+    // U6: levels 3 and 4. One velocity/indirection pair per pool level, up to
+    // MAX_RENDER_POOL_LEVELS -- see shaders/amr_render.wgsl, which walks them.
+    // Bound unconditionally; N_POOL_LEVELS is what stops the walk, because a
+    // dummy blockSlot read out of bounds is not safe on every WebGPU stack.
+    { binding: 8, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
+    { binding: 9, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
+    { binding: 10, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
+    { binding: 11, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } }
   ]});
   const interpBGL = device.createBindGroupLayout({ label: 'interpBGL', entries: [
     { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
@@ -603,7 +622,11 @@ async function init() {
   const renPL = device.createRenderPipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [renBGL] }),
     vertex: { module: renSM, entryPoint: 'vs_main', constants },
-    fragment: { module: renSM, entryPoint: 'fs_main', targets: [{ format: fmt }], constants: fineConstants },
+    fragment: { module: renSM, entryPoint: 'fs_main', targets: [{ format: fmt }],
+      // U6: THIS PAGE NEVER PASSED A LEVEL OVERRIDE AT ALL, so the shader's
+      // HAS_LEVEL2 default of 0 meant level 2 was solved, stepped, force-reduced
+      // -- and never drawn. Three of the five AMR pages were in that state.
+      constants: { ...fineConstants, N_POOL_LEVELS: renderPoolLevels(N_LEVELS) } },
     primitive: { topology: 'triangle-list' },
   });
   const interpPL = device.createComputePipeline({
@@ -728,8 +751,12 @@ async function init() {
       device.queue.writeBuffer(overlayOpacityBuf, 0, new Float32Array([v]));
     };
   }
-  const renBG = device.createBindGroup({ layout: renBGL, entries: [{ binding: 0, resource: { buffer: velBuf } }, { binding: 1, resource: { buffer: cardStateBuf } }, { binding: 2, resource: { buffer: pools[1].finePoolVel } }, { binding: 3, resource: { buffer: pools[1].blockSlotBuf } }, { binding: 4, resource: { buffer: overlayOpacityBuf } }, { binding: 5, resource: { buffer: N_LEVELS > 2 ? pools[2].finePoolVel : pools[1].finePoolVel } }, { binding: 6, resource: { buffer: N_LEVELS > 2 ? pools[2].blockSlotBuf : dummyBlockSlotBuf } }, { binding: 7, resource: { buffer: outlineOpacityBuf } }]});
-
+  // U6: one velocity/indirection pair per POOL level, walked finest-first by
+  // shaders/amr_render.wgsl. Shared with the other four AMR pages, which all
+  // built this inline and three of which never passed the level-2 override at
+  // all -- see makeRenderBindGroup.
+  const renBG = makeRenderBindGroup(device, renBGL, pools,
+    { velBuf, cardStateBuf, overlayOpacityBuf, outlineOpacityBuf });
   const interpBG_readA = device.createBindGroup({ layout: interpBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_a } }, { binding: 2, resource: { buffer: pools[1].finePoolF_a } }, { binding: 3, resource: { buffer: pools[1].slotToBlockBuf } }, { binding: 4, resource: { buffer: pools[1].newlyActivatedBuf } }, { binding: 5, resource: { buffer: pools[1].blockSlotBuf } }]});
   const interpBG_readB = device.createBindGroup({ layout: interpBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_b } }, { binding: 2, resource: { buffer: pools[1].finePoolF_a } }, { binding: 3, resource: { buffer: pools[1].slotToBlockBuf } }, { binding: 4, resource: { buffer: pools[1].newlyActivatedBuf } }, { binding: 5, resource: { buffer: pools[1].blockSlotBuf } }]});
   const interpFFBG_b = device.createBindGroup({ layout: interpBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_a } }, { binding: 2, resource: { buffer: pools[1].finePoolF_b } }, { binding: 3, resource: { buffer: pools[1].slotToBlockBuf } }, { binding: 4, resource: { buffer: pools[1].newlyActivatedBuf } }, { binding: 5, resource: { buffer: pools[1].blockSlotBuf } }]});

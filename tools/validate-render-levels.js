@@ -1,20 +1,24 @@
 #!/usr/bin/env node
 // Does every configured refinement level have a path into the PICTURE?
 //
-// THIS GATE FAILS TODAY, ON PURPOSE. `shaders/amr_render.wgsl` binds exactly
-// three velocity sources -- the dense L0 `vel`, `vel_pool` (level 1) and
-// `vel_pool2` (level 2) -- and `main-amr.js`'s `renBG` wires them to
-// `velBuf`, `pools[1]` and `pools[2]` by NUMBER, not by depth. There is no
-// `vel_pool3`. So at `?levels=4` a level-3 tile is refined, solved, stepped
-// twice per level-2 substep, force-reduced and invariant-checked -- and then
-// drawn as though it were its level-2 parent. The finest level in the
-// hierarchy, which is the whole reason the hierarchy exists, is invisible.
+// CLOSED BY plans/uniform-levels.md U6, AND IN THE DEFAULT SWEEP SINCE. It
+// was written red on purpose and stayed red for one stage: `amr_render.wgsl`
+// bound exactly three velocity sources -- the dense L0 `vel`, `vel_pool`
+// (level 1) and `vel_pool2` (level 2) -- wired by NUMBER, not by depth, with
+// no `vel_pool3`. At `?levels=4` a level-3 tile was refined, solved, stepped
+// twice per level-2 substep, force-reduced and invariant-checked, and then
+// drawn as its level-2 parent.
 //
-// Closed by plans/uniform-levels.md U6 (the renderer walks levels). Kept OUT
-// of tools/validate-all.js's default sweep until then, the same way a
-// known-red gate is kept out rather than being allowed to turn the whole
-// sweep red -- but it is a gate, it PASS/FAILs, and it must go INTO the sweep
-// in the same commit that fixes the renderer.
+// IT FOUND A SECOND, LARGER INSTANCE WHEN IT WAS FINALLY POINTED AT ANOTHER
+// PAGE. Three of the five AMR pages -- cylinder, TGV and channel -- never
+// passed the `HAS_LEVEL2` override to the render fragment at all, so it took
+// its declared default of 0 and **level 2 was solved and never drawn on any of
+// them**. Measured here on `index-cylinder-amr.html?levels=3` before the fix:
+// perturbing level 2's whole velocity pool (65600 cells, u=(9,9)) left the
+// picture byte-identical, while level 1 moved. That is the page the Cd/St
+// numbers come from.
+//
+// A FAILURE HERE IS NOW A REGRESSION, not the expected state.
 //
 // ── WHY IT IS SCORED THIS WAY ───────────────────────────────────────────────
 //
@@ -59,18 +63,14 @@
 // CLAUDE.md. `ensureServer` reuses whatever already answers on the port.
 
 const path = require('path');
-const crypto = require('crypto');
 const CDP = require('/usr/lib/node_modules/chrome-remote-interface');
 const {
   ensureServer, ensureChrome, openTab, navigateTo, evalExpr, waitForGlobal, teardown,
 } = require('./lib/browser-lifecycle');
 
-const REPO_ROOT = path.resolve(__dirname, '..');
+const { runRenderLevels } = require('./lib/render-levels');
 
-// Far outside anything this solver produces: the card page runs at |u| of a
-// few 1e-2, and the colour map saturates long before 9. A perturbation the
-// palette could swallow would answer a different question than the one asked.
-const PERTURB = 9.0;
+const REPO_ROOT = path.resolve(__dirname, '..');
 
 function parseArgs(argv) {
   const o = {
@@ -97,31 +97,14 @@ function parseArgs(argv) {
   return o;
 }
 
+// evalOrThrow stays here because main() reads N_LEVELS before handing off; the
+// perturbation magnitude and the check itself live in tools/lib/render-levels.js.
 async function evalOrThrow(Runtime, expr, timeoutMs) {
   const r = await evalExpr(Runtime, expr, timeoutMs);
   if (r.exceptionDetails) {
     throw new Error(`page threw evaluating ${expr.slice(0, 120)}: ${r.exceptionDetails.text} ${r.exceptionDetails.exception && r.exceptionDetails.exception.description || ''}`);
   }
   return r.result.value;
-}
-
-// One PNG of the sim canvas alone. The status line and the control panel are
-// outside the clip, so a step counter or an FPS readout cannot be mistaken for
-// a change in the field.
-async function shotCanvas(Page, Runtime) {
-  const clip = await evalOrThrow(Runtime, `(() => {
-    const el = document.getElementById('c');
-    if (!el) throw new Error('no #c canvas on this page');
-    const r = el.getBoundingClientRect();
-    return { x: r.x, y: r.y, width: r.width, height: r.height };
-  })()`);
-  if (!clip.width || !clip.height) throw new Error(`#c has zero area (${clip.width}x${clip.height}) -- is the page laid out?`);
-  const { data } = await Page.captureScreenshot({
-    format: 'png',
-    clip: { x: clip.x, y: clip.y, width: clip.width, height: clip.height, scale: 1 },
-    captureBeyondViewport: false,
-  });
-  return { hash: crypto.createHash('sha256').update(data).digest('hex').slice(0, 16), bytes: data.length };
 }
 
 async function main() {
@@ -138,7 +121,7 @@ async function main() {
   await Page.enable();
   Runtime.exceptionThrown(e => console.error('[browser exception]', e.exceptionDetails.text));
 
-  const rows = [];
+  let rows = [];
   let aborted = null;
 
   try {
@@ -147,79 +130,25 @@ async function main() {
     // waitForGlobal THROWS on timeout and returns undefined on success -- do
     // not test its return value, or every healthy page reads as a boot failure.
     await waitForGlobal(Runtime, o.global, 60000);
-
     const nLevels = await evalOrThrow(Runtime, `${o.global}.getNumLevels()`);
     if (nLevels !== o.levels) {
       console.log(`[warn] page reports N_LEVELS=${nLevels}, asked for ${o.levels} (the page may be refusing the request)`);
     }
-    const hasHooks = await evalOrThrow(Runtime, `typeof ${o.global}.debugRenderOnce === 'function' && typeof ${o.global}.debugPerturbLevelVel === 'function'`);
-    if (!hasHooks) throw new Error('this page exposes no debugRenderOnce/debugPerturbLevelVel -- the gate cannot run against it');
-
-    // Settle refinement so the deep levels actually hold tiles. reset() first:
-    // the page's rAF loop runs between load and setLive(false), so reading
-    // anything before a reset reads an unknown number of steps of drift.
-    console.log(`[setup] reset + ${o.steps} steps to settle refinement`);
-    await evalOrThrow(Runtime, `${o.global}.reset()`, 120000);
-    await evalOrThrow(Runtime, `${o.global}.debugStepSync(${o.steps})`, 600000);
-    await evalOrThrow(Runtime, `${o.global}.setLive(false)`);
-
-    const active = {};
-    for (let m = 1; m < nLevels; m++) {
-      active[m] = await evalOrThrow(Runtime, `${o.global}.debugListActiveBlocks(${m}).then(a => a.length)`, 120000);
-    }
-    console.log(`[setup] active tiles by level: ${Object.entries(active).map(([m, n]) => `L${m}=${n}`).join(' ')}`);
-
-    // Keep the snapshot IN THE PAGE. It is megabytes of typed array and there
-    // is no reason to move it through CDP twice per level.
-    await evalOrThrow(Runtime, `(async () => { window.__RLGATE = await ${o.global}.debugSnapshotSave(); return 1; })()`, 300000);
-
-    // ── 1. is a screenshot even reproducible here? ───────────────────────────
-    await evalOrThrow(Runtime, `${o.global}.debugRenderOnce()`, 60000);
-    const base1 = await shotCanvas(Page, Runtime);
-    await evalOrThrow(Runtime, `${o.global}.debugRenderOnce()`, 60000);
-    const base2 = await shotCanvas(Page, Runtime);
-    if (base1.hash !== base2.hash) {
-      aborted = `two identical renders produced different PNGs (${base1.hash} vs ${base2.hash}). ` +
-        `Screenshot equality cannot score anything on this setup; nothing below would mean what it says.`;
-      throw new Error(aborted);
-    }
-    console.log(`[setup] baseline reproducible: ${base1.hash} (${base1.bytes} B)\n`);
-
-    // ── 2. one level at a time ──────────────────────────────────────────────
-    for (let m = 1; m < nLevels; m++) {
-      if (active[m] === 0) {
-        rows.push({ level: m, verdict: 'ABSTAIN', note: 'no active tiles at this level -- nothing to draw, so nothing to prove' });
-        continue;
-      }
-
-      await evalOrThrow(Runtime, `${o.global}.debugSnapshotLoad(window.__RLGATE)`, 300000);
-      await evalOrThrow(Runtime, `${o.global}.debugRenderOnce()`, 60000);
-      const restored = await shotCanvas(Page, Runtime);
-      if (restored.hash !== base1.hash) {
-        rows.push({ level: m, verdict: 'ABSTAIN', note: `restore did not return to baseline (${restored.hash} != ${base1.hash}); the reference is moving` });
-        continue;
-      }
-
-      const perturbed = await evalOrThrow(Runtime, `JSON.stringify(${o.global}.debugPerturbLevelVel(${m}, ${PERTURB}, ${PERTURB}))`);
-      await evalOrThrow(Runtime, `${o.global}.debugRenderOnce()`, 60000);
-      const after = await shotCanvas(Page, Runtime);
-
-      const reached = after.hash !== base1.hash;
-      rows.push({
-        level: m,
-        verdict: reached ? 'PASS' : 'FAIL',
-        note: reached
-          ? `picture changed (${base1.hash} -> ${after.hash})`
-          : `picture UNCHANGED after overwriting ${JSON.parse(perturbed).cells} cells with u=(${PERTURB},${PERTURB}) -- this level has no path into the renderer`,
-      });
-    }
+    // THE CHECK ITSELF LIVES IN tools/lib/render-levels.js, shared with
+    // validate-all.js's default sweep. This file owns the lifecycle and the
+    // report; a second copy of the protocol is exactly what tools/lib exists
+    // to prevent.
+    const r = await runRenderLevels({ Page, Runtime, global: o.global, steps: o.steps, log: console.log });
+    rows = r.rows;
+    aborted = r.aborted;
+    if (aborted) throw new Error(aborted);
   } finally {
     await client.close();
     await teardown({ port: o.port, tabId, chrome, server, keepOpen: o.keepOpen });
   }
 
   // ── report ────────────────────────────────────────────────────────────────
-  console.log(`\nrender reachability, ${o.page}${q}\n`);
+  console.log(`\nrender reachability, ${o.page}?levels=${o.levels}\n`);
   for (const r of rows) console.log(`  level ${r.level}  ${r.verdict.padEnd(8)} ${r.note}`);
 
   const failed = rows.filter(r => r.verdict === 'FAIL');
@@ -239,9 +168,24 @@ async function main() {
     console.log(`  Discrimination OK: ${passed.length} level(s) reached the renderer, ${failed.length} did not.`);
   }
 
+  // WHAT KEEPS AN ALL-PASS RUN FROM BEING VACUOUS, now that the expected
+  // result is all-PASS and the pass/fail split can no longer supply the
+  // discrimination. Two guards, both already enforced above, and they are the
+  // reason this still measures something:
+  //
+  //   the BASELINE is reproducible -- two untouched renders byte-identical, or
+  //     the run aborts. Without it "the picture changed" means nothing.
+  //   the RESTORE returns to baseline before every level, or that level
+  //     ABSTAINS. Without it each level would be compared against the previous
+  //     level's perturbation and would "pass" trivially.
+  //
+  // Neither is a pass/fail row, so they are restated here rather than left to
+  // be inferred from a green summary.
+
   if (failed.length) {
     console.log(`\nFAIL: level(s) ${failed.map(r => r.level).join(', ')} are solved but never drawn.`);
-    console.log('Expected on this branch -- see this file\'s header and plans/uniform-levels.md U6.');
+    console.log('This is a REGRESSION -- U6 closed it. Check N_POOL_LEVELS reaches the render');
+    console.log('pipeline on this page, and that renBG binds a pair for every level.');
     process.exit(1);
   }
   console.log('\nPASS: every level with active tiles reaches the renderer.');

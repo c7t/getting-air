@@ -37,6 +37,7 @@ const { evalExpr: evalExprCyl, runCase } = require('./lib/cylinder-metrics');
 const { evalExpr: evalExprChan, runCase: runChanCase } = require('./lib/channel-metrics');
 const { evalExpr: evalExprTgv, runCase: runTgvCase } = require('./lib/tgv-metrics');
 const { runInvariantSweep } = require('./lib/amr-invariants');
+const { runRenderLevels } = require('./lib/render-levels');
 const {
   ensureServer, ensureChrome, openTab, firstTab, navigateTo, waitForGlobal, teardown,
 } = require('./lib/browser-lifecycle');
@@ -218,6 +219,28 @@ function defaultConfigs(baseUrl) {
       url: `${baseUrl}/index-amr.html`,
       global: 'window.__AMR',
       checkInvariants: true,
+    },
+    // RENDER REACHABILITY -- in the default sweep since plans/uniform-levels.md
+    // U6 closed it, and deliberately not before: a known-red gate does not get
+    // to turn the whole sweep red. It perturbs one level's velocity pool with a
+    // value no flow produces, redraws, and asks whether the picture moved.
+    //
+    // BOTH PAGES, because the defect it found was not the one it was written
+    // for. index-amr.html was missing level 3; index-cylinder-amr.html -- and
+    // the TGV and channel pages with it -- never passed a level override to the
+    // render fragment at all, so level 2 was solved and never drawn on the page
+    // the Cd/St numbers come from.
+    {
+      name: 'render-levels-card',
+      url: `${baseUrl}/index-amr.html?levels=4`,
+      global: 'window.__AMR',
+      checkRenderLevels: true,
+    },
+    {
+      name: 'render-levels-cylinder',
+      url: `${baseUrl}/index-cylinder-amr.html?levels=3`,
+      global: 'window.__CYL',
+      checkRenderLevels: true,
     },
     {
       name: 'dense-reference',
@@ -601,7 +624,7 @@ async function main() {
       console.log(`\n=== ${config.name} (${config.url}) ===`);
       currentConfigName = config.name;
 
-      let physics = null, invariants = null, boot = null;
+      let physics = null, invariants = null, boot = null, renderLevels = null;
 
       if (config.checkChannelPhysics) {
         // Owns its own per-(mode,res) navigation -- see runChannelPhysics's
@@ -624,6 +647,15 @@ async function main() {
             console.log('  -- physics (Cd/St) --');
             physics = await runPhysics(Runtime, opts);
           }
+          if (config.checkRenderLevels) {
+            console.log('  -- render reachability (every level reaches the picture) --');
+            renderLevels = await runRenderLevels({
+              Page, Runtime, global: config.global, steps: opts.renderSteps || 4096,
+              log: (m) => console.log('  ' + m),
+            });
+            for (const r of renderLevels.rows) console.log(`    level ${r.level}  ${r.verdict.padEnd(8)} ${r.note}`);
+            if (renderLevels.aborted) console.log(`    ABORTED: ${renderLevels.aborted}`);
+          }
           if (config.checkInvariants) {
             console.log('  -- structural invariants --');
             // Re-navigate with ?diag=1 so the refinement-convergence counters
@@ -641,7 +673,7 @@ async function main() {
         }
       }
 
-      report.push({ config, physics, invariants, boot });
+      report.push({ config, physics, invariants, boot, renderLevels });
     }
   } finally {
     await client.close();
@@ -657,14 +689,25 @@ async function main() {
   console.log('SUMMARY');
   console.log('='.repeat(72));
   const pad = (s, n) => (String(s) + ' '.repeat(n)).slice(0, Math.max(String(s).length, n)) + ' ';
-  console.log(pad('config', 26) + pad('boot', 8) + pad('physics', 12) + pad('invariants', 12));
+  console.log(pad('config', 26) + pad('boot', 8) + pad('physics', 12) + pad('invariants', 12) + pad('render', 10));
   let allOk = true;
-  for (const { config, physics, invariants, boot } of report) {
+  for (const { config, physics, invariants, boot, renderLevels } of report) {
     const bootStr = boot ? (boot.ok ? 'PASS' : 'FAIL') : 'n/a';
     const physStr = physics ? (physics.ok ? 'PASS' : 'FAIL') : 'n/a';
     const invStr = invariants ? (invariants.ok ? 'PASS' : 'FAIL') : 'n/a';
-    console.log(pad(config.name, 26) + pad(bootStr, 8) + pad(physStr, 12) + pad(invStr, 12));
+    // A run that ABORTED is not a pass and not a fail -- it is a comparison
+    // that could not be made, and it must not be reported as either. An
+    // ABSTAIN row (a level with no tiles) likewise does not pass; only the
+    // absence of FAIL rows over at least one real PASS does.
+    let renStr = 'n/a';
+    if (renderLevels) {
+      const bad = renderLevels.rows.filter(r => r.verdict === 'FAIL').length;
+      const good = renderLevels.rows.filter(r => r.verdict === 'PASS').length;
+      renStr = renderLevels.aborted ? 'ABORTED' : (bad || !good ? 'FAIL' : 'PASS');
+    }
+    console.log(pad(config.name, 26) + pad(bootStr, 8) + pad(physStr, 12) + pad(invStr, 12) + pad(renStr, 10));
     if (boot && !boot.ok) allOk = false;
+    if (renStr === 'FAIL' || renStr === 'ABORTED') allOk = false;
     if (physics && !physics.ok) allOk = false;
     if (invariants && !invariants.ok) allOk = false;
   }

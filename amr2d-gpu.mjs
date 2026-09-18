@@ -661,6 +661,63 @@ export async function readCardState(device, cardStateBuf) {
 // unconditionally (tools/lib/amr-invariants.js), which is a stronger check
 // than this trip-wire and already fails loudly. A second implicit latch there
 // would change what existing tooling means without adding coverage.
+// --- the renderer's per-level wiring (plans/uniform-levels.md U6) -----------
+//
+// `shaders/amr_render.wgsl` binds one velocity/indirection pair per POOL
+// level and walks them finest-first. WGSL cannot index an array of storage
+// buffers, so the pairs are separate bindings and this table is the one place
+// that says which binding belongs to which level.
+//
+// IT LIVES HERE BECAUSE FIVE PAGES BUILD THE SAME BIND GROUP. Before U6 they
+// each spelled out a fixed two-tier `renBG` inline, and three of the five
+// never passed the `HAS_LEVEL2` override at all -- so level 2 was solved and
+// never drawn on the cylinder, TGV and channel pages, and level 3 was never
+// drawn anywhere. A table copied five times is a table that will be updated
+// three times.
+export const MAX_RENDER_POOL_LEVELS = 4;
+const RENDER_LEVEL_BINDINGS = { 1: [2, 3], 2: [5, 6], 3: [8, 9], 4: [10, 11] };
+
+// A level the configuration does not have is bound to LEVEL 1's buffers, not
+// to a dummy. The walk stops at `N_POOL_LEVELS` and never reads them, so the
+// contents do not matter -- but a one-element dummy would matter: an
+// out-of-range `blockSlot` read is not guaranteed to return the in-bounds -1
+// (Dawn clamps to element 0, other stacks need not), and a positive slot there
+// would falsely activate a level. That hazard is exactly what the old
+// `HAS_LEVEL2` override existed to gate, and the loop bound now carries it.
+export function makeRenderBindGroup(device, layout, pools, { velBuf, cardStateBuf, overlayOpacityBuf, outlineOpacityBuf }) {
+  const entries = [
+    { binding: 0, resource: { buffer: velBuf } },
+    { binding: 1, resource: { buffer: cardStateBuf } },
+    { binding: 4, resource: { buffer: overlayOpacityBuf } },
+    { binding: 7, resource: { buffer: outlineOpacityBuf } },
+  ];
+  for (let m = 1; m <= MAX_RENDER_POOL_LEVELS; m++) {
+    const pool = pools[m] || pools[1];
+    const [velBinding, slotBinding] = RENDER_LEVEL_BINDINGS[m];
+    entries.push({ binding: velBinding, resource: { buffer: pool.finePoolVel } });
+    entries.push({ binding: slotBinding, resource: { buffer: pool.blockSlotBuf } });
+  }
+  return device.createBindGroup({ layout, entries });
+}
+
+// How many pool levels the renderer will actually walk, and the refusal when a
+// configuration asks for more than it can draw.
+//
+// A CAP THAT SILENTLY DROPS THE FINEST LEVEL IS THE DEFECT U6 EXISTS TO FIX,
+// so this refuses rather than rendering a lie. `tools/validate-render-levels.js`
+// measured the old behaviour directly: at `?levels=4`, perturbing level 3's
+// whole velocity pool left the picture BYTE-IDENTICAL.
+export function renderPoolLevels(nLevels) {
+  const want = nLevels - 1;
+  if (want > MAX_RENDER_POOL_LEVELS) {
+    throw new Error(`?levels=${nLevels} needs ${want} pool levels in the renderer, `
+      + `which binds ${MAX_RENDER_POOL_LEVELS} (shaders/amr_render.wgsl). Raising it means one more `
+      + `binding pair there, in RENDER_LEVEL_BINDINGS, and in every page's renBGL. `
+      + `Refused rather than drawn without the finest level -- see plans/uniform-levels.md U6.`);
+  }
+  return want;
+}
+
 export function makeRefusalWatch({ device, pools, nLevels, checkCoverage, minIntervalMs = 500 }) {
   const U = GPUBufferUsage;
   let inFlight = false;

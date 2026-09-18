@@ -39,7 +39,7 @@ import { tauChainSingularity, tauSingularityMessage } from './amr2d.mjs';
 import { createTotalUnwrapper } from './card-total.mjs';
 import { loadShader } from './shader-loader.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
-import { check21BalanceOnGPU, allocLevelPool, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState, checkGeometryCoverageOnGPU, makeRefusalWatch , checkRefinementClosureOnGPU , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU } from './amr2d-gpu.mjs';
+import { check21BalanceOnGPU, allocLevelPool, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState, checkGeometryCoverageOnGPU, makeRefusalWatch , checkRefinementClosureOnGPU , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU, makeRenderBindGroup, renderPoolLevels, MAX_RENDER_POOL_LEVELS } from './amr2d-gpu.mjs';
 // tauAtLevel: extracted to card-params.mjs by B3a-1, which landed the CALL
 // in all five AMR pages and this IMPORT in only main-amr.js. The other four
 // threw `ReferenceError: tauAtLevelOf is not defined` at init -- but only at
@@ -189,6 +189,17 @@ const N_LEVELS = urlParams.has('levels') ? parseInt(urlParams.get('levels')) : 2
 // refuseConfig, not throw: this runs at module scope, where
 // init().catch(handleErr) can never see it -- see error-overlay.mjs.
 if (N_LEVELS < 2) refuseConfig(statusEl, `?levels=${N_LEVELS} invalid -- must be >= 2 (L0 + at least one fine level)`);
+// U6: and the renderer's own ceiling, refused BEFORE anything is allocated for
+// a configuration that cannot be drawn. A cap that silently drops the finest
+// level is the defect U6 exists to fix -- at ?levels=4 a level-3 tile used to
+// be refined, solved, force-reduced and then drawn as its level-2 parent, and
+// `tools/validate-render-levels.js` measured the picture as BYTE-IDENTICAL
+// after perturbing that level's whole velocity pool.
+if (N_LEVELS - 1 > MAX_RENDER_POOL_LEVELS) {
+  refuseConfig(statusEl, `?levels=${N_LEVELS} needs ${N_LEVELS - 1} pool levels in the renderer, `
+    + `which binds ${MAX_RENDER_POOL_LEVELS} (shaders/amr_render.wgsl's walk). Raising it means one `
+    + `more binding pair there, in amr2d-gpu.mjs's RENDER_LEVEL_BINDINGS, and in every page's renBGL.`);
+}
 
 // ── Milestone 4b (plans/AMR.md): automatic vorticity-driven refinement ────
 // Simplified AGAL Algorithm 3 for our 2-level case (see amr_criterion.wgsl/
@@ -801,7 +812,15 @@ async function init() {
     { binding: 4, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
     { binding: 5, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
     { binding: 6, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
-    { binding: 7, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } }
+    { binding: 7, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
+    // U6: levels 3 and 4. One velocity/indirection pair per pool level, up to
+    // MAX_RENDER_POOL_LEVELS -- see shaders/amr_render.wgsl, which walks them.
+    // Bound unconditionally; N_POOL_LEVELS is what stops the walk, because a
+    // dummy blockSlot read out of bounds is not safe on every WebGPU stack.
+    { binding: 8, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
+    { binding: 9, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
+    { binding: 10, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
+    { binding: 11, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } }
   ]});
 
   // Milestone 4: interp (coarse->fine ghosts), fine step, average (fine->coarse),
@@ -979,7 +998,10 @@ async function init() {
   // Render fragment needs HAS_LEVEL2 to gate the level-2 override; keep it
   // separate from fineConstants, which is also fed to the avg compute
   // pipeline (whose shader has no HAS_LEVEL2 override).
-  const renderConstants = { W, H, RB, HAS_LEVEL2: N_LEVELS > 2 ? 1 : 0, K_EPS };
+  // U6: how many pool levels the renderer walks. renderPoolLevels() REFUSES a
+  // configuration deeper than the shader binds, rather than drawing it without
+  // its finest level -- which is what this override replaced HAS_LEVEL2 for.
+  const renderConstants = { W, H, RB, N_POOL_LEVELS: renderPoolLevels(N_LEVELS), K_EPS };
   // GHOST_ONLY=1: steady-state ghost-only reinterpolation (every macro-step).
   // GHOST_ONLY=0: full-slot fill, used once on block activation (see debugActivateBlock).
   const interpConstants = { W, H, RB, GHOST_ONLY: 1, F16, DC_PRE };
@@ -1182,8 +1204,12 @@ async function init() {
   // uniform from overlayOpacityBuf's fill).
   const outlineOpacityBuf = device.createBuffer({ size: 4, usage: U.UNIFORM | U.COPY_DST });
   device.queue.writeBuffer(outlineOpacityBuf, 0, new Float32Array([0.0]));
-  const renBG = device.createBindGroup({ layout: renBGL, entries: [{ binding: 0, resource: { buffer: velBuf } }, { binding: 1, resource: { buffer: cardStateBuf } }, { binding: 2, resource: { buffer: pools[1].finePoolVel } }, { binding: 3, resource: { buffer: pools[1].blockSlotBuf } }, { binding: 4, resource: { buffer: overlayOpacityBuf } }, { binding: 5, resource: { buffer: N_LEVELS > 2 ? pools[2].finePoolVel : pools[1].finePoolVel } }, { binding: 6, resource: { buffer: N_LEVELS > 2 ? pools[2].blockSlotBuf : dummyBlockSlotBuf } }, { binding: 7, resource: { buffer: outlineOpacityBuf } }]});
-
+  // U6: one velocity/indirection pair per POOL level, walked finest-first by
+  // shaders/amr_render.wgsl. Shared with the other four AMR pages, which all
+  // built this inline and three of which never passed the level-2 override at
+  // all -- see makeRenderBindGroup.
+  const renBG = makeRenderBindGroup(device, renBGL, pools,
+    { velBuf, cardStateBuf, overlayOpacityBuf, outlineOpacityBuf });
   // Milestone 4 bind groups (pool-aware, superseding M2's single-region ones).
   // interp always WRITES pools[1].finePoolF_a (the pool's current-at-macro-step-
   // boundary buffer, mirroring f_a's own invariant -- 2 fine substeps per

@@ -25,7 +25,7 @@
 import { reportFatal, refuseConfig, setStatus, reportNoWebGPU, reportNoAdapter } from './error-overlay.mjs';
 import { loadShader } from './shader-loader.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
-import { check21BalanceOnGPU, allocLevelPool, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState, checkGeometryCoverageOnGPU, makeRefusalWatch , checkRefinementClosureOnGPU , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU } from './amr2d-gpu.mjs';
+import { check21BalanceOnGPU, allocLevelPool, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState, checkGeometryCoverageOnGPU, makeRefusalWatch , checkRefinementClosureOnGPU , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU, makeRenderBindGroup, renderPoolLevels, MAX_RENDER_POOL_LEVELS } from './amr2d-gpu.mjs';
 // tauAtLevel: extracted to card-params.mjs by B3a-1, which landed the CALL
 // in all five AMR pages and this IMPORT in only main-amr.js. The other four
 // threw `ReferenceError: tauAtLevelOf is not defined` at init -- but only at
@@ -195,6 +195,17 @@ const N_LEVELS = urlParams.has('levels') ? parseInt(urlParams.get('levels')) : 2
 // refuseConfig, not throw: this runs at module scope, where
 // init().catch(handleErr) can never see it -- see error-overlay.mjs.
 if (N_LEVELS < 2) refuseConfig(statusEl, `?levels=${N_LEVELS} invalid -- must be >= 2 (L0 + at least one fine level)`);
+// U6: and the renderer's own ceiling, refused BEFORE anything is allocated for
+// a configuration that cannot be drawn. A cap that silently drops the finest
+// level is the defect U6 exists to fix -- at ?levels=4 a level-3 tile used to
+// be refined, solved, force-reduced and then drawn as its level-2 parent, and
+// `tools/validate-render-levels.js` measured the picture as BYTE-IDENTICAL
+// after perturbing that level's whole velocity pool.
+if (N_LEVELS - 1 > MAX_RENDER_POOL_LEVELS) {
+  refuseConfig(statusEl, `?levels=${N_LEVELS} needs ${N_LEVELS - 1} pool levels in the renderer, `
+    + `which binds ${MAX_RENDER_POOL_LEVELS} (shaders/amr_render.wgsl's walk). Raising it means one `
+    + `more binding pair there, in amr2d-gpu.mjs's RENDER_LEVEL_BINDINGS, and in every page's renBGL.`);
+}
 
 // ── POOL CAPACITY PER LEVEL, MEASURED (2026-09-15) ───────────────────────────
 // Max live tiles over 40000 steps with every cap lifted, this page's pinned
@@ -1048,7 +1059,15 @@ async function init() {
     { binding: 4, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
     { binding: 5, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
     { binding: 6, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
-    { binding: 7, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } }
+    { binding: 7, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
+    // U6: levels 3 and 4. One velocity/indirection pair per pool level, up to
+    // MAX_RENDER_POOL_LEVELS -- see shaders/amr_render.wgsl, which walks them.
+    // Bound unconditionally; N_POOL_LEVELS is what stops the walk, because a
+    // dummy blockSlot read out of bounds is not safe on every WebGPU stack.
+    { binding: 8, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
+    { binding: 9, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
+    { binding: 10, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
+    { binding: 11, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } }
   ]});
 
   // Milestone 4: interp (coarse->fine ghosts), fine step, average (fine->coarse),
@@ -1254,7 +1273,11 @@ async function init() {
   const renPL = device.createRenderPipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [renBGL] }),
     vertex: { module: renSM, entryPoint: 'vs_main', constants },
-    fragment: { module: renSM, entryPoint: 'fs_main', targets: [{ format: fmt }], constants: fineConstants },
+    fragment: { module: renSM, entryPoint: 'fs_main', targets: [{ format: fmt }],
+      // U6: THIS PAGE NEVER PASSED A LEVEL OVERRIDE AT ALL, so the shader's
+      // HAS_LEVEL2 default of 0 meant level 2 was solved, stepped, force-reduced
+      // -- and never drawn. Three of the five AMR pages were in that state.
+      constants: { ...fineConstants, N_POOL_LEVELS: renderPoolLevels(N_LEVELS) } },
     primitive: { topology: 'triangle-list' },
   });
   const interpPL = device.createComputePipeline({
@@ -1420,8 +1443,12 @@ async function init() {
   // uniform from overlayOpacityBuf's fill).
   const outlineOpacityBuf = device.createBuffer({ size: 4, usage: U.UNIFORM | U.COPY_DST });
   device.queue.writeBuffer(outlineOpacityBuf, 0, new Float32Array([0.0]));
-  const renBG = device.createBindGroup({ layout: renBGL, entries: [{ binding: 0, resource: { buffer: velBuf } }, { binding: 1, resource: { buffer: cardStateBuf } }, { binding: 2, resource: { buffer: pools[1].finePoolVel } }, { binding: 3, resource: { buffer: pools[1].blockSlotBuf } }, { binding: 4, resource: { buffer: overlayOpacityBuf } }, { binding: 5, resource: { buffer: N_LEVELS > 2 ? pools[2].finePoolVel : pools[1].finePoolVel } }, { binding: 6, resource: { buffer: N_LEVELS > 2 ? pools[2].blockSlotBuf : dummyBlockSlotBuf } }, { binding: 7, resource: { buffer: outlineOpacityBuf } }]});
-
+  // U6: one velocity/indirection pair per POOL level, walked finest-first by
+  // shaders/amr_render.wgsl. Shared with the other four AMR pages, which all
+  // built this inline and three of which never passed the level-2 override at
+  // all -- see makeRenderBindGroup.
+  const renBG = makeRenderBindGroup(device, renBGL, pools,
+    { velBuf, cardStateBuf, overlayOpacityBuf, outlineOpacityBuf });
   // Milestone 4 bind groups (pool-aware, superseding M2's single-region ones).
   // interp always WRITES pools[1].finePoolF_a (the pool's current-at-macro-step-
   // boundary buffer, mirroring f_a's own invariant -- 2 fine substeps per
@@ -2847,8 +2874,47 @@ async function init() {
     };
   }
 
+  // ── The scene render, as ONE encoder path (plans/uniform-levels.md U6) ────
+  // frame() and debugRenderOnce() both go through this. A second copy of the
+  // pass descriptor is exactly the duplication that lets a render change land
+  // in the live path and not in the verification path -- which is the failure
+  // mode tools/validate-render-levels.js exists to catch, so it would be
+  // perverse for the gate to run against its own copy of the render.
+  // main-amr.js carries the same function, verbatim.
+  function encodeSceneRender(enc) {
+    const rp = enc.beginRenderPass({ colorAttachments: [{ view: ctx.getCurrentTexture().createView(), clearValue: { r:0.07, g:0.07, b:0.1, a:1 }, loadOp: 'clear', storeOp: 'store' }]});
+    rp.setPipeline(renPL); rp.setBindGroup(0, renBG); rp.draw(6); rp.end();
+  }
+
+  // Render one frame on demand, without stepping. A PAUSED page never
+  // redraws, so anything that changes a buffer the renderer reads has no way
+  // to ask for the result.
+  async function debugRenderOnce() {
+    const enc = device.createCommandEncoder();
+    encodeSceneRender(enc);
+    device.queue.submit([enc.finish()]);
+    await device.queue.onSubmittedWorkDone();
+  }
+
+  // Overwrite EVERY cell of one level's velocity pool with a constant -- the
+  // instrument for tools/validate-render-levels.js. Added to THIS page at U6
+  // because the gate could only run on index-amr.html, and the defect it found
+  // here was bigger: this page never passed a level override to the render
+  // fragment at all, so level 2 was solved and never drawn.
+  function debugPerturbLevelVel(level, ux, uy) {
+    const pool = pools[level];
+    if (!pool) throw new Error(`debugPerturbLevelVel: no pool at level ${level} (N_LEVELS=${N_LEVELS}, pools 1..${N_LEVELS - 1})`);
+    const cells = pool.MAX_FINE_BLOCKS * NCELLS1;
+    const a = new Float32Array(cells * 2);
+    for (let i = 0; i < cells; i++) { a[2 * i] = ux; a[2 * i + 1] = uy; }
+    device.queue.writeBuffer(pool.finePoolVel, 0, a.buffer, a.byteOffset, a.byteLength);
+    return { level, cells };
+  }
+
   window.__CYL = {
     debugReadDiag,
+    debugRenderOnce,
+    debugPerturbLevelVel,
     setLive: (v) => { liveMode = !!v; },
     isLive: () => liveMode,
     reset: resetSim,
@@ -2935,8 +3001,7 @@ async function init() {
         enc.copyBufferToBuffer(queryResolveBuffer, 0, stage.query, 0, 16);
       }
 
-      const rp = enc.beginRenderPass({ colorAttachments: [{ view: ctx.getCurrentTexture().createView(), clearValue: { r:0.07, g:0.07, b:0.1, a:1 }, loadOp: 'clear', storeOp: 'store' }]});
-      rp.setPipeline(renPL); rp.setBindGroup(0, renBG); rp.draw(6); rp.end();
+      encodeSceneRender(enc);
 
       enc.copyBufferToBuffer(cardStateBuf, 0, stage.card, 0, 104);
 

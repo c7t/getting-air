@@ -27,7 +27,7 @@ it runs on.
 | U3 | The step kernel serves the root | **DONE — BIT-IDENTICAL** on 8 rungs, 512 macro-steps; controls saturate at 98.4% | word equality + field health, `?rootstep=0` as control |
 | U4 | criterion, force, digest, conserved totals | **DONE** — all four consumers on the root. Exact on the criterion, digest max and conserved totals; the force to the truncation floor | `tools/validate-root-kernels.js`, 8 rungs + 2 controls |
 | U5 | L1 becomes a quad child of the root | **U5-0…U5-4 DONE under `?rootpool=1`** — both hops of the coupling and the manager. Level 1 is quad-allocated and quad-managed; tiles +28-32%; new fingerprints, default unmoved. `amr_manage.wgsl` cannot retire until the other four AMR pages get a root pool, and Cd/St is unmeasurable until then | `validate-root-kernels.js` (11 rungs, 4 controls); `validate-all.js` invariants ± starved pool; `measure-determinism.js` |
-| U6 | The renderer walks levels | not started; **its gate already exists and already fails** | `tools/validate-render-levels.js` |
+| U6 | The renderer walks levels | **DONE** — and it found that three of the five pages never drew level 2 either. Level 1 bit-identical to before; gate green on two pages and in the default sweep | `tools/validate-render-levels.js`, `tools/lib/render-levels.js` |
 | U7 | One implementation across the five pages, then delete the dense path | not started, **split into U7-0…U7-6** — U1–U5 all landed on `main-amr.js` alone, so the remaining work is propagation before deletion. Measured: all 14 bind group layouts are byte-identical across five pages, and `S_Advance` is byte-identical across the other four | each rung byte-identical on the default path (`measure-determinism.js`), except U7-5 which is the one that moves numbers |
 
 **Where the risk actually sits.** U0–U2 went in clean and each found something
@@ -2094,6 +2094,110 @@ cell. A change to what explode writes into the ring reaches the picture and
 nothing else. Score it with screenshots, deliberately, rather than assuming a
 green sweep covers it.
 
+### U6 — DONE (2026-09-18). The renderer walks levels, and the defect was bigger than the one it was written for.
+
+`amr_render.wgsl` binds one velocity/indirection pair per POOL level (up to
+`MAX_RENDER_POOL_LEVELS` = 4) and walks them finest-first in a loop.
+`N_POOL_LEVELS` replaces `HAS_LEVEL2`, and a configuration deeper than the
+shader can draw is now REFUSED at init rather than rendered without its finest
+level.
+
+**WGSL cannot index an array of storage buffers**, so the buffers stay one
+binding each and `poolVel`/`poolSlotOf` are a four-way `if` ladder. That ladder
+is irreducible. What is NOT, and is what actually carried the bug, is the
+per-level block arithmetic, the bilinear sample, the finest-wins precedence and
+the outline colour -- all copy-pasted per tier before, all written once now.
+
+#### It found a second, larger instance the moment it was pointed at another page
+
+The gate was written for one defect: level 3 invisible at `?levels=4` on
+`index-amr.html`. Running it against the cylinder page found another.
+
+**Three of the five AMR pages -- cylinder, TGV and channel -- never passed a
+level override to the render fragment at all.** They pass `fineConstants`,
+which has no `HAS_LEVEL2` field, so the shader's declared default of `0u` stood
+and the level-2 branch was statically dead. Measured on
+`index-cylinder-amr.html?levels=3` before the fix: perturbing level 2's whole
+velocity pool (65600 cells, u=(9,9)) left the picture **byte-identical**, while
+level 1 moved.
+
+That is the page the Cd/St numbers come from. Every screenshot anyone has taken
+of the cylinder at `?levels=3` showed level-1 resolution.
+
+**The gate could only ever have found it by being pointed there**, which needed
+two page hooks the cylinder page did not have. Those are ~25 lines and they are
+now in it. The lesson is not about the renderer: a capability gate that exists
+on one page measures one page.
+
+#### And the first draft of the fix had a visible artifact, caught by eye
+
+The walk generalises the tile lookup, and the half-cell shift in it does not
+generalise the way it looks.
+
+A tile is picked by which CELL OF THE LEVEL ABOVE contains the point, so the
+shift is **half a level-(m-1) cell = 2^-m in L0 units**, i.e. `1/dens`. Written
+as a flat `0.5` -- which is what level 1's original line says, because at level
+1 those are the same number -- it is half an L0 cell, which is `2^(m-1)` FINE
+cells:
+
+```
+  level   shift as written (0.5 L0)   in fine cells   ring is 2 deep
+    1                                      0.5        ok
+    2                                      1.5        ok
+    3                                      3.5        OUTSIDE THE RING
+    4                                      7.5        OUTSIDE THE RING
+```
+
+Past level 2 the bilinear tap lands outside the ring entirely, `poolVel`'s clamp
+pins it to the tile edge, and a band of pixels along every level-3 tile boundary
+reads one frozen value. On screen: **a dark lattice over the refined region**,
+which is what it looked like and how it was found -- the user watching the debug
+Chrome during the test runs, not any gate.
+
+**NO GATE HERE WOULD HAVE CAUGHT IT, AND THAT IS THE POINT WORTH KEEPING.** The
+reachability gate asks whether a level changes the picture AT ALL; a level whose
+every seam is wrong still changes it. The paused baseline was byte-reproducible
+(6 of 6 renders identical). The field was finite. Live frames showed no
+alternation (12 distinct hashes, no 2-cycle). Every instrument was green over a
+visibly broken picture. **This stage's own note already said to score the
+renderer with screenshots deliberately rather than assume a green sweep covers
+it, and that note earned itself inside one stage.**
+
+With `shift = 1/dens` the ring reach is exactly 0.5 fine cells at EVERY level --
+the reach level 1 has always had.
+
+#### Gates
+
+- **Level 1 is BIT-IDENTICAL to the pre-U6 renderer.** `?levels=2&detslots=1`,
+  paused after 4096 steps, screenshot hash `04635a0ad09a721b` on both builds.
+  That is the check that says the walk reproduces the old level-1 path rather
+  than merely resembling it, and it is available only because D0 made the
+  state reproducible.
+- **`tools/validate-render-levels.js` green on both pages**: card at
+  `?levels=4` (levels 1, 2, 3 all PASS), cylinder at `?levels=3` (1, 2 PASS).
+- **In the default sweep**, as this stage's own note required, as
+  `render-levels-card` and `render-levels-cylinder`. The check moved to
+  `tools/lib/render-levels.js` so the leaf tool and the sweep call ONE
+  implementation.
+- **The solver did not move**: `measure-determinism.js` returns
+  `7ac54e170f903ac3` / `ce1bd4d8a3a1055c`, unchanged. The renderer is
+  render-only and this proves it rather than asserting it.
+
+Level 2's assignment DID change (`?levels=3` hashes differ): the old code split
+an L1 tile at `halfRB` with no shift at all, so the seam fell between cell
+centres and the two halves each sampled their own interior with no shared ring
+tap. The new rule is the same one level 1 uses, one octave down.
+
+#### What the gate can and cannot say now that it is green
+
+The pass/fail split used to supply its own discrimination -- levels 1 and 2
+green while level 3 went red. With everything green that is gone, so the two
+guards that remain are restated in the tool rather than left to be inferred:
+the baseline must be reproducible (or the run aborts), and the restore must
+return to baseline before every level (or that level abstains). Without the
+first, "the picture changed" means nothing; without the second, each level is
+compared against the previous level's perturbation and passes trivially.
+
 ### U7 — one implementation, five pages, then delete the dense path
 
 **U7 AS ORIGINALLY WRITTEN IS ONE TASK WITH A TEN-ITEM LIST AND NO GATE UNTIL
@@ -2192,6 +2296,13 @@ average / step1 / force / criterion / manage bind groups. Same shape on every
 page; the buffers it names all come from `allocLevelPool`, which is already
 shared.
 
+**U6 ALREADY PAID PART OF THIS RUNG, and the shape is the one to copy.** The
+renderer's per-level bind group moved to `amr2d-gpu.mjs`'s
+`makeRenderBindGroup` and all five pages call it, because the alternative was
+adding two binding pairs to five inline `renBG` literals -- and the defect U6
+found was precisely that three of those five had drifted (they never passed the
+level override). One function, one table of bindings, five callers.
+
 **TAKE THE POOL-ALLOCATION AND RESET SCAFFOLDING WITH IT.** U7-4's itemisation
 below shows why: more than half of what a page would otherwise have to change
 for the root pool is a LOOP BOUND in one of these loops -- the allocation loop,
@@ -2201,13 +2312,10 @@ is another per-page edit there.
 
 *Gate:* as U7-1.
 
-**U6 SHOULD RIDE ON THIS RUNG RATHER THAN BE DONE FIVE TIMES.** The renderer
-change -- replacing `renBG`'s fixed `vel_pool`/`vel_pool2` wiring with a
-per-level walk -- is a per-page bind group today, and its gate
-(`tools/validate-render-levels.js`) already exists and already fails on level 3.
-Doing it before U7-2 means writing it five times; doing it as part of U7-2
-means writing it once. If U6 is already done by the time this is read, fold its
-bind group into this rung anyway.
+**U6 WENT FIRST AND SHARED ITS OWN BIND GROUP RATHER THAN WRITING IT FIVE
+TIMES** (2026-09-18). `makeRenderBindGroup` is in `amr2d-gpu.mjs` and every page
+calls it; fold it into this rung's shared builder when that exists, rather than
+leaving two homes for the same wiring.
 
 #### U7-3 — the scheduler
 

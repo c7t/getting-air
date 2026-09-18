@@ -5,20 +5,40 @@
 
 @group(0) @binding(0) var<storage, read> vel         : array<f32>;
 @group(0) @binding(1) var<storage, read> state       : CardState;
-@group(0) @binding(2) var<storage, read> vel_pool    : array<f32>; // Milestone 4: fine pool (level 1)
-@group(0) @binding(3) var<storage, read> blockSlot   : array<i32>; // Milestone 4: coarse block -> pool slot (level 1)
+// ONE VELOCITY/INDIRECTION PAIR PER POOL LEVEL, AND THE WALK OVER THEM IS A
+// LOOP (plans/uniform-levels.md U6).
+//
+// It used to be two hard-coded tiers -- `vel_pool`/`blockSlot` for level 1 and
+// `vel_pool2`/`blockSlot2` for level 2 -- with the compositing written out
+// twice. There was no third pair, so at `?levels=4` a level-3 tile was
+// refined, solved, stepped twice per level-2 substep, force-reduced and
+// invariant-checked, and then DRAWN AS ITS LEVEL-2 PARENT. The finest level in
+// the hierarchy, which is the whole reason the hierarchy exists, was invisible.
+// `tools/validate-render-levels.js` measured it directly: perturbing level 3's
+// velocity pool by u=(9,9) over 446400 cells left the picture byte-identical.
+//
+// WGSL CANNOT INDEX AN ARRAY OF STORAGE BUFFERS, so the buffers stay one
+// binding each and `poolVel`/`poolSlotOf` below are a 4-way `if` ladder. That
+// ladder is the irreducible part. What is NOT irreducible -- and is what
+// actually had the bug -- is the per-level block arithmetic, the bilinear
+// sample, the finest-wins precedence and the outline colour, all of which were
+// copy-pasted per tier and are now written ONCE inside `for (m = 1; m <=
+// N_POOL_LEVELS; m++)`.
+//
+// Levels above `N_POOL_LEVELS` are bound to a harmless duplicate of level 1's
+// buffers and never read: the loop stops, rather than the bindings being
+// absent. Reading a dummy `blockSlot` out of bounds is NOT safe -- Dawn clamps
+// to element 0, other stacks need not -- which is the hazard the old
+// `HAS_LEVEL2` gate existed for, and the loop bound is now what enforces it.
+@group(0) @binding(2) var<storage, read> vel_pool    : array<f32>;
+@group(0) @binding(3) var<storage, read> blockSlot   : array<i32>;
 @group(0) @binding(4) var<uniform>       overlayOpacity : f32;     // refinement-coverage overlay opacity [0,1]
-// Milestone 10: level 2's own vel_pool/blockSlot, for finest-active-level-
-// wins compositing -- harmless dummy buffers (blockSlot2 all -1) when
-// N_LEVELS<3, in which case level 2 is simply never "active" anywhere and
-// this file's behavior is exactly today's fixed two-tier logic. See this
-// file's header comment on why a third tier doesn't need a bigger
-// redesign (bindless/dynamic-arity level arrays) -- this plan's own scope
-// stops at N<=3 (plans/AMR-multilevel.md's own scalability notes), so one
-// more fixed set of bindings, not a generalized loop, is the right size
-// of change here.
 @group(0) @binding(5) var<storage, read> vel_pool2   : array<f32>;
 @group(0) @binding(6) var<storage, read> blockSlot2  : array<i32>;
+@group(0) @binding(8) var<storage, read> vel_pool3   : array<f32>;
+@group(0) @binding(9) var<storage, read> blockSlot3  : array<i32>;
+@group(0) @binding(10) var<storage, read> vel_pool4  : array<f32>;
+@group(0) @binding(11) var<storage, read> blockSlot4 : array<i32>;
 // Quadtree outline opacity [0,1] -- optional, off (0) by default. Separate
 // uniform from overlayOpacity (the coverage FILL) so the two can be toggled
 // independently -- an outline-only view is useful precisely when the fill
@@ -36,14 +56,15 @@ const BLOCK = 8u;
 override RB : u32;
 const GHOST = 2u;
 
-// Whether level 2 exists (N_LEVELS > 2). When 0, blockSlot2/vel_pool2 are
-// harmless dummy bindings and the level-2 override below MUST be gated off:
-// the dummy blockSlot2 is a single -1 element, so the childBlockID index is
-// out of bounds, and an OOB storage read is NOT guaranteed to return the
-// in-bounds -1 (Dawn clamps to element 0, but other WebGPU stacks can return
-// >=0, which falsely activates the L2 override and renders every refined
-// block black). Mirror amr_manage.wgsl's own HAS_LEVEL2 gate.
-override HAS_LEVEL2 : u32 = 0u;
+// How many POOL levels this configuration actually has, i.e. N_LEVELS - 1.
+// The walk below runs m = 1 .. N_POOL_LEVELS and never touches a deeper
+// binding, which is what makes the dummy bindings safe (see their note above).
+//
+// MAX_RENDER_POOL_LEVELS IS 4 AND THE PAGE MUST REFUSE ABOVE IT. A cap that
+// silently drops the finest level is precisely the defect U6 exists to fix, so
+// a configuration this shader cannot draw has to fail at init with a message
+// rather than render a lie. main-amr.js checks it.
+override N_POOL_LEVELS : u32 = 1u;
 
 // Block-major linear index for a cell at BUFFER coordinates (cx, cy).
 // See amr_step.wgsl for the full derivation; vel is laid out this way
@@ -120,49 +141,56 @@ fn coarseOmegaCell(cx: i32, cy: i32) -> f32 {
        - (get_ux(cx, cy + 1) - get_ux(cx, cy - 1)) * 0.5f;
 }
 
-// Fine-pool velocity at a fine-cell INDEX (cx, cy) within a slot. The ghost
-// ring (cells [0,1] and [FB-2,FB-1]) is c2f-filled from the coarse field, so a
-// fine stencil that reaches into the ring stays consistent with the coarse
-// level -- this is what lets the perimeter fine curl match the coarse curl
+// THE BUFFER SELECTOR, and it is the one part WGSL forces to be a ladder.
+// There is no way to index an array of storage buffers, so `m` picks a binding
+// here and nowhere else -- every caller below works in `m` and never names a
+// buffer. The `>= 4u` fallthrough rather than `== 4u` keeps the function total
+// without a default that could be reached by a level the loop never visits.
+fn poolVel(m: u32, slot: u32, cx: i32, cy: i32) -> vec2<f32> {
+  let FBl = RB * 2u + 2u * GHOST;
+  let ix = u32(clamp(cx, 0, i32(FBl) - 1));
+  let iy = u32(clamp(cy, 0, i32(FBl) - 1));
+  let cell = slot * (FBl * FBl) + iy * FBl + ix;
+  if (m == 1u) { return vec2<f32>(vel_pool[cell * 2u],  vel_pool[cell * 2u + 1u]); }
+  if (m == 2u) { return vec2<f32>(vel_pool2[cell * 2u], vel_pool2[cell * 2u + 1u]); }
+  if (m == 3u) { return vec2<f32>(vel_pool3[cell * 2u], vel_pool3[cell * 2u + 1u]); }
+  return vec2<f32>(vel_pool4[cell * 2u], vel_pool4[cell * 2u + 1u]);
+}
+fn poolSlotOf(m: u32, blockID: i32) -> i32 {
+  if (m == 1u) { return blockSlot[blockID]; }
+  if (m == 2u) { return blockSlot2[blockID]; }
+  if (m == 3u) { return blockSlot3[blockID]; }
+  return blockSlot4[blockID];
+}
+
+// Fine-grid vorticity at fine cell (cx, cy) of a level-m slot.
+//
+// The ghost ring (cells [0,1] and [FB-2,FB-1]) is c2f-filled from the parent,
+// so a fine stencil that reaches into the ring stays consistent with the level
+// above -- this is what lets the perimeter fine curl match the coarse curl
 // without a hard operator switch. Clamp keeps out-of-range taps in the ring.
-fn poolVelCell(slot: u32, cx: i32, cy: i32) -> vec2<f32> {
-  let FBl = RB * 2u + 2u * GHOST;
-  let ix = u32(clamp(cx, 0, i32(FBl) - 1));
-  let iy = u32(clamp(cy, 0, i32(FBl) - 1));
-  let cell = slot * (FBl * FBl) + iy * FBl + ix;
-  return vec2<f32>(vel_pool[cell * 2u], vel_pool[cell * 2u + 1u]);
+//
+// NORMALISATION IS PER-COARSE-UNIT AT EVERY LEVEL, which is what makes the
+// levels directly comparable at an interface. Level m's spacing is 2^-m coarse
+// units and the central difference spans +/-1 fine cell, so the factor is
+// 1/(2 * 2^-m) = 2^(m-1): 1 at level 1, 2 at level 2, and so on. The two
+// hand-written copies this replaces carried exactly those two constants.
+fn fineOmegaAt(m: u32, slot: u32, cx: i32, cy: i32) -> f32 {
+  let uyp = poolVel(m, slot, cx + 1, cy).y;
+  let uym = poolVel(m, slot, cx - 1, cy).y;
+  let uxp = poolVel(m, slot, cx, cy + 1).x;
+  let uxm = poolVel(m, slot, cx, cy - 1).x;
+  return ((uyp - uym) - (uxp - uxm)) * exp2(f32(m) - 1.0f);
 }
 
-// Fine-grid vorticity at fine cell (cx, cy) of a slot. Fine spacing is 0.5
-// coarse units and the central difference spans +/-1 fine cell, so the factor
-// is 1/(2*0.5) = 1 -- the SAME per-coarse-unit normalization as
-// coarseOmegaCell, so the two levels are directly comparable at interfaces.
-fn fineOmegaCell(slot: u32, cx: i32, cy: i32) -> f32 {
-  let uyp = poolVelCell(slot, cx + 1, cy).y;
-  let uym = poolVelCell(slot, cx - 1, cy).y;
-  let uxp = poolVelCell(slot, cx, cy + 1).x;
-  let uxm = poolVelCell(slot, cx, cy - 1).x;
-  return (uyp - uym) - (uxp - uxm);
-}
-
-// Milestone 10: level 2's own vel_pool/omega, same shape as
-// poolVelCell/fineOmegaCell above, one level deeper. Level 2's own spacing
-// is 0.25 coarse units, so the normalizing factor is 1/(2*0.25)=2 (not 1
-// like level 1) -- same per-coarse-unit convention, still directly
-// comparable at interfaces.
-fn poolVelCell2(slot: u32, cx: i32, cy: i32) -> vec2<f32> {
-  let FBl = RB * 2u + 2u * GHOST;
-  let ix = u32(clamp(cx, 0, i32(FBl) - 1));
-  let iy = u32(clamp(cy, 0, i32(FBl) - 1));
-  let cell = slot * (FBl * FBl) + iy * FBl + ix;
-  return vec2<f32>(vel_pool2[cell * 2u], vel_pool2[cell * 2u + 1u]);
-}
-fn fineOmegaCell2(slot: u32, cx: i32, cy: i32) -> f32 {
-  let uyp = poolVelCell2(slot, cx + 1, cy).y;
-  let uym = poolVelCell2(slot, cx - 1, cy).y;
-  let uxp = poolVelCell2(slot, cx, cy + 1).x;
-  let uxm = poolVelCell2(slot, cx, cy - 1).x;
-  return ((uyp - uym) - (uxp - uxm)) * 2.0f;
+// This level's own outline colour. White at level 1, then yellow, cyan,
+// magenta -- distinct hues rather than a ramp, because the question the
+// outline answers is "which level owns this footprint", not "how deep".
+fn levelOutlineColor(m: u32) -> vec3<f32> {
+  if (m == 1u) { return vec3(1.0f, 1.0f, 1.0f); }
+  if (m == 2u) { return vec3(1.0f, 1.0f, 0.0f); }
+  if (m == 3u) { return vec3(0.0f, 1.0f, 1.0f); }
+  return vec3(1.0f, 0.0f, 1.0f);
 }
 
 @fragment
@@ -231,10 +259,64 @@ fn fs_main(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> {
   let bufX = wrapf(fx + state.off_x, f32(W));
   let bufY = wrapf(fy + state.off_y, f32(H));
   let nbx = W / BLOCK;
-  let bBX = u32(wrapf(bufX + 0.5, f32(W))) / RB;
-  let bBY = u32(wrapf(bufY + 0.5, f32(H))) / RB;
-  let slot = blockSlot[i32(bBY * nbx + bBX)];
-  var level2Active = false;
+  // THE WALK. Finest-active-level wins, one level per iteration, and every
+  // quantity below is the same expression evaluated at this level's own scale
+  // (plans/uniform-levels.md U6).
+  //
+  // Level m's tile covers RB * 2^(1-m) L0 units, its block grid is nbx *
+  // 2^(m-1) wide, and a point's fine coordinate inside the tile is
+  // GHOST + 2^m * (offset within the tile) + 0.5. Check those against the two
+  // tiers this replaces: level 1 gave footprint RB, grid nbx, coefficient 2;
+  // level 2 gave RB/2, 2*nbx, coefficient 4. Both fall out of the same three
+  // lines now.
+  //
+  // THE LOOP STOPS AT THE FIRST ABSENT TILE, and that is a statement about the
+  // quadtree rather than an optimisation: a level-(m+1) tile exists only as a
+  // quad carved from an active level-m parent, so once this pixel's level-m
+  // tile is absent no deeper one can cover it. That is also what keeps the
+  // deeper `blockSlot` reads in range -- the index is only ever formed from a
+  // parent that exists.
+  var deepest = 0u;          // finest level that actually covers this pixel
+  var deepestSlot = 0u;
+  var deepestLocal = vec2<f32>(0.0f, 0.0f); // offset within that tile, L0 units
+  var deepestFootprint = f32(RB);
+  {
+    var footprint = f32(RB);   // level 1's tile, in L0 units
+    var nbxL = nbx;
+    for (var m = 1u; m <= N_POOL_LEVELS; m++) {
+      // THE HALF-CELL SHIFT IS PER LEVEL, AND GETTING THAT WRONG IS VISIBLE.
+      //
+      // A tile is picked by which CELL of the level above contains this point,
+      // so the shift is half a level-(m-1) cell = 2^-m in L0 units, i.e.
+      // 1/dens. That puts the tile boundary on a cell centre and leaves the
+      // bilinear stencil reaching exactly 0.5 FINE CELLS into the ring, at
+      // every level -- which is the reach level 1 has always had, and the ring
+      // is c2f-filled precisely so that tap is consistent across the seam.
+      //
+      // Written as a flat 0.5 it is half an L0 cell, which is 2^(m-1) FINE
+      // cells: 0.5 at level 1, 1.5 at level 2, 3.5 at level 3, 7.5 at level 4.
+      // GHOST is 2, so from level 3 down the tap lands outside the ring
+      // entirely, `poolVel`'s clamp pins it to the tile edge, and a band of
+      // pixels along every level-3 tile boundary reads one frozen value. On
+      // screen that is a dark lattice over the refined region -- caught by
+      // eye, not by the reachability gate, which only asks whether a level
+      // changes the picture at all.
+      let dens = exp2(f32(m));
+      let shift = 1.0f / dens;
+      let bX = u32(wrapf(bufX + shift, f32(W)) / footprint);
+      let bY = u32(wrapf(bufY + shift, f32(H)) / footprint);
+      let sl = poolSlotOf(m, i32(bY * nbxL + bX));
+      if (sl < 0) { break; }
+      var dx = bufX - f32(bX) * footprint; dx -= f32(W) * round(dx / f32(W));
+      var dy = bufY - f32(bY) * footprint; dy -= f32(H) * round(dy / f32(H));
+      deepest = m;
+      deepestSlot = u32(sl);
+      deepestLocal = vec2<f32>(dx, dy);
+      deepestFootprint = footprint;
+      footprint = footprint * 0.5f;
+      nbxL = nbxL * 2u;
+    }
+  }
   // Quadtree outline: additive line color, drawn along each ACTIVE block's
   // own 4 edges (not a fixed background grid -- only where a level actually
   // owns this footprint), one color per level so the tree structure itself
@@ -244,58 +326,30 @@ fn fs_main(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> {
   // other buffer-space-native visual element here.
   const LINE_WIDTH = 0.15f;
   var outlineColor = vec3(0.0f);
-  if (slot >= 0) {
-    let s = u32(slot);
-    var dxr = bufX - f32(bBX * RB); dxr -= f32(W) * round(dxr / f32(W));
-    var dyr = bufY - f32(bBY * RB); dyr -= f32(H) * round(dyr / f32(H));
-    let fxc = f32(GHOST) + 2.0 * dxr + 0.5;
-    let fyc = f32(GHOST) + 2.0 * dyr + 0.5;
+  if (deepest > 0u) {
+    // Sample the level the walk settled on. `exp2(f32(deepest))` is the
+    // fine-cells-per-L0-unit density -- 2 at level 1, 4 at level 2 -- which is
+    // the one coefficient the two hand-written tiers spelled out by hand. It is
+    // the same expression the walk used for its own shift, and it has to stay
+    // that way: the shift is defined as half a cell of the level ABOVE, and
+    // this is what converts the offset it produced into fine coordinates.
+    let dens = exp2(f32(deepest));
+    let fxc = f32(GHOST) + dens * deepestLocal.x + 0.5;
+    let fyc = f32(GHOST) + dens * deepestLocal.y + 0.5;
     let fx0 = i32(floor(fxc)); let fy0 = i32(floor(fyc));
     let ftx = fxc - f32(fx0);  let fty = fyc - f32(fy0);
     omega = mix(
-        mix(fineOmegaCell(s, fx0, fy0),     fineOmegaCell(s, fx0 + 1, fy0),     ftx),
-        mix(fineOmegaCell(s, fx0, fy0 + 1), fineOmegaCell(s, fx0 + 1, fy0 + 1), ftx),
+        mix(fineOmegaAt(deepest, deepestSlot, fx0, fy0),         fineOmegaAt(deepest, deepestSlot, fx0 + 1, fy0),     ftx),
+        mix(fineOmegaAt(deepest, deepestSlot, fx0, fy0 + 1),     fineOmegaAt(deepest, deepestSlot, fx0 + 1, fy0 + 1), ftx),
         fty);
 
-    // This L1 block's own edge distance (periodic within [0,RB)), white.
-    let edgeDist1 = min(min(dxr, f32(RB) - dxr), min(dyr, f32(RB) - dyr));
-    if (edgeDist1 < LINE_WIDTH) { outlineColor = vec3(1.0f, 1.0f, 1.0f); }
-
-    // Milestone 10: finest-active-level-wins. If this L1 block also has an
-    // active level-2 child covering this pixel's own quadrant, override
-    // again with level 2's own (denser) field. Which quadrant (0/1 on each
-    // axis) is exactly dxr/dyr's own half of the RB-wide L1 footprint --
-    // same test amr_force1.wgsl's masking check uses, just reading instead
-    // of masking.
-    let halfRB = f32(RB) * 0.5f;
-    let qx = select(0u, 1u, dxr >= halfRB);
-    let qy = select(0u, 1u, dyr >= halfRB);
-    let nbxL2 = nbx * 2u;
-    let childBlockID = (bBY * 2u + qy) * nbxL2 + (bBX * 2u + qx);
-    let slot2 = blockSlot2[i32(childBlockID)];
-    if (HAS_LEVEL2 != 0u && slot2 >= 0) {
-      level2Active = true;
-      let s2 = u32(slot2);
-      // This pixel's own offset WITHIN the quadrant (L0 units, [0,halfRB)),
-      // then the same fine-coordinate mapping as level 1's own above, just
-      // at level 2's own 4x-of-L0 density (coefficient 4.0, not 2.0).
-      let dxr2 = dxr - f32(qx) * halfRB;
-      let dyr2 = dyr - f32(qy) * halfRB;
-      let fxc2 = f32(GHOST) + 4.0 * dxr2 + 0.5;
-      let fyc2 = f32(GHOST) + 4.0 * dyr2 + 0.5;
-      let fx02 = i32(floor(fxc2)); let fy02 = i32(floor(fyc2));
-      let ftx2 = fxc2 - f32(fx02);  let fty2 = fyc2 - f32(fy02);
-      omega = mix(
-          mix(fineOmegaCell2(s2, fx02, fy02),     fineOmegaCell2(s2, fx02 + 1, fy02),     ftx2),
-          mix(fineOmegaCell2(s2, fx02, fy02 + 1), fineOmegaCell2(s2, fx02 + 1, fy02 + 1), ftx2),
-          fty2);
-
-      // This L2 quadrant's own edge distance (periodic within [0,halfRB)),
-      // yellow -- takes over from level 1's white where finer, same
-      // finest-wins precedence the omega field itself just used above.
-      let edgeDist2 = min(min(dxr2, halfRB - dxr2), min(dyr2, halfRB - dyr2));
-      if (edgeDist2 < LINE_WIDTH) { outlineColor = vec3(1.0f, 1.0f, 0.0f); }
-    }
+    // This tile's own edge distance, periodic within its own footprint. Only
+    // the FINEST level's outline is drawn, which is the same finest-wins
+    // precedence the omega field just used -- level 2's yellow took over from
+    // level 1's white before, and it still does.
+    let edgeDist = min(min(deepestLocal.x, deepestFootprint - deepestLocal.x),
+                       min(deepestLocal.y, deepestFootprint - deepestLocal.y));
+    if (edgeDist < LINE_WIDTH) { outlineColor = levelOutlineColor(deepest); }
   }
 
   // Blue for clockwise (negative), red for counter-clockwise (positive).
@@ -307,20 +361,18 @@ fn fs_main(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> {
   // Refined-block coverage overlay: additive green (not a mix toward gray --
   // a mix is barely visible against the near-black low-vorticity
   // background where coverage most needs to be legible) over the whole
-  // coarse block footprint currently holding a pool slot (slot>=0), not
-  // just its sampled interior. Reuses slot already computed above at no
-  // extra cost. Canvas output is unorm, so this saturates harmlessly in
-  // already-bright (high-vorticity or solid-body) regions.
+  // footprint of the tile the walk settled on, not just its sampled interior.
+  // Reuses `deepest` already computed above at no extra cost. Canvas output is
+  // unorm, so this saturates harmlessly in already-bright (high-vorticity or
+  // solid-body) regions.
   //
-  // Milestone 10: brighter/bluer green for level 2's own quadrant
-  // footprint, so the two refinement tiers are visually distinguishable,
-  // not just "some refinement happened here" -- level2Active is already
-  // computed per-pixel above (this level's own quadrant only, not the
-  // whole L1 block, since level 2 doesn't necessarily cover all 4).
-  if (level2Active) {
-    c += vec3(0.0, 0.32, 0.12) * overlayOpacity;
-  } else if (slot >= 0) {
-    c += vec3(0.0, 0.22, 0.0) * overlayOpacity;
+  // Milestone 10 used two shades so the two refinement tiers were visually
+  // distinguishable; with the walk there can be more than two, so the green
+  // brightens with DEPTH on the same ramp the two fixed shades sat on --
+  // (0, 0.22, 0) at level 1 and (0, 0.32, 0.12) at level 2, continued.
+  if (deepest > 0u) {
+    let t = f32(deepest - 1u);
+    c += (vec3(0.0, 0.22, 0.0) + vec3(0.0, 0.10, 0.12) * t) * overlayOpacity;
   }
 
   // Blend with solid color
