@@ -1313,6 +1313,29 @@ export function denseCellIndex({ dims, block = DENSE_BLOCK }, gx, gy) {
   return (by * nbx + bx) * (block * block) + ly * block + lx;
 }
 
+// The root pool's storage index for a cell at SPATIAL coordinates (gx, gy) --
+// the companion to `denseCellIndex`, which answers the same question for the
+// dense grid.
+//
+// U4-4 needs it because `readConservedTotals` is already parameterised by a
+// `cellIndex` callback: it walks (x, y) in spatial order and asks where that
+// cell lives. Hand it this instead of the dense one and the same reduction
+// reads the root pool, in the same order, with no other change -- which is
+// what makes the two totals comparable EXACTLY rather than to a tolerance.
+//
+// `rootCellToDense` goes the other way (pool slot+local -> dense index), and
+// tools/test-amr2d.js scores the two as a round trip rather than reading them
+// side by side, because U2's lesson is that two routes written together agree.
+export function rootCellIndex({ dims, rb = RB_DEFAULT }, gx, gy) {
+  const side = tileCellsAtLevel(0, rb);
+  if (gx < 0 || gy < 0 || gx >= dims.W || gy >= dims.H) {
+    throw new Error(`(${gx},${gy}) is outside a ${dims.W}x${dims.H} domain`);
+  }
+  const [nbx] = blockGridAtLevel(dims, 0, rb);
+  const slot = Math.floor(gy / side) * nbx + Math.floor(gx / side);
+  return slot * side * side + (gy % side) * side + (gx % side);
+}
+
 // ── U2: the root pool's addressing, as a host route ────────────────────────
 //
 // Where a root pool cell sits in the dense grid it mirrors. This is the

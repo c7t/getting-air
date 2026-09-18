@@ -25,7 +25,7 @@ it runs on.
 | U1 | The root pool exists, unused | **DONE** — identity proved on live buffers, page provably inert | `checkRootPoolIdentity`; hashes unmoved |
 | U2 | The mirror | **WAS VACUOUS, NOW FIXED** — both "independent" routes wrote `gy*W+gx`; the dense grid is 8x8 block-major, so 98.4% of the pool read the wrong cell | a THIRD route (`field-reconstruct.js`'s `rawIndex`), GPU-free in `make check` |
 | U3 | The step kernel serves the root | **DONE — BIT-IDENTICAL** on 8 rungs, 512 macro-steps; controls saturate at 98.4% | word equality + field health, `?rootstep=0` as control |
-| U4 | criterion, force, digest, conserved totals | **U4-0/1/2 DONE** — `vel` and the criterion bit-identical; the FORCE agrees to the truncation floor and the bit-identity prediction is falsified. digest + conserved totals remain | `tools/validate-root-kernels.js`, 3 GPU mutants |
+| U4 | criterion, force, digest, conserved totals | **DONE** — all four consumers on the root. Exact on the criterion, digest max and conserved totals; the force to the truncation floor | `tools/validate-root-kernels.js`, 8 rungs + 2 controls |
 | U5 | L1 becomes a quad child of the root | not started | — |
 | U6 | The renderer walks levels | not started; **its gate already exists and already fails** | `tools/validate-render-levels.js` |
 | U7 | Delete the dense path | not started | — |
@@ -1517,6 +1517,59 @@ the `* areaWeight` suspicion by deleting that multiply was CONFOUNDED:
 card's motion and the two runs were no longer comparable -- the dense total
 itself moved from -486022 to -269736. Recorded so the same experiment is not
 run again. Isolating it needs a diagnostic that leaves level 1 alone.
+
+### U4-3/U4-4 — DONE (2026-09-17). The digest and the conserved totals, and THREE different answers to "can this be exact".
+
+Both read the dense L0 buffers that U7 deletes, and both now read the root pool
+instead. Neither needed a new kernel.
+
+**U4-3, THE DIGEST.** It needs no shader change at all to serve the root: it
+addresses a flat cell index and the root pool holds exactly `W*H` cells, so
+only the bound buffer moves. What it needed was a comparison that MEANS
+something. The shipped form samples 4096 cells by STORAGE INDEX, and the root
+pool is a permutation of the dense grid, so sample `i` is a different physical
+cell in each -- two honest digests of one field, legitimately unequal.
+
+`FULL=1` (default 0, byte-identical) reduces over every cell instead, which
+makes exactly one component comparable: `max` is invariant under BOTH
+permutation and summation order, so `digest[2]` must match bit-for-bit. The two
+sums are not required to -- adding the same 65536 floats in two orders need not
+give the same f32 -- so they are reported and not gated. (In practice they came
+back identical at `levels=2` and `res=9` and 6.2e-8 apart at `levels=3`; that
+is luck, not a guarantee, and gating it would be gating luck.)
+
+**U4-4, THE CONSERVED TOTALS, AND THIS ONE IS EXACTLY EQUAL.**
+`readConservedTotals` was already parameterised by a `cellIndex` callback: it
+walks `(x, y)` in SPATIAL order and asks where that cell lives, then sums in
+f64 on the host. So pointing it at the root pool changes the addressing and
+NOTHING ELSE -- same values (U3), same order, same f64 reduction. `mass`,
+`momX`, `momY`, `rhoMin`, `rhoMax` and `maxU` all match exactly.
+`amr2d.mjs`'s `rootCellIndex` is the addressing, scored against
+`rootCellToDense` as a ROUND TRIP rather than side by side -- U2's lesson is
+that two routes written together agree over a shared mistake, and a round trip
+cannot.
+
+**THE THREE ANSWERS, WHICH IS THE RESULT WORTH CARRYING PAST U4.**
+
+```
+  f, vel, criterion    EXACT      same per-cell arithmetic; only the address
+                                  space moves
+  conserved totals     EXACT      same values, same spatial order, f64 on the
+                                  host -- only the addressing moves
+  digest               max EXACT  sampled by storage index, so only a
+                       sums not   permutation- and order-invariant reduction
+                                  can be compared at all
+  force                |d| <= 5   per-workgroup truncation; the pool kernel
+                                  also carries a `* areaWeight` the dense one
+                                  does not
+```
+
+U3 concluded that bit-identity was achievable and the plan's retraction of it
+had been wrong. That was right for the step and wrong as a general rule. The
+useful statement is narrower: **exactness survives a change of ADDRESS SPACE,
+and does not survive a change of ARITHMETIC or of REDUCTION ORDER** -- and
+which of those a consumer suffers is a property of the consumer, decided before
+the measurement rather than discovered by it.
 
 ### U4 — criterion, force, digest, conserved totals
 

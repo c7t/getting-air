@@ -26,6 +26,24 @@
 
 override NCELLS : u32;
 
+// FULL: reduce over EVERY cell instead of the 4096-sample fingerprint.
+//
+// plans/uniform-levels.md U4-3. The sampled form is what ships, and it is
+// deliberately addressed by STORAGE INDEX -- which is why it cannot be
+// compared across two buffers that hold the same field in different orders.
+// The root pool is a permutation of the dense grid, so sample `i` is a
+// different physical cell in each and the digests legitimately differ.
+//
+// Exhaustive changes that for exactly one component. `max` is invariant under
+// BOTH permutation and summation order, so digest[2] must be BIT-IDENTICAL
+// between the dense grid and the root pool. digest[0] and digest[1] are sums
+// and stay order-dependent, so they are reported and not gated -- summing the
+// same 65536 floats in two orders is not required to give the same f32.
+//
+// Default 0 and byte-identical to not having this: the shipped per-frame
+// digest is untouched.
+override FULL : u32 = 0u;
+
 var<workgroup> wg_a : array<f32, 64>;
 var<workgroup> wg_b : array<f32, 64>;
 var<workgroup> wg_m : array<f32, 64>;
@@ -42,17 +60,29 @@ fn main(@builtin(local_invocation_index) lid: u32) {
   // case for a mobile tile-based GPU, and this instrument must not be a
   // suspect in the performance it is being used to investigate. 512 samples
   // is far more fingerprint than an exact-repeat test needs.
-  let anchors = 8u;
-  let per = 8u;
-  for (var a: u32 = 0u; a < anchors; a = a + 1u) {
-    let base = (NCELLS / anchors) * a + lid * per;
-    for (var j: u32 = 0u; j < per; j = j + 1u) {
-      let i = (base + j) % NCELLS;
+  if (FULL != 0u) {
+    // Strided so the 64 threads stay coalesced; see FULL's own note for why
+    // only the max component of this is comparable across buffers.
+    for (var i: u32 = lid; i < NCELLS; i = i + 64u) {
       let ux = vel[i * 2u];
       let uy = vel[i * 2u + 1u];
-      s += ux + 2f * uy;            // asymmetric weight so ux/uy cannot cancel
+      s += ux + 2f * uy;
       q += ux * ux + uy * uy;
       m = max(m, max(abs(ux), abs(uy)));
+    }
+  } else {
+    let anchors = 8u;
+    let per = 8u;
+    for (var a: u32 = 0u; a < anchors; a = a + 1u) {
+      let base = (NCELLS / anchors) * a + lid * per;
+      for (var j: u32 = 0u; j < per; j = j + 1u) {
+        let i = (base + j) % NCELLS;
+        let ux = vel[i * 2u];
+        let uy = vel[i * 2u + 1u];
+        s += ux + 2f * uy;            // asymmetric weight so ux/uy cannot cancel
+        q += ux * ux + uy * uy;
+        m = max(m, max(abs(ux), abs(uy)));
+      }
     }
   }
   wg_a[lid] = s; wg_b[lid] = q; wg_m[lid] = m;

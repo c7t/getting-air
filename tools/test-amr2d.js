@@ -75,7 +75,7 @@ const sorted = (s) => [...s].sort();
     parentCellOfFineCell, fineCellsOfParentCell, ringDepth, ringSlotRole,
     poolInverseViolations,
     coalesceSource, explodeTarget, transferLedger,
-    rootPoolSpec, rootCellToDense, denseCellIndex, DENSE_BLOCK,
+    rootPoolSpec, rootCellToDense, denseCellIndex, DENSE_BLOCK, rootCellIndex,
     makePool, poolAtLevel, nbAtLevel, parentOfBlock,
     quadrantOfBlock, quadrantOrigin, tileOriginL0, tileOriginL0Recursive,
     refineWhere, nearBodyWant, nearBodyWantCentre, refineNearBody,
@@ -1882,6 +1882,48 @@ const sorted = (s) => [...s].sort();
       }
       assert.strictEqual(blocks.size, 4, `root slot ${slot} spans ${blocks.size} dense blocks, not 4`);
     }
+  });
+
+  ok('rootCellIndex and rootCellToDense are exact inverses, both ways round', () => {
+    // U4-4. Scored as a ROUND TRIP rather than by reading the two formulas
+    // side by side -- U2's whole lesson is that two routes written together
+    // agree with each other over a shared mistake. A round trip cannot: a
+    // wrong slot or a wrong local offset fails to come back.
+    for (const dims of [{ W: 128, H: 128 }, { W: 512, H: 256 }]) {
+      const rb = 8;
+      const spec = rootPoolSpec({ dims, rb });
+      const seen = new Uint8Array(spec.cells);
+      for (let gy = 0; gy < dims.H; gy++) {
+        for (let gx = 0; gx < dims.W; gx++) {
+          const idx = rootCellIndex({ dims, rb }, gx, gy);
+          assert.ok(idx >= 0 && idx < spec.cells, `(${gx},${gy}) -> ${idx}, out of the pool`);
+          assert.strictEqual(seen[idx], 0, `pool index ${idx} claimed twice`);
+          seen[idx] = 1;
+          // back the other way: that index's slot/local must name the dense
+          // cell the same coordinates do.
+          const slot = Math.floor(idx / spec.cellsPerSlot);
+          const rem = idx % spec.cellsPerSlot;
+          assert.strictEqual(
+            rootCellToDense({ dims, rb }, slot, rem % spec.side, Math.floor(rem / spec.side)),
+            denseCellIndex({ dims }, gx, gy),
+            `round trip at (${gx},${gy})`);
+        }
+      }
+      assert.strictEqual(seen.reduce((a, b) => a + b, 0), spec.cells, 'not a bijection');
+    }
+  });
+
+  ok('rootCellIndex is NOT the dense index -- it is a different layout', () => {
+    // The discrimination. If these ever coincide, the round-trip check above
+    // is satisfied by two spellings of one function and proves nothing.
+    const dims = { W: 512, H: 256 };
+    let same = 0, n = 0;
+    for (let gy = 0; gy < dims.H; gy++) for (let gx = 0; gx < dims.W; gx++) {
+      n++;
+      if (rootCellIndex({ dims }, gx, gy) === denseCellIndex({ dims }, gx, gy)) same++;
+    }
+    assert.ok(same / n < 0.05,
+      `root and dense indices agree on ${(100 * same / n).toFixed(1)}% of cells`);
   });
 
   ok('the root grid is the level-1 grid halved, in both axes', () => {

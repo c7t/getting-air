@@ -10,15 +10,31 @@
 //   f     the step's populations        amr_step1.wgsl      vs amr_step.wgsl
 //   vel   the step's velocity           (same pair)
 //   crit  the refinement criterion      amr_criterion_pool  vs amr_criterion
-//   force the body force integral        amr_force1          vs amr_force
+//   force the body force integral       amr_force1          vs amr_force
+//   dig   the per-frame field digest    amr_digest      on the root pool
+//   cons  mass/momentum/rho totals      readConservedTotals on the root pool
 //
-// Mirror the dense grid into the root pool, advance both, and compare word for
-// word -- BOTH of the step kernel's outputs, `f` and `vel`. The bar is BIT-IDENTITY, not a tolerance: `amr_step1.wgsl` and
-// `amr_step.wgsl` perform the same operations in the same order per cell and
-// only the address space moves, so equality is what "the root pool is a
-// faithful representation of the dense grid" actually means. A tolerance here
-// would pass over an addressing bug worth 2e-3 -- which is exactly what
-// happened before U2's mirror was fixed.
+// THREE DIFFERENT ANSWERS TO "CAN THIS BE EXACT", AND EACH HAS A REASON. The
+// step and the criterion are bit-identical because the per-cell arithmetic is
+// spelled the same and only the address space moves. The FORCE is not, because
+// the pool kernel carries a `* areaWeight` the dense one does not and the
+// reduction truncates per workgroup. The DIGEST is only partly comparable: it
+// samples by STORAGE INDEX, and the root pool is a permutation of the dense
+// grid, so the sampled form reads different physical cells -- exhaustively
+// (FULL=1) its `max` component is invariant under both permutation and
+// summation order and must match bit-for-bit, while its two sums are not
+// required to. CONSERVED TOTALS are exactly equal, because
+// readConservedTotals walks (x,y) in SPATIAL order and sums in f64 on the
+// host, so pointing it at the root changes the addressing and nothing else.
+//
+// Mirror the dense grid into the root pool, advance both, and compare -- word
+// for word where that is meaningful, and where it is not, on the one component
+// that is. For the step's two outputs the bar is BIT-IDENTITY rather than a
+// tolerance: `amr_step1.wgsl` and `amr_step.wgsl` perform the same operations
+// in the same order per cell and only the address space moves, so equality is
+// what "the root pool is a faithful representation of the dense grid" actually
+// means. A tolerance there would pass over an addressing bug worth 2e-3 --
+// which is exactly what happened before U2's mirror was fixed.
 //
 // `vel` is checked because it is U4's INPUT GATE, not for completeness: the
 // criterion differences it, the force reduction integrates over it and the
@@ -203,7 +219,9 @@ async function runCase(Runtime, Page, o, q) {
   const vel = JSON.parse(await ev(Runtime, 'window.__AMR.debugCheckRootVel().then(r => JSON.stringify(r))'));
   const crit = JSON.parse(await ev(Runtime, 'window.__AMR.debugCheckRootCriterion().then(r => JSON.stringify(r))'));
   const force = JSON.parse(await ev(Runtime, 'window.__AMR.debugCheckRootForce().then(r => JSON.stringify(r))'));
-  return { q, seeded, after, vel, crit, force, health };
+  const dig = JSON.parse(await ev(Runtime, 'window.__AMR.debugCheckRootDigest().then(r => JSON.stringify(r))'));
+  const cons = JSON.parse(await ev(Runtime, 'window.__AMR.debugCheckRootConserved().then(r => JSON.stringify(r))'));
+  return { q, seeded, after, vel, crit, force, dig, cons, health };
 }
 
 function fmt(r) {
@@ -216,6 +234,7 @@ function fmt(r) {
     `   vel ${String(r.vel.mismatched).padStart(6)}/${r.vel.checked}` +
     `   crit ${String(r.crit.mismatched).padStart(5)}/${r.crit.checked}` +
     `   force ${r.force.exact ? '  exact' : '|d|<=' + String(r.force.maxDiff).padStart(2)}` +
+    `   dig ${r.dig.maxExact ? 'exact' : ' DIFF'}   cons ${r.cons.exact ? 'exact' : ' DIFF'}` +
     `   seeded ${r.seeded.mismatched}   ${h}`;
 }
 
@@ -244,6 +263,7 @@ async function main() {
       const ok = r.after.mismatched === 0 && r.vel.mismatched === 0
         && r.crit.mismatched === 0 && r.crit.nonZero > 0
         && r.force.nonZero && r.force.maxDiff <= FORCE_TOL
+        && r.dig.maxExact && r.dig.cellsMatch && r.cons.exact && r.cons.live
         && r.seeded.mismatched === 0 && r.health.nonFinite === 0;
       if (!ok) fails.push(q);
       console.log(`${ok ? '  ok  ' : ' FAIL '} ${q.padEnd(46)} ${fmt(r)}`);
@@ -253,6 +273,7 @@ async function main() {
       const r = await runCase(Runtime, Page, o, q);
       const ok = r.after.mismatched > 0 && r.vel.mismatched > 0
         && r.crit.mismatched > 0 && r.force.maxDiff > FORCE_TOL
+        && !r.dig.maxExact && !r.cons.exact
         && r.health.nonFinite === 0;
       if (!ok) fails.push(`${q} (control came back clean)`);
       console.log(`${ok ? '  ok  ' : ' FAIL '} ${q.padEnd(46)} ${fmt(r)}`);
@@ -272,7 +293,9 @@ async function main() {
     console.log(`FAIL: ${fails.join(', ')}`);
     process.exit(1);
   }
-  console.log('PASS: every root-pool kernel reproduces its dense counterpart -- exactly, except\n      the force integral, which agrees to the per-workgroup truncation floor (see FORCE_TOL).');
+  console.log('PASS: every root-pool consumer reproduces its dense counterpart. Exact on\n'
+    + '      f, vel, the criterion, the digest max and the conserved totals; the force\n'
+    + '      integral to the per-workgroup truncation floor (see FORCE_TOL).');
   process.exit(0);
 }
 

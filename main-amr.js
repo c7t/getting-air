@@ -22,8 +22,8 @@ import {
   tauAtLevel as tauAtLevelOf,
 } from './card-params.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
-import { check21BalanceOnGPU, allocLevelPool, checkRootPoolIdentity, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState, checkGeometryCoverageOnGPU, makeRefusalWatch , checkRefinementClosureOnGPU , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU } from './amr2d-gpu.mjs';
-import { poolSlotsFor, tauChainSingularity, tauSingularityMessage, rootPoolSpec, rootCellToDense } from './amr2d.mjs';
+import { check21BalanceOnGPU, allocLevelPool, checkRootPoolIdentity, readConservedTotals, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState, checkGeometryCoverageOnGPU, makeRefusalWatch , checkRefinementClosureOnGPU , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU } from './amr2d-gpu.mjs';
+import { poolSlotsFor, tauChainSingularity, tauSingularityMessage, rootPoolSpec, rootCellToDense, rootCellIndex } from './amr2d.mjs';
 import { EX, EY, WT } from './lattice-2d.mjs';
 import { makeCanvasFit } from './canvas-fit.mjs';
 
@@ -1834,6 +1834,49 @@ async function init() {
     compute: { module: digestSM, entryPoint: 'main', constants: { NCELLS } },
   });
 
+  // U4-3: the DIGEST, over the root pool.
+  //
+  // It needs NO shader change to serve the root -- it addresses a flat cell
+  // index and the root pool holds exactly W*H cells, the same count. Only the
+  // bound buffer moves. What it needs instead is a comparison that is
+  // MEANINGFUL, and the shipped sampled form is not: it picks cells by STORAGE
+  // INDEX, and the root pool is a permutation of the dense grid, so sample `i`
+  // is a different physical cell in each. Two honest digests of one field,
+  // legitimately unequal.
+  //
+  // FULL=1 reduces over every cell, which makes exactly one component
+  // comparable: `max` is invariant under permutation AND summation order, so
+  // digest[2] must match bit-for-bit. The two sums are not -- adding the same
+  // 65536 floats in two orders is not required to give the same f32 -- and
+  // they are reported rather than gated.
+  let digestFullPL = null, digestDenseFullBG = null, digestRootFullBG = null,
+      digestDenseFullBuf = null, digestRootFullBuf = null;
+  if (ROOT_POOL) {
+    const spec = rootPoolSpec({ dims: { W, H }, rb: RB });
+    const mk = () => device.createBuffer({ size: 16, usage: U.STORAGE | U.COPY_SRC });
+    digestDenseFullBuf = mk();
+    digestRootFullBuf = mk();
+    digestFullPL = device.createComputePipeline({
+      layout: device.createPipelineLayout({ bindGroupLayouts: [digestBGL] }),
+      compute: { module: digestSM, entryPoint: 'main', constants: { NCELLS, FULL: 1 } },
+    });
+    digestDenseFullBG = device.createBindGroup({ layout: digestBGL, entries: [
+      { binding: 0, resource: { buffer: velBuf } },
+      { binding: 1, resource: { buffer: digestDenseFullBuf } },
+    ]});
+    digestRootFullBG = device.createBindGroup({ layout: digestBGL, entries: [
+      { binding: 0, resource: { buffer: pools[0].finePoolVel } },
+      { binding: 1, resource: { buffer: digestRootFullBuf } },
+    ]});
+    // The root pool holds exactly the dense grid's cell count -- U1's whole
+    // no-padding claim. If that ever stops being true the digest would silently
+    // read past one of them, so it is asserted rather than assumed.
+    if (spec.cells !== NCELLS) {
+      throw new Error(`root pool holds ${spec.cells} cells, dense grid ${NCELLS}`);
+    }
+  }
+
+
   const renBG = device.createBindGroup({ layout: renBGL, entries: [{ binding: 0, resource: { buffer: velBuf } }, { binding: 1, resource: { buffer: cardStateBuf } }, { binding: 2, resource: { buffer: pools[1].finePoolVel } }, { binding: 3, resource: { buffer: pools[1].blockSlotBuf } }, { binding: 4, resource: { buffer: overlayOpacityBuf } }, { binding: 5, resource: { buffer: N_LEVELS > 2 ? pools[2].finePoolVel : pools[1].finePoolVel } }, { binding: 6, resource: { buffer: N_LEVELS > 2 ? pools[2].blockSlotBuf : dummyBlockSlotBuf } }, { binding: 7, resource: { buffer: outlineOpacityBuf } }]});
 
   // Milestone 4 bind groups (pool-aware, superseding M2's single-region ones).
@@ -2355,6 +2398,80 @@ async function init() {
       exact: diff.every(v => v === 0), nonZero,
       dense: d, root: r, diff, maxDiff: Math.max(...diff.map(Math.abs)),
     };
+  }
+
+  // U4-3: the root's DIGEST against the dense grid's, on the one component
+  // that can be exact. See digestFullPL above for why only max qualifies.
+  async function debugCheckRootDigest() {
+    if (!digestFullPL) return { ok: null, skipped: 'no root pool (?rootpool=1)' };
+    const enc = device.createCommandEncoder();
+    for (const [pl, bg] of [[digestFullPL, digestDenseFullBG], [digestFullPL, digestRootFullBG]]) {
+      const p = enc.beginComputePass();
+      p.setPipeline(pl); p.setBindGroup(0, bg); p.dispatchWorkgroups(1); p.end();
+    }
+    const sD = device.createBuffer({ size: 16, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    const sR = device.createBuffer({ size: 16, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    enc.copyBufferToBuffer(digestDenseFullBuf, 0, sD, 0, 16);
+    enc.copyBufferToBuffer(digestRootFullBuf, 0, sR, 0, 16);
+    device.queue.submit([enc.finish()]);
+    await Promise.all([sD.mapAsync(GPUMapMode.READ), sR.mapAsync(GPUMapMode.READ)]);
+    const dw = new Uint32Array(sD.getMappedRange()).slice();
+    const rw = new Uint32Array(sR.getMappedRange()).slice();
+    const d = new Float32Array(dw.buffer), r = new Float32Array(rw.buffer);
+    sD.unmap(); sR.unmap(); sD.destroy(); sR.destroy();
+    // WORD equality on the max, so it cannot be softened by a tolerance.
+    const maxExact = dw[2] === rw[2];
+    const cellsMatch = dw[3] === rw[3];
+    // The sums are order-dependent; report how far apart, as a sanity check
+    // that the two really are digests of the same field and not of two fields.
+    const relSum = Math.abs(r[0] - d[0]) / Math.max(Math.abs(d[0]), 1e-12);
+    const relSq = Math.abs(r[1] - d[1]) / Math.max(Math.abs(d[1]), 1e-12);
+    return {
+      ok: maxExact && cellsMatch && d[2] > 0,
+      maxExact, cellsMatch, maxU: d[2], rootMaxU: r[2], relSum, relSq,
+      dense: Array.from(d), root: Array.from(r),
+    };
+  }
+
+  // U4-4: the CONSERVED TOTALS, read off the root pool instead of the dense
+  // grid -- and this one IS exactly equal, for a reason worth stating.
+  //
+  // readConservedTotals is already parameterised by a `cellIndex` callback: it
+  // walks (x, y) in SPATIAL order and asks where that cell lives, then sums in
+  // f64 on the host. So pointing it at the root pool changes the addressing and
+  // NOTHING ELSE -- same values (U3), same order, same f64 reduction. Bit
+  // equality is therefore the right bar here, where it was not for the digest
+  // (whose GPU reduction order differs) or the force (whose per-cell arithmetic
+  // differs). Three consumers, three different answers to "can this be exact",
+  // and each one has a reason.
+  async function debugCheckRootConserved() {
+    if (!pools[0]) return { ok: null, skipped: 'no root pool (?rootpool=1)' };
+    const spec = rootPoolSpec({ dims: { W, H }, rb: RB });
+    const common = { W, H, ex: EX, ey: EY, decode: (m, n) => readF(m, n) };
+    const dense = await readConservedTotals(device, {
+      ...common, f: f_a, NCELLS,
+      cellIndex: (x, y) => {
+        const nbx = W / BLOCK;
+        return (Math.floor(y / BLOCK) * nbx + Math.floor(x / BLOCK)) * BLOCK * BLOCK
+             + (y % BLOCK) * BLOCK + (x % BLOCK);
+      },
+    });
+    const root = await readConservedTotals(device, {
+      ...common, f: pools[0].finePoolF_a, NCELLS: spec.cells,
+      cellIndex: (x, y) => rootCellIndex({ dims: { W, H }, rb: RB }, x, y),
+    });
+    const keys = ['mass', 'momX', 'momY', 'rhoMin', 'rhoMax', 'maxU'];
+    const diff = {};
+    let exact = true;
+    for (const k of keys) {
+      if (!(k in dense)) continue;
+      diff[k] = root[k] - dense[k];
+      if (root[k] !== dense[k]) exact = false;
+    }
+    // VACUITY GUARD: two zero totals agree perfectly. rhoMax must have found a
+    // real field, not an unwritten buffer.
+    const live = Number.isFinite(dense.rhoMax) && dense.rhoMax > 0;
+    return { ok: exact && live, exact, live, dense, root, diff };
   }
 
   // ── Debug/verification support (window.__AMR) ────────────────────────────
@@ -4008,6 +4125,8 @@ async function init() {
     debugCheckRootVel,
     debugCheckRootCriterion,
     debugCheckRootForce,
+    debugCheckRootDigest,
+    debugCheckRootConserved,
     getRootPool: () => (ROOT_POOL ? { ...rootPoolSpec({ dims: { W, H }, rb: RB }), stepped: !!ROOT_STEP } : null),
     debugRenderOnce,
     debugPerturbLevelVel,
