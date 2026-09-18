@@ -13,6 +13,19 @@
 //   force the body force integral       amr_force1          vs amr_force
 //   dig   the per-frame field digest    amr_digest      on the root pool
 //   cons  mass/momentum/rho totals      readConservedTotals on the root pool
+//   interp level 1's ghost ring         amr_interp_pool_parent (PARENT_GHOST 0)
+//                                       vs amr_interp_dense_parent
+//
+// `interp` is the ONE ROW THAT IS NOT A KERNEL ON THE ROOT, and it is here
+// anyway. Every other row asks "does this kernel, dispatched over the root
+// pool, reproduce the dense kernel?"; this one asks whether level 1's ghost
+// ring, interpolated FROM the root pool, reproduces the ring interpolated from
+// the dense grid (plans/uniform-levels.md U5-1). It belongs with them because
+// it is the same differential protocol against the same reference and it wants
+// the same rungs -- and specifically because it wants `ghostcopy`, which is
+// the rung that caught U3's one real defect. The alternative was a second tool
+// that duplicates this one's lifecycle and rung table, which is how a project
+// ends up with two rung tables that disagree.
 //
 // THREE DIFFERENT ANSWERS TO "CAN THIS BE EXACT", AND EACH HAS A REASON. The
 // step and the criterion are bit-identical because the per-cell arithmetic is
@@ -221,7 +234,8 @@ async function runCase(Runtime, Page, o, q) {
   const force = JSON.parse(await ev(Runtime, 'window.__AMR.debugCheckRootForce().then(r => JSON.stringify(r))'));
   const dig = JSON.parse(await ev(Runtime, 'window.__AMR.debugCheckRootDigest().then(r => JSON.stringify(r))'));
   const cons = JSON.parse(await ev(Runtime, 'window.__AMR.debugCheckRootConserved().then(r => JSON.stringify(r))'));
-  return { q, seeded, after, vel, crit, force, dig, cons, health };
+  const interp = JSON.parse(await ev(Runtime, 'window.__AMR.debugCheckRootInterp().then(r => JSON.stringify(r))'));
+  return { q, seeded, after, vel, crit, force, dig, cons, interp, health };
 }
 
 function fmt(r) {
@@ -235,6 +249,7 @@ function fmt(r) {
     `   crit ${String(r.crit.mismatched).padStart(5)}/${r.crit.checked}` +
     `   force ${r.force.exact ? '  exact' : '|d|<=' + String(r.force.maxDiff).padStart(2)}` +
     `   dig ${r.dig.maxExact ? 'exact' : ' DIFF'}   cons ${r.cons.exact ? 'exact' : ' DIFF'}` +
+    `   interp ${String(r.interp.mismatched).padStart(6)}/${r.interp.checked} (hop ${r.interp.staleDiff})` +
     `   seeded ${r.seeded.mismatched}   ${h}`;
 }
 
@@ -264,6 +279,7 @@ async function main() {
         && r.crit.mismatched === 0 && r.crit.nonZero > 0
         && r.force.nonZero && r.force.maxDiff <= FORCE_TOL
         && r.dig.maxExact && r.dig.cellsMatch && r.cons.exact && r.cons.live
+        && r.interp.ok
         && r.seeded.mismatched === 0 && r.health.nonFinite === 0;
       if (!ok) fails.push(q);
       console.log(`${ok ? '  ok  ' : ' FAIL '} ${q.padEnd(46)} ${fmt(r)}`);
@@ -274,6 +290,7 @@ async function main() {
       const ok = r.after.mismatched > 0 && r.vel.mismatched > 0
         && r.crit.mismatched > 0 && r.force.maxDiff > FORCE_TOL
         && !r.dig.maxExact && !r.cons.exact
+        && r.interp.mismatched > 0
         && r.health.nonFinite === 0;
       if (!ok) fails.push(`${q} (control came back clean)`);
       console.log(`${ok ? '  ok  ' : ' FAIL '} ${q.padEnd(46)} ${fmt(r)}`);
@@ -294,8 +311,9 @@ async function main() {
     process.exit(1);
   }
   console.log('PASS: every root-pool consumer reproduces its dense counterpart. Exact on\n'
-    + '      f, vel, the criterion, the digest max and the conserved totals; the force\n'
-    + '      integral to the per-workgroup truncation floor (see FORCE_TOL).');
+    + '      f, vel, the criterion, the digest max, the conserved totals and level 1\'s\n'
+    + '      root-parent ghost ring; the force integral to the per-workgroup truncation\n'
+    + '      floor (see FORCE_TOL).');
   process.exit(0);
 }
 

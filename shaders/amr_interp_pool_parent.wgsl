@@ -32,6 +32,13 @@ struct LevelParams {
 @group(0) @binding(5) var<storage, read>       blockSlot      : array<i32>;
 // The two genuinely new per-slot fields the quadtree parent hop needs --
 // see common_interp_parent_pool.wgsl's header.
+//
+// UNREAD ON THE ROOT-PARENT PIPELINE (PARENT_GHOST = 0), where both are
+// derived from the child's own block index instead. They stay DECLARED because
+// WGSL module scope has no conditional bindings and this entry file serves both
+// pipelines; main-amr.js binds a sentinel buffer there rather than a plausible
+// one, so a read that should not happen cannot return a number that looks like
+// data (plans/2D-backport.md B6-9c).
 @group(0) @binding(6) var<storage, read>       parentSlot     : array<i32>;
 @group(0) @binding(7) var<storage, read>       quadrant       : array<u32>;
 

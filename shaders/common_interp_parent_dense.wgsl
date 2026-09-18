@@ -59,7 +59,12 @@ fn wrapCoord(v: i32, n: u32) -> u32 {
 // CoarseSample lives in common_interp.wgsl, alongside the blend that consumes
 // it -- this supplies only the FETCH. (ix,iy) are BUFFER-space integer
 // coordinates, periodic, no off_x mapping needed.
-fn sampleParent(slot: u32, ix: i32, iy: i32) -> CoarseSample {
+//
+// (bx, by) are ignored here and that is the point of the frame: this half
+// works in coarse buffer coordinates over the whole domain, so a cell's
+// identity is already absolute. They are in the signature because the POOL
+// half needs them -- see common_interp_kernel.wgsl's accessor contract.
+fn sampleParent(slot: u32, bx: u32, by: u32, ix: i32, iy: i32) -> CoarseSample {
   let cx = wrapCoord(ix, W);
   let cy = wrapCoord(iy, H);
   let cell = cellIndex(cx, cy);

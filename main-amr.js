@@ -1725,6 +1725,83 @@ async function init() {
     ]});
   }
 
+  // U5-1: the COARSE->FINE INTERPOLATION into level 1, from the ROOT POOL.
+  //
+  // The same module every L(m)->L(m+1) hop with m>=1 uses --
+  // amr_interp_pool_parent.wgsl -- with PARENT_GHOST 0. That override is the
+  // whole of the change: level 1's parentTau is already tauAtLevel(0), i.e.
+  // the dense accessor's own `state.tau`, and its parent SLOT and QUADRANT are
+  // derivable from its own block index because the root is always full (see
+  // shaders/common_interp_parent_pool.wgsl's parentSlotOf/quadrantOf). What is
+  // NOT free is the fetch: a child covers one RB-wide quadrant of its parent
+  // and the bilinear stencil reaches GHOST cells past it, so every level-1
+  // tile needs root cells from outside its parent root tile on two of its four
+  // sides. A ringed parent has those in its ring; the root has no ring, and
+  // resolving them against the neighbouring ROOT TILE is what U5-1 adds.
+  //
+  // IT IS INERT, in the stronger sense U4's pipelines are not quite: BOTH
+  // sides write scratch buffers, so the page's own level-1 pool is not touched
+  // at all and the comparison's two legs start from bit-identical state. The
+  // interp pass is idempotent on a paused page (a ghost cell's value depends
+  // only on the parent and on INTERIOR cells, which it never writes), but
+  // re-running the shipped pass on the shipped buffer would still leave the
+  // page's ghosts holding something a macro-step did not produce.
+  //
+  // `debugCheckRootInterp` is the gate. See it for the protocol and for why
+  // the wrong-parent leg is not optional.
+  let rootInterpPL = null, rootInterpBG = null, rootInterpStaleBG = null,
+      denseInterpScratchBG = null, interpScratchDense = null, interpScratchRoot = null;
+  if (ROOT_POOL) {
+    const mkScratch = () => device.createBuffer({
+      size: pools[1].fSizePool, usage: U.STORAGE | U.COPY_SRC | U.COPY_DST,
+    });
+    interpScratchDense = mkScratch();
+    interpScratchRoot = mkScratch();
+    // The two per-slot fields the root path derives instead of reading. They
+    // cannot be left unbound (WGSL module scope has no conditional bindings),
+    // so they are bound to ONE buffer of 0xFFFFFFFF, which reads as -1 through
+    // binding 6's array<i32> and as an out-of-range slot through binding 7's
+    // array<u32>. A sentinel rather than a zero-filled buffer on purpose: slot
+    // 0 and quadrant 0 are both real values, and a binding that returns a
+    // plausible number when it should be unreachable is exactly the failure
+    // plans/2D-backport.md B6-9c is about.
+    const unread = device.createBuffer({
+      size: pools[1].MAX_FINE_BLOCKS * 4, usage: U.STORAGE | U.COPY_DST,
+    });
+    device.queue.writeBuffer(unread, 0, new Uint32Array(pools[1].MAX_FINE_BLOCKS).fill(0xFFFFFFFF));
+    rootInterpPL = device.createComputePipeline({
+      layout: device.createPipelineLayout({ bindGroupLayouts: [interpPoolParentBGL] }),
+      compute: { module: interpPoolSM, entryPoint: 'main',
+                 constants: { ...interpPoolConstants, PARENT_GHOST: 0 } },
+    });
+    const rootBG = (parentF) => device.createBindGroup({ layout: interpPoolParentBGL, entries: [
+      { binding: 0, resource: { buffer: pools[1].levelParamsBuf } },
+      { binding: 1, resource: { buffer: parentF } },
+      { binding: 2, resource: { buffer: interpScratchRoot } },
+      { binding: 3, resource: { buffer: pools[1].slotToBlockBuf } },
+      { binding: 4, resource: { buffer: pools[1].newlyActivatedBuf } },
+      { binding: 5, resource: { buffer: pools[1].blockSlotBuf } },
+      { binding: 6, resource: { buffer: unread } },
+      { binding: 7, resource: { buffer: unread } },
+    ]});
+    rootInterpBG = rootBG(pools[0].finePoolF_a);
+    // The wrong-parent CONTROL: the root's other ping-pong buffer, which at
+    // rest holds the state one substep back. Must come back DIRTY, and how
+    // dirty is the count of ring cells that actually take the parent hop --
+    // see debugCheckRootInterp.
+    rootInterpStaleBG = rootBG(pools[0].finePoolF_b);
+    // The dense leg, writing the other scratch. interpPL's own bind groups
+    // target the real pool; this is the same pipeline against a copy.
+    denseInterpScratchBG = device.createBindGroup({ layout: interpBGL, entries: [
+      { binding: 0, resource: { buffer: cardStateBuf } },
+      { binding: 1, resource: { buffer: f_a } },
+      { binding: 2, resource: { buffer: interpScratchDense } },
+      { binding: 3, resource: { buffer: pools[1].slotToBlockBuf } },
+      { binding: 4, resource: { buffer: pools[1].newlyActivatedBuf } },
+      { binding: 5, resource: { buffer: pools[1].blockSlotBuf } },
+    ]});
+  }
+
   // D0's candidate scan: two pipelines from one entry point, so the grant and
   // release rules cannot drift into two spellings of "candidate". One
   // workgroup each -- see scanCandidates' header for why that is enough.
@@ -2472,6 +2549,110 @@ async function init() {
     // real field, not an unwritten buffer.
     const live = Number.isFinite(dense.rhoMax) && dense.rhoMax > 0;
     return { ok: exact && live, exact, live, dense, root, diff };
+  }
+
+  // U5-1: level 1's ghost ring, interpolated from the ROOT POOL, against the
+  // same ring interpolated from the dense L0 grid. EXACTLY.
+  //
+  // WHY BIT-IDENTITY IS THE RIGHT BAR AND NOT AN AMBITIOUS ONE. The two
+  // accessors' `sampleParent` bodies are arithmetically the same statement --
+  // same nine-term loop in the same order, same max(rho, 1e-6) floor, same
+  // fneq -- and everything downstream of the fetch (fineToCoarseUnit, the
+  // floor/frac split, interpCoarseToFine) is the SHARED kernel. Only the
+  // address space moves, which is U3/U4's rule for when exactness survives.
+  // The parent-local and dense-buffer coordinates differ by exactly the
+  // parent root tile's integer origin, so even `tx`/`ty` are the same f32.
+  //
+  // THREE LEGS, AND THE THIRD IS THE ONE THAT MAKES THE FIRST MEAN ANYTHING.
+  //
+  //   dense   interpPL against a COPY of level 1's pool          the reference
+  //   root    rootInterpPL, parent = the root pool               the subject
+  //   stale   rootInterpPL, parent = the root's OTHER buffer     the control
+  //
+  // Both real legs start from a byte-identical copy of the live pool, so the
+  // fine-fine consultation branch -- which reads the target buffer's own
+  // INTERIOR and is indifferent to the parent -- resolves identically on each
+  // and contributes guaranteed agreement. That is the vacuity risk here: if
+  // every ring cell had an active same-level neighbour, the parent hop would
+  // never run and `mismatched == 0` would be saying nothing at all. The stale
+  // leg measures exactly that, by changing ONLY the parent: whatever it moves
+  // is what takes the parent hop, and it must be a lot.
+  //
+  // `wrote` is the second guard, against the whole comparison running on a
+  // pass that did nothing: it counts ring words the dense leg changed relative
+  // to the seed.
+  //
+  // Scored over RING cells of ACTIVE slots only. Interiors are untouched by
+  // both legs (GHOST_ONLY=1 returns early on them) and inactive slots by
+  // neither, so including either would pad the denominator with words that
+  // agree by construction -- and a rate diluted to meaninglessness is how a
+  // checker stops being read.
+  async function debugCheckRootInterp(maxReport = 8) {
+    if (!rootInterpPL) return { ok: null, skipped: 'no root pool (?rootpool=1)' };
+    const pool = pools[1];
+    const planeStride = pool.MAX_FINE_BLOCKS * NCELLS1;
+    const nw = fWords(F16);
+
+    const readBuf = async (buf, bytes) => {
+      const stage = device.createBuffer({ size: bytes, usage: U.MAP_READ | U.COPY_DST });
+      const enc = device.createCommandEncoder();
+      enc.copyBufferToBuffer(buf, 0, stage, 0, bytes);
+      device.queue.submit([enc.finish()]);
+      await stage.mapAsync(GPUMapMode.READ);
+      const out = new Uint32Array(stage.getMappedRange()).slice();
+      stage.unmap(); stage.destroy();
+      return out;
+    };
+    // Seed a scratch from the live pool and run one leg into it. The seed is
+    // what makes the legs comparable: the fine-fine branch reads this buffer.
+    const leg = (dst, pl, bg) => {
+      const enc = device.createCommandEncoder();
+      enc.copyBufferToBuffer(pool.finePoolF_a, 0, dst, 0, pool.fSizePool);
+      const p = enc.beginComputePass();
+      p.setPipeline(pl); p.setBindGroup(0, bg);
+      p.dispatchWorkgroups(WGX1, WGY1, pool.MAX_FINE_BLOCKS);
+      p.end();
+      device.queue.submit([enc.finish()]);
+      return device.queue.onSubmittedWorkDone();
+    };
+
+    await leg(interpScratchDense, interpPL, denseInterpScratchBG);
+    await leg(interpScratchRoot, rootInterpPL, rootInterpBG);
+    const seed = await readBuf(pool.finePoolF_a, pool.fSizePool);
+    const denseW = await readBuf(interpScratchDense, pool.fSizePool);
+    const rootW = await readBuf(interpScratchRoot, pool.fSizePool);
+    await leg(interpScratchRoot, rootInterpPL, rootInterpStaleBG);
+    const staleW = await readBuf(interpScratchRoot, pool.fSizePool);
+    const s2b = new Int32Array((await readBuf(pool.slotToBlockBuf, pool.MAX_FINE_BLOCKS * 4)).buffer);
+
+    let checked = 0, mismatched = 0, wrote = 0, staleDiff = 0, activeSlots = 0;
+    const first = [];
+    for (let slot = 0; slot < pool.MAX_FINE_BLOCKS; slot++) {
+      if (s2b[slot] < 0) continue;
+      activeSlots++;
+      for (let fy = 0; fy < FB; fy++) {
+        for (let fx = 0; fx < FB; fx++) {
+          const interior = fx >= GHOST && fx < GHOST + RB * 2 && fy >= GHOST && fy < GHOST + RB * 2;
+          if (interior) continue;
+          const cell = slot * NCELLS1 + fy * FB + fx;
+          for (let wi = 0; wi < nw; wi++) {
+            const i = wi * planeStride + cell;
+            checked++;
+            if (denseW[i] !== seed[i]) wrote++;
+            if (denseW[i] !== staleW[i]) staleDiff++;
+            if (denseW[i] === rootW[i]) continue;
+            mismatched++;
+            if (first.length < maxReport) {
+              first.push({ slot, block: s2b[slot], fx, fy, word: wi, dense: denseW[i], root: rootW[i] });
+            }
+          }
+        }
+      }
+    }
+    return {
+      ok: mismatched === 0 && activeSlots > 0 && wrote > 0 && staleDiff > 0,
+      checked, mismatched, wrote, staleDiff, activeSlots, first,
+    };
   }
 
   // ── Debug/verification support (window.__AMR) ────────────────────────────
@@ -4127,6 +4308,7 @@ async function init() {
     debugCheckRootForce,
     debugCheckRootDigest,
     debugCheckRootConserved,
+    debugCheckRootInterp,
     getRootPool: () => (ROOT_POOL ? { ...rootPoolSpec({ dims: { W, H }, rb: RB }), stepped: !!ROOT_STEP } : null),
     debugRenderOnce,
     debugPerturbLevelVel,

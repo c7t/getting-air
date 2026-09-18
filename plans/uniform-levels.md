@@ -26,7 +26,7 @@ it runs on.
 | U2 | The mirror | **WAS VACUOUS, NOW FIXED** — both "independent" routes wrote `gy*W+gx`; the dense grid is 8x8 block-major, so 98.4% of the pool read the wrong cell | a THIRD route (`field-reconstruct.js`'s `rawIndex`), GPU-free in `make check` |
 | U3 | The step kernel serves the root | **DONE — BIT-IDENTICAL** on 8 rungs, 512 macro-steps; controls saturate at 98.4% | word equality + field health, `?rootstep=0` as control |
 | U4 | criterion, force, digest, conserved totals | **DONE** — all four consumers on the root. Exact on the criterion, digest max and conserved totals; the force to the truncation floor | `tools/validate-root-kernels.js`, 8 rungs + 2 controls |
-| U5 | L1 becomes a quad child of the root | **U5-0 DONE**, U5-1 DESIGNED (it is the FOURTH ring site, not an override swap). The allocator — the part that moves numbers — remains | `tools/test-amr2d.js`, containment + 1 mutant |
+| U5 | L1 becomes a quad child of the root | **U5-0 and U5-1 DONE** — the root-parent interp is BIT-IDENTICAL on 8 rungs, 3 mutants caught, shipped fingerprints unmoved. The allocator — the part that moves numbers — remains | `tools/test-amr2d.js`; `validate-root-kernels.js`'s `interp` column |
 | U6 | The renderer walks levels | not started; **its gate already exists and already fails** | `tools/validate-render-levels.js` |
 | U7 | Delete the dense path | not started | — |
 
@@ -1627,7 +1627,7 @@ by two checks. Also gated: an L1 block is a quadrant of a root block at every
 block, scored against the two block grids (each root block gets exactly four
 distinct children, and every root block gets some), not asserted.
 
-### U5-1 — DESIGNED, NOT BUILT (2026-09-17). The interp accessor is the FOURTH ring site, and the one that says so out loud.
+### U5-1 — DONE (2026-09-17), BIT-IDENTICAL on 8 rungs. The interp accessor was the FOURTH ring site, and the one that says so out loud.
 
 Read this before starting it: the swap is **not** the override change it looks
 like.
@@ -1676,6 +1676,110 @@ hierarchy.
 
 **Predicted result: bit-identical**, on the reasoning above. If it is not, the
 difference is in the FETCH and nowhere else, which is a narrow place to look.
+
+#### What was built, and the prediction held
+
+`PARENT_GHOST` is the whole of the change: one override on
+`common_interp_parent_pool.wgsl`, default 2 so every existing pipeline is
+byte-identical, 0 on the root-parent pipeline. Everything root-specific is
+DERIVED from it rather than flagged separately -- at 0 the parent has no ring,
+which means it has no parent, which means it is the root, which means it is
+always full. That chain is what makes `parentSlotOf`/`quadrantOf` derivable and
+what makes resolving an out-of-tile index against the owning tile the only
+correct behaviour rather than one option among several. (`amr_criterion_pool`'s
+GHOST override records the same reasoning; U3 already paid once for the other
+shape.)
+
+**One contract change, in the shared kernel.** `sampleParent` now takes
+`(slot, bx, by, ix, iy)`. A root parent needs the child's block coordinates to
+find the neighbouring root tile, and `parentOrigin` already took them --
+handing them to only one of a PAIR that must agree on a frame is the split this
+fragment exists to prevent. The dense half ignores them.
+
+**Gate: `tools/validate-root-kernels.js` gained an `interp` column** rather
+than getting a tool of its own. It is the one row that is not a kernel on the
+root -- it asks whether level 1's ghost ring interpolated FROM the root
+reproduces the ring interpolated from the dense grid -- but it is the same
+differential protocol against the same reference and it wants the same rungs,
+including `ghostcopy`, which is the rung that caught U3's one real defect.
+
+**THREE LEGS, AND THE THIRD IS WHAT MAKES THE FIRST MEAN ANYTHING.** Both real
+legs write SCRATCH buffers seeded from a byte-identical copy of the live pool,
+so the page's own level-1 pool is never touched and the fine-fine consultation
+branch -- which reads the target buffer's interior and is indifferent to the
+parent -- resolves identically on each. That is the vacuity risk: if every ring
+cell had an active same-level neighbour, the parent hop would never run and
+`mismatched == 0` would say nothing. The third leg changes ONLY the parent (the
+root's other ping-pong buffer), so whatever it moves is exactly what takes the
+parent hop.
+
+    rung (512 macro-steps, index-amr.html)     ring words   differ   parent hop
+    levels=2                                       53136        0         9688
+    levels=3                                       62208        0        10420
+    levels=4                                       66096        0        10500
+    levels=2 f16=1                                 29520        0         4893
+    levels=2 f16=2                                 29520        0         5314
+    levels=2 res=9                                 93312        0        13690
+    levels=2 ghostcopy=1                           53136        0         9688
+    levels=2 dcpre=1                               53136        0         9699
+
+**18% of ring words take the parent hop; the rest are fine-fine copies.** That
+fraction is the number to watch if this ever goes green for the wrong reason.
+
+**THREE MUTANTS, MEASURED, all on the `levels=2` rung (53136 ring words):**
+
+    clamp instead of resolving to the neighbour tile      6695 differ
+    quadrant 0 for every child (drop the derivation)      5868 differ
+    PARENT_GHOST left at 2 -- the named constant-GHOST     9720 differ
+      mistake, i.e. exactly what U5-0 caught on the host
+
+Note the first two are caught on ~60-70% of the hop words, not all of them:
+wherever a bilinear tap happened to land inside the tile anyway, or wherever
+quadrant 0 happened to be right, the wrong code returns the right number. **A
+mutant that survives on a third of its own footprint is the normal case here**,
+which is why the gate is exact equality and not a rate.
+
+**THE SHIPPED PATH DID NOT MOVE, AND IT IS PROVEN BY EQUALITY, NOT BY Cd.**
+`tools/measure-determinism.js` with `?detslots=1` returned `7ac54e170f903ac3`
+(levels=2) and `ce1bd4d8a3a1055c` (levels=3) -- the SAME fingerprints 1.2c
+recorded for the pre-U5-1 build, over 4096 steps of live refinement churn,
+covering the field and the whole pool indirection. That is D0's promised
+dividend arriving: an AMR change scored by exact equality across builds,
+immune to GPU load and unforgeable. Do not reach for a Cd A/B when this is
+available -- and note `amr-N2-diffuse` reads **Cd 1.631 / St 0.1466** on this
+branch, not CLAUDE.md's 1.642, because D0 moved slot assignment. That is a
+BRANCH baseline to re-record, not a regression, and the fingerprint is what
+says so.
+
+#### Would a dummy level -1 help? No, and the reason is worth keeping
+
+The idea: give the root a parent so the root gets a ring, and the accessor's
+`+GHOST` offset works unchanged at every level with no ring-free path at all.
+It does not survive contact with what a ring is FOR.
+
+1. **It does not terminate.** L(-1) would itself be parentless and need its own
+   ring, filled by L(-2). Some level has to be ring-free; the question is only
+   which, and the root is the one that costs nothing to make so.
+2. **It would be WRONG, not just wasteful.** A ring holds an interpolation of
+   the parent -- a lossy, coarser reconstruction. The root's neighbour cells
+   are not coarser: they are the same resolution, exact, and already in memory
+   one tile over. Filling a root ring from an L(-1) would substitute a
+   coarse-interpolated approximation for exact data that is sitting right
+   there, at every root tile boundary, i.e. everywhere. It also forfeits
+   bit-identity, which is this stage's gate.
+3. **It costs 56% of the root's memory.** The root is the whole domain and
+   always full, so ringing it takes its tiles from 16x16 to 20x20 -- and
+   `ghostDepthAtLevel(0) == 0` is exactly what keeps root memory at today's
+   `W*H` (U1's `cells === dims.W * dims.H` identity). Plus an L(-1) pool, its
+   step, and a fill pass.
+4. **The ring-free path is three lines.** Modular arithmetic on the root block
+   grid, no new binding, no new buffer, bit-identical.
+
+The useful way to say it: **the root's ring is a VIEW, not storage.** It is
+always full, so every out-of-tile index has an owner, and `resolveSource` names
+it. That is the same sentence U3 used to justify pinning `DIRECT_GHOST` on the
+root step and U4-1 used for the criterion's stencil -- the fourth application
+of one rule, not a fourth special case.
 
 ### U5 — L1 becomes a quad child of the root
 

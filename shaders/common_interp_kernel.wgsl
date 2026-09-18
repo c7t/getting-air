@@ -16,15 +16,22 @@
 //   fn levelNbx() -> u32
 //   fn levelNby() -> u32
 //   fn parentOrigin(slot: u32, bx: u32, by: u32) -> vec2<u32>
-//   fn sampleParent(slot: u32, ix: i32, iy: i32) -> CoarseSample
+//   fn sampleParent(slot: u32, bx: u32, by: u32, ix: i32, iy: i32) -> CoarseSample
 //
 // and nothing else. `parentOrigin`/`sampleParent` are a PAIR and must agree on
 // a frame: the dense half works in coarse BUFFER coordinates over the whole
 // periodic domain (origin = bx*RB, sample wraps and goes through cellIndex());
 // the pool half works in PARENT-LOCAL INTERIOR coordinates inside one tile
-// (origin = the quadrant's own 0-or-RB offset, sample is a +GHOST shift into
-// that tile, no wrap and no second slot lookup). Only the two together are
-// meaningful, which is why they are one fragment rather than two knobs.
+// (origin = the quadrant's own 0-or-RB offset, sample is a +PARENT_GHOST shift
+// into that tile). Only the two together are meaningful, which is why they are
+// one fragment rather than two knobs.
+//
+// BOTH TAKE (bx, by), and the dense half ignores them. They were added for
+// plans/uniform-levels.md U5-1: a ROOT parent has no ring, so a stencil tap
+// that leaves the parent tile has to be resolved against the NEIGHBOURING root
+// tile, and finding that tile needs the child's own block coordinates. Passing
+// them to only one of the pair would split a frame that must not be split --
+// the same argument that keeps origin and sample in one file.
 //
 // Everything else -- the dispatch shape, the GHOST_ONLY/FINE_FINE_ONLY modes,
 // and the whole same-level fine-fine + diagonal-corner consultation -- is a
@@ -230,10 +237,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let tx = px - f32(x0);
   let ty = py - f32(y0);
 
-  let s00 = sampleParent(slot, x0, y0);
-  let s10 = sampleParent(slot, x1, y0);
-  let s01 = sampleParent(slot, x0, y1);
-  let s11 = sampleParent(slot, x1, y1);
+  let s00 = sampleParent(slot, bx, by, x0, y0);
+  let s10 = sampleParent(slot, bx, by, x1, y0);
+  let s01 = sampleParent(slot, bx, by, x0, y1);
+  let s11 = sampleParent(slot, bx, by, x1, y1);
 
   // Bilinear blend + Dupuis-Chopard rescale: common_interp.wgsl.
   // f_pool is direction-major across the WHOLE pool (matching the coarse
