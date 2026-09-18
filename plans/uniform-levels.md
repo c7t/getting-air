@@ -26,7 +26,7 @@ it runs on.
 | U2 | The mirror | **WAS VACUOUS, NOW FIXED** — both "independent" routes wrote `gy*W+gx`; the dense grid is 8x8 block-major, so 98.4% of the pool read the wrong cell | a THIRD route (`field-reconstruct.js`'s `rawIndex`), GPU-free in `make check` |
 | U3 | The step kernel serves the root | **DONE — BIT-IDENTICAL** on 8 rungs, 512 macro-steps; controls saturate at 98.4% | word equality + field health, `?rootstep=0` as control |
 | U4 | criterion, force, digest, conserved totals | **DONE** — all four consumers on the root. Exact on the criterion, digest max and conserved totals; the force to the truncation floor | `tools/validate-root-kernels.js`, 8 rungs + 2 controls |
-| U5 | L1 becomes a quad child of the root | **U5-0 DONE** — the host rule, and the quadrant offset was a THIRD constant-GHOST site. The allocator and the accessors remain | `tools/test-amr2d.js`, containment + 1 mutant |
+| U5 | L1 becomes a quad child of the root | **U5-0 DONE**, U5-1 DESIGNED (it is the FOURTH ring site, not an override swap). The allocator — the part that moves numbers — remains | `tools/test-amr2d.js`, containment + 1 mutant |
 | U6 | The renderer walks levels | not started; **its gate already exists and already fails** | `tools/validate-render-levels.js` |
 | U7 | Delete the dense path | not started | — |
 
@@ -1626,6 +1626,56 @@ invariant, and the mutation -- the shipped constant-GHOST formula -- is caught
 by two checks. Also gated: an L1 block is a quadrant of a root block at every
 block, scored against the two block grids (each root block gets exactly four
 distinct children, and every root block gets some), not asserted.
+
+### U5-1 — DESIGNED, NOT BUILT (2026-09-17). The interp accessor is the FOURTH ring site, and the one that says so out loud.
+
+Read this before starting it: the swap is **not** the override change it looks
+like.
+
+`common_interp_parent_pool.wgsl` is nearly ready to serve a root parent. Its
+`sampleParent` is arithmetically IDENTICAL to the dense accessor's -- same
+loop, same order, same `max(rho, 1e-6)` floor, same `fneq` -- so only the FETCH
+addressing differs, and by U4's rule that means the swap should be
+BIT-IDENTICAL. Three of the four things it needs are free:
+
+  - `parentTau()` already reads `levelParams.parentTau`, and level 1's is
+    already `tauAtLevel(0)`. No change.
+  - the parent SLOT needs no buffer and no allocator change. The root is always
+    full and its indirection is the identity, so the parent of L1 block
+    `(bx, by)` is root block `(by>>1)*(nbx/2) + (bx>>1)` -- derivable from the
+    child's own `slotToBlock` entry and `levelParams.nbx`.
+  - the QUADRANT likewise: `(by&1)<<1 | (bx&1)`. No `quadrant` buffer needed.
+
+**The fourth is the problem, and the file states it as the reason it is
+simple.** Its header justifies having no wrap and no neighbour lookup like
+this: a child's parent-local index lands in `[-GHOST, 2*RB-1+GHOST]` and maps
+via a plain `+GHOST` offset onto the parent's already-valid `[0, FB)` range --
+*"including the parent's ghost cells"*. **The root has none.** Index -1 maps to
+-1.
+
+And it is not an edge case. A child tile's ring is GHOST = 2 fine cells = ONE
+parent cell deep, so a child in quadrant 0 needs parent cells from -1, and one
+in quadrant 1 needs them through 2*RB. **Every L1 tile needs a root cell
+outside its parent root tile, on two of its four sides.** Under a ringed parent
+those land in the parent's ring, which interp filled. At the root they must
+resolve into the NEIGHBOURING ROOT TILE.
+
+**So this is the FOURTH site of the constant-GHOST mistake** (after
+`resolveSource`, the criterion's stencil, the force's gather, and
+`quadrantOrigin`'s parent frame -- five, counting U5-0). The resolution is the
+same rule each time, `amr2d.mjs`'s `resolveSource`, and here it is cheaper than
+anywhere else: because the root's indirection is the identity, resolving to a
+neighbour tile is modular arithmetic on the root block grid and needs **no new
+binding** -- the interp kernel's existing `blockSlot` at binding 5 is the
+CHILD's and is not what this wants.
+
+**The gate needs no second pool.** Run the dense-parent interp, copy level 1's
+`f` to one scratch buffer, run the root-parent interp into the same pool, and
+compare -- one buffer the size of L1's pool rather than a whole second
+hierarchy.
+
+**Predicted result: bit-identical**, on the reasoning above. If it is not, the
+difference is in the FETCH and nowhere else, which is a narrow place to look.
 
 ### U5 — L1 becomes a quad child of the root
 
