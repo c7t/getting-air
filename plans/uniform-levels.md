@@ -2192,6 +2192,13 @@ average / step1 / force / criterion / manage bind groups. Same shape on every
 page; the buffers it names all come from `allocLevelPool`, which is already
 shared.
 
+**TAKE THE POOL-ALLOCATION AND RESET SCAFFOLDING WITH IT.** U7-4's itemisation
+below shows why: more than half of what a page would otherwise have to change
+for the root pool is a LOOP BOUND in one of these loops -- the allocation loop,
+the levelParams loop, the `quadCPU` mirrors, the per-level half of `resetSim`.
+They are duplicated five times already, and each one still duplicated at U7-4
+is another per-page edit there.
+
 *Gate:* as U7-1.
 
 **U6 SHOULD RIDE ON THIS RUNG RATHER THAN BE DONE FIVE TIMES.** The renderer
@@ -2221,11 +2228,62 @@ failure, not a re-baseline).
 
 #### U7-4 — the root pool on every page
 
-Now ~60 lines per page: allocate, seed, and expose the flags. Everything else
-is already shared. The COMPARATORS stay on `index-amr.html` -- they are the
-dev page's instrument and five copies of them would be five copies of a
-checker, which is how this project collected its vacuous gates in the first
-place.
+Allocate, seed, and expose the flags. Everything else is already shared.
+
+**"~60 LINES PER PAGE" WAS AN ESTIMATE AND IT WAS ABOUT 3x HIGH.** Itemised
+against the real sites in `main-amr.js` (2026-09-18), what a page actually
+grows once U7-0…U7-3 are done is roughly **20 new lines and 7 single-token
+edits**:
+
+```
+  NEW LINES
+   2   call a shared readRootFlags(urlParams) and destructure it
+   3   if (ROOT_POOL) pools[0] = allocRootPool(...)
+   1   quadAlloc argument on the existing allocLevelPool call
+   2   the `if (!ROOT_MANAGED)` guard around level 1's per-block free-list seed
+   1   quadCompleteFrom argument on makeCascadePipelines
+   3   seedRootFromDense() at init, in resetSim, after debugSnapshotLoad
+   2   the same guard inside resetSim
+   4   debugActivateBlock's refusal under quad allocation
+   1   getRootPool on the debug surface
+  ---
+  ~19  and 5 of those (the activate refusal, the snapshot seed) exist only on
+       the three pages that HAVE those functions. tgv and channel have neither,
+       and their resetSim keeps no CPU mirrors at all, so they grow ~4 lines.
+
+  SINGLE-TOKEN EDITS TO EXISTING LINES
+   the levelParams loop start          (ROOT_POOL ? 0 : 1)
+   the pipelines loop start            (ROOT_MANAGED ? 0 : 1)
+   the bind-groups loop start          (ROOT_MANAGED ? 0 : 1)
+   the quadCPU loop start              (ROOT_MANAGED ? 1 : 2)
+   the resetSim loop start             (ROOT_MANAGED ? 1 : 2)
+   blockSlotCPUAtLevel's ternary
+   criterionBG's target buffer
+```
+
+**AND THE SHAPE OF THAT RESIDUE IS THE USEFUL PART.** More than half of it is
+not root-pool code at all -- it is LOOP BOUNDS in code that is itself
+duplicated five times (the pool-allocation loop, the levelParams loop, the
+`quadCPU`/reset scaffolding). Every one of those edits disappears if U7-2
+shares the loop instead of only the bind groups it builds. So this itemisation
+is also a scope note for U7-2: **share the pool-allocation and reset
+scaffolding, not just the bind groups**, and U7-4 shrinks to the handful of
+lines that are genuinely about having a root.
+
+**The flags are the one thing that must NOT be copied.** The four `const`
+declarations are four lines; the design record attached to them in
+`main-amr.js` is about sixty-five lines of comment, and that belongs in one
+place. A shared `readRootFlags` is where it goes.
+
+**And the other four pages should probably never get `?rootcouple` or
+`?rootmanage` at all.** They are staging flags -- they exist so U5-2, U5-3 and
+U5-4 could be A/B'd in one build on the page being developed, and U7-5
+collapses them. Giving four more pages a knob that is already scheduled for
+deletion is work in both directions.
+
+The COMPARATORS stay on `index-amr.html` -- they are the dev page's instrument
+and five copies of them would be five copies of a checker, which is how this
+project collected its vacuous gates in the first place.
 
 Two things this rung finally makes possible, both of which U5 had to leave
 open:
