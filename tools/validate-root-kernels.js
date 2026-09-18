@@ -74,9 +74,15 @@
 // (`stepBG_ab/ba` binding 2) and the L1->L0 average (`avgBG_targetA/B` binding
 // 2). Everything else -- force, interp, criterion, render -- reads. With the
 // average skipped the step kernel is the SOLE writer of the dense grid, so
-// equality is a complete statement about the two kernels. With it on, the
-// difference is whatever `average` writes, and the root pool receives no
-// restriction until U4/U5. Both are reported; only the isolated one is gated.
+// equality is a complete statement about the two kernels -- the STEP's
+// statement, with the coupling held out of it.
+//
+// SINCE U5-3 BOTH CONFIGURATIONS ARE GATED. The root pool now receives the
+// same restriction the dense grid does, so leaving `average` on no longer
+// introduces an unrestricted side: the isolated rungs gate the step alone and
+// the shipped rungs gate the step and both directions of the coupling running
+// together, indefinitely. The root average shares `avg`'s skip group, which is
+// what keeps the isolated rungs isolated.
 //
 // `crit` carries its own VACUITY guard: two all-zero criterion arrays agree
 // perfectly and say nothing, so the dense kernel is required to have found
@@ -174,19 +180,38 @@ const GATED = [
   'levels=2&rootpool=1&rootstep=1&benchSkip=avg&res=9',
   'levels=2&rootpool=1&rootstep=1&benchSkip=avg&ghostcopy=1',
   'levels=2&rootpool=1&rootstep=1&benchSkip=avg&dcpre=1',
+  // THE SHIPPED PATH, and since U5-3 it is GATED rather than reported.
+  // `average` writes L0 here, and the root pool now receives the SAME
+  // restriction (?rootcouple=1, the default whenever the root pool exists),
+  // so the two L0 representations must agree word for word indefinitely --
+  // not merely until the first average, which is all the benchSkip=avg rungs
+  // above can say. This is the row the REPORTED section existed to watch.
+  'levels=2&rootpool=1',
+  'levels=3&rootpool=1',
+  'levels=4&rootpool=1',
 ];
 // Must come back DIRTY. Without these the zeros above are unfalsifiable.
+//
+// `rootcouple=0` IS PART OF THE FIRST TWO SINCE U5-3, and dropping it was not
+// an option: with the coupling live, a frozen root pool is not a stale buffer
+// nobody reads, it is level 1's PARENT. Level 1 is then fed a parent that
+// never advances while it does, and the field goes 100% non-finite -- at which
+// point the comparison reports ZERO differing words, because identical NaN bit
+// patterns are identical words, and the control silently inverts into a pass.
+// Measured directly, and it is the same trap this file already records for
+// ?benchSkip=interp. So the stale-root control turns the coupling OFF and
+// reproduces exactly the configuration it was written for.
 const CONTROLS = [
-  'levels=2&rootpool=1&rootstep=0&benchSkip=avg',
-  'levels=3&rootpool=1&rootstep=0&benchSkip=avg',
+  'levels=2&rootpool=1&rootstep=0&rootcouple=0&benchSkip=avg',
+  'levels=3&rootpool=1&rootstep=0&rootcouple=0&benchSkip=avg',
+  // U5-3's OWN discrimination: the shipped path with the coupling turned off.
+  // The root is stepped and correct but receives no restriction, so it must go
+  // dirty -- which is what says the clean shipped rows above are the coupling's
+  // doing and not a comparison that stopped looking.
+  'levels=2&rootpool=1&rootcouple=0',
+  'levels=3&rootpool=1&rootcouple=0',
 ];
-// Reported, not gated: the shipped path, where `average` writes L0 and the
-// root pool does not yet receive a restriction. The number to watch is that
-// stepping the root beats freezing it; exactness is U4/U5's to deliver.
-const REPORTED = [
-  'levels=2&rootpool=1&rootstep=1',
-  'levels=2&rootpool=1&rootstep=0',
-];
+const REPORTED = [];
 
 function parseArgs(argv) {
   const o = { baseUrl: 'https://localhost:4444', port: 9333, page: 'index-amr.html', steps: 512, keepOpen: false };
@@ -301,20 +326,26 @@ async function main() {
     console.log('\n  CONTROL -- must be DIRTY, or the comparison above proves nothing');
     for (const q of CONTROLS) {
       const r = await runCase(Runtime, Page, o, q);
+      // `f` and `vel` dirty plus a finite field is the load-bearing pair: a
+      // blown-up run also reports "dirty" and means nothing. The per-kernel
+      // columns are NOT asserted here, because the two control shapes reach
+      // them differently -- a frozen root moves every column that reads it,
+      // while a correct-but-unrestricted root leaves the criterion and the
+      // digest agreeing for many steps. Asserting the union would be asserting
+      // a coincidence.
       const ok = r.after.mismatched > 0 && r.vel.mismatched > 0
-        && r.crit.mismatched > 0 && r.force.maxDiff > FORCE_TOL
-        && !r.dig.maxExact && !r.cons.exact
-        && r.interp.mismatched > 0
         // NOT r.avg -- see the header. Restriction cannot see a stale parent.
         && r.avg.ok
         && r.health.nonFinite === 0;
       if (!ok) fails.push(`${q} (control came back clean)`);
       console.log(`${ok ? '  ok  ' : ' FAIL '} ${q.padEnd(46)} ${fmt(r)}`);
     }
-    console.log('\n  REPORTED -- shipped path; the residual is `average`, which the root does not receive (U4/U5)');
-    for (const q of REPORTED) {
-      const r = await runCase(Runtime, Page, o, q);
-      console.log(`       ${q.padEnd(46)} ${fmt(r)}`);
+    if (REPORTED.length) {
+      console.log('\n  REPORTED -- not gated');
+      for (const q of REPORTED) {
+        const r = await runCase(Runtime, Page, o, q);
+        console.log(`       ${q.padEnd(46)} ${fmt(r)}`);
+      }
     }
   } finally {
     await client.close();

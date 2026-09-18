@@ -596,6 +596,22 @@ const ROOT_POOL = urlParams.has('rootpool') ? (parseInt(urlParams.get('rootpool'
 // provably stale and the checker has to say so.
 const ROOT_STEP = urlParams.has('rootstep') ? (parseInt(urlParams.get('rootstep')) ? 1 : 0) : 1;
 
+// ?rootcouple=0 -- allocate, mirror and step the root pool, but leave level 1
+// coupled to the DENSE grid (plans/uniform-levels.md U5-3).
+//
+// Default 1 whenever the root pool exists: with `?rootpool=1`, level 1's ghost
+// ring is interpolated from the root pool and its restriction is written to
+// the root pool. The dense grid keeps its own step and its own restriction, so
+// the two L0 representations stay byte-identical and every remaining dense
+// consumer is untouched -- see the U5-3 block below for why that staging is
+// the whole point.
+//
+// This flag exists to separate "the root pool is allocated" from "the solver
+// uses it", the same split ?rootstep= made for U3. `?rootpool=1&rootcouple=0`
+// is U5-2's configuration exactly, which is what makes the coupling A/B-able
+// in one build rather than across two.
+const ROOT_COUPLE = urlParams.has('rootcouple') ? (parseInt(urlParams.get('rootcouple')) ? 1 : 0) : 1;
+
 // Milestone 10: per-CHILD-level threshold overrides -- see
 // main-cylinder-amr.js's copy of this function for the full rationale (a
 // level-2 block's vorticity is measured on the same RB=8 stencil at half
@@ -1753,6 +1769,9 @@ async function init() {
       denseInterpScratchBG = null, interpScratchDense = null, interpScratchRoot = null;
   let rootAvgPL = null, rootAvgBG_live = null, rootAvgBG_stale = null,
       denseAvgScratchBG = null, avgScratchDense = null, avgScratchRoot = null;
+  let rootInterpLivePL = null, rootInterpInitPL = null, rootInterpFFPL = null,
+      rootInterpNoopPL = null, rootInterpLiveBG_readA = null, rootInterpLiveBG_readB = null,
+      rootInterpLiveFFBG_b = null, rootAvgLiveBG_targetA = null, rootAvgLiveBG_targetB = null;
   if (ROOT_POOL) {
     const mkScratch = () => device.createBuffer({
       size: pools[1].fSizePool, usage: U.STORAGE | U.COPY_SRC | U.COPY_DST,
@@ -1847,6 +1866,87 @@ async function init() {
       { binding: 2, resource: { buffer: avgScratchDense } },
       { binding: 3, resource: { buffer: pools[1].slotToBlockBuf } },
     ]});
+
+    // ── U5-3: THE COUPLING, LIVE ─────────────────────────────────────────
+    //
+    // The pipelines above are inert twins scored against the dense path. These
+    // are the same two hops wired into the SOLVER: level 1's ghost ring is
+    // interpolated from the root pool, and level 1's restriction is written to
+    // the root pool.
+    //
+    // THE DENSE GRID KEEPS ITS OWN STEP AND ITS OWN RESTRICTION, and that is
+    // the whole staging device. Both L0 representations are stepped (U3) and
+    // both now receive level 1's restriction, so they stay BYTE-IDENTICAL
+    // forever rather than only until the first `average` -- which is exactly
+    // what validate-root-kernels.js's REPORTED rows were waiting for. Every
+    // remaining dense consumer (the renderer, the criterion, the force, the
+    // digest, `debugSnapshotSave`, the whole host and tool tail) therefore
+    // needs no change at this stage and cannot be broken by it. They are
+    // flipped one at a time afterwards, each against a buffer that is already
+    // proven equal, and the dense writers go at U7.
+    //
+    // The cost is one duplicated L0 step and one duplicated restriction per
+    // macro-step, for as long as `?rootpool=1` is opt-in. That is a
+    // measurement cost on a dev flag, not a shipped one.
+    //
+    // ONLY ONE THING IS REPLACED RATHER THAN DUPLICATED: the dense-parent
+    // interp. It cannot be run alongside, because both would write the same
+    // ghost cells of the same pool -- and U5-1's whole result is that they
+    // write the same words, so there would be nothing to gain from a race.
+    //
+    // Phase: the root pool ping-pongs in lockstep with L0's own `useB` (U3),
+    // so "the current buffer" is the same name on both sides. interp reads the
+    // current one BEFORE the step; average targets the one the step just wrote.
+    rootInterpLivePL = device.createComputePipeline({
+      layout: device.createPipelineLayout({ bindGroupLayouts: [interpPoolParentBGL] }),
+      compute: { module: interpPoolSM, entryPoint: 'main',
+                 constants: { ...interpPoolConstants, PARENT_GHOST: 0 } },
+    });
+    rootInterpInitPL = device.createComputePipeline({
+      layout: device.createPipelineLayout({ bindGroupLayouts: [interpPoolParentBGL] }),
+      compute: { module: interpPoolSM, entryPoint: 'main',
+                 constants: { ...interpPoolInitConstants, PARENT_GHOST: 0 } },
+    });
+    // FINE_FINE_ONLY never reaches the parent at all (it returns before the
+    // parent hop), so this pipeline is behaviourally identical to the dense
+    // one. It exists anyway so that ?ghostcopy=1 does not leave a
+    // dense-parent pipeline in the live path -- U3 paid once for a root
+    // pipeline inheriting a constant that did not belong to it.
+    rootInterpFFPL = device.createComputePipeline({
+      layout: device.createPipelineLayout({ bindGroupLayouts: [interpPoolParentBGL] }),
+      compute: { module: interpPoolSM, entryPoint: 'main',
+                 constants: { ...interpPoolFFConstants, PARENT_GHOST: 0 } },
+    });
+    rootInterpNoopPL = device.createComputePipeline({
+      layout: device.createPipelineLayout({ bindGroupLayouts: [interpPoolParentBGL] }),
+      compute: { module: interpPoolSM, entryPoint: 'main',
+                 constants: { ...interpPoolConstants, PARENT_GHOST: 0, NOOP: 1 } },
+    });
+    const liveInterpBG = (parentF, childF) => device.createBindGroup({ layout: interpPoolParentBGL, entries: [
+      { binding: 0, resource: { buffer: pools[1].levelParamsBuf } },
+      { binding: 1, resource: { buffer: parentF } },
+      { binding: 2, resource: { buffer: childF } },
+      { binding: 3, resource: { buffer: pools[1].slotToBlockBuf } },
+      { binding: 4, resource: { buffer: pools[1].newlyActivatedBuf } },
+      { binding: 5, resource: { buffer: pools[1].blockSlotBuf } },
+      { binding: 6, resource: { buffer: unread } },
+      { binding: 7, resource: { buffer: unread } },
+    ]});
+    rootInterpLiveBG_readA = liveInterpBG(pools[0].finePoolF_a, pools[1].finePoolF_a);
+    rootInterpLiveBG_readB = liveInterpBG(pools[0].finePoolF_b, pools[1].finePoolF_a);
+    // The between-substep fine-fine refresh targets level 1's own _b, mirroring
+    // the dense interpFFBG_b. Its parent binding is never read (see above).
+    rootInterpLiveFFBG_b = liveInterpBG(pools[0].finePoolF_a, pools[1].finePoolF_b);
+    const liveAvgBG = (parentF) => device.createBindGroup({ layout: avgPoolBGL, entries: [
+      { binding: 0, resource: { buffer: pools[1].levelParamsBuf } },
+      { binding: 1, resource: { buffer: pools[1].finePoolF_a } },
+      { binding: 2, resource: { buffer: parentF } },
+      { binding: 3, resource: { buffer: pools[1].slotToBlockBuf } },
+      { binding: 4, resource: { buffer: unread } },
+      { binding: 5, resource: { buffer: unread } },
+    ]});
+    rootAvgLiveBG_targetA = liveAvgBG(pools[0].finePoolF_a);
+    rootAvgLiveBG_targetB = liveAvgBG(pools[0].finePoolF_b);
   }
 
   // D0's candidate scan: two pipelines from one entry point, so the grant and
@@ -2038,6 +2138,32 @@ async function init() {
   // selection as the steady-state interp bind groups above.
   const interpInitBG_readA = device.createBindGroup({ layout: interpBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_a } }, { binding: 2, resource: { buffer: pools[1].finePoolF_a } }, { binding: 3, resource: { buffer: pools[1].slotToBlockBuf } }, { binding: 4, resource: { buffer: pools[1].newlyActivatedBuf } }, { binding: 5, resource: { buffer: pools[1].blockSlotBuf } }]});
   const interpInitBG_readB = device.createBindGroup({ layout: interpBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_b } }, { binding: 2, resource: { buffer: pools[1].finePoolF_a } }, { binding: 3, resource: { buffer: pools[1].slotToBlockBuf } }, { binding: 4, resource: { buffer: pools[1].newlyActivatedBuf } }, { binding: 5, resource: { buffer: pools[1].blockSlotBuf } }]});
+
+  // ── U5-3: which parent level 1 is coupled to, chosen ONCE ────────────────
+  //
+  // Five dispatch sites want level 1's interp (the macro-step, the
+  // between-substep fine-fine refresh, the post-refine init fill in
+  // dispatchMacroStep, debugActivateBlock, and the benchSkip no-op twin), and
+  // a sixth wants its restriction. Selecting the parent at each of them is how
+  // a page ends up coupled two different ways depending on the path taken --
+  // the shape CLAUDE.md records for the bind-group mirroring trap, one level
+  // down. So the choice is made here, once, and every site below reads these
+  // names without knowing which parent it got.
+  //
+  // `rootCouple` is the live predicate rather than the flag, so the fallback
+  // to the dense path is structural: with no root pool there is nothing to
+  // couple to, and ROOT_COUPLE alone would be a promise the buffers cannot
+  // keep.
+  const rootCouple = !!(ROOT_POOL && ROOT_COUPLE && rootInterpLivePL);
+  const l1InterpPL      = rootCouple ? rootInterpLivePL : interpPL;
+  const l1InterpInitPL  = rootCouple ? rootInterpInitPL : interpInitPL;
+  const l1InterpFFPL    = rootCouple ? rootInterpFFPL   : interpFFPL;
+  const l1InterpNoopPL  = rootCouple ? rootInterpNoopPL : noopPLs.interpDense;
+  const l1InterpBG      = (b) => rootCouple ? (b ? rootInterpLiveBG_readB : rootInterpLiveBG_readA)
+                                            : (b ? interpBG_readB : interpBG_readA);
+  const l1InterpInitBG  = (b) => rootCouple ? (b ? rootInterpLiveBG_readB : rootInterpLiveBG_readA)
+                                            : (b ? interpInitBG_readB : interpInitBG_readA);
+  const l1InterpFFBG    = rootCouple ? rootInterpLiveFFBG_b : interpFFBG_b;
 
   // Milestone 4b bind groups.
   const criterionBG = device.createBindGroup({ layout: criterionBGL, entries: [{ binding: 0, resource: { buffer: velBuf } }, { binding: 1, resource: { buffer: pools[1].blockCriterionBuf } }]});
@@ -2304,6 +2430,32 @@ async function init() {
   // same invariant (STEPS_PER_FRAME is even, so useB returns to false), and
   // debugStepSync leaves it that way -- so "mirror, then check" is only
   // meaningful from the same rest state a snapshot is.
+  // SEEDING THE ROOT POOL, AND WHY IT IS A CALL AND NOT A COMMENT.
+  //
+  // U1 deliberately gave the root pool NO initial field: "a buffer nothing
+  // reads should not be given a state that could be mistaken for one." That
+  // was right for three stages and became a defect the moment U5-3 made level
+  // 1's ghosts read it -- every load and every reset() left the solver
+  // interpolating from an unwritten buffer, and nothing said so, because every
+  // gate to date called debugMirrorRoot() by hand before looking.
+  //
+  // MEASURED: `tools/measure-determinism.js --extra=rootpool=1` came back
+  // DIFFERS on both level counts with `?detslots=1` -- the configuration D0
+  // proved bit-reproducible. The tile counts moved run to run (49 vs 54 at
+  // levels=2), so refinement itself was being driven by the unseeded field.
+  // That is the fingerprint gate doing exactly what 1.2 promised: catching a
+  // state bug no Cd comparison and no 512-step word diff had reported.
+  //
+  // The mirror is the seeder because it is the map U2 already validated
+  // against a third route. At U7 the root is the only L0 and takes `initF()`
+  // directly; until then this is one dispatch at init, at reset and after a
+  // snapshot load, and never per frame (see debugMirrorRoot's own note).
+  const seedRootFromDense = () => { if (ROOT_POOL) debugMirrorRoot(); };
+  // The initial seed. resetSim() is NOT called at page load -- the dense grid
+  // is written once inline, far above -- so this is a separate call site and
+  // not a duplicate of the one in resetSim().
+  seedRootFromDense();
+
   function debugMirrorRoot() {
     if (!mirrorRootPL) throw new Error('debugMirrorRoot: no root pool (?rootpool=1)');
     const spec = rootPoolSpec({ dims: { W, H }, rb: RB });
@@ -2701,8 +2853,19 @@ async function init() {
         }
       }
     }
+    // `wrote` IS REPORTED, NOT GATED, AND THAT DISTINCTION COST A RED SWEEP.
+    // It counts ring words the dense leg changed relative to the seed, which
+    // reads as a liveness guard right up until the pass it re-runs is ALREADY
+    // LIVE in the macro-step: re-running an idempotent pass on a buffer that
+    // already holds its output legitimately changes nothing, and `wrote == 0`
+    // then means "the page is doing this correctly", not "the pass did
+    // nothing". Measured on the U5-3 shipped-path rungs, where it inverted
+    // both the gate and its control at once. `staleDiff` is the guard that
+    // survives, because it changes an INPUT rather than looking for movement:
+    // if the root leg wrote nothing at all, its stale twin would match the
+    // dense leg and this would be zero.
     return {
-      ok: mismatched === 0 && activeSlots > 0 && wrote > 0 && staleDiff > 0,
+      ok: mismatched === 0 && activeSlots > 0 && checked > 0 && staleDiff > 0,
       checked, mismatched, wrote, staleDiff, activeSlots, first,
     };
   }
@@ -2788,8 +2951,10 @@ async function init() {
         }
       }
     }
+    // `wrote` reported, not gated -- see debugCheckRootInterp's note on why,
+    // which this column is where it was actually measured.
     return {
-      ok: mismatched === 0 && activeBlocks > 0 && wrote > 0 && staleDiff > 0,
+      ok: mismatched === 0 && activeBlocks > 0 && checked > 0 && staleDiff > 0,
       checked, mismatched, wrote, staleDiff, activeBlocks, first,
     };
   }
@@ -2948,6 +3113,11 @@ async function init() {
     // (derived from f in the diff tool) round-tripped exactly, but ux/uy
     // (read from velBuf) didn't -- the asymmetry was the tell.
     device.queue.writeBuffer(velBuf, 0, vel.buffer, vel.byteOffset, NCELLS * 2 * 4);
+    // U5-3: and the root pool, which is the same L0 in the other layout. The
+    // snapshot format does not carry it yet (that is U7's); mirroring the
+    // just-restored dense grid is exact by U2's proof, so a load lands both
+    // representations in the same state rather than one.
+    seedRootFromDense();
     device.queue.writeBuffer(cardStateBuf, 0, new Float32Array(snapshot.cardState));
 
     for (let m = 1; m < N_LEVELS; m++) {
@@ -3076,8 +3246,8 @@ async function init() {
     if (level === 0) {
       const stepBG = useB ? stepBG_ba : stepBG_ab;
       if (hasChild) {
-        const readBG = useB ? interpBG_readB : interpBG_readA;
-        if (!skipGroup('interp')) { const p = beginPass(enc, 'L0->L1 interp'); p.setPipeline(skipGroup('interp-noop') ? noopPLs.interpDense : interpPL); p.setBindGroup(0, readBG); p.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); p.end(); }
+        const readBG = l1InterpBG(useB);
+        if (!skipGroup('interp')) { const p = beginPass(enc, 'L0->L1 interp'); p.setPipeline(skipGroup('interp-noop') ? l1InterpNoopPL : l1InterpPL); p.setBindGroup(0, readBG); p.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); p.end(); }
       }
       const s = beginPass(enc, 'L0 step'); s.setPipeline(stepPL); s.setBindGroup(0, stepBG); s.dispatchWorkgroups(WGX, WGY); s.end();
       // U3: the same step, on the root pool, in parallel and read by nobody.
@@ -3094,6 +3264,19 @@ async function init() {
         S_Advance(1, enc);
         const avgBG = useB ? avgBG_targetA : avgBG_targetB;
         if (!skipGroup('avg')) { const a = beginPass(enc, 'L1->L0 average'); a.setPipeline(skipGroup('avg-noop') ? noopPLs.avg : avgPL); a.setBindGroup(0, avgBG); a.dispatchWorkgroups(1, 1, MAX_FINE_BLOCKS); a.end(); }
+        // U5-3: the SAME restriction into the root pool, in parallel. Not an
+        // alternative to the line above -- BOTH run, which is what keeps the
+        // two L0 representations byte-identical while the remaining dense
+        // consumers are flipped over one at a time. Shares `avg`'s skip group
+        // so ?benchSkip=avg still isolates the step as the sole writer of
+        // either representation, which validate-root-kernels.js relies on.
+        if (rootCouple && !skipGroup('avg')) {
+          const a = beginPass(enc, 'L1->root average');
+          a.setPipeline(rootAvgPL);
+          a.setBindGroup(0, useB ? rootAvgLiveBG_targetA : rootAvgLiveBG_targetB);
+          a.dispatchWorkgroups(1, 1, MAX_FINE_BLOCKS);
+          a.end();
+        }
       }
       return;
     }
@@ -3125,7 +3308,7 @@ async function init() {
     };
     const fineFineRefresh = () => {
       if (isL1) {
-        const p = beginPass(enc, 'L1 fine-fine ghost'); p.setPipeline(interpFFPL); p.setBindGroup(0, interpFFBG_b); p.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); p.end();
+        const p = beginPass(enc, 'L1 fine-fine ghost'); p.setPipeline(l1InterpFFPL); p.setBindGroup(0, l1InterpFFBG); p.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); p.end();
       } else {
         const p = beginPass(enc, `L${level} fine-fine ghost`); p.setPipeline(interpPoolParentFFPL); p.setBindGroup(0, pool.interpPoolParentFFBG_b); p.dispatchWorkgroups(WGX1, WGY1, pool.MAX_FINE_BLOCKS); p.end();
       }
@@ -3245,7 +3428,7 @@ async function init() {
   // apart.
   function dispatchMacroStep(enc) {
     const frcBG        = useB ? frcBG_b            : frcBG_a;
-    const interpInitBG = useB ? interpInitBG_readB : interpInitBG_readA;
+    const interpInitBG = l1InterpInitBG(useB);
 
     // Milestone 4b/9: re-evaluate refinement every REFINE_EVERY macro-steps,
     // now generalized across every configured level. Runs BEFORE S_Advance
@@ -3352,7 +3535,7 @@ async function init() {
       // level>=2: pool-parent init pipeline, reading readA since a
       // level's own buffer is always "current" at a macro-step boundary --
       // same invariant debugActivateBlock already relies on).
-      const init = beginPass(enc, 'L1 init fill'); init.setPipeline(interpInitPL); init.setBindGroup(0, interpInitBG); init.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); init.end();
+      const init = beginPass(enc, 'L1 init fill'); init.setPipeline(l1InterpInitPL); init.setBindGroup(0, interpInitBG); init.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); init.end();
       for (let m = 2; m < N_LEVELS; m++) {
         const pool = pools[m];
         const p = beginPass(enc, `L${m} init fill`); p.setPipeline(interpPoolParentInitPL); p.setBindGroup(0, pool.interpPoolParentBG_readA); p.dispatchWorkgroups(WGX1, WGY1, pool.MAX_FINE_BLOCKS); p.end();
@@ -3454,6 +3637,10 @@ async function init() {
     autoRefine = true; // matches the on-by-default initial state -- reset shouldn't silently disable it
     macroStepCounter = 0;
     useB = false;
+    // U5-3: the root pool is L0 too, and reset() has to reach it. Ordered
+    // after the writeBuffer above by the queue; `useB = false` above is the
+    // phase the mirror writes (finePoolF_a).
+    seedRootFromDense();
     step = 0;
     trajectory.length = 0;
     trail.clear();
@@ -3531,10 +3718,10 @@ async function init() {
       // clearBuffer lifecycle.
       device.queue.writeBuffer(pools[1].newlyActivatedBuf, slot * 4, new Uint32Array([1]));
 
-      const interpInitBG = useB ? interpInitBG_readB : interpInitBG_readA;
+      const interpInitBG = l1InterpInitBG(useB);
       const enc = device.createCommandEncoder();
       const ipl = enc.beginComputePass();
-      ipl.setPipeline(interpInitPL);
+      ipl.setPipeline(l1InterpInitPL);
       ipl.setBindGroup(0, interpInitBG);
       ipl.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS);
       ipl.end();

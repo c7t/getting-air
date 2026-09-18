@@ -26,7 +26,7 @@ it runs on.
 | U2 | The mirror | **WAS VACUOUS, NOW FIXED** — both "independent" routes wrote `gy*W+gx`; the dense grid is 8x8 block-major, so 98.4% of the pool read the wrong cell | a THIRD route (`field-reconstruct.js`'s `rawIndex`), GPU-free in `make check` |
 | U3 | The step kernel serves the root | **DONE — BIT-IDENTICAL** on 8 rungs, 512 macro-steps; controls saturate at 98.4% | word equality + field health, `?rootstep=0` as control |
 | U4 | criterion, force, digest, conserved totals | **DONE** — all four consumers on the root. Exact on the criterion, digest max and conserved totals; the force to the truncation floor | `tools/validate-root-kernels.js`, 8 rungs + 2 controls |
-| U5 | L1 becomes a quad child of the root | **U5-0 and U5-1 DONE** — the root-parent interp is BIT-IDENTICAL on 8 rungs, 3 mutants caught, shipped fingerprints unmoved. The allocator — the part that moves numbers — remains | `tools/test-amr2d.js`; `validate-root-kernels.js`'s `interp` column |
+| U5 | L1 becomes a quad child of the root | **U5-0…U5-3 DONE** — both hops of the coupling are live under `?rootpool=1` and the whole simulation is BIT-IDENTICAL to the dense path (same fingerprint, 4096 steps). The MANAGER — the part that moves numbers — remains | `validate-root-kernels.js` (11 gated rungs, 4 controls); `measure-determinism.js` |
 | U6 | The renderer walks levels | not started; **its gate already exists and already fails** | `tools/validate-render-levels.js` |
 | U7 | Delete the dense path | not started | — |
 
@@ -1834,6 +1834,94 @@ two allocator writes were budgeted for and are not needed** -- the same shape
 as B2-2b0's `childQuadrant` and B3-5's origin buffers, found a third time. The
 bindings stay declared (WGSL has no conditional bindings, and one entry file
 serves both pipelines) but are bound to a sentinel on the root pipeline.
+
+### U5-3 — DONE (2026-09-17). The coupling goes live, and the whole simulation is BIT-IDENTICAL.
+
+U5-1 and U5-2 built both hops as inert twins. U5-3 wires them into the solver:
+under `?rootpool=1`, level 1's ghost ring is interpolated FROM the root pool
+and level 1's restriction is written TO the root pool.
+
+**THE DENSE GRID KEEPS ITS OWN STEP AND ITS OWN RESTRICTION, and that staging
+device is most of the stage.** Both L0 representations are stepped (U3) and
+both now receive the restriction, so they stay byte-identical *indefinitely*
+rather than only until the first `average`. Every remaining dense consumer --
+the renderer, the criterion, the force, the digest, `debugSnapshotSave`, the
+whole host and tool tail -- therefore needs no change at this stage and cannot
+be broken by it. They get flipped one at a time afterwards, each against a
+buffer already proven equal, and the dense writers go at U7. The cost is one
+duplicated L0 step and one duplicated restriction per macro-step, on an opt-in
+flag.
+
+Exactly one thing is REPLACED rather than duplicated: the dense-parent interp.
+Both would write the same ghost cells of the same pool, and U5-1's result is
+that they write the same words, so a race would buy nothing.
+
+`?rootcouple=0` turns the coupling off while keeping the root pool -- U5-2's
+configuration exactly, in the same build, which is what makes the coupling
+A/B-able rather than requiring two checkouts.
+
+**Gate 1: `validate-root-kernels.js`'s shipped-path rows, promoted from
+REPORTED to GATED and green.**
+
+    rung (512 macro-steps)          f differing / 589824      the control
+    levels=2 rootpool=1                    0                  580531  (rootcouple=0)
+    levels=3 rootpool=1                    0                  580570  (rootcouple=0)
+    levels=4 rootpool=1                    0                  --
+
+`vel`, `crit`, `dig` and `cons` are exact on those rows too and the force is
+exact or within 2. The control is the same page with `?rootcouple=0`: the root
+is stepped and correct but receives no restriction, and 98.4% of it goes dirty.
+That is the discrimination the REPORTED section was waiting for, and the plan's
+own note -- "the root pool receives no restriction until U4/U5" -- is now spent.
+
+**Gate 2, and it is the stronger one: `?rootpool=1` produces the SAME
+FINGERPRINT as `?rootpool=0`.**
+
+    levels=2 detslots=1    7ac54e170f903ac3    rootpool=0 AND rootpool=1
+    levels=3 detslots=1    ce1bd4d8a3a1055c    rootpool=0 AND rootpool=1
+
+Two different coupling implementations, 4096 steps of live refinement churn,
+one fingerprint covering the field AND the whole pool indirection. This is the
+second stage in a row where D0's determinism has paid for itself.
+
+#### The fingerprint caught a real bug that nothing else did
+
+The first run of gate 2 came back **DIFFERS on both level counts with
+`?detslots=1`** -- the configuration D0 proved bit-reproducible -- and the tile
+counts moved run to run (49 vs 54 at `levels=2`), so refinement itself was
+being driven by something unstable.
+
+**The root pool was never seeded.** U1 deliberately gave it no initial field:
+*"a buffer nothing reads should not be given a state that could be mistaken for
+one."* That was right for three stages and became a defect the instant level 1
+started reading it -- every page load and every `reset()` left the solver
+interpolating from an unwritten buffer.
+
+**And no existing gate could have found it**, which is the part worth keeping.
+Every root-pool checker to date calls `debugMirrorRoot()` by hand before it
+looks, so the buffer was always seeded *by the instrument* and never by the
+page. The 512-step word diff was green, the invariant sweep was green, the boot
+smoke was green, and Cd would have been within its own noise. Only a gate that
+asks "does this build reproduce itself exactly" could see it.
+
+The fix seeds from the mirror -- U2's validated dense->root map -- at init, at
+`reset()` and after `debugSnapshotLoad`. At U7 the root is the only L0 and takes
+`initF()` directly.
+
+#### And one instrument trap, measured
+
+`debugCheckRootInterp`/`debugCheckRootAverage` originally gated on
+`wrote > 0`: ring words the dense leg changed relative to the seed, as a
+liveness guard. **It inverts the moment the pass it re-runs is already LIVE in
+the macro-step.** Re-running an idempotent pass on a buffer that already holds
+its output legitimately changes nothing, so `wrote == 0` means "the page is
+doing this correctly", not "the pass did nothing" -- and it took out the new
+gate and its control in the same sweep.
+
+`staleDiff` is the guard that survives, because it changes an INPUT rather than
+looking for movement: if the root leg wrote nothing at all, its stale twin
+would match the dense leg and it would read zero. **A liveness control has to
+perturb something, not merely observe something.**
 
 ### U5 — L1 becomes a quad child of the root
 
