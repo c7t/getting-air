@@ -1643,6 +1643,33 @@ else's tree. A full sweep and a "pristine A/B" have both already run green
 against the wrong checkout and had to be discarded. Prove the tree with a token
 you added, then pin both ports.
 
+**A BINDING ADDED TO A SHARED SHADER MUST BE MIRRORED INTO FIVE BIND GROUP
+LAYOUTS, AND THIS TRAP CAUGHT U4 EVEN THOUGH CLAUDE.md DOCUMENTS IT.** U4-1
+added binding 3 to `amr_criterion_pool.wgsl` and U4-2 added binding 6 to
+`amr_force1.wgsl`; both were mirrored into `main-amr.js` and nowhere else, and
+every other AMR page stopped booting with `Binding doesn't exist in
+[BindGroupLayoutInternal "force1BGL"]`. That is 238e48c's shape with the
+direction reversed. The boot smoke found it in seconds -- which is the whole
+reason CLAUDE.md added it -- but only because it was RUN. Run it after any
+shader binding change, before believing the page you happen to be testing is
+the only one that matters:
+
+    node tools/validate-all.js --configs=index-boot,amr-dev-boot,reentry-boot,reentry-amr-boot
+
+Note that list does NOT include the cylinder, channel or TGV pages, so it is
+necessary and not sufficient; those three have their own boot configs
+(`cylinder-amr-boot-N3`, `channel-amr-boot-N3`, `tgv-amr-boot-N3`) and the
+default sweep runs them.
+
+**AND DO NOT RUN `validate-all.js` WITHOUT PINNING ITS PORTS.** It takes no
+`--help`; an unrecognised flag makes it run the FULL default sweep on
+`https://localhost:4444` and debug port 9333, which starts a second dev server
+and a second WebGPU Chrome. Killing the node process leaves both behind, and an
+orphaned Chrome holding a GPU context is the exact condition CLAUDE.md records
+as having already produced one confidently-wrong reading. Clean up by PROFILE
+DIR, never by process name -- `make chrome-clean` kills every debug Chrome
+under `/tmp/vpm-chrome-profile`, including the one you are driving.
+
 **TWO ROUTES ARE ONLY INDEPENDENT IF THEY DO NOT SHARE A PREMISE.** U2 scored
 a shader against a host function, neither consulting the other, and both wrote
 `gy*W + gx` over a dense grid that is 8x8 block-major. The check was green over
