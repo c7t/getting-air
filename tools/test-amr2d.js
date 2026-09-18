@@ -77,7 +77,7 @@ const sorted = (s) => [...s].sort();
     coalesceSource, explodeTarget, transferLedger,
     rootPoolSpec, rootCellToDense, denseCellIndex, DENSE_BLOCK, rootCellIndex,
     makePool, poolAtLevel, nbAtLevel, parentOfBlock,
-    quadrantOfBlock, quadrantOrigin, tileOriginL0, tileOriginL0Recursive,
+    quadrantOfBlock, quadrantOrigin, quadrantFitsParent, tileOriginL0, tileOriginL0Recursive,
     refineWhere, nearBodyWant, nearBodyWantCentre, refineNearBody,
     resolveSource, toGlobalFine, fromGlobalFine, storageRatio,
     check21Balance, checkRingParentCoverage, checkGeometryCoverage, cascade21,
@@ -205,6 +205,75 @@ const sorted = (s) => [...s].sort();
     assert.strictEqual(quadrantOrigin(8, 1), GHOST + 8);
     // ...and the two quadrants exactly halve the parent's 2*RB interior.
     assert.strictEqual(quadrantOrigin(8, 1) + 8, GHOST + 2 * 8);
+  });
+
+  // ── U5-0: level 1 as a quad child of the ROOT ────────────────────────────
+  //
+  // The root's tile is 2*RB cells and level 1's block grid is exactly twice
+  // the root's, so an L1 block IS a quadrant of a root tile -- the same
+  // relation level 2 already has to level 1. What differs is the PARENT's ring
+  // depth, and that is the third site of one mistake (see quadrantOrigin).
+
+  ok('a quadrant halves its parent interior at BOTH parent ring depths', () => {
+    for (const rb of [4, 8]) {
+      for (const g of [GHOST, 0]) {
+        assert.strictEqual(quadrantOrigin(rb, 0, g), g, `q0 at parentGhost=${g}`);
+        assert.strictEqual(quadrantOrigin(rb, 1, g), g + rb, `q1 at parentGhost=${g}`);
+        // the two quadrants tile the parent's interior exactly: no gap, no
+        // overlap, and the far edge lands on the interior's far edge.
+        assert.strictEqual(quadrantOrigin(rb, 0, g) + rb, quadrantOrigin(rb, 1, g), 'gap or overlap');
+        assert.strictEqual(quadrantOrigin(rb, 1, g) + rb, g + 2 * rb, 'far edge');
+        assert.ok(quadrantFitsParent(rb, 0, g) && quadrantFitsParent(rb, 1, g),
+          `a quadrant escapes its parent at parentGhost=${g}`);
+      }
+    }
+  });
+
+  ok('the ringed offset applied to a ROOT parent escapes the tile, and that is caught', () => {
+    // The mutant is the code that shipped: quadrantOrigin reading the module
+    // constant. With a root parent (ring depth 0) a quadrant-1 child would
+    // start at GHOST + RB = 10 and end at 18, in a root tile whose cells stop
+    // at 2*RB - 1 = 15. Containment is the invariant, exactly as in U4-1a --
+    // and for the same reason: the WRONG answer is still a valid-looking index.
+    const rb = 8;
+    assert.ok(quadrantFitsParent(rb, 1, GHOST), 'a ringed parent must still fit');
+    // The mutant: the ringed offset, applied to a ring-free parent.
+    const lo = quadrantOrigin(rb, 1, GHOST);     // 10 -- the shipped formula
+    const rootSide = 2 * rb;                      // 16 -- a root tile's cells
+    assert.ok(lo + rb > rootSide,
+      `the ringed offset (${lo}..${lo + rb}) fits inside a ${rootSide}-cell root tile, `
+      + 'so this test cannot tell the two conventions apart');
+    // ...and the correct one does fit.
+    assert.ok(quadrantOrigin(rb, 1, 0) + rb <= rootSide, 'the ring-free offset must fit');
+  });
+
+  ok('an L1 block is a quadrant of a ROOT block, at every block', () => {
+    // The relation U5 rests on, scored against the two block grids rather than
+    // asserted: level 1 is the root doubled, so parentOfBlock must land inside
+    // the root grid and the four children of each root block must be distinct
+    // and cover it.
+    const dims = { W: 512, H: 256 }, rb = 8;
+    const [nbx0, nby0] = blockGridAtLevel(dims, 0, rb);
+    const [nbx1, nby1] = blockGridAtLevel(dims, 1, rb);
+    assert.deepStrictEqual([nbx1, nby1], [nbx0 * 2, nby0 * 2]);
+    const seen = new Map();
+    for (let by = 0; by < nby1; by++) {
+      for (let bx = 0; bx < nbx1; bx++) {
+        const pb = parentOfBlock([bx, by]);
+        const q = quadrantOfBlock([bx, by]);
+        assert.ok(pb[0] < nbx0 && pb[1] < nby0, `L1 (${bx},${by}) parent ${pb} is off the root grid`);
+        const key = `${pb[0]},${pb[1]}`;
+        const qi = q[1] * 2 + q[0];
+        const set = seen.get(key) || new Set();
+        assert.ok(!set.has(qi), `root block ${key} got quadrant ${qi} twice`);
+        set.add(qi);
+        seen.set(key, set);
+      }
+    }
+    assert.strictEqual(seen.size, nbx0 * nby0, 'not every root block has children');
+    for (const [k, set] of seen) {
+      assert.strictEqual(set.size, 4, `root block ${k} has ${set.size} quadrants, not 4`);
+    }
   });
 
   ok('a tile\'s L0 origin agrees between the closed form and the GPU\'s parent-chain walk', () => {

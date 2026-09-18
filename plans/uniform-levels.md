@@ -26,7 +26,7 @@ it runs on.
 | U2 | The mirror | **WAS VACUOUS, NOW FIXED** — both "independent" routes wrote `gy*W+gx`; the dense grid is 8x8 block-major, so 98.4% of the pool read the wrong cell | a THIRD route (`field-reconstruct.js`'s `rawIndex`), GPU-free in `make check` |
 | U3 | The step kernel serves the root | **DONE — BIT-IDENTICAL** on 8 rungs, 512 macro-steps; controls saturate at 98.4% | word equality + field health, `?rootstep=0` as control |
 | U4 | criterion, force, digest, conserved totals | **DONE** — all four consumers on the root. Exact on the criterion, digest max and conserved totals; the force to the truncation floor | `tools/validate-root-kernels.js`, 8 rungs + 2 controls |
-| U5 | L1 becomes a quad child of the root | not started | — |
+| U5 | L1 becomes a quad child of the root | **U5-0 DONE** — the host rule, and the quadrant offset was a THIRD constant-GHOST site. The allocator and the accessors remain | `tools/test-amr2d.js`, containment + 1 mutant |
 | U6 | The renderer walks levels | not started; **its gate already exists and already fails** | `tools/validate-render-levels.js` |
 | U7 | Delete the dense path | not started | — |
 
@@ -37,14 +37,25 @@ and it is failing — which is the staging working as designed: the defect is
 sitting in a flag-gated, inert code path with an instrument pointed at it,
 rather than in the shipped solver.
 
-**One correction to this plan's own reasoning, worth reading before U4.** The
-table used to say U3–U4 are scored by "bit-identity", justified by "the
-arithmetic per cell is unchanged; only the address space moves". That holds for
-ONE kernel on a different buffer and NOT for `amr_step.wgsl` against
-`amr_step1.wgsl`, which are separately written and owe each other no f32
-association. Bit-identity is the right bar at U7, where the comparison becomes
-one kernel against itself across builds. Until then the bar is agreement after
-a SINGLE macro-step, scored by magnitude — see U3.
+**This plan corrected itself here, and then the correction was itself wrong.**
+The table originally said U3–U4 are scored by bit-identity, justified by "the
+arithmetic per cell is unchanged; only the address space moves". That was
+retracted on the argument that `amr_step.wgsl` and `amr_step1.wgsl` are
+separately written and owe each other no f32 association, and the bar was
+lowered to agreement after one macro-step scored by magnitude.
+
+**MEASURED, the original bar was right for the step and the retraction was
+right for the force.** U3 is bit-identical on eight rungs at 512 macro-steps;
+U4's force is not, on the same protocol. The rule that survives both is
+narrower than either:
+
+> Exactness survives a change of ADDRESS SPACE. It does not survive a change of
+> ARITHMETIC or of REDUCTION ORDER.
+
+Which of those a consumer suffers is decidable by reading it, BEFORE the
+measurement — see U4-3/U4-4's table, where four consumers split three ways.
+Bit-identity is still the right bar at U7, where the comparison becomes one
+kernel against itself across builds.
 
 And one prerequisite that is **not** part of this plan's thesis but should
 probably come before all of it — see 1.1:
@@ -1583,6 +1594,38 @@ Check the 16-storage-buffer ceiling before designing each of these, not after.
 `amr_manage_pool.wgsl` sits at 10 since B3-5, so there is slack, but the
 failure mode is a `CreateBindGroupLayout` error at init — a page that does not
 boot.
+
+### U5-0 — DONE (2026-09-17). The quadrant offset was a THIRD site of one mistake.
+
+The host rule U5 rests on, stated and mutation-checked before anything moves.
+
+`quadrantOrigin(rb, q)` returned `GHOST + q*RB` -- where `GHOST` is the
+**parent's** ring depth, read from the module constant. Every pool parent has
+one, so it was right everywhere it had ever been used. Under U5 the parent is
+the ROOT, which has none, and a quadrant-1 child would be placed at 10..18
+inside a root tile whose cells stop at 15.
+
+**THAT IS THE THIRD SITE OF THE SAME MISTAKE**, and naming the pattern is worth
+more than the fix:
+
+```
+  U4-1a  resolveSource                 read the module constant, not the pool's
+  U4-1   amr_criterion_pool.wgsl       assumed a ring in its STENCIL
+  U4-2   amr_force1.wgsl               assumed a ring in its GATHER
+  U5-0   quadrantOrigin                assumed a ring in the PARENT's frame
+```
+
+**A ring depth written as a constant is an assertion that every level has a
+ring, and it is wrong exactly once -- at the root.** Anything that will serve
+level 0 should be audited for a literal `GHOST` before it is pointed there,
+rather than after.
+
+Gated the same way U4-1a was, and for the same reason: the wrong answer is a
+VALID-LOOKING INDEX, not a crash. `quadrantFitsParent` makes containment the
+invariant, and the mutation -- the shipped constant-GHOST formula -- is caught
+by two checks. Also gated: an L1 block is a quadrant of a root block at every
+block, scored against the two block grids (each root block gets exactly four
+distinct children, and every root block gets some), not asserted.
 
 ### U5 — L1 becomes a quad child of the root
 

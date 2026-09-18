@@ -256,9 +256,31 @@ export function quadrantOfBlock(b) { return [b[0] & 1, b[1] & 1]; }
 
 // Where a child's interior starts inside its PARENT's tile-local frame. The
 // parent's 2*RB interior cells are halved by the quadrant, so the offset is
-// GHOST + q*RB on each axis -- it falls out of the quadrant bits alone, with
-// no spatial coordinate involved.
-export function quadrantOrigin(rb, q) { return GHOST + q * rb; }
+// `parentGhost + q*RB` on each axis -- it falls out of the quadrant bits
+// alone, with no spatial coordinate involved.
+//
+// `parentGhost` IS A PARAMETER FOR U5, and it is the PARENT's ring depth, not
+// the child's. Every pool parent today has GHOST=2, so the default is
+// byte-identical; the ROOT has none (ghostDepthAtLevel(0) is 0), and once
+// level 1 becomes a quad child of the root its interior starts at `q*RB`
+// inside a root tile that is exactly 2*RB wide.
+//
+// This is the THIRD site of one mistake -- resolveSource read the module
+// constant (U4-1a), amr_criterion_pool/amr_force1 assumed a ring in their
+// stencils (U4-1, U4-2), and this assumed one in the parent's frame. The
+// pattern worth naming: a ring depth written as a CONSTANT is an assertion
+// that every level has a ring, and it is wrong exactly once -- at the root.
+export function quadrantOrigin(rb, q, parentGhost = GHOST) { return parentGhost + q * rb; }
+
+// Does `child`'s interior lie entirely inside its parent's tile, given the
+// parent's ring depth? The containment U5 needs and the check that catches the
+// constant-GHOST mistake: a root-parented child placed with parentGhost=2
+// starts at 10 and ends at 18 in a tile whose cells stop at 15.
+export function quadrantFitsParent(rb, q, parentGhost = GHOST) {
+  const lo = quadrantOrigin(rb, q, parentGhost);
+  const parentSide = 2 * rb + 2 * parentGhost;
+  return lo >= parentGhost && lo + rb <= parentGhost + 2 * rb && lo + rb <= parentSide;
+}
 
 // A SLOT'S QUADRANT IS A FUNCTION OF THE SLOT INDEX, not stored data.
 //
