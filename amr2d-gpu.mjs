@@ -1223,13 +1223,22 @@ export function makeRootPool(device, U, layouts, modules, pools, {
   // 580623/589824 words differing from the dense grid at 512 macro-steps --
   // indistinguishable from not stepping the root at all -- while every other
   // rung was bit-identical. See plans/uniform-levels.md U3.
+  //
+  // AND IT IS REBUILDABLE, because one page's step constants are not fixed for
+  // the session: main-channel-amr.js bakes Re into FORCE_X/WALL_U1 and
+  // recreates its step pipelines on every `setRe`. A root left on the pipeline
+  // built at init would then be driving a different flow from the dense grid
+  // it is supposed to be a second copy of -- silently, since both still step.
+  // `rebuildStep` is how that page keeps them one scenario; the bind groups do
+  // not depend on the constants, so only the pipeline is rebuilt.
   let rootStepPL = null, rootStepBG_ab = null, rootStepBG_ba = null, rootStepWG = 0;
+  const buildRootStepPL = (c) => device.createComputePipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [layouts.step1BGL] }),
+    compute: { module: modules.step1SM, entryPoint: 'main',
+               constants: { ...c, DIRECT_GHOST: 1, GHOST: 0, NO_PARENT: 1, SPONGE_CELL_SNAP: 1 } },
+  });
   if (flags.stepped) {
-    rootStepPL = device.createComputePipeline({
-      layout: device.createPipelineLayout({ bindGroupLayouts: [layouts.step1BGL] }),
-      compute: { module: modules.step1SM, entryPoint: 'main',
-                 constants: { ...step1Constants, DIRECT_GHOST: 1, GHOST: 0, NO_PARENT: 1, SPONGE_CELL_SNAP: 1 } },
-    });
+    rootStepPL = buildRootStepPL(step1Constants);
     const rootBG = (fin, fout) => device.createBindGroup({ layout: layouts.step1BGL, entries: [
       { binding: 0, resource: { buffer: cardStateBuf } },
       { binding: 1, resource: { buffer: fin } },
@@ -1343,6 +1352,11 @@ export function makeRootPool(device, U, layouts, modules, pools, {
 
   return {
     spec, seedRootFromDense, denseCritBuf, unread,
+    // See buildRootStepPL: for a page whose step constants move with a live
+    // parameter, this is how the root stays the same scenario as the dense L0.
+    rebuildStep: (nextStep1Constants) => {
+      if (rootStepPL) rootStepPL = buildRootStepPL(nextStep1Constants);
+    },
     mirrorRootPL, mirrorRootBG, rootAvgPL,
     rootStepPL, rootStepBG_ab, rootStepBG_ba, rootStepWG,
     rootInterpLivePL, rootInterpInitPL, rootInterpFFPL, rootInterpNoopPL,

@@ -2594,6 +2594,21 @@ async function init() {
     if (snapshot.layout !== 'block8') {
       throw new Error(`snapshot layout is '${snapshot.layout}', this build expects 'block8'`);
     }
+    // REFUSED RATHER THAN DEGRADED (found porting this path at U7-4b; it was
+    // latent here before, under a flag no load-side gate exercises). Under
+    // quad allocation level 1 carries a parentSlot/quadrant pair and a
+    // QUAD-indexed free list, and the format records neither -- it only ever
+    // saved those from level 2 up. Restoring would rebuild a block-indexed
+    // free list over a quad pool, where slot `q` and quad `q` are different
+    // things, and corrupt the pool with no thrown error. SAVE is deliberately
+    // not refused: tools/measure-determinism.js fingerprints through it under
+    // `--extra=rootpool=1`, and a hash of a consistent subset is still a
+    // hash. Porting the format is U7-6's.
+    if (ROOT_MANAGED) {
+      throw new Error('debugSnapshotLoad: the snapshot format does not carry the root pool '
+        + "or level 1's quad indirection yet (plans/uniform-levels.md U7-6) -- "
+        + 'reload with ?rootmanage=0, or with ?rootpool=0');
+    }
     // Milestone 10: formatVersion 4's singular `pool` key (level 1 only)
     // is REJECTED explicitly, not silently reinterpreted as pools[1] --
     // same "fail loud on layout mismatch" convention as the `layout`

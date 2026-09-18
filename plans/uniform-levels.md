@@ -28,7 +28,7 @@ it runs on.
 | U4 | criterion, force, digest, conserved totals | **DONE** — all four consumers on the root. Exact on the criterion, digest max and conserved totals; the force to the truncation floor | `tools/validate-root-kernels.js`, 8 rungs + 2 controls |
 | U5 | L1 becomes a quad child of the root | **U5-0…U5-4 DONE under `?rootpool=1`** — both hops of the coupling and the manager. Level 1 is quad-allocated and quad-managed; tiles +28-32%; new fingerprints, default unmoved. `amr_manage.wgsl` cannot retire until the other four AMR pages get a root pool, and Cd/St is unmeasurable until then | `validate-root-kernels.js` (11 rungs, 4 controls); `validate-all.js` invariants ± starved pool; `measure-determinism.js` |
 | U6 | The renderer walks levels | **DONE** — and it found that three of the five pages never drew level 2 either. Level 1 bit-identical to before; gate green on two pages and in the default sweep | `tools/validate-render-levels.js`, `tools/lib/render-levels.js` |
-| U7 | One implementation across the five pages, then delete the dense path | **U7-0…U7-3 DONE** (layouts, coupling pipelines, per-level bind groups, and both orderings shared — net −1559 lines, every gate unmoved); U7-4…U7-6 remain. **Split into U7-0…U7-6** — U1–U5 all landed on `main-amr.js` alone, so the remaining work is propagation before deletion. Measured: all 14 bind group layouts are byte-identical across five pages, and `S_Advance` is byte-identical across the other four | each rung byte-identical on the default path (`measure-determinism.js`), except U7-5 which is the one that moves numbers |
+| U7 | One implementation across the five pages, then delete the dense path | **U7-0…U7-4 DONE** (layouts, coupling pipelines, per-level bind groups, both orderings, and now the root pool itself shared — net −1559 lines through U7-3, every gate unmoved; U7-4 puts a root pool on all five pages behind `?rootpool=1` and MEASURES U5-4's Cd/St, which U5 could not); U7-5…U7-6 remain, and U7-6's snapshot half must go FIRST — see U7-4b. **Split into U7-0…U7-6** — U1–U5 all landed on `main-amr.js` alone, so the remaining work is propagation before deletion. Measured: all 14 bind group layouts are byte-identical across five pages, and `S_Advance` is byte-identical across the other four | each rung byte-identical on the default path (`measure-determinism.js`), except U7-5 which is the one that moves numbers |
 
 **Where the risk actually sits.** U0–U2 went in clean and each found something
 (a half-cell convention, an f16 stride, a window-convention split between L0 and
@@ -84,7 +84,9 @@ at the end.
     U1..U5  uniform levels, on index-amr.html
     U7-0..3   share the layouts, pipelines, bind groups and scheduler
     U6        the renderer walks levels -- ride it on U7-2
-    U7-4..6   the root pool everywhere, flip the default, delete the dense path
+    U7-4      the root pool everywhere (4a: share the solver half; 4b: call it)
+    U7-6a     the snapshot format -- a PREREQUISITE for the flip, not a follower
+    U7-5..6   flip the default, delete the dense path
     --   the sponge seam INVARIANT (gate only)
     B6   explode/coalesce
     --   sponge refinement policy, then section 8's ladders
@@ -2546,20 +2548,162 @@ The COMPARATORS stay on `index-amr.html` -- they are the dev page's instrument
 and five copies of them would be five copies of a checker, which is how this
 project collected its vacuous gates in the first place.
 
-Two things this rung finally makes possible, both of which U5 had to leave
-open:
+One thing this rung was expected to make possible stays open and MOVES:
+**`POOL_PEAKS` re-measured at quad granularity**, 40k steps, both pages, all
+level counts. U5-4 measured +28-32% tiles at 4096 steps and left the peak table
+outstanding; `?rootpool=1` is still opt-in on every page after U7-4, so that
+demand is not yet anybody's shipped demand. It belongs with **U7-5**, which is
+the rung that makes it one. The refusal watch reports a wrong guess either way,
+and nothing refused over the 8192-step invariant sweep at the current defaults.
 
-- **`validate-root-kernels.js` gains `--page=` and runs against the cylinder
-  page.** That is the first time U5's coupling is scored on a harness with
-  literature values attached.
-- **`POOL_PEAKS` re-measured at quad granularity**, 40k steps, both pages, all
-  level counts. U5-4 measured +28-32% tiles at 4096 steps and explicitly left
-  the peak table outstanding; the refusal watch (restored to the pool manager
-  in U5-4) is the instrument that reports a wrong guess.
+#### U7-4a — DONE (2026-09-18). The root pool's solver half is one function.
 
-*Gate:* `validate-root-kernels.js` green on `index-amr.html` AND
-`index-cylinder-amr.html`; the invariant sweep plus its starved-pool control on
-both; no refusal at the new defaults over 40k steps.
+`makeRootPool(device, U, layouts, modules, pools, {...})` in `amr2d-gpu.mjs`,
+with `allocRootPool` and `readRootFlags` beside it. **-6 lines net, which is
+not the point: U7-4b is.**
+
+The 372-line construction block split as the estimate said, and the two halves
+landed where the estimate said:
+
+```
+  SOLVER      the mirror (which is also the SEEDER since 1.2), U3's root step,
+              U4-1's criterion REDIRECT, U5-3's live coupling, and the two
+              pass bodies the scheduler needs          -> amr2d-gpu.mjs
+  INSTRUMENT  the root force pass, the full digest, U5-1/U5-2's inert scratch
+              legs, and ~280 lines of debugCheckRoot*  -> stays on index-amr
+```
+
+**THE INTERLEAVING WAS THE WORK, exactly as scoped.** The two halves shared
+locals -- the `unread` sentinel and `rootAvgPL`, both declared inside an inert
+block and both read by the live path. Both are RETURNED rather than rebuilt, so
+the instrument leg that scores the live restriction runs the live pipeline and
+not a second copy of it that could drift from its subject.
+
+**THE INERT CRITERION TWIN STAYED BEHIND, and that corrects this stage's own
+itemisation**, which listed "the criterion" as solver. Under `managed` the live
+level-1 criterion is `criterionPoolPLs[0]` -- built by each page's existing
+per-parent-level loop once its bound starts at 0 -- so U4-1's `rootCritPL` is
+never the live writer in any configuration; it is an instrument in both. What
+the SOLVER needs from that stage is the REDIRECT: the shared refine round still
+encodes `amr_criterion.wgsl`, and under quad management it must not land on
+level 1's real criterion buffer. `denseCritBuf` is that target, and it is the
+only piece of U4-1 in the shared half.
+
+**`readRootFlags` takes `{ staging }`, and that is where "the other four pages
+should probably never get `?rootcouple`" landed.** The dev page reads the full
+set; the four shipped pages call `readRootFlags(urlParams, { staging: false })`
+and get `?rootpool=` only, with the other three pinned on. One reader, one copy
+of the sixty-five lines of design record, and U7-5 has one place to collapse.
+
+*Gate, all four green:*
+- `make check`; boot smoke on all seven configs plus both render configs.
+- `measure-determinism.js` unmoved on the DEFAULT path (`7ac54e170f903ac3` /
+  `ce1bd4d8a3a1055c`) **and** under `--extra=rootpool=1`, which is what covers
+  the live coupling: `f71bce9d33945265` / `71560c03a3d34c21`, U5-4's own
+  figures to the digit. Its `levels=2 detslots=0` row still comes back
+  IDENTICAL under rootpool=1 and still exits nonzero for it, as U5-4 recorded
+  and deliberately did not relax; `levels=3 detslots=0` still DIFFERS.
+- `validate-root-kernels.js` green on all eleven rungs and all four controls.
+
+#### U7-4b — DONE (2026-09-18). The four pages call it.
+
+**The `~20 new lines and 7 single-token edits` estimate held.** Measured across
+the four pages the shape is what the itemisation predicted: the three pages
+with a body grow ~20 lines each, the two bodyless ones ~12 (they have no
+`debugActivateBlock` refusal and no snapshot seed, but they do have their own
+reset and the coupling selection, so "~4" was low). More than half of every
+page's diff is still LOOP BOUNDS, as predicted -- and U7-2's decision not to
+share the allocation and levelParams loops still looks right, because a bound
+is one token and a shared loop with three per-page policies is not.
+
+One thing the itemisation did not have:
+
+**`makeRootPool` gained `rebuildStep`, because one page's step constants are
+not fixed for the session.** `main-channel-amr.js` bakes Re into
+`FORCE_X`/`WALL_U1` and recreates its step pipelines on every `setRe`. A root
+left on the pipeline built at init would be driving a different flow from the
+dense grid it is supposed to be a second copy of -- silently, since both still
+step and neither goes NaN. The bind groups do not depend on the constants, so
+only the pipeline is rebuilt. This is the same class as U3's inherited
+`DIRECT_GHOST`: a constant the root must not be allowed to fall behind on.
+
+*Gate.* Default path first, because this rung must not move it:
+- `make check`; boot smoke on all seven configs plus both render configs.
+- The four analytic AMR configs PASS.
+- `amr-N2-diffuse` **Cd 1.630 / St 0.1466** and `amr-N3-diffuse` **Cd 1.463 /
+  St 0.1565** -- unmoved from U7-3's readings (N2's 1.630 against 1.631 is
+  inside that config's own ±0.001 floor; N3 is exact).
+- `render-levels-cylinder` came back **bit-identical** to its pre-edit
+  screenshot hash (`66b3e770d32be4c7`, 11884 B). An intermediate run of the
+  same build gave `d978e035217d9400` instead, which is that page's known
+  several-attractor behaviour and not a change -- the IDENTICAL is the
+  conclusive reading, since no race can forge a bit-exact match.
+
+Then the leg this rung exists to make possible, `--extra=rootpool=1`:
+- Boot smoke green on all seven configs, **including the four pages that had
+  never had a root pool before**.
+- All four analytic AMR configs PASS, and both cylinder configs' seven
+  invariants green at every checkpoint through 8192 steps.
+
+**AND THE Cd/St CONSEQUENCE OF U5-4 IS MEASURED, which U5 said it could not
+be.** First reading on a harness with literature values attached:
+
+```
+                      rootpool=0            rootpool=1 (quad-managed L1)
+  amr-N2-diffuse   Cd 1.630  St 0.1466    Cd 1.607  St 0.1446
+  amr-N3-diffuse   Cd 1.463  St 0.1565    Cd 1.473  St 0.1571
+```
+
+Both moves are far outside their configs' reproducibility floors (±0.001 at
+N=2, ±0.002 at N=3), so they are real and not slot regrouping. N=3 still passes
+both bands either way; N=2 stays the known-red cell, and the root pool does not
+rescue it -- which is the expected answer, since that cell is the
+diffuse-band-width issue and U5-4 changes refinement granularity, not the band.
+**These are single readings.** U7-5's gate is where they get same-build repeats
+on both sides, which is the protocol CLAUDE.md requires before a build-vs-build
+claim on an AMR config.
+
+#### `validate-root-kernels.js --page=` is the wrong instrument, and withdrawn
+
+This stage promised that the tool "gains `--page=` and runs against the cylinder
+page", so that U5's coupling is finally scored on a harness with literature
+values. Those two things pull opposite ways, and the same stage says why: every
+row in that tool is a differential against a dense counterpart, and the
+comparators that compute it (`compareRootToDense` and the `debugCheckRoot*`
+family, ~280 lines) are deliberately ONE COPY on the dev page. `--page=` would
+mean porting a checker to a second page, which is precisely the move this
+project has three vacuous gates from.
+
+And it would buy nothing: after U7-4a the root's kernels on the cylinder page
+are the SAME PIPELINE OBJECTS, from the same shared function, as the ones the
+dev page already scores bit-for-bit. What the literature harness adds is not a
+word diff, it is Cd and St -- which is `validate-all.js --extra=rootpool=1`,
+run above. **That is the substitute, and the `--page=` item is withdrawn.**
+
+#### AND U7-6's SNAPSHOT WORK IS A PREREQUISITE FOR U7-5, NOT A FOLLOWER
+
+Found while porting `debugSnapshotLoad` (2026-09-18). The snapshot format only
+ever saved `parentSlot`/`quadrant` from level 2 up, and rebuilds level 1's free
+list at BLOCK granularity from `slotToBlock`. Under quad allocation level 1's
+free list holds QUAD indices -- slot `q` and quad `q` are different things --
+so a load writes a block-indexed list over a quad pool and the next refine
+hands out overlapping quads. No thrown error, no NaN: a corrupted allocator.
+
+This was latent on `main-amr.js` before this rung too, under `?rootpool=1`,
+because no load-side gate has ever run with that flag set. It is now REFUSED
+loudly on all three pages that have snapshots rather than degraded, with the
+message naming U7-6. SAVE is deliberately not refused:
+`tools/measure-determinism.js` fingerprints through it under
+`--extra=rootpool=1`, and a hash of a consistent subset is still a hash.
+
+**The refusal immediately turned `render-levels-card` red under
+`?rootpool=1`**, because `tools/lib/render-levels.js` restores its baseline
+through `debugSnapshotLoad`. That is the sequencing finding: at U7-5 the flag
+becomes the default, and on that day the render-levels gate, `amr-diff.js`,
+`validate-divergence.js` and every snapshot round-trip go with it. So the
+snapshot half of U7-6's host-and-tool tail moves BEFORE U7-5. The two render
+configs are consequently scoped out of this rung's `?rootpool=1` leg, and say
+so rather than being quietly dropped.
 
 #### U7-5 — flip the default
 
