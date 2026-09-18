@@ -1630,6 +1630,113 @@ const sorted = (s) => [...s].sort();
   });
 
 
+  // ── U4-1: the resolution rule at a RING-FREE level ───────────────────────
+  //
+  // The root has no ring, so any kernel whose stencil leaves a tile must
+  // resolve against the OWNING tile rather than read a ghost cell. That is
+  // resolveSource, which until U4-1 read the module constant GHOST and so was
+  // silently a level-1-and-below rule. These score it at ghost 0 the same way
+  // the depth-2 tests score it: against the global-fine route, which shares no
+  // arithmetic with it.
+
+  ok('resolveSource agrees with the global route at ring depth 0 too', () => {
+    for (const rb of [4, 8]) {
+      const pool = makePool({ dims: [32, 32], rb, ghost: 0 });
+      assert.strictEqual(pool.FB, 2 * rb, 'a ring-free tile IS its own interior');
+      const blockSlot = new Int32Array(pool.nBlocks).map((_, i) => i);
+      const slotToBlockId = new Int32Array(pool.nBlocks).map((_, i) => i);
+      for (const b of [[0, 0], [1, 2], [pool.nb[0] - 1, pool.nb[1] - 1]]) {
+        for (let sy = -1; sy <= pool.FB; sy++) {
+          for (let sx = -1; sx <= pool.FB; sx++) {
+            const r = resolveSource(pool, blockSlot, b, [sx, sy]);
+            assert.ok(r !== null, `ghost 0 rb=${rb} b=${b} src=${sx},${sy}: no owner`);
+            const owner = r.own ? b : pool.blockOf(slotToBlockId[r.slot]);
+            const viaResolve = toGlobalFine(pool, owner, [r.fx, r.fy]);
+            const direct = fromGlobalFine(pool, toGlobalFine(pool, b, [sx, sy]));
+            assert.deepStrictEqual(viaResolve, toGlobalFine(pool, direct.block, direct.local),
+              `ghost 0 rb=${rb} b=${b} src=${sx},${sy}`);
+            assert.deepStrictEqual(owner, direct.block, 'wrong owning tile at ghost 0');
+            assert.ok(r.fx >= 0 && r.fx < pool.FB && r.fy >= 0 && r.fy < pool.FB,
+              `resolved cell ${r.fx},${r.fy} is outside a ${pool.FB}-wide ring-free tile`);
+          }
+        }
+      }
+    }
+  });
+
+  ok('a ring-free level NEVER falls back -- the root is always full', () => {
+    // The property that lets a ring-free level carry a stencil at all. At
+    // depth 2 resolveSource returns null at a coarse/fine interface and the
+    // ring covers it; the root has no ring AND no interface, and the second
+    // fact is what makes the first survivable.
+    const pool = makePool({ dims: [32, 32], rb: 8, ghost: 0 });
+    const full = new Int32Array(pool.nBlocks).map((_, i) => i);
+    let resolved = 0;
+    for (let b = 0; b < pool.nBlocks; b++) {
+      const xy = pool.blockOf(b);
+      for (const [sx, sy] of [[-1, -1], [-1, 0], [0, -1], [pool.FB, pool.FB], [pool.FB, 0], [0, pool.FB]]) {
+        assert.ok(resolveSource(pool, full, xy, [sx, sy]) !== null,
+          `block ${b} src=${sx},${sy} found no owner on a FULL ring-free pool`);
+        resolved++;
+      }
+    }
+    assert.ok(resolved > 0);
+    // And it DOES fall back when the pool is not full -- otherwise the check
+    // above is satisfied by a function that never returns null at all.
+    const holey = Int32Array.from(full); holey[pool.blockId(1, 1)] = -1;
+    assert.strictEqual(resolveSource(pool, holey, [2, 1], [-1, 4]), null,
+      'a missing neighbour must still resolve to null at ghost 0');
+  });
+
+  ok('the ring-free pool model and rootPoolSpec describe the SAME grid', () => {
+    // U0's spec and the pool model are two statements of the root's geometry,
+    // written for different consumers (allocation vs. addressing). If they
+    // disagree, one of them is describing a grid that does not exist.
+    for (const [W, H] of [[256, 256], [512, 256]]) {
+      const rb = 8;
+      const spec = rootPoolSpec({ dims: { W, H }, rb });
+      const pool = makePool({ dims: [W / 2, H / 2], rb, ghost: 0 });
+      assert.deepStrictEqual(pool.nb, [spec.nbx, spec.nby], `root block grid at ${W}x${H}`);
+      assert.strictEqual(pool.FB, spec.side, 'root tile side');
+      assert.strictEqual(pool.tileCells, spec.cellsPerSlot, 'root slot size');
+      assert.strictEqual(pool.nBlocks, spec.slots, 'root slot count');
+    }
+  });
+
+  ok('the depth-2 rule applied at the root resolves OUTSIDE the tile, and that is caught', () => {
+    // The mutant is the code that shipped: resolveSource reading the module
+    // constant instead of the pool's own depth.
+    //
+    // THE GLOBAL-COORDINATE ROUTE CANNOT SEE IT, and that is worth recording
+    // rather than quietly picking a different check. At ghost 0 the mutant
+    // treats x < 2 as ring, sends it to the tile on the left and adds RB2 --
+    // and toGlobalFine subtracts the pool's own ghost (0), so the block shift
+    // and the coordinate shift cancel EXACTLY. Both routes name the same
+    // global cell. The two agree and the mutant is still wrong.
+    //
+    // What is actually wrong is the LOCAL coordinate: it comes back as 2*rb on
+    // a tile whose valid indices stop at 2*rb - 1, so the kernel would read
+    // off the end of the slot -- into the next tile's first row, which is a
+    // real cell holding the wrong data rather than an out-of-range crash. So
+    // the invariant to assert is containment, not agreement.
+    const rb = 8, G = 2;
+    const pool = makePool({ dims: [32, 32], rb, ghost: 0 });
+    const blockSlot = new Int32Array(pool.nBlocks).map((_, i) => i);
+    const RB2 = 2 * rb;
+    const mutantLocal = (v) => (v < G ? v + RB2 : (v >= G + RB2 ? v - RB2 : v));
+
+    let escapes = 0;
+    for (let sx = 0; sx < pool.FB; sx++) {
+      const r = resolveSource(pool, blockSlot, [2, 2], [sx, 4]);
+      assert.ok(r.fx >= 0 && r.fx < pool.FB && r.fy >= 0 && r.fy < pool.FB,
+        `resolveSource put src=${sx},4 at ${r.fx},${r.fy}, outside a ${pool.FB}-wide tile`);
+      const m = mutantLocal(sx);
+      if (m < 0 || m >= pool.FB) escapes++;
+    }
+    assert.strictEqual(escapes, G,
+      `the hardcoded-GHOST mutant escapes the tile at ${escapes} of ${pool.FB} columns -- expected ${G}`);
+  });
+
   // ── U1: the root pool's shape ────────────────────────────────────────────
 
   ok('a tiled root costs EXACTLY the dense grid it replaces, no padding', () => {

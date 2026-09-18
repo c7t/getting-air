@@ -192,16 +192,20 @@ export function tauSingularityMessage({ level, tau, tau0, band }) {
 
 // --- the pool, and why one pool description serves every level -------------
 
-export function makePool({ dims, rb = RB_DEFAULT, maxSlots }) {
+// `ghost` is the tile's ring depth, and it is a PARAMETER because the ROOT has
+// none (U0's ghostDepthAtLevel). The root is exactly this function at ghost 0
+// on a half-scaled domain: NBX = W/(2*rb) and a tile whose FB IS its own 2*rb
+// interior. Default GHOST keeps every existing caller byte-identical.
+export function makePool({ dims, rb = RB_DEFAULT, maxSlots, ghost = GHOST }) {
   const [NX, NY] = dims;
   for (const [n, name] of [[NX, 'NX'], [NY, 'NY']]) {
     if (!Number.isInteger(n) || n <= 0) throw new Error(`${name}=${n} is not a positive integer`);
     if (n % rb !== 0) throw new Error(`${name}=${n} is not a multiple of RB=${rb}`);
   }
   const NBX = NX / rb, NBY = NY / rb;
-  const FB = 2 * rb + 2 * GHOST;
+  const FB = 2 * rb + 2 * ghost;
   return {
-    dims: [NX, NY], rb, GHOST, FB,
+    dims: [NX, NY], rb, GHOST: ghost, FB,
     nb: [NBX, NBY],
     nBlocks: NBX * NBY,
     tileCells: FB * FB,
@@ -210,7 +214,7 @@ export function makePool({ dims, rb = RB_DEFAULT, maxSlots }) {
     blockOf: (id) => [id % NBX, Math.floor(id / NBX)],
     // Tile-local fine cell -> index within the pool's f array.
     cellIndex: (slot, fx, fy) => slot * FB * FB + fy * FB + fx,
-    isInterior: (j) => j >= GHOST && j < GHOST + 2 * rb,
+    isInterior: (j) => j >= ghost && j < ghost + 2 * rb,
   };
 }
 
@@ -234,6 +238,7 @@ export function poolAtLevel(pool, m, { maxSlots } = {}) {
     dims: [pool.dims[0] * s, pool.dims[1] * s],
     rb: pool.rb,
     maxSlots: maxSlots ?? pool.maxSlots,
+    ghost: pool.GHOST,
   });
 }
 
@@ -596,15 +601,22 @@ export function refineNearBody(pool, sdf, margin) {
 // Returns { slot, own, fx, fy } in the owning tile's local frame -- `own`
 // when the source never left this tile -- or null when no tile owns it,
 // which is a coarse/fine interface and the ring's one remaining job.
+//
+// IT READS THE POOL'S OWN RING DEPTH, not the module constant, because the
+// ROOT has no ring (U0's ghostDepthAtLevel) and U4 needs this rule there. At
+// the root the `null` return is unreachable by construction -- the root is
+// always full, so every source has an owner -- which is what lets a ring-free
+// level use a stencil that would otherwise need one.
 export function resolveSource(pool, blockSlot, blockXY, src) {
   const { rb, nb } = pool;
   const RB2 = 2 * rb;
+  const g = pool.GHOST;   // the POOL's ring depth -- 0 at the root (U4-1)
   const out = [0, 0];
   const nbr = [0, 0];
   for (let a = 0; a < 2; a++) {
     const s = src[a];
-    if (s < GHOST) { nbr[a] = -1; out[a] = s + RB2; }
-    else if (s >= GHOST + RB2) { nbr[a] = 1; out[a] = s - RB2; }
+    if (s < g) { nbr[a] = -1; out[a] = s + RB2; }
+    else if (s >= g + RB2) { nbr[a] = 1; out[a] = s - RB2; }
     else { nbr[a] = 0; out[a] = s; }
   }
   if (nbr[0] === 0 && nbr[1] === 0) {
@@ -623,7 +635,7 @@ export function resolveSource(pool, blockSlot, blockXY, src) {
 // cannot drift into agreement.
 export function toGlobalFine(pool, blockXY, local) {
   const RB2 = 2 * pool.rb;
-  return [0, 1].map(a => blockXY[a] * RB2 + (local[a] - GHOST));
+  return [0, 1].map(a => blockXY[a] * RB2 + (local[a] - pool.GHOST));
 }
 
 export function fromGlobalFine(pool, g) {
@@ -631,7 +643,7 @@ export function fromGlobalFine(pool, g) {
   const nFine = [0, 1].map(a => pool.dims[a] * 2);
   const w = [0, 1].map(a => ((g[a] % nFine[a]) + nFine[a]) % nFine[a]);
   const b = [0, 1].map(a => Math.floor(w[a] / RB2));
-  const l = [0, 1].map(a => w[a] - b[a] * RB2 + GHOST);
+  const l = [0, 1].map(a => w[a] - b[a] * RB2 + pool.GHOST);
   return { block: b, local: l };
 }
 
