@@ -25,7 +25,7 @@ it runs on.
 | U1 | The root pool exists, unused | **DONE** — identity proved on live buffers, page provably inert | `checkRootPoolIdentity`; hashes unmoved |
 | U2 | The mirror | **WAS VACUOUS, NOW FIXED** — both "independent" routes wrote `gy*W+gx`; the dense grid is 8x8 block-major, so 98.4% of the pool read the wrong cell | a THIRD route (`field-reconstruct.js`'s `rawIndex`), GPU-free in `make check` |
 | U3 | The step kernel serves the root | **DONE — BIT-IDENTICAL** on 8 rungs, 512 macro-steps; controls saturate at 98.4% | word equality + field health, `?rootstep=0` as control |
-| U4 | criterion, force, digest, conserved totals | **U4-0 DONE** — the root's `vel` is the dense `vel` on 8 rungs; the consumers are next | `debugCheckRootVel`, in `tools/validate-root-step.js` |
+| U4 | criterion, force, digest, conserved totals | **U4-0/U4-1 DONE** — `vel` and the CRITERION are both bit-identical on the root; force, digest and conserved totals remain | `tools/validate-root-kernels.js`, 2 GPU mutants |
 | U5 | L1 becomes a quad child of the root | not started | — |
 | U6 | The renderer walks levels | not started; **its gate already exists and already fails** | `tools/validate-render-levels.js` |
 | U7 | Delete the dense path | not started | — |
@@ -1399,6 +1399,62 @@ One comparator now serves both questions (`compareRootToDense`), differing only
 in the component count and in whether components are PLANE-MAJOR (`f`) or
 INTERLEAVED (`vel`). A second copy of that loop is the shape CLAUDE.md keeps
 recording.
+
+### U4-1 — DONE (2026-09-17). The criterion on the root, ring-free, BIT-IDENTICAL.
+
+`amr_criterion_pool.wgsl` now serves the root: the same module every level >= 1
+uses, with `GHOST = 0` and the root's own block grid. It writes its OWN buffer,
+never level 1's, so the page's refinement decisions still come entirely from
+`amr_criterion.wgsl` and this stage moves nothing.
+
+**The root->level-1 relation IS the pool parent->child relation, which is why
+the two kernels are comparable at all.** A root tile is `2*RB = 16` cells and
+level 1's block grid is `W/RB`, exactly twice the root's `W/(2*RB)` -- so one
+root tile carries four level-1 children and each 8x8 quadrant is one workgroup
+producing one child criterion, which is the same shape the dense kernel has,
+where one L0 8x8 block produces one.
+
+```
+  512 macro-steps, ?benchSkip=avg      criterion differing / blocks
+    levels=2                                  0 / 1024
+    levels=3                                  0 / 1024
+    res=9                                     0 / 4096
+  CONTROL ?rootstep=0                      1024 / 1024
+  CONTROL shipped path (avg on)            1024 / 1024
+```
+
+**THE OBSTACLE WAS THE STENCIL, AND IT IS THE SHAPE EVERY U4 CONSUMER HAS.**
+The pool criterion differences +-1 and relies on the ring holding the
+neighbour's data; the root has no ring. So a tap that leaves the tile resolves
+against the OWNING tile instead -- the same move `amr_step1.wgsl`'s
+DIRECT_GHOST already makes, and the same rule `amr2d.mjs`'s `resolveSource`
+already states. U4-1a made that rule read the pool's own ring depth instead of
+the module constant, which it had been ignoring since B0.
+
+**It is DERIVED from `GHOST == 0`, not put behind its own flag.** At ring depth
+0 there is no other correct behaviour, and a separate override is something a
+ring-free pipeline can be given wrongly -- which U3 already paid for once, when
+the root inherited `DIRECT_GHOST: 0` from `step1Constants` and was asked to
+read a ghost cell nothing fills.
+
+**SCORED AGAINST TWO GPU MUTANTS, because a clean comparison is also what a
+blind one produces:**
+
+```
+  clamp inside the tile instead of resolving      891 / 1024 caught
+  quadrant axes swapped (qx <-> qy)               512 / 1024 caught
+```
+
+The second is exactly half, which is what a diagonal-preserving swap must give
+-- the off-diagonal quadrants move and the diagonal ones do not. **The first is
+the more interesting number, because it is NOT 1024.** The criterion reduces by
+MAX over a quadrant, so a wrong edge value is invisible wherever the maximum
+happens to land on an interior cell, and 133 blocks agreed with a stencil that
+was outright wrong. A max-reduction gate is sharp but not total, and the tool's
+header says so.
+
+The comparison also carries a VACUITY guard (`nonZero > 0`): two all-zero
+criterion arrays agree perfectly and say nothing.
 
 ### U4 — criterion, force, digest, conserved totals
 

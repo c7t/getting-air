@@ -1273,7 +1273,11 @@ async function init() {
   const criterionPoolBGL = device.createBindGroupLayout({ label: 'criterionPoolBGL', entries: [
     { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }
+    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    // binding 3: the PARENT level's blockSlot, for U4-1's ring-free stencil.
+    // Always bound, read only when that pipeline's GHOST is 0. Four bindings,
+    // against a 16-per-stage ceiling -- see CLAUDE.md before adding a fifth.
+    { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }
   ]});
   // Milestone 9: quad allocator + 2:1 balance for any level-(m+1) decision,
   // parent=level m>=1 -- see amr_manage_pool.wgsl's header. 16 bindings
@@ -1636,6 +1640,42 @@ async function init() {
     rootStepWG = Math.ceil((RB * 2) / 8);
   }
 
+  // U4-1: the CRITERION, serving the ROOT.
+  //
+  // The same module every level >= 1 uses -- amr_criterion_pool.wgsl -- with
+  // GHOST 0 and the root's own block grid. The root->level-1 relation IS the
+  // pool parent->child relation: a root tile is 2*RB = 16 cells and level 1's
+  // block grid is W/RB, exactly twice the root's W/(2*RB), so one root tile
+  // carries four level-1 children and each 8x8 quadrant is one workgroup
+  // producing one child criterion. That is the same shape the dense kernel
+  // has, where one L0 8x8 block produces one -- which is why these two can be
+  // compared at all.
+  //
+  // IT IS INERT. It writes its OWN buffer, never level 1's, so the page's
+  // refinement decisions still come entirely from amr_criterion.wgsl. What it
+  // buys is the differential test: same velocity field (U4-0 proved the root's
+  // IS the dense one), two separately written kernels, and the question is
+  // whether they agree bit for bit.
+  let rootCritPL = null, rootCritBG = null, rootCritBuf = null;
+  if (ROOT_POOL) {
+    const spec = rootPoolSpec({ dims: { W, H }, rb: RB });
+    rootCritBuf = device.createBuffer({
+      size: pools[1].NBLOCKS * 4,
+      usage: U.STORAGE | U.COPY_SRC | U.COPY_DST,
+    });
+    rootCritPL = device.createComputePipeline({
+      layout: device.createPipelineLayout({ bindGroupLayouts: [criterionPoolBGL] }),
+      compute: { module: criterionPoolSM, entryPoint: 'main',
+                 constants: { RB, NBX_PARENT: spec.nbx, NBY_PARENT: spec.nby, GHOST: 0 } },
+    });
+    rootCritBG = device.createBindGroup({ layout: criterionPoolBGL, entries: [
+      { binding: 0, resource: { buffer: pools[0].finePoolVel } },
+      { binding: 1, resource: { buffer: pools[0].slotToBlockBuf } },
+      { binding: 2, resource: { buffer: rootCritBuf } },
+      { binding: 3, resource: { buffer: pools[0].blockSlotBuf } },
+    ]});
+  }
+
   // D0's candidate scan: two pipelines from one entry point, so the grant and
   // release rules cannot drift into two spellings of "candidate". One
   // workgroup each -- see scanCandidates' header for why that is enough.
@@ -1835,6 +1875,8 @@ async function init() {
       { binding: 0, resource: { buffer: parentVel } },
       { binding: 1, resource: { buffer: parentSlotToBlockBuf } },
       { binding: 2, resource: { buffer: childPool.blockCriterionBuf } },
+      // Bound but never read at GHOST=2 -- these levels have a ring.
+      { binding: 3, resource: { buffer: parentPool.blockSlotBuf } },
     ]});
     managePoolBGs[m] = device.createBindGroup({ layout: managePoolBGL, entries: [
       { binding: 0, resource: { buffer: childPool.blockCriterionBuf } },
@@ -2163,6 +2205,47 @@ async function init() {
     denseBuf: velBuf, poolBuf: pools[0] && pools[0].finePoolVel,
     comps: 2, interleaved: true, asFloat: true, maxReport,
   });
+
+  // U4-1: the root's CRITERION against the dense kernel's, exactly.
+  //
+  // Both write one f32 per level-1 block, indexed the same way, so this is a
+  // flat array comparison with no addressing in it -- deliberately. The
+  // addressing question was settled by U2/U4-0; what is under test here is the
+  // STENCIL, and specifically whether resolving a tap against the owning tile
+  // reproduces what a periodic wrap over the whole dense grid produces.
+  //
+  // Raw words again, so it is bit-exact. A max-reduction has no accumulation
+  // order to differ over, which is why exactness is the right bar and not an
+  // ambitious one.
+  async function debugCheckRootCriterion(maxReport = 8) {
+    if (!rootCritBuf) return { ok: null, skipped: 'no root pool (?rootpool=1)' };
+    const n = pools[1].NBLOCKS;
+    const mk = () => device.createBuffer({ size: n * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    const sDense = mk(), sRoot = mk();
+    const enc = device.createCommandEncoder();
+    enc.copyBufferToBuffer(pools[1].blockCriterionBuf, 0, sDense, 0, n * 4);
+    enc.copyBufferToBuffer(rootCritBuf, 0, sRoot, 0, n * 4);
+    device.queue.submit([enc.finish()]);
+    await Promise.all([sDense.mapAsync(GPUMapMode.READ), sRoot.mapAsync(GPUMapMode.READ)]);
+    const dw = new Uint32Array(sDense.getMappedRange()).slice();
+    const rw = new Uint32Array(sRoot.getMappedRange()).slice();
+    sDense.unmap(); sRoot.unmap(); sDense.destroy(); sRoot.destroy();
+    const df = new Float32Array(dw.buffer), rf = new Float32Array(rw.buffer);
+    let mismatched = 0, maxAbs = 0, nonZero = 0;
+    const first = [];
+    for (let i = 0; i < n; i++) {
+      if (df[i] !== 0) nonZero++;
+      const d = Math.abs(rf[i] - df[i]);
+      if (d > maxAbs) maxAbs = d;
+      if (dw[i] === rw[i]) continue;
+      mismatched++;
+      if (first.length < maxReport) first.push({ block: i, root: rf[i], dense: df[i] });
+    }
+    // nonZero is the VACUITY guard: two all-zero criterion arrays agree
+    // perfectly and say nothing. The dense kernel must have found some
+    // vorticity for the comparison to mean anything.
+    return { ok: mismatched === 0 && nonZero > 0, checked: n, mismatched, nonZero, maxAbs, first };
+  }
 
   // ── Debug/verification support (window.__AMR) ────────────────────────────
   // Dedicated staging buffers, separate from the triple-buffered readback
@@ -2638,6 +2721,15 @@ async function init() {
       // vorticity doesn't change just because a neighbor gets (de)activated
       // this round, so re-evaluating per iteration would be wasted work.
       const crit = beginPass(enc, 'criterion L0'); crit.setPipeline(criterionPL); crit.setBindGroup(0, criterionBG); crit.dispatchWorkgroups(WGX, WGY); crit.end();
+      // U4-1: the same decision, from the root pool, into its own buffer.
+      // Encoded immediately after the dense one so both read the SAME velocity
+      // state -- a criterion compared across a step boundary would differ for
+      // reasons that have nothing to do with the kernel.
+      if (rootCritPL) {
+        const rc = beginPass(enc, 'criterion root');
+        rc.setPipeline(rootCritPL); rc.setBindGroup(0, rootCritBG);
+        rc.dispatchWorkgroups(2, 2, pools[0].MAX_FINE_BLOCKS); rc.end();
+      }
       for (let m = 1; m < N_LEVELS - 1; m++) {
         const c = beginPass(enc, `criterion L${m}`); c.setPipeline(criterionPoolPLs[m]); c.setBindGroup(0, criterionPoolBGs[m]); c.dispatchWorkgroups(2, 2, pools[m].MAX_FINE_BLOCKS); c.end();
       }
@@ -3804,6 +3896,7 @@ async function init() {
     debugMirrorRoot,
     debugCheckRootMirror,
     debugCheckRootVel,
+    debugCheckRootCriterion,
     getRootPool: () => (ROOT_POOL ? { ...rootPoolSpec({ dims: { W, H }, rb: RB }), stepped: !!ROOT_STEP } : null),
     debugRenderOnce,
     debugPerturbLevelVel,

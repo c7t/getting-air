@@ -36,13 +36,57 @@
 @group(0) @binding(0) var<storage, read>       vel            : array<f32>; // parent level's finePoolVel
 @group(0) @binding(1) var<storage, read>       slotToBlock    : array<i32>; // parent level's own
 @group(0) @binding(2) var<storage, read_write> childCriterion : array<f32>; // child level's blockCriterion
+// Parent level's blockSlot, for the ring-free stencil below. Always bound;
+// only read when GHOST == 0.
+@group(0) @binding(3) var<storage, read>       blockSlot      : array<i32>; // parent level's own
 
 override RB : u32;
 override NBX_PARENT : u32;
-const GHOST = 2u;
+// Only read on the ring-free path; every ringed pipeline leaves it at the
+// default, where it is folded away unused.
+override NBY_PARENT : u32 = 1u;
+
+// GHOST is an OVERRIDE since plans/uniform-levels.md U4-1: the ROOT level has
+// no ring (amr2d.mjs's ghostDepthAtLevel(0) is 0). Default 2 keeps every
+// existing pipeline byte-identical.
+override GHOST : u32 = 2u;
 
 fn velAt(slot: u32, fx: u32, fy: u32, FB: u32, comp: u32) -> f32 {
   return vel[(slot * (FB * FB) + fy * FB + fx) * 2u + comp];
+}
+
+// One stencil tap, resolved against the OWNING same-level tile when it leaves
+// this one's interior.
+//
+// THE RING-FREE PATH, AND IT IS DERIVED FROM GHOST RATHER THAN FLAGGED. At
+// GHOST == 0 a slot is exactly its own 2*RB x 2*RB cells and there is no ring
+// to read, so resolving against the neighbour is not an option among several
+// -- it is the only correct behaviour. A separate override could be left unset
+// on a ring-free pipeline, and U3 already paid for exactly that shape once
+// (the root inheriting DIRECT_GHOST: 0 from step1Constants, which asked a
+// level with no ring to read a ghost cell nothing fills).
+//
+// The rule is amr2d.mjs's resolveSource, which reads the POOL's own ring depth
+// -- at 0 a tap of -1 lands at 2*RB - 1 in the tile on the low side, and one
+// of 2*RB lands at 0 in the tile on the high side. The block grid is periodic,
+// matching every other kernel here.
+//
+// THE ROOT IS ALWAYS FULL, so `blockSlot` is the identity and the `< 0` branch
+// is unreachable there. It is written anyway because the same ring-free path
+// would be wrong to leave open-coded if a future level is ever ring-free and
+// sparse, and because a `cannot happen` branch that returns a plausible number
+// silently is exactly what plans/2D-backport.md B6-9c is about: 0 velocity is
+// what a quiescent cell reads.
+fn tapVel(bx: u32, by: u32, sx: i32, sy: i32, FB: u32, comp: u32) -> f32 {
+  var nx = sx; var ny = sy;
+  var tbx = bx; var tby = by;
+  if (nx < 0)            { nx += i32(FB); tbx = (bx + NBX_PARENT - 1u) % NBX_PARENT; }
+  else if (nx >= i32(FB)) { nx -= i32(FB); tbx = (bx + 1u) % NBX_PARENT; }
+  if (ny < 0)            { ny += i32(FB); tby = (by + NBY_PARENT - 1u) % NBY_PARENT; }
+  else if (ny >= i32(FB)) { ny -= i32(FB); tby = (by + 1u) % NBY_PARENT; }
+  let s = blockSlot[tby * NBX_PARENT + tbx];
+  if (s < 0) { return 0f; }
+  return velAt(u32(s), u32(nx), u32(ny), FB, comp);
 }
 
 // Read by common_criterion.wgsl's wgReduceMax1 -- see its own comment.
@@ -64,10 +108,20 @@ fn main(
   var omega = 0f;
   if (blockID >= 0) {
     let fx = lx + GHOST; let fy = ly + GHOST;
-    // The ghost border guarantees fx+-1 is in range (see header), which is
-    // the whole difference from the dense kernel's periodic wrap.
-    omega = discreteCurl(velAt(slot, fx + 1u, fy, FB, 1u), velAt(slot, fx - 1u, fy, FB, 1u),
-                         velAt(slot, fx, fy + 1u, FB, 0u), velAt(slot, fx, fy - 1u, FB, 0u));
+    if (GHOST == 0u) {
+      // Ring-free: every tap that leaves the tile is resolved against the
+      // owning one. See tapVel.
+      let bx = u32(blockID) % NBX_PARENT;
+      let by = u32(blockID) / NBX_PARENT;
+      let ix = i32(fx); let iy = i32(fy);
+      omega = discreteCurl(tapVel(bx, by, ix + 1, iy, FB, 1u), tapVel(bx, by, ix - 1, iy, FB, 1u),
+                           tapVel(bx, by, ix, iy + 1, FB, 0u), tapVel(bx, by, ix, iy - 1, FB, 0u));
+    } else {
+      // The ghost border guarantees fx+-1 is in range (see header), which is
+      // the whole difference from the dense kernel's periodic wrap.
+      omega = discreteCurl(velAt(slot, fx + 1u, fy, FB, 1u), velAt(slot, fx - 1u, fy, FB, 1u),
+                           velAt(slot, fx, fy + 1u, FB, 0u), velAt(slot, fx, fy - 1u, FB, 0u));
+    }
   }
 
   wg_omega[lid] = abs(omega);

@@ -1,6 +1,15 @@
 #!/usr/bin/env node
-// U3: does the FINE step kernel, dispatched on the ROOT POOL, reproduce the
-// dense L0 kernel EXACTLY? (plans/uniform-levels.md U3)
+// U3/U4: does each kernel dispatched on the ROOT POOL reproduce its dense L0
+// counterpart EXACTLY? (plans/uniform-levels.md U3, U4)
+//
+// Was validate-root-step.js while the step was the only one. Renamed when the
+// criterion joined it rather than left with a name that covers a third of what
+// it gates -- a tool whose name has drifted from its subject is how a checker
+// ends up run for the wrong reason.
+//
+//   f     the step's populations        amr_step1.wgsl      vs amr_step.wgsl
+//   vel   the step's velocity           (same pair)
+//   crit  the refinement criterion      amr_criterion_pool  vs amr_criterion
 //
 // Mirror the dense grid into the root pool, advance both, and compare word for
 // word -- BOTH of the step kernel's outputs, `f` and `vel`. The bar is BIT-IDENTITY, not a tolerance: `amr_step1.wgsl` and
@@ -27,6 +36,14 @@
 // difference is whatever `average` writes, and the root pool receives no
 // restriction until U4/U5. Both are reported; only the isolated one is gated.
 //
+// `crit` carries its own VACUITY guard: two all-zero criterion arrays agree
+// perfectly and say nothing, so the dense kernel is required to have found
+// some vorticity (`nonZero > 0`) before a clean comparison counts. Note also
+// that the criterion reduces by MAX, so a wrong edge value is invisible
+// wherever the maximum lands on an interior cell -- measured, a mutant that
+// clamps inside the tile instead of resolving against the owning one is caught
+// on 891 of 1024 blocks, not all of them.
+//
 // Do NOT reach for `?benchSkip=interp,avg` instead. Skipping interp leaves the
 // level-1 pool unfed, the force reduction takes it, and the dense field goes
 // 100% non-finite -- at which point this comparison reports ZERO differing
@@ -51,9 +68,9 @@
 // there `average` moves the dense `vel` and not the root's, and it reads
 // 130941/131072 differing.
 //
-//     node tools/validate-root-step.js
-//     node tools/validate-root-step.js --baseUrl=https://localhost:4471 --port=9371
-//     node tools/validate-root-step.js --steps=2048
+//     node tools/validate-root-kernels.js
+//     node tools/validate-root-kernels.js --baseUrl=https://localhost:4471 --port=9371
+//     node tools/validate-root-kernels.js --steps=2048
 
 const path = require('path');
 const CDP = require('/usr/lib/node_modules/chrome-remote-interface');
@@ -148,7 +165,8 @@ async function runCase(Runtime, Page, o, q) {
   const health = JSON.parse(await ev(Runtime, HEALTH));
   const after = JSON.parse(await ev(Runtime, 'window.__AMR.debugCheckRootMirror().then(r => JSON.stringify(r))'));
   const vel = JSON.parse(await ev(Runtime, 'window.__AMR.debugCheckRootVel().then(r => JSON.stringify(r))'));
-  return { q, seeded, after, vel, health };
+  const crit = JSON.parse(await ev(Runtime, 'window.__AMR.debugCheckRootCriterion().then(r => JSON.stringify(r))'));
+  return { q, seeded, after, vel, crit, health };
 }
 
 function fmt(r) {
@@ -158,7 +176,9 @@ function fmt(r) {
     ? `FIELD NOT FINITE ${r.health.nonFinite}/${r.health.n}`
     : `max|u| ${r.health.maxU.toFixed(4)}`;
   return `f ${String(r.after.mismatched).padStart(7)}/${r.after.checked}  ${abs}  ${rel}` +
-    `   vel ${String(r.vel.mismatched).padStart(6)}/${r.vel.checked}   seeded ${r.seeded.mismatched}   ${h}`;
+    `   vel ${String(r.vel.mismatched).padStart(6)}/${r.vel.checked}` +
+    `   crit ${String(r.crit.mismatched).padStart(5)}/${r.crit.checked}` +
+    `   seeded ${r.seeded.mismatched}   ${h}`;
 }
 
 async function main() {
@@ -184,6 +204,7 @@ async function main() {
     for (const q of GATED) {
       const r = await runCase(Runtime, Page, o, q);
       const ok = r.after.mismatched === 0 && r.vel.mismatched === 0
+        && r.crit.mismatched === 0 && r.crit.nonZero > 0
         && r.seeded.mismatched === 0 && r.health.nonFinite === 0;
       if (!ok) fails.push(q);
       console.log(`${ok ? '  ok  ' : ' FAIL '} ${q.padEnd(46)} ${fmt(r)}`);
@@ -191,7 +212,8 @@ async function main() {
     console.log('\n  CONTROL -- must be DIRTY, or the comparison above proves nothing');
     for (const q of CONTROLS) {
       const r = await runCase(Runtime, Page, o, q);
-      const ok = r.after.mismatched > 0 && r.vel.mismatched > 0 && r.health.nonFinite === 0;
+      const ok = r.after.mismatched > 0 && r.vel.mismatched > 0
+        && r.crit.mismatched > 0 && r.health.nonFinite === 0;
       if (!ok) fails.push(`${q} (control came back clean)`);
       console.log(`${ok ? '  ok  ' : ' FAIL '} ${q.padEnd(46)} ${fmt(r)}`);
     }
@@ -210,7 +232,7 @@ async function main() {
     console.log(`FAIL: ${fails.join(', ')}`);
     process.exit(1);
   }
-  console.log('PASS: the fine step kernel on the root pool reproduces the dense kernel exactly.');
+  console.log('PASS: every root-pool kernel reproduces its dense counterpart exactly.');
   process.exit(0);
 }
 
