@@ -28,7 +28,7 @@ it runs on.
 | U4 | criterion, force, digest, conserved totals | **DONE** — all four consumers on the root. Exact on the criterion, digest max and conserved totals; the force to the truncation floor | `tools/validate-root-kernels.js`, 8 rungs + 2 controls |
 | U5 | L1 becomes a quad child of the root | **U5-0…U5-4 DONE under `?rootpool=1`** — both hops of the coupling and the manager. Level 1 is quad-allocated and quad-managed; tiles +28-32%; new fingerprints, default unmoved. `amr_manage.wgsl` cannot retire until the other four AMR pages get a root pool, and Cd/St is unmeasurable until then | `validate-root-kernels.js` (11 rungs, 4 controls); `validate-all.js` invariants ± starved pool; `measure-determinism.js` |
 | U6 | The renderer walks levels | **DONE** — and it found that three of the five pages never drew level 2 either. Level 1 bit-identical to before; gate green on two pages and in the default sweep | `tools/validate-render-levels.js`, `tools/lib/render-levels.js` |
-| U7 | One implementation across the five pages, then delete the dense path | **U7-0 and U7-1 DONE** (layouts and the twelve coupling pipelines shared, net −789 lines, every gate unmoved); U7-2…U7-6 remain. **Split into U7-0…U7-6** — U1–U5 all landed on `main-amr.js` alone, so the remaining work is propagation before deletion. Measured: all 14 bind group layouts are byte-identical across five pages, and `S_Advance` is byte-identical across the other four | each rung byte-identical on the default path (`measure-determinism.js`), except U7-5 which is the one that moves numbers |
+| U7 | One implementation across the five pages, then delete the dense path | **U7-0…U7-2 DONE** (layouts, the twelve coupling pipelines and the per-level bind groups shared — net −1194 lines, every gate unmoved); U7-3…U7-6 remain. **Split into U7-0…U7-6** — U1–U5 all landed on `main-amr.js` alone, so the remaining work is propagation before deletion. Measured: all 14 bind group layouts are byte-identical across five pages, and `S_Advance` is byte-identical across the other four | each rung byte-identical on the default path (`measure-determinism.js`), except U7-5 which is the one that moves numbers |
 
 **Where the risk actually sits.** U0–U2 went in clean and each found something
 (a half-cell convention, an f16 stride, a window-convention split between L0 and
@@ -2337,28 +2337,66 @@ render-reachability configs; `measure-determinism.js` unmoved at
 rather than the seam, which is exactly what a pipeline refactor wants;
 `amr-N2-diffuse` unmoved at Cd 1.631 / St 0.1466.
 
-#### U7-2 — the per-level bind groups
+#### U7-2 — DONE (2026-09-18). The per-level bind groups are two functions.
 
-The `for (c = 2; c < N_LEVELS; c++)` loop that builds every level's interp /
-average / step1 / force / criterion / manage bind groups. Same shape on every
-page; the buffers it names all come from `allocLevelPool`, which is already
-shared.
+**621 lines removed, 216 added, a net −405.** Three things moved:
 
-**U6 ALREADY PAID PART OF THIS RUNG, and the shape is the one to copy.** The
-renderer's per-level bind group moved to `amr2d-gpu.mjs`'s
-`makeRenderBindGroup` and all five pages call it, because the alternative was
-adding two binding pairs to five inline `renBG` literals -- and the defect U6
-found was precisely that three of those five had drifted (they never passed the
-level override). One function, one table of bindings, five callers.
+- `makeLevelBindGroups` — every level >= 2's interp / step / average / force
+  bind groups. Byte-identical across the card, cylinder and reentry pages;
+  TGV and channel had the same loop minus the force block, a strict subset.
+  `forceBuf` is the CONDITION for that block rather than a flag: a page with no
+  body has no force accumulator, so there is nothing to decide.
+- `makeManageBindGroups` — one criterion/manage pair per parent level.
+  Byte-identical across four pages; `main-amr.js` differed only by where the
+  loop starts since U5-4 made the root a parent level. `firstParentLevel` is
+  that and nothing else, and it disappears at U7-5.
+- `makeRenderBindGroup` — already moved at U6, listed here because it belongs
+  to this rung.
 
-**TAKE THE POOL-ALLOCATION AND RESET SCAFFOLDING WITH IT.** U7-4's itemisation
-below shows why: more than half of what a page would otherwise have to change
-for the root pool is a LOOP BOUND in one of these loops -- the allocation loop,
-the levelParams loop, the `quadCPU` mirrors, the per-level half of `resetSim`.
-They are duplicated five times already, and each one still duplicated at U7-4
-is another per-page edit there.
+**A dead line went with the move.** Four of the five copies still computed
+`grandchildPool` for a grandchild cascade B2-2d deleted -- legal, free at
+runtime, and reading as though the loop still weighed it.
+`amr_manage_pool.wgsl`'s own header records the identical lesson about
+`refineWants`: deleting a mechanism has to include deleting what fed it.
 
-*Gate:* as U7-1.
+*Gate, all five green:* `make check`; boot smoke on seven configs plus both
+render configs; `measure-determinism.js` unmoved at `7ac54e170f903ac3` /
+`ce1bd4d8a3a1055c`; the analytic AMR configs PASS; `amr-N2-diffuse` unmoved at
+Cd 1.631 / St 0.1466 with its invariants green.
+
+#### AND THE POOL-ALLOCATION SCAFFOLDING DOES NOT BELONG HERE — a correction
+
+This rung was scoped to "take the pool-allocation and reset scaffolding with
+it", on the argument that more than half of U7-4's per-page residue is a loop
+bound in one of those loops. **Measured before doing it, that advice did not
+hold**, and the difference is the whole basis of this ladder:
+
+```
+  the level>=2 bind-group loop   2 variants, one a strict SUBSET of the other
+  the manage bind-group loop     2 variants, differing by a loop bound
+  the pool-ALLOCATION loop       3 variants
+  the levelParams loop           4 variants across 5 pages
+```
+
+Everything shared in U7-0, U7-1 and U7-2 had ONE premise: it was already
+byte-identical, and the change made that structural. The allocation and
+levelParams loops are not — they differ in genuine per-scenario policy (see
+below). Sharing them would be a parameterising refactor without that premise,
+which is exactly how a shared function acquires per-page options and becomes
+five copies with extra steps -- the hazard `makeAMRLayouts`'s own header names.
+**So U7-4 keeps its handful of loop-bound edits, and that is the cheaper
+trade.**
+
+**One finding while measuring it, not acted on.** The pages differ in pool
+SIZING policy: the card and cylinder pages use `poolSlotsFor(POOL_PEAKS, m,
+N_LEVELS)`, measured per level; **the reentry, TGV and channel pages still use
+a flat `128` for every level >= 2.** That flat-per-level default is the exact
+shape CLAUDE.md records as the cause of a `?levels=4` refusal ("the old flat 512
+(card) / 128 (cylinder) for every level >= 2 is exactly why `?levels=4`
+refused"). It is latent rather than live on the two bodyless pages, which hold
+zero active tiles; on the reentry page it is not obviously latent. Fixing it is
+a behaviour change that needs its own measurement, not a drive-by inside a
+refactor rung.
 
 **U6 WENT FIRST AND SHARED ITS OWN BIND GROUP RATHER THAN WRITING IT FIVE
 TIMES** (2026-09-18). `makeRenderBindGroup` is in `amr2d-gpu.mjs` and every page

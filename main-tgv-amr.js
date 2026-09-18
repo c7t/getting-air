@@ -62,7 +62,7 @@ import { reportFatal, refuseConfig, reportNoWebGPU, reportNoAdapter } from './er
 import { tauChainSingularity, tauSingularityMessage } from './amr2d.mjs';
 import { loadShader } from './shader-loader.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
-import { check21BalanceOnGPU, readConservedTotals, allocLevelPool, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState , checkRefinementClosureOnGPU , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU, makeRenderBindGroup, renderPoolLevels, MAX_RENDER_POOL_LEVELS, makeAMRLayouts, makeCouplingPipelines } from './amr2d-gpu.mjs';
+import { check21BalanceOnGPU, readConservedTotals, allocLevelPool, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState , checkRefinementClosureOnGPU , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU, makeRenderBindGroup, renderPoolLevels, MAX_RENDER_POOL_LEVELS, makeAMRLayouts, makeCouplingPipelines, makeLevelBindGroups, makeManageBindGroups } from './amr2d-gpu.mjs';
 // tauAtLevel: extracted to card-params.mjs by B3a-1, which landed the CALL
 // in all five AMR pages and this IMPORT in only main-amr.js. The other four
 // threw `ReferenceError: tauAtLevelOf is not defined` at init -- but only at
@@ -621,110 +621,19 @@ async function init() {
   const criterionBG = device.createBindGroup({ layout: criterionBGL, entries: [{ binding: 0, resource: { buffer: velBuf } }, { binding: 1, resource: { buffer: pools[1].blockCriterionBuf } }]});
   const manageBG = device.createBindGroup({ layout: manageBGL, entries: [{ binding: 0, resource: { buffer: pools[1].blockCriterionBuf } }, { binding: 1, resource: { buffer: pools[1].blockSlotBuf } }, { binding: 2, resource: { buffer: pools[1].slotToBlockBuf } }, { binding: 3, resource: { buffer: pools[1].freeListBuf } }, { binding: 4, resource: { buffer: pools[1].freeCountBuf } }, { binding: 5, resource: { buffer: pools[1].newlyActivatedBuf } }, { binding: 6, resource: { buffer: cardStateBuf } }, { binding: 7, resource: { buffer: pools[1].candRankBuf } }, { binding: 9, resource: { buffer: diagBuf } }, { binding: 10, resource: { buffer: pools[1].wantBuf } }]});
 
-  const criterionPoolBGs = {};
-  const managePoolBGs = {};
-  for (let m = 1; m < N_LEVELS - 1; m++) {
-    const parentPool = pools[m];
-    const childPool = pools[m + 1];
-    // BUGFIX: ALWAYS the parent pool's own finePoolVel, never velBuf.
-    // amr_criterion_pool.wgsl's binding 0 is the PARENT LEVEL's fine pool
-    // velocity and it addresses that buffer BY POOL SLOT
-    // (slot*(FB*FB) + fy*FB + fx). This shader only ever runs with a pool
-    // level as its parent -- m >= 1 -- so there is no dense case to special-
-    // case here; the `m === 1 ? velBuf : ...` this replaces was the
-    // dense-parent pattern the neighbouring interp/step bind groups legitimately
-    // use, copied to a shader that has no dense-parent variant.
-    //
-    // Handing it velBuf fed a dense, cellIndex-addressed L0 buffer to
-    // slot-addressed reads: wrong layout for every slot, and past roughly the
-    // first third of the slots the reads run off the end of a buffer less than
-    // half the size the pool layout expects. The result was a level-2
-    // blockCriterion of essentially ZERO everywhere -- measured 2^-39.86 for
-    // all 85 active L1 parents, against a host reconstruction from level 1's
-    // own field showing up to 2^-5.6.
-    //
-    // So amr_manage_pool.wgsl's refine() saw maxCrit ~= 0 for every parent,
-    // desiredLevel(toPhysical(eps)) was 0, and the vorticity criterion could
-    // NEVER promote a tile to level 2. Level 2 was 100% geometry-forced --
-    // which is exactly what a phi scan showed independently before the cause
-    // was known: L2 covered block centres at phi -0.5 .. 7.9, the
-    // childLevel-2 forced halo (margin 8) and nothing beyond it. That pins
-    // the L1/L2 boundary a few cells off the body, so every shed vortex
-    // crosses it right at the trailing edge -- the reported block artifacts
-    // and the lumpiness induced on the shed vortices.
-    const parentVel = parentPool.finePoolVel;
-    const parentSlotToBlockBuf = m === 1 ? pools[1].slotToBlockBuf : parentPool.slotToBlockBuf;
-    const grandchildPool = (m + 2) < N_LEVELS ? pools[m + 2] : null;
+  // U7-2: one criterion/manage bind-group pair per parent level, from ONE
+  // place -- byte-identical across four pages before this, and differing on
+  // the fifth only by where the loop starts. See makeManageBindGroups.
+  const { criterionPoolBGs, managePoolBGs } = makeManageBindGroups(
+    device, layouts, pools, N_LEVELS,
+    { cardStateBuf, diagBuf, firstParentLevel: 1 });
 
-    criterionPoolBGs[m] = device.createBindGroup({ layout: criterionPoolBGL, entries: [
-      { binding: 0, resource: { buffer: parentVel } },
-      { binding: 1, resource: { buffer: parentSlotToBlockBuf } },
-      { binding: 2, resource: { buffer: childPool.blockCriterionBuf } },
-      // Bound but never read at GHOST=2 -- these levels have a ring.
-      { binding: 3, resource: { buffer: parentPool.blockSlotBuf } },
-    ]});
-    managePoolBGs[m] = device.createBindGroup({ layout: managePoolBGL, entries: [
-      { binding: 0, resource: { buffer: childPool.blockCriterionBuf } },
-      { binding: 1, resource: { buffer: childPool.blockSlotBuf } },
-      { binding: 2, resource: { buffer: childPool.slotToBlockBuf } },
-      { binding: 3, resource: { buffer: childPool.freeListBuf } },
-      { binding: 4, resource: { buffer: childPool.freeCountBuf } },
-      { binding: 5, resource: { buffer: childPool.newlyActivatedBuf } },
-      { binding: 6, resource: { buffer: cardStateBuf } },
-      { binding: 7, resource: { buffer: childPool.parentSlotBuf } },
-      { binding: 8, resource: { buffer: childPool.wantBuf } },
-      { binding: 9, resource: { buffer: diagBuf } },
-      { binding: 12, resource: { buffer: parentSlotToBlockBuf } },
-    ]});
-  }
 
-  for (let c = 2; c < N_LEVELS; c++) {
-    const parentPool = pools[c - 1];
-    const childPool = pools[c];
-    const interpEntries = (parentBuf) => [
-      { binding: 0, resource: { buffer: childPool.levelParamsBuf } },
-      { binding: 1, resource: { buffer: parentBuf } },
-      { binding: 2, resource: { buffer: childPool.finePoolF_a } },
-      { binding: 3, resource: { buffer: childPool.slotToBlockBuf } },
-      { binding: 4, resource: { buffer: childPool.newlyActivatedBuf } },
-      { binding: 5, resource: { buffer: childPool.blockSlotBuf } },
-      { binding: 6, resource: { buffer: childPool.parentSlotBuf } },
-      { binding: 7, resource: { buffer: childPool.quadrantBuf } },
-    ];
-    childPool.interpPoolParentBG_readA = device.createBindGroup({ layout: interpPoolParentBGL, entries: interpEntries(parentPool.finePoolF_a) });
-    childPool.interpPoolParentBG_readB = device.createBindGroup({ layout: interpPoolParentBGL, entries: interpEntries(parentPool.finePoolF_b) });
-    childPool.interpPoolParentFFBG_b = device.createBindGroup({ layout: interpPoolParentBGL, entries: interpEntries(parentPool.finePoolF_a).map((e, i) => i === 2 ? { binding: 2, resource: { buffer: childPool.finePoolF_b } } : e) });
-
-    childPool.step1BG_ab = device.createBindGroup({ layout: step1BGL, entries: [
-      { binding: 0, resource: { buffer: cardStateBuf } },
-      { binding: 1, resource: { buffer: childPool.finePoolF_a } },
-      { binding: 2, resource: { buffer: childPool.finePoolF_b } },
-      { binding: 3, resource: { buffer: childPool.finePoolVel } },
-      { binding: 4, resource: { buffer: childPool.slotToBlockBuf } },
-      { binding: 5, resource: { buffer: childPool.levelParamsBuf } },
-      { binding: 6, resource: { buffer: childPool.blockSlotBuf } },
-    ]});
-    childPool.step1BG_ba = device.createBindGroup({ layout: step1BGL, entries: [
-      { binding: 0, resource: { buffer: cardStateBuf } },
-      { binding: 1, resource: { buffer: childPool.finePoolF_b } },
-      { binding: 2, resource: { buffer: childPool.finePoolF_a } },
-      { binding: 3, resource: { buffer: childPool.finePoolVel } },
-      { binding: 4, resource: { buffer: childPool.slotToBlockBuf } },
-      { binding: 5, resource: { buffer: childPool.levelParamsBuf } },
-      { binding: 6, resource: { buffer: childPool.blockSlotBuf } },
-    ]});
-
-    const avgEntries = (parentBuf) => [
-      { binding: 0, resource: { buffer: childPool.levelParamsBuf } },
-      { binding: 1, resource: { buffer: childPool.finePoolF_a } },
-      { binding: 2, resource: { buffer: parentBuf } },
-      { binding: 3, resource: { buffer: childPool.slotToBlockBuf } },
-      { binding: 4, resource: { buffer: childPool.parentSlotBuf } },
-      { binding: 5, resource: { buffer: childPool.quadrantBuf } },
-    ];
-    childPool.avgPoolBG_targetA = device.createBindGroup({ layout: avgPoolBGL, entries: avgEntries(parentPool.finePoolF_a) });
-    childPool.avgPoolBG_targetB = device.createBindGroup({ layout: avgPoolBGL, entries: avgEntries(parentPool.finePoolF_b) });
-  }
+  // U7-2: every level >= 2's interp / step / average / force bind groups, from
+  // ONE place. Three pages had this loop byte-identical and two had it minus
+  // the force block; see makeLevelBindGroups.
+  makeLevelBindGroups(device, U, layouts, pools, N_LEVELS,
+    { cardStateBuf });
 
   const error = await device.popErrorScope();
   if (error) { handleErr(error); return; }
