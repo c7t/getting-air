@@ -6,6 +6,7 @@ plans/*
 !plans/perf-characterization.md
 !plans/AMR-vs-dense-validation.md
 !plans/2D-backport.md
+!plans/uniform-levels.md
 transcripts/
 snapshots/
 https.py
