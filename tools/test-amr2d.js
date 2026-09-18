@@ -75,6 +75,7 @@ const sorted = (s) => [...s].sort();
     parentCellOfFineCell, fineCellsOfParentCell, ringDepth, ringSlotRole,
     poolInverseViolations,
     coalesceSource, explodeTarget, transferLedger,
+    rootPoolSpec, rootCellToDense, denseCellIndex, DENSE_BLOCK,
     makePool, poolAtLevel, nbAtLevel, parentOfBlock,
     quadrantOfBlock, quadrantOrigin, tileOriginL0, tileOriginL0Recursive,
     refineWhere, nearBodyWant, nearBodyWantCentre, refineNearBody,
@@ -1627,6 +1628,166 @@ const sorted = (s) => [...s].sort();
     assert.ok(unclaimed.length > 0,
       'a claimant rule pointing the wrong way produced a balanced ledger -- the audit is vacuous');
   });
+
+
+  // ── U1: the root pool's shape ────────────────────────────────────────────
+
+  ok('a tiled root costs EXACTLY the dense grid it replaces, no padding', () => {
+    // The whole reason the root gets ghost depth 0. If this identity fails,
+    // U1 is trading correctness for memory and the plan's cost claim is wrong.
+    for (const W of [128, 256, 512, 1024]) {
+      const spec = rootPoolSpec({ dims: { W, H: W }, rb: 8 });
+      assert.strictEqual(spec.cells, W * W,
+        `root pool at W=${W} holds ${spec.cells} cells for a ${W * W}-cell domain`);
+      assert.strictEqual(spec.side, 16, 'root tile side moved');
+      assert.strictEqual(spec.cellsPerSlot, 256, 'root slot size moved');
+    }
+    // A ringed root would NOT be free -- the contrast is the point.
+    const ringed = tileSideAtLevel(1, 8) ** 2 / tileSideAtLevel(0, 8) ** 2;
+    assert.ok(ringed > 1.5, `a ringed root would cost ${ringed}x, so ghost depth 0 is load-bearing`);
+  });
+
+  ok('the root has one slot per block, with no headroom', () => {
+    // Every other level sizes its pool by poolSlotsFor's 1.7x measured
+    // headroom. The root never grows, so headroom there would be a buffer
+    // nothing can ever use -- and a root pool SHORT of its block count would
+    // be a silent hole in the domain, which is why allocLevelPool refuses it
+    // rather than defaulting.
+    const spec = rootPoolSpec({ dims: { W: 512, H: 256 }, rb: 8 });
+    assert.strictEqual(spec.nbx, 32, 'root nbx');
+    assert.strictEqual(spec.nby, 16, 'root nby');
+    assert.strictEqual(spec.slots, spec.nblocks, 'root pool is not exactly full');
+  });
+
+  // ── U2: the root pool's ADDRESSING, against a route neither side wrote ───
+  //
+  // THE CHECK U2 SHIPPED WITHOUT, AND THE ONE THAT WOULD HAVE CAUGHT IT.
+  // U2 scored shaders/amr_mirror_root.wgsl against amr2d.mjs's rootCellToDense
+  // and called them independent because neither consulted the other. They both
+  // ended in `gy*W + gx`, the dense L0 grid is 8x8 block-major, and the mirror
+  // was CLEAN over a pool whose cells were reading the wrong dense cell 98.4%
+  // of the time. Independence is about PREMISES, not authorship.
+  //
+  // So the route scored here is tools/lib/field-reconstruct.js's `rawIndex`,
+  // which is what decodes real GPU snapshots into fields the validation tools
+  // compare against literature -- a decoder validated by data, not by another
+  // formula in this repo.
+  ok("the dense index agrees with the decoder that reads real snapshots", () => {
+    const { rawIndex } = require('../tools/lib/field-reconstruct.js');
+    for (const dims of [{ W: 128, H: 128 }, { W: 512, H: 256 }, { W: 256, H: 512 }]) {
+      for (let gy = 0; gy < dims.H; gy++) {
+        for (let gx = 0; gx < dims.W; gx++) {
+          assert.strictEqual(denseCellIndex({ dims }, gx, gy),
+            rawIndex(gx, gy, dims.W, dims.H, 'block8'),
+            `dense index at (${gx},${gy}) of ${dims.W}x${dims.H}`);
+        }
+      }
+    }
+    // And it is NOT the flat layout -- the slip that shipped. If these ever
+    // coincide the check above has stopped discriminating.
+    const dims = { W: 512, H: 256 };
+    let same = 0, n = 0;
+    for (let gy = 0; gy < dims.H; gy++) for (let gx = 0; gx < dims.W; gx++) {
+      n++;
+      if (denseCellIndex({ dims }, gx, gy) === rawIndex(gx, gy, dims.W, dims.H, 'flat')) same++;
+    }
+    assert.ok(same / n < 0.05,
+      `block8 and flat agree on ${(100 * same / n).toFixed(1)}% of cells -- this test cannot tell them apart`);
+  });
+
+  ok('every root pool cell maps onto the dense grid ONE-TO-ONE', () => {
+    // The property the mirror actually needs and that no formula comparison
+    // states: the map is a BIJECTION. A permutation that is merely consistent
+    // with itself -- which is what `gy*W + gx` on both sides was -- passes any
+    // check that only ever compares the two routes to each other. A wrong
+    // bijection still fails this the moment it is composed with the dense
+    // grid's own index, below.
+    const dims = { W: 512, H: 256 }, rb = 8;
+    const spec = rootPoolSpec({ dims, rb });
+    const seen = new Uint8Array(dims.W * dims.H);
+    let n = 0;
+    for (let slot = 0; slot < spec.slots; slot++) {
+      for (let ly = 0; ly < spec.side; ly++) {
+        for (let lx = 0; lx < spec.side; lx++) {
+          const c = rootCellToDense({ dims, rb }, slot, lx, ly);
+          assert.ok(c >= 0 && c < seen.length, `root cell ${slot}/${lx},${ly} -> ${c}, out of range`);
+          assert.strictEqual(seen[c], 0, `dense cell ${c} claimed twice`);
+          seen[c] = 1; n++;
+        }
+      }
+    }
+    assert.strictEqual(n, dims.W * dims.H, 'root pool does not cover the domain exactly once');
+  });
+
+  ok('a root pool cell stands for the dense cell at its own COORDINATES', () => {
+    // The composition the mirror performs, end to end and in the one direction
+    // that can be wrong: take the (gx,gy) the root cell geometrically IS, ask
+    // the dense grid where that lives, and require rootCellToDense to have
+    // landed there. This is what distinguishes "self-consistent permutation"
+    // from "correct address", and it is the check the flat slip fails at
+    // 98.4%.
+    const dims = { W: 512, H: 256 }, rb = 8;
+    const spec = rootPoolSpec({ dims, rb });
+    let checked = 0;
+    for (let slot = 0; slot < spec.slots; slot++) {
+      const bx = slot % spec.nbx, by = Math.floor(slot / spec.nbx);
+      for (let ly = 0; ly < spec.side; ly++) {
+        for (let lx = 0; lx < spec.side; lx++) {
+          const gx = bx * spec.side + lx, gy = by * spec.side + ly;
+          assert.strictEqual(rootCellToDense({ dims, rb }, slot, lx, ly),
+            denseCellIndex({ dims }, gx, gy),
+            `root slot ${slot} cell (${lx},${ly}) -> dense (${gx},${gy})`);
+          checked++;
+        }
+      }
+    }
+    assert.strictEqual(checked, dims.W * dims.H);
+    // MUTATION: the map that shipped. It must be caught, and loudly.
+    let wrong = 0;
+    for (let slot = 0; slot < spec.slots; slot++) {
+      const bx = slot % spec.nbx, by = Math.floor(slot / spec.nbx);
+      for (let ly = 0; ly < spec.side; ly++) {
+        for (let lx = 0; lx < spec.side; lx++) {
+          const gx = bx * spec.side + lx, gy = by * spec.side + ly;
+          if (gy * dims.W + gx !== denseCellIndex({ dims }, gx, gy)) wrong++;
+        }
+      }
+    }
+    assert.ok(wrong / checked > 0.9,
+      `the row-major mirror is wrong on only ${(100 * wrong / checked).toFixed(1)}% of cells -- expected nearly all`);
+  });
+
+  ok('a root TILE is exactly four dense blocks, which is why the slip survived', () => {
+    // 2*RB = 16 and the dense block is 8, so a root tile covers 2x2 dense
+    // blocks EXACTLY. Same cells, different order -- which is why a row-major
+    // mirror produced a field that still looked like a field, and why U3 read
+    // a plausible 2e-3 rather than an obvious O(1).
+    assert.strictEqual(tileCellsAtLevel(0, 8), 2 * DENSE_BLOCK,
+      'a root tile is no longer a whole number of dense blocks');
+    const dims = { W: 512, H: 256 }, rb = 8;
+    const spec = rootPoolSpec({ dims, rb });
+    for (const slot of [0, 1, spec.nbx, spec.slots - 1]) {
+      const bx = slot % spec.nbx, by = Math.floor(slot / spec.nbx);
+      const blocks = new Set();
+      for (let ly = 0; ly < spec.side; ly++) for (let lx = 0; lx < spec.side; lx++) {
+        const gx = bx * spec.side + lx, gy = by * spec.side + ly;
+        blocks.add(Math.floor(denseCellIndex({ dims }, gx, gy) / (DENSE_BLOCK * DENSE_BLOCK)));
+      }
+      assert.strictEqual(blocks.size, 4, `root slot ${slot} spans ${blocks.size} dense blocks, not 4`);
+    }
+  });
+
+  ok('the root grid is the level-1 grid halved, in both axes', () => {
+    // The relation that makes level 1 a QUADRANT of a root tile, which is what
+    // collapses three allocation regimes into one.
+    const dims = { W: 512, H: 256 }, rb = 8;
+    const spec = rootPoolSpec({ dims, rb });
+    const [nbx1, nby1] = blockGridAtLevel(dims, 1, rb);
+    assert.strictEqual(nbx1, spec.nbx * 2, 'level 1 is not double the root in x');
+    assert.strictEqual(nby1, spec.nby * 2, 'level 1 is not double the root in y');
+    assert.strictEqual(nbx1 * nby1, spec.nblocks * 4, 'a root tile does not carry four level-1 blocks');
+  });
+
   if (!process.exitCode) console.log(`\n${pass} check(s) passed`);
   else console.log('\nFAILED');
 })();

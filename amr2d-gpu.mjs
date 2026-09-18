@@ -37,7 +37,7 @@
 import {
   check21Balance, nbAtLevel, makePool, cellSizeL0AtLevel,
   nearBodyWant, nearBodyWantCentre, bodyPhiL0, bodyFrameL0, bodyFrameL0Legacy,
-  cascade21, quadrantOfSlot, tileOriginL0,
+  cascade21, quadrantOfSlot, tileOriginL0, poolInverseViolations,
 } from './amr2d.mjs';
 
 // Every level's blockSlot, copied in one command encoder and one submit, so
@@ -315,7 +315,52 @@ export function allocLevelPool(device, U, m, NBX_m, NBY_m, maxFineBlocks, NCELLS
   // caller-side init is ever forgotten again.
   device.queue.writeBuffer(pool.blockSlotBuf, 0, new Int32Array(NBLOCKS_m).fill(-1));
   device.queue.writeBuffer(pool.slotToBlockBuf, 0, new Int32Array(maxFineBlocks).fill(-1));
+  // THE ROOT IS ALWAYS FULL, so its indirection is the identity and is written
+  // once, here, over the -1 fill above. plans/uniform-levels.md U1.
+  //
+  // It is a level like any other in every respect this function cares about --
+  // same buffers, same addressing -- and differs only in the three things that
+  // follow from having no parent: every slot is permanently assigned, nothing
+  // is ever granted or released (so the free list is allocated and left
+  // untouched rather than seeded), and `newlyActivated` never fires because no
+  // slot is ever new.
+  //
+  // `maxFineBlocks === NBLOCKS_m` is REQUIRED, not defaulted: a root pool that
+  // could not hold its own domain would be a silent hole in the grid, and
+  // poolSlotsFor's 1.7x headroom has no meaning for a level that never grows.
+  if (m === 0) {
+    if (maxFineBlocks !== NBLOCKS_m) {
+      throw new Error(`root pool must have exactly one slot per block (${maxFineBlocks} slots, ${NBLOCKS_m} blocks)`);
+    }
+    const identity = new Int32Array(NBLOCKS_m).map((_, i) => i);
+    device.queue.writeBuffer(pool.blockSlotBuf, 0, identity);
+    device.queue.writeBuffer(pool.slotToBlockBuf, 0, identity);
+    pool.isRoot = true;
+  }
   return pool;
+}
+
+// The root's indirection is the identity, and blockSlot/slotToBlock are
+// inverses. Scored on the LIVE buffers, not on the host's intent -- the same
+// reason debugCheckSlotQuadrants scores quadrantBuf against quadrantOfSlot
+// rather than trusting the write that produced it.
+export async function checkRootPoolIdentity(device, pools) {
+  const pool = pools[0];
+  if (!pool) return { ok: null, skipped: 'no root pool allocated' };
+  const { blockSlot, slotToBlock } = await readPoolIndirection(device, pools, 0);
+  const notIdentity = [];
+  for (let i = 0; i < blockSlot.length; i++) {
+    if (blockSlot[i] !== i) notIdentity.push({ kind: 'blockSlot', at: i, got: blockSlot[i] });
+  }
+  for (let s2 = 0; s2 < slotToBlock.length; s2++) {
+    if (slotToBlock[s2] !== s2) notIdentity.push({ kind: 'slotToBlock', at: s2, got: slotToBlock[s2] });
+  }
+  const inverse = poolInverseViolations(Array.from(blockSlot), Array.from(slotToBlock));
+  return {
+    ok: notIdentity.length === 0 && inverse.length === 0,
+    blocks: blockSlot.length, slots: slotToBlock.length,
+    notIdentity: notIdentity.slice(0, 8), inverse: inverse.slice(0, 8),
+  };
 }
 
 // --- conservation (plans/2D-backport.md B0b) --------------------------------

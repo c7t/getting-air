@@ -22,8 +22,8 @@ import {
   tauAtLevel as tauAtLevelOf,
 } from './card-params.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
-import { check21BalanceOnGPU, allocLevelPool, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState, checkGeometryCoverageOnGPU, makeRefusalWatch , checkRefinementClosureOnGPU , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU } from './amr2d-gpu.mjs';
-import { poolSlotsFor, tauChainSingularity, tauSingularityMessage } from './amr2d.mjs';
+import { check21BalanceOnGPU, allocLevelPool, checkRootPoolIdentity, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState, checkGeometryCoverageOnGPU, makeRefusalWatch , checkRefinementClosureOnGPU , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU } from './amr2d-gpu.mjs';
+import { poolSlotsFor, tauChainSingularity, tauSingularityMessage, rootPoolSpec, rootCellToDense } from './amr2d.mjs';
 import { EX, EY, WT } from './lattice-2d.mjs';
 import { makeCanvasFit } from './canvas-fit.mjs';
 
@@ -572,6 +572,30 @@ const SPONGE_EXCLUDE_W = urlParams.has('spongeExclude') ? parseFloat(urlParams.g
 // See shaders/amr_manage.wgsl's DET_SLOTS for why the serial loop is the right
 // shape for a MEASUREMENT and the wrong shape for a default.
 const DET_SLOTS = urlParams.has('detslots') ? (parseInt(urlParams.get('detslots')) ? 1 : 0) : 0;
+
+// ?rootpool=1 -- allocate the ROOT as a pool level (plans/uniform-levels.md U1).
+//
+// Default 0 and byte-identical when absent: with the flag off nothing is
+// allocated at all, so this cannot cost the phone ~21 MB for a buffer no
+// kernel reads. With it on the pool exists, carries the identity indirection,
+// and is STILL read by nothing -- U1's whole claim is that a correctly shaped
+// root pool changes no number, and the way to establish that is to build it
+// and prove the page did not move.
+//
+// The next stage points a kernel at it; this one only proves the shape.
+const ROOT_POOL = urlParams.has('rootpool') ? (parseInt(urlParams.get('rootpool')) ? 1 : 0) : 0;
+
+// ?rootstep=0 -- allocate and mirror the root pool but do NOT step it.
+//
+// The CONTROL for U3's gate, and it is not optional. U3 asks "does the fine
+// kernel on the root agree with the dense kernel, bit for bit, from identical
+// input", and the answer is read as a CLEAN comparison after stepping. But a
+// clean comparison is also what a broken COMPARISON produces, so the gate
+// needs a configuration where the same procedure must come back DIRTY. That is
+// this one: mirror, step, and leave the root untouched, so the pool is
+// provably stale and the checker has to say so.
+const ROOT_STEP = urlParams.has('rootstep') ? (parseInt(urlParams.get('rootstep')) ? 1 : 0) : 1;
+
 // Milestone 10: per-CHILD-level threshold overrides -- see
 // main-cylinder-amr.js's copy of this function for the full rationale (a
 // level-2 block's vorticity is measured on the same RB=8 stencil at half
@@ -942,6 +966,13 @@ async function init() {
   const readF = (mapped, ncells) =>
     F16 ? unpackF(new Uint32Array(mapped), ncells, true) : new Float32Array(mapped).slice();
   const pools = [undefined]; // pools[0] unused -- L0 is the dense grid, not a pool level
+  if (ROOT_POOL) {
+    // The root, as a level. Nothing reads it yet -- see ROOT_POOL's note.
+    const spec = rootPoolSpec({ dims: { W, H }, rb: RB });
+    pools[0] = allocLevelPool(device, U, 0, spec.nbx, spec.nby, spec.slots, spec.cellsPerSlot);
+    // No initial field: a buffer nothing reads should not be given a state
+    // that could be mistaken for one. U3 seeds it when a kernel wants it.
+  }
   {
     let curNBX = NBX, curNBY = NBY; // level 1's logical grid = today's coarse block grid
     for (let m = 1; m < N_LEVELS; m++) {
@@ -984,8 +1015,13 @@ async function init() {
   // the whole session, geometric/topological, never change) and
   // updateLevelParams() below (parentTau only -- the one field that
   // actually moves, when the TAU slider changes).
-  for (let c = 1; c < N_LEVELS; c++) {
+  // The ROOT gets one too (U3). `parentTau` is deliberately left at 0: the
+  // root's pipeline sets OWN_TAU, so that field is never read, and writing a
+  // plausible value there would create a second source of truth for a number
+  // `state.tau` already holds.
+  for (let c = (ROOT_POOL ? 0 : 1); c < N_LEVELS; c++) {
     const pool = pools[c];
+    if (!pool) continue;
     pool.levelParamsBuf = device.createBuffer({ size: 32, usage: U.UNIFORM | U.COPY_DST });
     const staticBuf = new ArrayBuffer(32);
     const staticDv = new DataView(staticBuf);
@@ -1106,7 +1142,7 @@ async function init() {
     };
   }
 
-  const [stepSM, frcSM, phySM, renSM, digestSM, interpDenseSM, interpPoolSM, step1SM, avgSM, avgPoolSM, criterionSM, manageSM, force1SM, criterionPoolSM, managePoolSM] = await Promise.all([
+  const [stepSM, frcSM, phySM, renSM, digestSM, interpDenseSM, interpPoolSM, step1SM, avgSM, avgPoolSM, criterionSM, manageSM, force1SM, criterionPoolSM, managePoolSM, mirrorRootSM] = await Promise.all([
     loadShader(device, 'shaders/amr_step.wgsl'),
     loadShader(device, 'shaders/amr_force.wgsl'),
     loadShader(device, 'shaders/amr_physics.wgsl'),
@@ -1133,6 +1169,11 @@ async function init() {
     // parent=level>=1 -- see amr_criterion_pool.wgsl/amr_manage_pool.wgsl.
     loadShader(device, 'shaders/amr_criterion_pool.wgsl'),
     loadShader(device, 'shaders/amr_manage_pool.wgsl'),
+    // U2: dense L0 -> root pool, an addressing proof and nothing else.
+    // Loaded unconditionally (a module nothing instantiates costs nothing)
+    // so the WGSL is compiled on every page load rather than only under
+    // ?rootpool=1, where a syntax error would hide until someone set it.
+    loadShader(device, 'shaders/amr_mirror_root.wgsl'),
   ]);
 
   const stepBGL = device.createBindGroupLayout({ label: 'stepBGL', entries: [
@@ -1523,6 +1564,77 @@ async function init() {
     layout: device.createPipelineLayout({ bindGroupLayouts: [manageBGL] }),
     compute: { module: manageSM, entryPoint: 'linkRefine', constants: manageConstants }
   });
+  // U2's mirror: dense L0 -> the root pool, so the pool's addressing can be
+  // scored against the live dense buffer before any kernel depends on it.
+  // Built only when the root pool exists; nothing in the solver reads it.
+  let mirrorRootPL = null, mirrorRootBG = null;
+  if (ROOT_POOL) {
+    const mirrorBGL = device.createBindGroupLayout({ entries: [
+      { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+      { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+      { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    ]});
+    mirrorRootPL = device.createComputePipeline({
+      layout: device.createPipelineLayout({ bindGroupLayouts: [mirrorBGL] }),
+      compute: { module: mirrorRootSM, entryPoint: 'main', constants: { W, H, RB, F16 } },
+    });
+    mirrorRootBG = device.createBindGroup({ layout: mirrorBGL, entries: [
+      { binding: 0, resource: { buffer: f_a } },
+      { binding: 1, resource: { buffer: pools[0].finePoolF_a } },
+      { binding: 2, resource: { buffer: pools[0].slotToBlockBuf } },
+    ]});
+  }
+
+  // U3: the fine step kernel, serving the ROOT.
+  //
+  // The SAME module as every other level -- amr_step1.wgsl -- with GHOST 0 and
+  // OWN_TAU 1. Everything else is the fine step's own constants, and the
+  // scenario overrides (SPONGE_W, USE_BOUNCEBACK, SOLID_EQ, HAS_BODY, WALL_Y,
+  // FORCE_*) are deliberately NOT passed by either kernel on this page, so
+  // both take their shader defaults and are matched by construction rather
+  // than by a list somebody has to keep in step.
+  //
+  // IT IS INERT. It reads and writes the root pool only; the dense path stays
+  // authoritative and the page's numbers do not move. What it buys is a
+  // DIFFERENTIAL TEST: mirror the dense grid into the root, step both, and ask
+  // whether the two kernels agree bit for bit on identical input. U2's
+  // discrimination case (stale pool -> dirty) becomes U3's gate (stepped in
+  // parallel -> still clean), with the same checker and the opposite
+  // expectation.
+  let rootStepPL = null, rootStepBG_ab = null, rootStepBG_ba = null, rootStepWG = 0;
+  if (ROOT_POOL && ROOT_STEP) {
+    rootStepPL = device.createComputePipeline({
+      layout: device.createPipelineLayout({ bindGroupLayouts: [step1BGL] }),
+      // DIRECT_GHOST IS PINNED, and it is the one constant the root may not
+      // inherit. `step1Constants` carries `DIRECT_GHOST: GHOST_COPY ? 0 : 1`,
+      // so `?ghostcopy=1` would hand the root the legacy path -- clamp at the
+      // slot's own buffer edge and read a ghost cell a separate fine-fine copy
+      // pass filled. The root has GHOST = 0, so there is no ring to clamp into
+      // and no copy pass that fills one; it would stream from its own edge
+      // cells. The root is also ALWAYS FULL, so the direct path never falls
+      // back (amr2d.mjs's ghostDepthAtLevel(0) and rootPoolSpec's `slots ===
+      // nblocks`) and the legacy path has nothing to offer it.
+      //
+      // MEASURED, not argued: inherited, `?ghostcopy=1&benchSkip=avg` read
+      // 580623/589824 words differing from the dense grid at 512 macro-steps
+      // -- indistinguishable from not stepping the root at all -- while every
+      // other rung was bit-identical. See plans/uniform-levels.md U3.
+      compute: { module: step1SM, entryPoint: 'main',
+                 constants: { ...step1Constants, DIRECT_GHOST: 1, GHOST: 0, NO_PARENT: 1, SPONGE_CELL_SNAP: 1 } },
+    });
+    const rootBG = (fin, fout) => device.createBindGroup({ layout: step1BGL, entries: [
+      { binding: 0, resource: { buffer: cardStateBuf } },
+      { binding: 1, resource: { buffer: fin } },
+      { binding: 2, resource: { buffer: fout } },
+      { binding: 3, resource: { buffer: pools[0].finePoolVel } },
+      { binding: 4, resource: { buffer: pools[0].slotToBlockBuf } },
+      { binding: 5, resource: { buffer: pools[0].levelParamsBuf } },
+      { binding: 6, resource: { buffer: pools[0].blockSlotBuf } },
+    ]});
+    rootStepBG_ab = rootBG(pools[0].finePoolF_a, pools[0].finePoolF_b);
+    rootStepBG_ba = rootBG(pools[0].finePoolF_b, pools[0].finePoolF_a);
+    rootStepWG = Math.ceil((RB * 2) / 8);
+  }
 
   // D0's candidate scan: two pipelines from one entry point, so the grant and
   // release rules cannot drift into two spellings of "candidate". One
@@ -1917,6 +2029,112 @@ async function init() {
   const gpuMsEl = document.getElementById('val-gpu-ms');
   const syncMsEl = document.getElementById('val-sync-ms');
 
+  // ── U2: the mirror, and the proof it lands where the host says ───────────
+  //
+  // ON DEMAND, NOT PER MACRO-STEP. The plan first said "copy every macro-step";
+  // that would make the pool's contents a function of WHEN you look, and the
+  // thing under test -- the addressing -- is static. Mirroring on request and
+  // comparing immediately tests the same map with none of that, and costs a
+  // paused page rather than every frame.
+  //
+  // It binds f_a, which is the current dense buffer whenever the caller has
+  // stopped on an even macro-step. debugSnapshotSave relies on exactly the
+  // same invariant (STEPS_PER_FRAME is even, so useB returns to false), and
+  // debugStepSync leaves it that way -- so "mirror, then check" is only
+  // meaningful from the same rest state a snapshot is.
+  function debugMirrorRoot() {
+    if (!mirrorRootPL) throw new Error('debugMirrorRoot: no root pool (?rootpool=1)');
+    const spec = rootPoolSpec({ dims: { W, H }, rb: RB });
+    const enc = device.createCommandEncoder();
+    const p = enc.beginComputePass();
+    p.setPipeline(mirrorRootPL);
+    p.setBindGroup(0, mirrorRootBG);
+    p.dispatchWorkgroups(spec.side / 8, spec.side / 8, spec.slots);
+    p.end();
+    device.queue.submit([enc.finish()]);
+    return device.queue.onSubmittedWorkDone();
+  }
+
+  // Score the mirrored pool against the dense grid, cell by cell, EXACTLY.
+  //
+  // The comparison is on raw words, so it is bit-exact and layout-agnostic --
+  // under ?f16= it compares packed halves rather than round-tripped floats,
+  // which is the regime where a mismatch would otherwise be easiest to lose.
+  //
+  // The host route is amr2d.mjs's rootCellToDense, which derives the dense
+  // index from the spec and blockGridAtLevel. The shader derives it from
+  // slotToBlock and its own overrides. Neither consults the other, which is
+  // what makes agreement evidence rather than a tautology.
+  async function debugCheckRootMirror(maxReport = 8) {
+    if (!pools[0]) return { ok: null, skipped: 'no root pool (?rootpool=1)' };
+    const spec = rootPoolSpec({ dims: { W, H }, rb: RB });
+    const nw = fWords(F16);
+    const denseWords = NCELLS * nw;
+    const rootWords = spec.slots * spec.cellsPerSlot * nw;
+    const stageDense = device.createBuffer({ size: denseWords * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    const stageRoot = device.createBuffer({ size: rootWords * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    const enc = device.createCommandEncoder();
+    enc.copyBufferToBuffer(f_a, 0, stageDense, 0, denseWords * 4);
+    enc.copyBufferToBuffer(pools[0].finePoolF_a, 0, stageRoot, 0, rootWords * 4);
+    device.queue.submit([enc.finish()]);
+    await Promise.all([stageDense.mapAsync(GPUMapMode.READ), stageRoot.mapAsync(GPUMapMode.READ)]);
+    const dense = new Uint32Array(stageDense.getMappedRange()).slice();
+    const root = new Uint32Array(stageRoot.getMappedRange()).slice();
+    stageDense.unmap(); stageRoot.unmap();
+    stageDense.destroy(); stageRoot.destroy();
+
+    const rootPlane = spec.slots * spec.cellsPerSlot;
+    // MAGNITUDE, not just inequality.
+    //
+    // Counting differing WORDS is the right metric for U2, where the mirror
+    // must reproduce the dense grid exactly and any difference is an
+    // addressing bug. It is the WRONG metric for U3: two separately written
+    // kernels stepping the same field will differ in the last bits, and after
+    // a hundred macro-steps that seed difference has reached every cell -- so
+    // the count saturates and says nothing about how well they agree.
+    //
+    // f32 views only (F16 packs two halves per word, and unpacking here would
+    // duplicate f-pack.mjs for a diagnostic); under ?f16= the word count is
+    // still reported and the magnitude is not.
+    const denseF = F16 ? null : new Float32Array(dense.buffer);
+    const rootF = F16 ? null : new Float32Array(root.buffer);
+    let maxAbs = 0, maxRel = 0, sumSq = 0, sumRef = 0;
+    const first = [];
+    let checked = 0, mismatched = 0;
+    for (let slot = 0; slot < spec.slots; slot++) {
+      for (let ly = 0; ly < spec.side; ly++) {
+        for (let lx = 0; lx < spec.side; lx++) {
+          const denseCell = rootCellToDense({ dims: { W, H }, rb: RB }, slot, lx, ly);
+          const rootCell = slot * spec.cellsPerSlot + ly * spec.side + lx;
+          for (let wi = 0; wi < nw; wi++) {
+            checked++;
+            const a = root[wi * rootPlane + rootCell];
+            const b = dense[wi * NCELLS + denseCell];
+            if (denseF) {
+              const va = rootF[wi * rootPlane + rootCell];
+              const vb = denseF[wi * NCELLS + denseCell];
+              const d = Math.abs(va - vb);
+              if (d > maxAbs) maxAbs = d;
+              const r = d / Math.max(Math.abs(vb), 1e-12);
+              if (r > maxRel) maxRel = r;
+              sumSq += d * d; sumRef += vb * vb;
+            }
+            if (a === b) continue;
+            mismatched++;
+            if (first.length < maxReport) first.push({ slot, lx, ly, word: wi, root: a, dense: b, denseCell });
+          }
+        }
+      }
+    }
+    return {
+      ok: mismatched === 0, checked, mismatched, first,
+      // relL2 is the field-level agreement: sqrt(sum d^2 / sum ref^2).
+      maxAbs: denseF ? maxAbs : null,
+      maxRel: denseF ? maxRel : null,
+      relL2: denseF ? (sumRef > 0 ? Math.sqrt(sumSq / sumRef) : 0) : null,
+    };
+  }
+
   // ── Debug/verification support (window.__AMR) ────────────────────────────
   // Dedicated staging buffers, separate from the triple-buffered readback
   // stages above, so debug reads can't race frame()'s own in-flight readback.
@@ -2203,6 +2421,16 @@ async function init() {
         if (!skipGroup('interp')) { const p = beginPass(enc, 'L0->L1 interp'); p.setPipeline(skipGroup('interp-noop') ? noopPLs.interpDense : interpPL); p.setBindGroup(0, readBG); p.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); p.end(); }
       }
       const s = beginPass(enc, 'L0 step'); s.setPipeline(stepPL); s.setBindGroup(0, stepBG); s.dispatchWorkgroups(WGX, WGY); s.end();
+      // U3: the same step, on the root pool, in parallel and read by nobody.
+      // Shares L0's own `useB` ping-pong so the two stay in phase -- which is
+      // what lets debugCheckRootMirror compare _a against f_a at rest.
+      if (rootStepPL) {
+        const rs = beginPass(enc, 'root step');
+        rs.setPipeline(rootStepPL);
+        rs.setBindGroup(0, useB ? rootStepBG_ba : rootStepBG_ab);
+        rs.dispatchWorkgroups(rootStepWG, rootStepWG, pools[0].MAX_FINE_BLOCKS);
+        rs.end();
+      }
       if (hasChild) {
         S_Advance(1, enc);
         const avgBG = useB ? avgBG_targetA : avgBG_targetB;
@@ -3487,6 +3715,10 @@ async function init() {
     debugActivateBlock,
     debugDeactivateBlock,
     debugListActiveBlocks,
+    debugCheckRootPool: () => checkRootPoolIdentity(device, pools),
+    debugMirrorRoot,
+    debugCheckRootMirror,
+    getRootPool: () => (ROOT_POOL ? { ...rootPoolSpec({ dims: { W, H }, rb: RB }), stepped: !!ROOT_STEP } : null),
     debugCheck21Balance,
     debugCheckRefinementClosure,
     debugCheckSlotQuadrants,

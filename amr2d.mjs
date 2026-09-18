@@ -1239,3 +1239,97 @@ export function transferLedger({ dims, covered, dirs }) {
       && !undelivered.length && !phantomDeliveries.length && !doubleDeliveries.length,
   };
 }
+
+// ── U1: the root pool's shape ──────────────────────────────────────────────
+//
+// The root is a pool level that is ALWAYS FULL and never allocated or freed,
+// so its slot count is not a capacity guess like every other level's -- it is
+// exactly its block count, forever. `poolSlotsFor`'s 1.7x headroom has no
+// meaning here and must not be applied.
+//
+// The identity that makes this worth doing is `cells === dims.W * dims.H`,
+// EXACTLY: because the root has no ring, tiling it costs no padding, and the
+// root pool is the same memory the dense grid it replaces already uses. That
+// is asserted in tools/test-amr2d.js rather than argued here.
+export function rootPoolSpec({ dims, rb = RB_DEFAULT }) {
+  const [nbx, nby] = blockGridAtLevel(dims, 0, rb);
+  const side = tileSideAtLevel(0, rb);
+  return {
+    nbx, nby,
+    nblocks: nbx * nby,
+    slots: nbx * nby,
+    side,
+    cellsPerSlot: side * side,
+    cells: nbx * nby * side * side,
+  };
+}
+
+// ── the dense L0 grid's own layout ─────────────────────────────────────────
+//
+// THE DENSE GRID IS NOT ROW-MAJOR. `shaders/amr_step.wgsl`'s `cellIndex`
+// groups it into fixed 8x8 buffer-space blocks laid out block-major, row-major
+// WITHIN a block, and `debugSnapshotSave` tags every snapshot `layout:
+// 'block8'` precisely so nothing downstream forgets it. Every dense-parent
+// accessor in shaders/ restates the same formula
+// (common_interp_parent_dense.wgsl, common_avg_parent_dense.wgsl,
+// amr_force.wgsl, amr_criterion.wgsl, amr_render.wgsl); `tools/lib/
+// field-reconstruct.js`'s `rawIndex` is the host's decoder for it.
+//
+// It is stated HERE because U2 needed it and did not have it, and the cost of
+// that is recorded in plans/uniform-levels.md U2: both of U2's supposedly
+// independent routes wrote `gy*W + gx`, so they agreed, the mirror was scored
+// CLEAN, and 98.4% of the root pool's cells were nonetheless reading the wrong
+// dense cell. Two routes are only independent if they do not share a premise,
+// and the premise they shared was never written down anywhere either of them
+// could be checked against.
+//
+// `block` is the dense grid's sub-tile, NOT a level's RB. They are equal today
+// (main-amr.js's `RB = BLOCK`) and that coincidence is exactly what makes the
+// mistake survivable-looking, so it is a separate parameter here.
+export const DENSE_BLOCK = 8;
+
+export function denseCellIndex({ dims, block = DENSE_BLOCK }, gx, gy) {
+  if (dims.W % block !== 0 || dims.H % block !== 0) {
+    throw new Error(`dense grid ${dims.W}x${dims.H} does not divide into ${block}-cell blocks`);
+  }
+  if (gx < 0 || gy < 0 || gx >= dims.W || gy >= dims.H) {
+    throw new Error(`(${gx},${gy}) is outside a ${dims.W}x${dims.H} domain`);
+  }
+  const nbx = dims.W / block;
+  const bx = Math.floor(gx / block), by = Math.floor(gy / block);
+  const lx = gx % block, ly = gy % block;
+  return (by * nbx + bx) * (block * block) + ly * block + lx;
+}
+
+// ── U2: the root pool's addressing, as a host route ────────────────────────
+//
+// Where a root pool cell sits in the dense grid it mirrors. This is the
+// INDEPENDENT ROUTE shaders/amr_mirror_root.wgsl is scored against: the shader
+// walks pool slots and derives a dense index; this walks the same cell from
+// the spec and derives it again from `blockGridAtLevel`.
+//
+// **AGREEMENT BETWEEN THEM IS NOT SUFFICIENT, AND U2 PROVED IT THE HARD WAY.**
+// Both routes originally ended in `gy*W + gx` and therefore agreed exactly,
+// over a mirror that was reading the wrong dense cell for 98.4% of the root
+// pool. The third route -- the one that makes this checkable -- is
+// `denseCellIndex` above, scored in tools/test-amr2d.js against
+// `tools/lib/field-reconstruct.js`'s `rawIndex`, which is what decodes real
+// GPU snapshots and is therefore validated by data neither of these wrote.
+//
+// Returns a linear cell index into one direction plane of the dense grid,
+// which is what `cellIndex()` means on that side.
+export function rootCellToDense({ dims, rb = RB_DEFAULT }, slot, lx, ly) {
+  const side = tileCellsAtLevel(0, rb);
+  if (lx < 0 || ly < 0 || lx >= side || ly >= side) {
+    throw new Error(`(${lx},${ly}) is outside a ${side}x${side} root tile`);
+  }
+  const [nbx] = blockGridAtLevel(dims, 0, rb);
+  const bx = slot % nbx;
+  const by = Math.floor(slot / nbx);
+  const gx = bx * side + lx;
+  const gy = by * side + ly;
+  if (gx >= dims.W || gy >= dims.H) {
+    throw new Error(`slot ${slot} cell (${lx},${ly}) lands outside the domain`);
+  }
+  return denseCellIndex({ dims }, gx, gy);
+}

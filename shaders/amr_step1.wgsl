@@ -126,7 +126,63 @@ override SKIP_GHOST : u32 = 0u;
 // exactly the legacy path, for exactly the cells that need it.
 override DIRECT_GHOST : u32 = 1u;
 
-const GHOST = 2u;
+// GHOST is an OVERRIDE, not a const, since plans/uniform-levels.md U3: the
+// ROOT level has no ring at all (amr2d.mjs's ghostDepthAtLevel(0) is 0),
+// because it has no parent to receive from and is always full, so DIRECT_GHOST
+// always resolves against an owning same-level tile and never falls back.
+// Default 2 keeps every existing pipeline byte-identical.
+//
+// It flows into FB = RB*2 + 2*GHOST, so at 0 a slot is exactly its own
+// 2*RB x 2*RB cells and the local coordinates ARE the cells.
+override GHOST : u32 = 2u;
+
+// NO_PARENT: this level is the ROOT. Two things follow, and both are
+// consequences of the same fact rather than two switches.
+//
+// 1. TAU IS ITS OWN. `2*parentTau - 0.5` has no meaning without a parent. The
+//    arithmetically equivalent dodge -- write `(tau+0.5)/2` into parentTau and
+//    let the kernel undo it -- is NOT used: `fl(fl(tau + 0.5) - 0.5)` is not
+//    guaranteed to be `tau` in f32, so a bit-identity gate could fail on the
+//    round trip rather than on anything real. It reads `state.tau`, the same
+//    word the dense kernel reads.
+//
+// 2. THE HALF-CELL OFFSET GOES AWAY. fineToCoarseUnit places cell j at
+//    `origin - 0.5*dxL + dxL*j`, where `origin` is the centre of the first
+//    PARENT cell the tile covers and the two children straddle it at
+//    +-dxL/2. At the root `origin` is the first cell's OWN centre -- there is
+//    nothing to straddle -- so the offset is 0 and cell j sits at
+//    `origin + dxL*j`.
+//
+//    This was found by U3's differential test, not by reading: the root and
+//    dense kernels disagreed at the very first cell, and a half-cell shift in
+//    the body's phi and the sponge's distance is exactly what that looks like.
+//    It would not have been visible in any single-kernel test, because the
+//    root is self-consistent with it -- just displaced half a cell from the
+//    grid it is supposed to reproduce.
+override NO_PARENT : u32 = 0u;
+
+// SPONGE_CELL_SNAP: take the window position the way amr_step.wgsl does.
+//
+// A REAL, PRE-EXISTING INCONSISTENCY, found by U3 and deliberately NOT fixed
+// here. The dense L0 step converts to window coordinates with
+// `bufferToWindowCell`, which is u32 modular arithmetic and therefore
+// TRUNCATES `off_x`/`off_y` to whole cells. Every pool level uses
+// `bufferToWindowPos`, which keeps the sub-cell part. So whenever the window
+// offset is fractional -- which on the falling-card page is essentially always
+// -- L0's sponge band sits up to half a cell away from where every finer
+// level's does.
+//
+// That is a physics difference, small and confined to the sponge band, and
+// unifying the two conventions would move published numbers. U3 is a
+// REPRESENTATION stage: its job is to show the root pool reproduces the dense
+// grid exactly, not to improve it. So the root takes L0's convention, the
+// inconsistency is recorded rather than silently absorbed, and fixing it is
+// its own change with its own gate.
+//
+// Folded at pipeline creation, so no non-root pipeline evaluates the u32
+// conversion below -- which matters, because a ring cell's buffer position can
+// be negative and this branch would be meaningless there.
+override SPONGE_CELL_SNAP : u32 = 0u;
 
 // Sponge relaxation target velocity -- mirrors amr_step.wgsl's SPONGE_UX/UY
 // exactly (same formula, see this file's sponge comment below for why the
@@ -223,14 +279,19 @@ override FORCE_Y : f32 = 0.0f;
 // level 2) moved from wrong-signed fx=-7.09 (1201 boundary-link triggers)
 // to still-wrong-but-improved fx=-6.05 (797 triggers) -- real
 // measured progress, not a full fix.
+// The half-cell straddle is a PARENT-RELATIVE term -- see NO_PARENT.
+fn cellCentreOffset() -> f32 {
+  return select(0.5f * levelParams.dxL, 0.0f, NO_PARENT != 0u);
+}
+
 fn fineToCoarseUnit(fCoord: u32, origin: f32) -> f32 {
   let j = f32(i32(fCoord) - i32(GHOST));
-  return origin - 0.5 * levelParams.dxL + levelParams.dxL * j;
+  return origin - cellCentreOffset() + levelParams.dxL * j;
 }
 
 fn fineToCoarseUnitI(fCoordI: i32, origin: f32) -> f32 {
   let j = f32(fCoordI - i32(GHOST));
-  return origin - 0.5 * levelParams.dxL + levelParams.dxL * j;
+  return origin - cellCentreOffset() + levelParams.dxL * j;
 }
 
 fn get_chi(phi: f32) -> f32 {
@@ -317,7 +378,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let bufY = fineToCoarseUnit(fy, originY_L0);
   // WINDOW position, for the sponge band below. The BODY's frame is just the
   // buffer position itself since B5 (common_geometry.wgsl).
-  let wpos = bufferToWindowPos(vec2<f32>(bufX, bufY), state);
+  var wpos = bufferToWindowPos(vec2<f32>(bufX, bufY), state);
+  if (SPONGE_CELL_SNAP != 0u) { // see the override -- L0's own convention
+    wpos = vec2<f32>(bufferToWindowCell(vec2<u32>(u32(bufX), u32(bufY)), state));
+  }
   let wx = wpos.x; let wy = wpos.y;
   let p = vec2<f32>(bufX, bufY);
   // Periodic minimum-image lever arm, matching amr_step.wgsl / amr_force.wgsl
@@ -428,9 +492,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let dist_y = min(wy, f32(H) - 1.0f - wy);
   let sponge_weight = spongeWeight(dist_x, dist_y, SPONGE_W);
 
-  // Relative to THIS level's own parent, not L0 -- see header.
+  // Relative to THIS level's own parent, not L0 -- see header. At the root
+  // there is no parent and `state.tau` IS this level's tau; see OWN_TAU.
   let tau_coarse = levelParams.parentTau;
-  let tau_fine = 2.0f * tau_coarse - 0.5f;
+  let tau_fine = select(2.0f * tau_coarse - 0.5f, state.tau, NO_PARENT != 0u);
   let omg = 1.0f / tau_fine;
   // Gathered, then stored a whole cell at a time: under F16 two planes share
   // a word, so a per-plane store would be a read-modify-write race. See
