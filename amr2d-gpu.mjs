@@ -222,6 +222,13 @@ export function allocLevelPool(device, U, m, NBX_m, NBY_m, maxFineBlocks, NCELLS
     // (including with sets that violate the invariant), COPY_SRC so the
     // result can be scored against amr2d.mjs's host twin.
     wantBuf: device.createBuffer({ size: NBLOCKS_m * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC }),
+    // D0's candidate rank, one i32 per block (plans/uniform-levels.md 1.2c).
+    // Allocated HERE rather than in each page, which is the whole point of
+    // this function: the five AMR pages each build their own manage bind
+    // group, and a buffer added five times is a buffer that will eventually be
+    // added four times. COPY_SRC so a test can read the ranks back and score
+    // them against amr2d.mjs's grantAssignment.
+    candRankBuf: device.createBuffer({ size: NBLOCKS_m * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC }),
   };
   if (m === 1) {
     // Per-block allocation, unchanged from today -- L0 isn't itself

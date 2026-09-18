@@ -945,3 +945,61 @@ export function cascade21(wantSets, nbAt, { levels }) {
   }
   return { sets, forced, counts: sets.map((s, m) => (m === 0 ? null : s.size)) };
 }
+
+// ── D0: the deterministic slot handout (plans/uniform-levels.md D0) ─────────
+//
+// THE DEFECT THESE REPLACE. Both GPU managers hand slots out through a racing
+// free list -- `atomicSub(&freeCount, 1)` in shaders/amr_manage.wgsl and
+// shaders/amr_manage_pool.wgsl -- so which block gets which slot depends on
+// which thread reaches the atomic first. amr_force1.wgsl then atomicAdds one
+// TRUNCATED i32 per workgroup, so regrouping the slots regroups the partials
+// and they truncate differently. Measured 2026-09-17
+// (tools/measure-determinism.js): that is the ONLY live source of run-to-run
+// nondeterminism in this solver. With the handout pinned, two runs of one
+// build are bit-identical; without it, `?levels=2` differs on every run.
+//
+// THE RULE. Order the candidates, then serve them in order. Nothing else
+// changes -- the pop discipline is still "take the top of the stack, then
+// decrement", which is what makes the deterministic and racing paths differ
+// only in WHO is served WHEN and not in what a service does.
+//
+// These return a FREE-LIST INDEX, not a slot or a quad. The free list's
+// CONTENTS are state that both paths share; what the rule fixes is which
+// index each candidate reads. Keeping the two apart is what lets the GPU be
+// scored against this without the test having to model the pool's history.
+//
+// ORDERING BY ID IS THE STATEMENT; the GPU may reach it by a cheaper route.
+// The dense manager dispatches over blocks, so its serial loop is already in
+// id order. The pool manager dispatches over parent SLOTS and serves in slot
+// order, which is a different permutation -- and legitimately so: a slot
+// assignment is part of the state (debugSnapshotLoad restores it), so slot
+// order is state-determined too. What it is NOT is id-ordered, so do not
+// score the pool manager against grantAssignment's `id` sequence; score it
+// against the INVARIANTS below, which are what actually matter.
+
+// Serve `candidates` (integer ids) from a free list of `freeCount` entries.
+// Returns, for each granted candidate, the free-list index it must read --
+// `freeIndex` counts DOWN from freeCount-1, matching the pop discipline.
+// Candidates past the end of the free list are refused, lowest id first, so a
+// starved pool starves predictably instead of arbitrarily.
+export function grantAssignment({ candidates, freeCount }) {
+  const ordered = [...candidates].sort((a, b) => a - b);
+  const granted = [];
+  const refused = [];
+  let count = freeCount;
+  for (const id of ordered) {
+    if (count <= 0) { refused.push(id); continue; }
+    count -= 1;
+    granted.push({ id, freeIndex: count });
+  }
+  return { granted, refused, freeCount: count };
+}
+
+// The inverse: return `releases` to the free list. Push order is id order, and
+// the j-th writes at freeCount + j -- the same "top of the stack" discipline
+// read the other way.
+export function releaseAssignment({ releases, freeCount }) {
+  const ordered = [...releases].sort((a, b) => a - b);
+  const writes = ordered.map((id, j) => ({ id, freeIndex: freeCount + j }));
+  return { writes, freeCount: freeCount + ordered.length };
+}

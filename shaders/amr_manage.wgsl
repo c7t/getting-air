@@ -116,6 +116,17 @@
 //       still propagating outward when the loop stopped. The lag signal.
 //   [5] refines wanted but the pool was exhausted
 // Gated by DIAG: at 0 no atomic is touched.
+// binding 7: D0's candidate RANK, one i32 per block, -1 for a non-candidate.
+// Reclaims one of the two holes B2-2d left (7 and 8 were level 2's
+// blockCriterion/blockSlot for the per-pass cascade) rather than renumbering,
+// so no existing binding index moves and the four pages that never set
+// DET_SLOTS need only bind a buffer, not re-read their layouts.
+//
+// It holds the GRANT rank or the RELEASE rank depending on which scan last
+// ran, and the two never collide: a block wants a tile and lacks one, or has
+// one and is no longer wanted, or neither. It cannot be both.
+@group(0) @binding(7)  var<storage, read_write> candRank : array<i32>;
+
 @group(0) @binding(9) var<storage, read_write> diag : array<atomic<u32>, 8>;
 // Level 1's WANT array, one u32 per L0 block -- written by decide(), closed
 // by shaders/amr_cascade.wgsl, consumed by coarsen/refine when CASCADE != 0.
@@ -163,6 +174,37 @@ override BOX_REFINE : u32 = 1u;
 // isNearBody (the body is window-centered, never in the edge band) and the
 // 2:1-balance cascade, gating only the vorticity (epsFor) term.
 override SPONGE_EXCLUDE_W : f32 = 0.0f;
+
+// ── D0: ?detslots=1 -- deterministic slot handout (MEASUREMENT MODE) ────────
+// Default 0 is the shipped atomic free-list race, byte-identical when absent.
+//
+// WHAT IT IS FOR. Which slot a block gets depends on which thread reaches the
+// `atomicSub` below first, so block->slot assignment varies run to run; and
+// amr_force1.wgsl atomicAdds one TRUNCATED i32 per workgroup, so regrouping
+// the slots regroups the partials and they truncate differently. That is the
+// mechanism behind every attractor table in CLAUDE.md. This flag exists to
+// answer ONE question before any of it is engineered away: is slot assignment
+// the ONLY live source of run-to-run nondeterminism? If it is, `?detslots=1`
+// makes repeated runs BIT-IDENTICAL, and no statistics are needed to say so.
+// (The second half of the chain is already exact: integer atomicAdd is
+// associative and commutative with no rounding, so once each workgroup's
+// partial is fixed the sum is order-independent.)
+//
+// IT IS NOT THE SHIPPING IMPLEMENTATION. One thread does the whole handout in
+// a serial loop -- obviously correct, obviously deterministic, and far too
+// slow to default on. The shipping version gives every candidate a RANK from
+// a prefix sum over the want set and keeps the parallel dispatch.
+//
+// AND IT PINS A WEAKER ORDER THAN THE SHIPPING ONE SHOULD. Candidates are
+// taken in DISPATCH-INDEX order, which is reproducible only from a
+// deterministic initial state (resetSim writes an identity free list), so the
+// assignment is a function of the whole run rather than of the current state.
+// That is enough to answer the question above and is not enough to ship: the
+// real rule should order by BLOCK ID, which is geometry and therefore makes a
+// snapshot reload reproduce the same assignment. amr2d.mjs's
+// grantAssignment/releaseAssignment state that rule, and tools/test-amr2d.js
+// mutation-checks it.
+override DET_SLOTS : u32 = 0u;
 const BLOCK = 8u;
 
 // This block's own centre and half-extent in L0 buffer space. An L0 block is
@@ -250,6 +292,28 @@ fn coarsen(@builtin(global_invocation_id) gid: vec3<u32>) {
   // each edge neighbour, and the criterion ladder -- are all one direction of
   // that closure read locally, and they are gone with plans/2D-backport.md
   // B2-2d.
+  if (DET_SLOTS != 0u) {
+    // The mirror of refine()'s path: rank among the releasing blocks, push at
+    // count0 + rank. amr2d.mjs's releaseAssignment is the rule.
+    //
+    // Same deferral, same reason: the rank reads blockSlot, so this path does
+    // not write it. It clears slotToBlock (which the rank does not read) and
+    // leaves blockSlot to linkCoarsen() below. Releasing ALL FOUR of a quad is
+    // not a concern here -- the dense manager allocates per block, not per
+    // quad (see allocLevelPool's m === 1 branch).
+    if (want[blockID] != 0u || blockSlot[blockID] < 0) { return; }
+    let rank = candRank[blockID];
+    if (rank < 0) { return; } // the scan and this predicate disagree -- refuse rather than corrupt
+    // See refine()'s note: linkCoarsen() derives the new free count, so no
+    // thread here re-scans the block range to compute a total every other
+    // thread is computing too.
+    let count0 = atomicLoad(&freeCount);
+    let s = blockSlot[blockID];
+    freeList[u32(count0 + rank)] = s;
+    slotToBlock[u32(s)] = -1;
+    return;
+  }
+
   if (want[blockID] == 0u && currentSlot >= 0) {
     let oldCount = atomicAdd(&freeCount, 1);
     freeList[u32(oldCount)] = currentSlot;
@@ -273,6 +337,51 @@ fn refine(@builtin(global_invocation_id) gid: vec3<u32>) {
   // neighbour that would only ever have been created BY that refine (B2-1
   // measured level 2 pinned to half its allowed reach because of it).
   // The want set arrives closed, so this is now a lookup.
+  if (DET_SLOTS != 0u) {
+    // PARALLEL and deterministic: every candidate counts the candidates below
+    // it and takes the free-list entry that rank names. amr2d.mjs's
+    // grantAssignment is the rule; `freeList[count0 - 1 - rank]` is its
+    // `freeIndex`, and refusing at rank >= count0 is its "lowest ids win when
+    // the pool is short".
+    //
+    // ONLY CANDIDATES SCAN, which is what makes an O(nblocks) loop affordable
+    // here and not in the serial version this replaces: in steady state a
+    // refine round has tens of new candidates, not thousands, and their scans
+    // run concurrently. Measured: the serial loop cost ~0.23 ms per refine
+    // round, 28% of total sim time at levels=2 (plans/uniform-levels.md 1.2b).
+    //
+    // THE RANK'S INPUTS MUST NOT MOVE WHILE IT IS BEING COUNTED, and that is
+    // why this path does NOT write blockSlot. `want` is read-only during
+    // refine; blockSlot is what the racing path mutates, and a thread that
+    // scanned after a lower-numbered thread had granted would count one
+    // candidate too few and collide on a slot. The blockSlot half of the
+    // grant is deferred to linkRefine() below -- a separate dispatch, so the
+    // ordering is guaranteed rather than hoped for.
+    if (want[blockID] == 0u || blockSlot[blockID] >= 0) { return; }
+    let rank = candRank[blockID];
+    // Safe to read: nothing writes freeCount during this dispatch. The new
+    // value is NOT computed here -- linkRefine() derives it from the pool
+    // itself.
+    //
+    // It used to be, by having every candidate re-scan the whole block range
+    // for the total and store the same answer. That was measured and it was
+    // the dominant cost: at levels=2 the parallel rank saved almost nothing
+    // over the serial loop it replaced (+26.8% against +27.9%), because each
+    // of a few hundred candidates was walking 2 x nblocks entries instead of
+    // one. The scan a thread cannot avoid is its own rank; the total is the
+    // same number for everyone and belongs somewhere it is computed once.
+    let count0 = atomicLoad(&freeCount);
+    if (rank < 0 || rank >= count0) {
+      if (DIAG != 0u) { atomicAdd(&diag[5], 1u); } // pool exhausted -- stay coarse
+      return;
+    }
+    let s = freeList[u32(count0 - 1 - rank)];
+    slotToBlock[u32(s)] = i32(blockID);
+    newlyActivated[u32(s)] = 1u;
+    if (DIAG != 0u) { atomicAdd(&diag[3], 1u); }
+    return;
+  }
+
   if (want[blockID] != 0u && currentSlot < 0) {
     let oldCount = atomicSub(&freeCount, 1);
     if (oldCount > 0) {
@@ -292,4 +401,126 @@ fn refine(@builtin(global_invocation_id) gid: vec3<u32>) {
       if (DIAG != 0u) { atomicAdd(&diag[5], 1u); }
     }
   }
+}
+
+// ── D0's deferred blockSlot writes ──────────────────────────────────────────
+//
+// refine()/coarsen()'s deterministic paths rank their candidates by scanning
+// `blockSlot`, so neither may write it -- see the rank comments there. These
+// two passes finish the job afterwards, as separate dispatches, which is what
+// makes the ordering a guarantee instead of an assumption.
+//
+// They are no-ops under the default (racing) path, which writes blockSlot
+// inline, and the host does not encode them there at all. Both are also
+// IDEMPOTENT: re-running either reproduces the same state, so an accidental
+// double dispatch is harmless.
+
+// ── D0's candidate scan ─────────────────────────────────────────────────────
+//
+// WHY A SCAN AND NOT A PER-CANDIDATE COUNT. The version this replaces had each
+// candidate count the candidates below it -- O(candidates x nblocks), no
+// buffer, and it read well. It was measured and it did not work: at levels=2
+// the card page has hundreds of live level-1 blocks and the criterion churns
+// them, so a refine round has hundreds of candidates each walking up to 4096
+// entries, and the parallel handout cost the same +27% the serial loop had
+// (plans/uniform-levels.md 1.2c-OPEN). The design note's "tens of candidates,
+// not thousands" was simply wrong about this page.
+//
+// ONE WORKGROUP, COOPERATIVE. Each of 256 threads counts its own contiguous
+// chunk, thread 0 scans the 256 chunk totals, then each thread writes its
+// chunk's ranks from its own offset. Serial depth is nblocks/256 + 256 rather
+// than nblocks: 272 against 4096 at this resolution, and it grows with the
+// domain far more slowly than the thing it replaces. A two-level scan across
+// many workgroups would be faster still and needs a second buffer and a third
+// dispatch; this is enough until it is measured not to be.
+//
+// SCAN_RELEASE picks the predicate. Two pipelines from one entry point, so the
+// grant and release rules cannot drift apart into two spellings of "candidate"
+// the way refine() and coarsen() once each ran their own geometric test at
+// different points (see coarsen()'s own history note).
+override SCAN_RELEASE : u32 = 0u;
+const SCAN_WG : u32 = 256u;
+var<workgroup> chunkTotal : array<i32, SCAN_WG>;
+
+fn isCandidate(b: u32) -> bool {
+  if (SCAN_RELEASE != 0u) { return want[b] == 0u && blockSlot[b] >= 0; }
+  return want[b] != 0u && blockSlot[b] < 0;
+}
+
+@compute @workgroup_size(256)
+fn scanCandidates(@builtin(local_invocation_id) lid: vec3<u32>) {
+  // Uniform (an override constant), so the barriers below stay in uniform
+  // control flow.
+  if (DET_SLOTS == 0u) { return; }
+  let nblocks = (W / BLOCK) * (H / BLOCK);
+  let t = lid.x;
+  let per = (nblocks + SCAN_WG - 1u) / SCAN_WG;
+  let lo = min(t * per, nblocks);
+  let hi = min(lo + per, nblocks);
+
+  var c = 0;
+  for (var b = lo; b < hi; b++) { if (isCandidate(b)) { c = c + 1; } }
+  chunkTotal[t] = c;
+  workgroupBarrier();
+
+  if (t == 0u) {
+    var acc = 0;
+    for (var i = 0u; i < SCAN_WG; i++) {
+      let v = chunkTotal[i];
+      chunkTotal[i] = acc;      // exclusive
+      acc = acc + v;
+    }
+  }
+  workgroupBarrier();
+
+  var r = chunkTotal[t];
+  for (var b = lo; b < hi; b++) {
+    if (isCandidate(b)) { candRank[b] = r; r = r + 1; } else { candRank[b] = -1; }
+  }
+}
+
+// The free count, derived rather than accumulated.
+//
+// `freeCount` is the number of unallocated slots, so it is a FUNCTION of
+// slotToBlock and does not have to be maintained incrementally. Deriving it
+// here costs one thread a walk over the POOL (a few hundred slots), where
+// maintaining it in refine/coarsen cost every candidate a walk over the
+// DOMAIN (thousands of blocks). One thread does it, and it runs in a dispatch
+// where nothing else writes slotToBlock, so there is no race to reason about.
+//
+// This also means the deterministic path never has to get the incremental
+// bookkeeping right -- a class of off-by-one that the racing path's
+// atomicSub/atomicAdd pair exists to handle and that would have had to be
+// re-derived here.
+fn recountFree() {
+  let nSlots = arrayLength(&slotToBlock);
+  var alloc = 0;
+  for (var t = 0u; t < nSlots; t++) {
+    if (slotToBlock[t] >= 0) { alloc = alloc + 1; }
+  }
+  atomicStore(&freeCount, i32(nSlots) - alloc);
+}
+
+// After coarsen: a block whose slot no longer points back at it was released.
+@compute @workgroup_size(64)
+fn linkCoarsen(@builtin(global_invocation_id) gid: vec3<u32>) {
+  if (DET_SLOTS == 0u) { return; }
+  let blockID = gid.x;
+  let nblocks = (W / BLOCK) * (H / BLOCK);
+  if (blockID >= nblocks) { return; }
+  let s = blockSlot[blockID];
+  if (s >= 0 && slotToBlock[u32(s)] != i32(blockID)) { blockSlot[blockID] = -1; }
+  if (blockID == 0u) { recountFree(); }
+}
+
+// After refine: every live slot publishes itself back to its block. Existing
+// slots rewrite the value they already had; newly granted ones install theirs.
+@compute @workgroup_size(64)
+fn linkRefine(@builtin(global_invocation_id) gid: vec3<u32>) {
+  if (DET_SLOTS == 0u) { return; }
+  let s = gid.x;
+  if (s >= arrayLength(&slotToBlock)) { return; }
+  let b = slotToBlock[s];
+  if (b >= 0) { blockSlot[u32(b)] = i32(s); }
+  if (s == 0u) { recountFree(); }
 }

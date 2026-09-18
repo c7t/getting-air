@@ -271,21 +271,51 @@ fn decide(@builtin(global_invocation_id) gid: vec3<u32>) {
   }
 }
 
-@compute @workgroup_size(64)
-fn refine(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let parentSlot = gid.x;
-  if (parentSlot >= arrayLength(&parentSlotToBlock)) { return; }
-  let parentBlockID = parentSlotToBlock[parentSlot];
-  if (parentBlockID < 0) { return; } // parent not active -- not a candidate at all
+// ── D0: ?detslots=1 -- deterministic slot handout (MEASUREMENT MODE) ────────
+// Default 0 is the shipped atomic free-list race, byte-identical when absent.
+//
+// WHAT IT IS FOR. Which slot a block gets depends on which thread reaches the
+// `atomicSub` below first, so block->slot assignment varies run to run; and
+// amr_force1.wgsl atomicAdds one TRUNCATED i32 per workgroup, so regrouping
+// the slots regroups the partials and they truncate differently. That is the
+// mechanism behind every attractor table in CLAUDE.md. This flag exists to
+// answer ONE question before any of it is engineered away: is slot assignment
+// the ONLY live source of run-to-run nondeterminism? If it is, `?detslots=1`
+// makes repeated runs BIT-IDENTICAL, and no statistics are needed to say so.
+// (The second half of the chain is already exact: integer atomicAdd is
+// associative and commutative with no rounding, so once each workgroup's
+// partial is fixed the sum is order-independent.)
+//
+// IT IS NOT THE SHIPPING IMPLEMENTATION. One thread does the whole handout in
+// a serial loop -- obviously correct, obviously deterministic, and far too
+// slow to default on. The shipping version gives every candidate a RANK from
+// a prefix sum over the want set and keeps the parallel dispatch.
+//
+// AND IT PINS A WEAKER ORDER THAN THE SHIPPING ONE SHOULD. Candidates are
+// taken in DISPATCH-INDEX order, which is reproducible only from a
+// deterministic initial state (resetSim writes an identity free list), so the
+// assignment is a function of the whole run rather than of the current state.
+// That is enough to answer the question above and is not enough to ship: the
+// real rule should order by BLOCK ID, which is geometry and therefore makes a
+// snapshot reload reproduce the same assignment. amr2d.mjs's
+// grantAssignment/releaseAssignment state that rule, and tools/test-amr2d.js
+// mutation-checks it.
+override DET_SLOTS : u32 = 0u;
 
+// Does this parent slot want a child quad it does not already have? Shared by
+// both handout paths so the racing and deterministic routes cannot disagree
+// about WHICH blocks are candidates -- only about the order they are served.
+fn refineWants(parentSlot: u32) -> bool {
+  if (parentSlot >= arrayLength(&parentSlotToBlock)) { return false; }
+  let parentBlockID = parentSlotToBlock[parentSlot];
+  if (parentBlockID < 0) { return false; } // parent not active -- not a candidate at all
   let bxP = u32(parentBlockID) % NBX_PARENT;
   let byP = u32(parentBlockID) / NBX_PARENT;
   let nbxChild = NBX_PARENT * 2u;
-
-  // Already refined? Quadrant 0 stands for all 4 (decision 3's all-or-
-  // nothing invariant).
+  // Already refined? Quadrant 0 stands for all 4 (decision 3's all-or-nothing
+  // invariant).
   let childBlockID0 = (byP * 2u) * nbxChild + (bxP * 2u);
-  if (childBlockSlot[childBlockID0] >= 0) { return; }
+  if (childBlockSlot[childBlockID0] >= 0) { return false; }
 
   // NO CRITERION AND NO GEOMETRY HERE. Both were still being computed at this
   // point -- a max over the 4 prospective quadrants, its log2, the parent's
@@ -326,55 +356,114 @@ fn refine(@builtin(global_invocation_id) gid: vec3<u32>) {
   //
   // The want array arrives closed under the rule, so none of it has anything
   // left to decide.
-  if (childWant[childBlockID0] == 0u) { return; }
+  return childWant[childBlockID0] != 0u;
+}
+
+// Hand one free quad to one parent slot. Lifted verbatim out of refine() so the
+// serial path can reuse it; the arithmetic and every comment below are
+// unchanged.
+fn grantQuad(parentSlot: u32, quadIdx: i32) {
+  let parentBlockID = parentSlotToBlock[parentSlot];
+  let bxP = u32(parentBlockID) % NBX_PARENT;
+  let byP = u32(parentBlockID) / NBX_PARENT;
+  let nbxChild = NBX_PARENT * 2u;
+  let baseSlot = u32(quadIdx) * 4u;
+  for (var qy = 0u; qy < 2u; qy++) {
+    for (var qx = 0u; qx < 2u; qx++) {
+      let quadrant = qx + 2u * qy;
+      let slot = baseSlot + quadrant;
+      let childBX = bxP * 2u + qx;
+      let childBY = byP * 2u + qy;
+      let childBlockID = childBY * nbxChild + childBX;
+      childBlockSlot[childBlockID] = i32(slot);
+      childSlotToBlock[slot] = i32(childBlockID);
+      childParentSlot[slot] = i32(parentSlot);
+      // BUGFIX (L2 bounce-back sign/magnitude investigation): the
+      // "Milestone 10 BUGFIX" that used to sit here had it backwards --
+      // see parentCenterX_L0's own BUGFIX comment above (same file, same
+      // root confusion): the parent's own interior is 2*RB cells (not
+      // RB -- amr_criterion_pool.wgsl's header), so RB is ALREADY half
+      // the parent's own physical width (RB*PARENT_CELL_SIZE_L0 out of a
+      // full 2*RB*PARENT_CELL_SIZE_L0), and that IS the correct quadrant
+      // step -- no further *0.5f belongs here, same as parentCenterX_L0
+      // needed none. The removed *0.5f halved every qx=1/qy=1 child's
+      // offset from its parent's origin, so the 4 children of a quad no
+      // longer tiled the parent's footprint 2x2 with no gap/overlap:
+      // quadrant 1 sat overlapping half of quadrant 0's true territory
+      // and left the outer half of the parent's footprint uncovered by
+      // any tile at all (masked-off at the parent level too, since
+      // masking only checks quadrant 0's existence, not its registered
+      // position) -- exactly the kind of corruption that would produce
+      // a wrong-sign, wrong-magnitude level>=2 bounce-back force while
+      // leaving 2:1-balance (an index-only check) and the field-finite
+      // check clean. Live-verified via a per-slot force readback
+      // (amr_force1_pool.wgsl's debugSlotForce / main-cylinder-amr.js's
+      // debugReadSlotForces) correlating each level-2 slot's own (fx,fy)
+      // against its geometric position -- restoring this formula to
+      // match the ORIGINAL (pre-Milestone-10) version fixes it.
+      childNewlyActivated[slot] = 1u;
+    }
+  }
+}
+
+@compute @workgroup_size(64)
+fn refine(@builtin(global_invocation_id) gid: vec3<u32>) {
+  if (DET_SLOTS != 0u) {
+    // One thread, dispatch order, no atomics in the decision. See DET_SLOTS.
+    if (gid.x != 0u) { return; }
+    var count = atomicLoad(&childFreeCount);
+    let nParentSlots = arrayLength(&parentSlotToBlock);
+    for (var ps = 0u; ps < nParentSlots; ps++) {
+      if (!refineWants(ps)) { continue; }
+      if (count <= 0) { continue; } // pool exhausted this round -- stay coarse
+      count = count - 1;
+      grantQuad(ps, childFreeList[u32(count)]);
+    }
+    atomicStore(&childFreeCount, count);
+    return;
+  }
+
+  let parentSlot = gid.x;
+  if (!refineWants(parentSlot)) { return; }
 
   let oldCount = atomicSub(&childFreeCount, 1);
   if (oldCount > 0) {
-    let quadIdx = childFreeList[u32(oldCount - 1)];
-    let baseSlot = u32(quadIdx) * 4u;
-    for (var qy = 0u; qy < 2u; qy++) {
-      for (var qx = 0u; qx < 2u; qx++) {
-        let quadrant = qx + 2u * qy;
-        let slot = baseSlot + quadrant;
-        let childBX = bxP * 2u + qx;
-        let childBY = byP * 2u + qy;
-        let childBlockID = childBY * nbxChild + childBX;
-        childBlockSlot[childBlockID] = i32(slot);
-        childSlotToBlock[slot] = i32(childBlockID);
-        childParentSlot[slot] = i32(parentSlot);
-        // BUGFIX (L2 bounce-back sign/magnitude investigation): the
-        // "Milestone 10 BUGFIX" that used to sit here had it backwards --
-        // see parentCenterX_L0's own BUGFIX comment above (same file, same
-        // root confusion): the parent's own interior is 2*RB cells (not
-        // RB -- amr_criterion_pool.wgsl's header), so RB is ALREADY half
-        // the parent's own physical width (RB*PARENT_CELL_SIZE_L0 out of a
-        // full 2*RB*PARENT_CELL_SIZE_L0), and that IS the correct quadrant
-        // step -- no further *0.5f belongs here, same as parentCenterX_L0
-        // needed none. The removed *0.5f halved every qx=1/qy=1 child's
-        // offset from its parent's origin, so the 4 children of a quad no
-        // longer tiled the parent's footprint 2x2 with no gap/overlap:
-        // quadrant 1 sat overlapping half of quadrant 0's true territory
-        // and left the outer half of the parent's footprint uncovered by
-        // any tile at all (masked-off at the parent level too, since
-        // masking only checks quadrant 0's existence, not its registered
-        // position) -- exactly the kind of corruption that would produce
-        // a wrong-sign, wrong-magnitude level>=2 bounce-back force while
-        // leaving 2:1-balance (an index-only check) and the field-finite
-        // check clean. Live-verified via a per-slot force readback
-        // (amr_force1_pool.wgsl's debugSlotForce / main-cylinder-amr.js's
-        // debugReadSlotForces) correlating each level-2 slot's own (fx,fy)
-        // against its geometric position -- restoring this formula to
-        // match the ORIGINAL (pre-Milestone-10) version fixes it.
-        childNewlyActivated[slot] = 1u;
-      }
-    }
+    grantQuad(parentSlot, childFreeList[u32(oldCount - 1)]);
   } else {
     atomicAdd(&childFreeCount, 1); // pool exhausted this round -- undo, stay coarse
   }
 }
 
+// Release one quad's four slots. Lifted out of coarsen() so the serial path can
+// reuse it.
+fn releaseQuadSlots(quadIdx: u32) {
+  for (var q = 0u; q < 4u; q++) {
+    let s = quadIdx * 4u + q;
+    let bID = childSlotToBlock[s];
+    if (bID >= 0) { childBlockSlot[u32(bID)] = -1; }
+    childSlotToBlock[s] = -1;
+  }
+}
+
 @compute @workgroup_size(64)
 fn coarsen(@builtin(global_invocation_id) gid: vec3<u32>) {
+  if (DET_SLOTS != 0u) {
+    // One thread, slot order, no atomics. See DET_SLOTS.
+    if (gid.x != 0u) { return; }
+    var count = atomicLoad(&childFreeCount);
+    let nSlots = arrayLength(&childSlotToBlock);
+    for (var s = 0u; s < nSlots; s += 4u) {
+      let bID = childSlotToBlock[s];
+      if (bID < 0) { continue; }
+      if (childWant[u32(bID)] != 0u) { continue; }
+      childFreeList[u32(count)] = i32(s / 4u);
+      count = count + 1;
+      releaseQuadSlots(s / 4u);
+    }
+    atomicStore(&childFreeCount, count);
+    return;
+  }
+
   let slot = gid.x;
   if (slot >= arrayLength(&childSlotToBlock)) { return; }
   let blockID = childSlotToBlock[slot];
@@ -417,11 +506,6 @@ fn coarsen(@builtin(global_invocation_id) gid: vec3<u32>) {
     let quadIdx = slot / 4u; // slot IS quadrant 0's own slot (slot % 4 == 0 checked above), so quadIdx*4u==slot
     let oldCount = atomicAdd(&childFreeCount, 1);
     childFreeList[u32(oldCount)] = i32(quadIdx);
-    for (var q = 0u; q < 4u; q++) {
-      let s = quadIdx * 4u + q;
-      let bID = childSlotToBlock[s];
-      if (bID >= 0) { childBlockSlot[u32(bID)] = -1; }
-      childSlotToBlock[s] = -1;
-    }
+    releaseQuadSlots(quadIdx);
   }
 }

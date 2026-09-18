@@ -553,6 +553,25 @@ const BOX_REFINE = urlParams.has('boxrefine') ? (parseInt(urlParams.get('boxrefi
 // disables it.
 const SPONGE_EXCLUDE_W = urlParams.has('spongeExclude') ? parseFloat(urlParams.get('spongeExclude')) : 8;
 
+// ?detslots=1 -- deterministic pool slot handout (plans/uniform-levels.md D0).
+//
+// Default 0 is the shipped atomic free-list race and is byte-identical to not
+// having this flag. 1 replaces BOTH managers' handout with a single-threaded
+// serial pass, which makes block->slot assignment a deterministic function of
+// the run from resetSim() onward.
+//
+// IT EXISTS TO ANSWER ONE QUESTION, not to be fast: is slot assignment the
+// ONLY live source of run-to-run nondeterminism in this solver? If it is, two
+// runs of the same build under ?detslots=1 are BIT-IDENTICAL, and the whole
+// attractor apparatus in CLAUDE.md -- "the repeat must be on both sides", the
+// 0.013 spread under unknown load, "match the baseline in TWO different
+// modes" -- is downstream of one atomicSub and can be engineered away rather
+// than worked around. If they are NOT identical there is a second source, and
+// finding that out costs a day rather than a refactor.
+//
+// See shaders/amr_manage.wgsl's DET_SLOTS for why the serial loop is the right
+// shape for a MEASUREMENT and the wrong shape for a default.
+const DET_SLOTS = urlParams.has('detslots') ? (parseInt(urlParams.get('detslots')) ? 1 : 0) : 0;
 // Milestone 10: per-CHILD-level threshold overrides -- see
 // main-cylinder-amr.js's copy of this function for the full rationale (a
 // level-2 block's vorticity is measured on the same RB=8 stencil at half
@@ -1199,6 +1218,9 @@ async function init() {
     // cascade. Gone with it (B2-2d) -- the closure needs no cross-level read
     // here. Holes, not renumbered.
     // binding 9: ?diag=1 convergence counters. Always bound; never touched at DIAG=0.
+    // binding 7: D0's candidate rank -- one of B2-2d's two holes, reclaimed
+    // rather than renumbering. Always bound; only written when ?detslots=1.
+    { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
     { binding: 9, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
     // binding 10: level 1's WANT array (B2). Always bound; only read when
     // CASCADE != 0, and only written by the decide() entry point.
@@ -1324,7 +1346,7 @@ async function init() {
   const step1Constants = { W, H, RB, SDF_FAR, F16, DIRECT_GHOST: GHOST_COPY ? 0 : 1 };
   const criterionConstants = { W, H };
   const manageConstants = { DIAG, W, H, SDF_FAR, REFINE_THRESH, COARSEN_THRESH, FORCE_REFINE_MARGIN, FORCE_REFINE_LOOKAHEAD, SPONGE_EXCLUDE_W, 
-    N_REFINE_INC, N_REFINE_MAX, MAX_LEVEL: N_LEVELS - 1, BOX_REFINE };
+    N_REFINE_INC, N_REFINE_MAX, MAX_LEVEL: N_LEVELS - 1, BOX_REFINE, DET_SLOTS };
 
   const stepPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [stepBGL] }),
@@ -1484,6 +1506,35 @@ async function init() {
     layout: device.createPipelineLayout({ bindGroupLayouts: [manageBGL] }),
     compute: { module: manageSM, entryPoint: 'coarsen', constants: manageConstants }
   });
+  // D0's deferred blockSlot writes.
+  //
+  // KEPT ON EVIDENCE, NOT ON ARGUMENT. Once scanCandidates took over the
+  // ranking, refine()/coarsen() no longer read another thread's blockSlot, so
+  // these looked redundant and were removed. Three runs later one of them had
+  // diverged (levels=3 read 4aafcac0 against the established ce1bd4d8, with
+  // 104/248 tiles against 103/240) and they went back. The mechanism is NOT
+  // understood -- see plans/uniform-levels.md 1.2e. Do not remove them again
+  // without a measurement that says they are inert.
+  const manageLinkCoarsenPL = device.createComputePipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [manageBGL] }),
+    compute: { module: manageSM, entryPoint: 'linkCoarsen', constants: manageConstants }
+  });
+  const manageLinkRefinePL = device.createComputePipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [manageBGL] }),
+    compute: { module: manageSM, entryPoint: 'linkRefine', constants: manageConstants }
+  });
+
+  // D0's candidate scan: two pipelines from one entry point, so the grant and
+  // release rules cannot drift into two spellings of "candidate". One
+  // workgroup each -- see scanCandidates' header for why that is enough.
+  const manageScanGrantPL = device.createComputePipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [manageBGL] }),
+    compute: { module: manageSM, entryPoint: 'scanCandidates', constants: { ...manageConstants, SCAN_RELEASE: 0 } }
+  });
+  const manageScanReleasePL = device.createComputePipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [manageBGL] }),
+    compute: { module: manageSM, entryPoint: 'scanCandidates', constants: { ...manageConstants, SCAN_RELEASE: 1 } }
+  });
   const manageRefinePL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [manageBGL] }),
     compute: { module: manageSM, entryPoint: 'refine', constants: manageConstants }
@@ -1520,6 +1571,7 @@ async function init() {
       ...childParams,
       N_REFINE_INC, N_REFINE_MAX, MAX_LEVEL: N_LEVELS - 1,
       BOX_REFINE,
+      DET_SLOTS,
     };
     criterionPoolPLs[m] = device.createComputePipeline({
       layout: device.createPipelineLayout({ bindGroupLayouts: [criterionPoolBGL] }),
@@ -1621,7 +1673,7 @@ async function init() {
 
   // Milestone 4b bind groups.
   const criterionBG = device.createBindGroup({ layout: criterionBGL, entries: [{ binding: 0, resource: { buffer: velBuf } }, { binding: 1, resource: { buffer: pools[1].blockCriterionBuf } }]});
-  const manageBG = device.createBindGroup({ layout: manageBGL, entries: [{ binding: 0, resource: { buffer: pools[1].blockCriterionBuf } }, { binding: 1, resource: { buffer: pools[1].blockSlotBuf } }, { binding: 2, resource: { buffer: pools[1].slotToBlockBuf } }, { binding: 3, resource: { buffer: pools[1].freeListBuf } }, { binding: 4, resource: { buffer: pools[1].freeCountBuf } }, { binding: 5, resource: { buffer: pools[1].newlyActivatedBuf } }, { binding: 6, resource: { buffer: cardStateBuf } }, { binding: 9, resource: { buffer: diagBuf } }, { binding: 10, resource: { buffer: pools[1].wantBuf } }]});
+  const manageBG = device.createBindGroup({ layout: manageBGL, entries: [{ binding: 0, resource: { buffer: pools[1].blockCriterionBuf } }, { binding: 1, resource: { buffer: pools[1].blockSlotBuf } }, { binding: 2, resource: { buffer: pools[1].slotToBlockBuf } }, { binding: 3, resource: { buffer: pools[1].freeListBuf } }, { binding: 4, resource: { buffer: pools[1].freeCountBuf } }, { binding: 5, resource: { buffer: pools[1].newlyActivatedBuf } }, { binding: 6, resource: { buffer: cardStateBuf } }, { binding: 7, resource: { buffer: pools[1].candRankBuf } }, { binding: 9, resource: { buffer: diagBuf } }, { binding: 10, resource: { buffer: pools[1].wantBuf } }]});
 
   // Milestone 9: one criterion/manage bind group per PARENT level
   // (1..N_LEVELS-2), deciding child level m+1. Parent=level 1 sources from
@@ -2375,7 +2427,12 @@ async function init() {
 
       for (let m = N_LEVELS - 1; m >= 1; m--) {
         if (m === 1) {
+          // The scan reads blockSlot as coarsen finds it, so it must run BEFORE
+          // coarsen -- and after refine's own link pass from the previous
+          // round, which is where blockSlot was last settled.
+          if (DET_SLOTS) { const q = enc.beginComputePass(); q.setPipeline(manageScanReleasePL); q.setBindGroup(0, manageBG); q.dispatchWorkgroups(1); q.end(); }
           const p = enc.beginComputePass(); p.setPipeline(manageCoarsenPL); p.setBindGroup(0, manageBG); p.dispatchWorkgroups(WG_MANAGE); p.end();
+          if (DET_SLOTS) { const q = enc.beginComputePass(); q.setPipeline(manageLinkCoarsenPL); q.setBindGroup(0, manageBG); q.dispatchWorkgroups(WG_MANAGE); q.end(); }
         } else {
           const wg = Math.ceil(pools[m].MAX_FINE_BLOCKS / 64);
           const p = enc.beginComputePass(); p.setPipeline(managePoolCoarsenPLs[m - 1]); p.setBindGroup(0, managePoolBGs[m - 1]); p.dispatchWorkgroups(wg); p.end();
@@ -2383,7 +2440,11 @@ async function init() {
       }
       for (let m = 1; m < N_LEVELS; m++) {
         if (m === 1) {
+          // After coarsen, so the blocks it released are already visible as
+          // candidates for a grant in the same round.
+          if (DET_SLOTS) { const q = enc.beginComputePass(); q.setPipeline(manageScanGrantPL); q.setBindGroup(0, manageBG); q.dispatchWorkgroups(1); q.end(); }
           const p = enc.beginComputePass(); p.setPipeline(manageRefinePL); p.setBindGroup(0, manageBG); p.dispatchWorkgroups(WG_MANAGE); p.end();
+          if (DET_SLOTS) { const q = enc.beginComputePass(); q.setPipeline(manageLinkRefinePL); q.setBindGroup(0, manageBG); q.dispatchWorkgroups(Math.ceil(MAX_FINE_BLOCKS / 64)); q.end(); }
         } else {
           const wg = Math.ceil(pools[m - 1].MAX_FINE_BLOCKS / 64);
           const p = enc.beginComputePass(); p.setPipeline(managePoolRefinePLs[m - 1]); p.setBindGroup(0, managePoolBGs[m - 1]); p.dispatchWorkgroups(wg); p.end();
@@ -3446,6 +3507,7 @@ async function init() {
     }),
     getNumLevels: () => N_LEVELS,
     getF16: () => F16,
+    getDetSlots: () => DET_SLOTS,
     // Set the pass-skip set AFTER warm-up, which is the only way a skip A/B
     // is valid: passing ?benchSkip= in the URL means the warm-up itself runs
     // with the modified physics, so the card follows a different trajectory

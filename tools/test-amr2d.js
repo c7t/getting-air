@@ -70,6 +70,7 @@ const sorted = (s) => [...s].sort();
   const A = await import(path.join(__dirname, '..', 'amr2d.mjs'));
   const {
     GHOST, RB_DEFAULT, fineToCoarseUnit, coarseUnitToFine, cellSizeL0AtLevel,
+    grantAssignment, releaseAssignment,
     makePool, poolAtLevel, nbAtLevel, parentOfBlock,
     quadrantOfBlock, quadrantOrigin, tileOriginL0, tileOriginL0Recursive,
     refineWhere, nearBodyWant, nearBodyWantCentre, refineNearBody,
@@ -1315,6 +1316,109 @@ const sorted = (s) => [...s].sort();
       'a tau well outside the band was refused');
   });
 
+
+  // ── D0: the deterministic slot handout ───────────────────────────────────
+  //
+  // MUTATION-CHECKED, per this file's rule 2. Every check below was run
+  // against a deliberately broken grantAssignment/releaseAssignment and the
+  // mutant it catches is named beside it. The one that matters most is
+  // PERMUTATION INVARIANCE: it is the entire property being bought, and a
+  // rule that merely "looks ordered" passes everything else.
+
+  ok('grant is invariant under the order candidates arrive in', () => {
+    // MUTANT: drop the sort (serve in arrival order) -> this is the only
+    // check that fires, which is exactly why it exists.
+    const freeCount = 6;
+    const ids = [41, 7, 19, 3, 28];
+    const ref = JSON.stringify(grantAssignment({ candidates: ids, freeCount }));
+    const perms = [
+      [3, 7, 19, 28, 41], [41, 28, 19, 7, 3], [19, 3, 41, 28, 7], [7, 41, 3, 19, 28],
+    ];
+    for (const p of perms) {
+      assert.strictEqual(JSON.stringify(grantAssignment({ candidates: p, freeCount })), ref,
+        `arrival order ${p.join(',')} changed the assignment`);
+    }
+  });
+
+  ok('grant pops down from the top of the stack, one index each', () => {
+    // MUTANT: freeIndex = i (pop from the bottom) -> caught here.
+    // MUTANT: count-- after the read (off by one) -> caught here.
+    const { granted, refused, freeCount } = grantAssignment({ candidates: [5, 2, 9], freeCount: 4 });
+    assert.deepStrictEqual(granted.map(g => g.id), [2, 5, 9], 'not served in id order');
+    assert.deepStrictEqual(granted.map(g => g.freeIndex), [3, 2, 1], 'wrong free-list indices');
+    assert.deepStrictEqual(refused, [], 'refused something with slots to spare');
+    assert.strictEqual(freeCount, 1, 'free count not decremented once per grant');
+  });
+
+  ok('a starved pool starves the HIGHEST ids, and never over-grants', () => {
+    // MUTANT: sort descending -> the wrong ids survive, caught here.
+    // MUTANT: `if (count < 0)` -> grants one too many, caught here.
+    const { granted, refused, freeCount } = grantAssignment({ candidates: [8, 1, 5, 3, 9], freeCount: 2 });
+    assert.deepStrictEqual(granted.map(g => g.id), [1, 3], 'starvation did not favour low ids');
+    assert.deepStrictEqual(refused, [5, 8, 9], 'wrong candidates refused');
+    assert.strictEqual(freeCount, 0, 'free count went past empty');
+    for (const g of granted) assert.ok(g.freeIndex >= 0 && g.freeIndex < 2, `freeIndex ${g.freeIndex} out of the valid region`);
+  });
+
+  ok('an empty pool grants nothing and is not an error', () => {
+    const r = grantAssignment({ candidates: [4, 1], freeCount: 0 });
+    assert.deepStrictEqual(r.granted, [], 'granted from an empty free list');
+    assert.deepStrictEqual(r.refused, [1, 4], 'refusals not in id order');
+    assert.strictEqual(r.freeCount, 0, 'free count went negative');
+  });
+
+  ok('every granted free-list index is distinct', () => {
+    // The property a race cannot guarantee and the one corruption would be
+    // silent: two blocks pointed at one quad.
+    const ids = [31, 4, 17, 22, 9, 40, 12];
+    const { granted } = grantAssignment({ candidates: ids, freeCount: ids.length });
+    const seen = new Set(granted.map(g => g.freeIndex));
+    assert.strictEqual(seen.size, granted.length, 'two candidates were given the same free-list index');
+  });
+
+  ok('release pushes in id order from the top', () => {
+    // MUTANT: write at freeCount + n - 1 - j -> caught here.
+    const { writes, freeCount } = releaseAssignment({ releases: [12, 3, 7], freeCount: 5 });
+    assert.deepStrictEqual(writes.map(w => w.id), [3, 7, 12], 'not released in id order');
+    assert.deepStrictEqual(writes.map(w => w.freeIndex), [5, 6, 7], 'wrong push indices');
+    assert.strictEqual(freeCount, 8, 'free count not incremented once per release');
+  });
+
+  ok('release is invariant under arrival order too', () => {
+    const ref = JSON.stringify(releaseAssignment({ releases: [12, 3, 7], freeCount: 5 }));
+    for (const p of [[3, 7, 12], [12, 7, 3], [7, 12, 3]]) {
+      assert.strictEqual(JSON.stringify(releaseAssignment({ releases: p, freeCount: 5 })), ref,
+        `arrival order ${p.join(',')} changed the release`);
+    }
+  });
+
+  ok('grant then release restores the free count', () => {
+    const ids = [6, 2, 11];
+    const g = grantAssignment({ candidates: ids, freeCount: 5 });
+    const r = releaseAssignment({ releases: g.granted.map(x => x.id), freeCount: g.freeCount });
+    assert.strictEqual(r.freeCount, 5, 'a grant/release round trip leaked or invented free entries');
+    // The indices touched on the way out are the ones touched on the way back.
+    assert.deepStrictEqual(
+      g.granted.map(x => x.freeIndex).sort((a, b) => a - b),
+      r.writes.map(x => x.freeIndex).sort((a, b) => a - b),
+      'release wrote to a different region than grant read');
+  });
+
+  ok('a refused candidate consumes nothing', () => {
+    // The failure this guards: counting refusals against the free list, which
+    // would leave the count wrong for the NEXT round rather than this one --
+    // a defect that only shows up a refine round later.
+    // The extras must genuinely EXCEED capacity or they are grants, not
+    // refusals -- the first version of this check used freeCount 3 with five
+    // candidates, where the third one is served and the premise is simply
+    // wrong. The test caught that before the code did.
+    const a = grantAssignment({ candidates: [1, 2], freeCount: 2 });
+    const b = grantAssignment({ candidates: [1, 2, 99, 98, 97], freeCount: 2 });
+    assert.strictEqual(a.freeCount, b.freeCount,
+      'refusals changed the free count');
+    assert.deepStrictEqual(a.granted, b.granted.slice(0, 2),
+      'refusals disturbed the grants that did succeed');
+  });
   if (!process.exitCode) console.log(`\n${pass} check(s) passed`);
   else console.log('\nFAILED');
 })();
