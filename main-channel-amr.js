@@ -497,7 +497,10 @@ async function init() {
   const criterionPoolBGL = device.createBindGroupLayout({ label: 'criterionPoolBGL', entries: [
     { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }
+    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    // binding 3: the PARENT level's blockSlot, for U4-1's ring-free stencil.
+    // Bound but never read here -- every level on this page has a ring.
+    { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }
   ]});
   const managePoolBGL = device.createBindGroupLayout({ label: 'managePoolBGL', entries: [
     { binding: 0,  visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
@@ -767,6 +770,8 @@ async function init() {
       { binding: 0, resource: { buffer: parentVel } },
       { binding: 1, resource: { buffer: parentSlotToBlockBuf } },
       { binding: 2, resource: { buffer: childPool.blockCriterionBuf } },
+      // Bound but never read at GHOST=2 -- these levels have a ring.
+      { binding: 3, resource: { buffer: parentPool.blockSlotBuf } },
     ]});
     managePoolBGs[m] = device.createBindGroup({ layout: managePoolBGL, entries: [
       { binding: 0, resource: { buffer: childPool.blockCriterionBuf } },

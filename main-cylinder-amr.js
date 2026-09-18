@@ -1117,7 +1117,10 @@ async function init() {
   const criterionPoolBGL = device.createBindGroupLayout({ label: 'criterionPoolBGL', entries: [
     { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }
+    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    // binding 3: the PARENT level's blockSlot, for U4-1's ring-free stencil.
+    // Bound but never read here -- every level on this page has a ring.
+    { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }
   ]});
   // Milestone 9: quad allocator + 2:1 balance for any level-(m+1) decision,
   // parent=level m>=1 -- see amr_manage_pool.wgsl's header. 16 bindings
@@ -1200,7 +1203,10 @@ async function init() {
     { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
     { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
-    { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }
+    { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    // binding 6: THIS level's blockSlot, for U4-2's ring-free gather. Bound
+    // but never read here -- every level on this page has a ring.
+    { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }
   ]});
 
   const constants = { W, H };
@@ -1494,6 +1500,8 @@ async function init() {
       { binding: 0, resource: { buffer: parentVel } },
       { binding: 1, resource: { buffer: parentSlotToBlockBuf } },
       { binding: 2, resource: { buffer: childPool.blockCriterionBuf } },
+      // Bound but never read at GHOST=2 -- these levels have a ring.
+      { binding: 3, resource: { buffer: parentPool.blockSlotBuf } },
     ]});
     managePoolBGs[m] = device.createBindGroup({ layout: managePoolBGL, entries: [
       { binding: 0, resource: { buffer: childPool.blockCriterionBuf } },
@@ -1583,6 +1591,8 @@ async function init() {
       { binding: 3, resource: { buffer: childPool.slotToBlockBuf } },
       { binding: 4, resource: { buffer: childPool.levelParamsBuf } },
       { binding: 5, resource: { buffer: childPool.debugSlotForceBuf } },
+      // Bound but never read at GHOST=2 -- these levels have a ring.
+      { binding: 6, resource: { buffer: childPool.blockSlotBuf } },
     ]});
   }
 
@@ -1600,6 +1610,8 @@ async function init() {
     { binding: 3, resource: { buffer: pools[1].slotToBlockBuf } },
     { binding: 4, resource: { buffer: pools[1].levelParamsBuf } },
     { binding: 5, resource: { buffer: pools[1].debugSlotForceBuf } },
+    // Bound but never read at GHOST=2 -- these levels have a ring.
+    { binding: 6, resource: { buffer: pools[1].blockSlotBuf } },
   ]});
 
   const error = await device.popErrorScope();
