@@ -26,7 +26,7 @@ it runs on.
 | U2 | The mirror | **WAS VACUOUS, NOW FIXED** — both "independent" routes wrote `gy*W+gx`; the dense grid is 8x8 block-major, so 98.4% of the pool read the wrong cell | a THIRD route (`field-reconstruct.js`'s `rawIndex`), GPU-free in `make check` |
 | U3 | The step kernel serves the root | **DONE — BIT-IDENTICAL** on 8 rungs, 512 macro-steps; controls saturate at 98.4% | word equality + field health, `?rootstep=0` as control |
 | U4 | criterion, force, digest, conserved totals | **DONE** — all four consumers on the root. Exact on the criterion, digest max and conserved totals; the force to the truncation floor | `tools/validate-root-kernels.js`, 8 rungs + 2 controls |
-| U5 | L1 becomes a quad child of the root | **U5-0…U5-3 DONE** — both hops of the coupling are live under `?rootpool=1` and the whole simulation is BIT-IDENTICAL to the dense path (same fingerprint, 4096 steps). The MANAGER — the part that moves numbers — remains | `validate-root-kernels.js` (11 gated rungs, 4 controls); `measure-determinism.js` |
+| U5 | L1 becomes a quad child of the root | **U5-0…U5-4 DONE under `?rootpool=1`** — both hops of the coupling and the manager. Level 1 is quad-allocated and quad-managed; tiles +28-32%; new fingerprints, default unmoved. `amr_manage.wgsl` cannot retire until the other four AMR pages get a root pool, and Cd/St is unmeasurable until then | `validate-root-kernels.js` (11 rungs, 4 controls); `validate-all.js` invariants ± starved pool; `measure-determinism.js` |
 | U6 | The renderer walks levels | not started; **its gate already exists and already fails** | `tools/validate-render-levels.js` |
 | U7 | Delete the dense path | not started | — |
 
@@ -1922,6 +1922,105 @@ gate and its control in the same sweep.
 looking for movement: if the root leg wrote nothing at all, its stale twin
 would match the dense leg and it would read zero. **A liveness control has to
 perturb something, not merely observe something.**
+
+### U5-4 — DONE (2026-09-17). One manager, every level. The stage that moves numbers, and it moved more than the plan said.
+
+`amr_manage_pool.wgsl` now decides and allocates LEVEL 1, with the root as the
+parent level; `amr_manage.wgsl` is not dispatched at all under `?rootpool=1`.
+Level 1 allocates in QUADS, its want set is closed into quads by
+`amr_cascade.wgsl`, and its reset is the same quad reset every deeper level
+already had. `?rootmanage=0` keeps the dense manager in the same build.
+
+Almost all of the shader fitted the root unchanged, which is the thesis
+holding: `myLevel()` reads 0, `parentOriginL0` is `block * 16`,
+`parentHalfExtentL0` is 8, and the 2:1 neighbour-active gate is trivially
+satisfied because the root is always full. The pieces that moved are host-side
+-- a `quadAlloc` option on `allocLevelPool`, a `quadCompleteFrom` option on the
+cascade, three loops that now start at parent level 0, and level 1 joining
+`quadCPU`.
+
+**THE PLAN UNDERSTATED THE MOVE, AND IT IS WORTH SAYING WHY.** It predicted
+"Cd moves in the 4th digit", attributing the change to slot regrouping alone.
+But the pool manager also DECIDES over the parent's footprint and allocates in
+quads, so level 1's refinement granularity goes from one 8-cell block to a
+16-cell quad. Measured, `index-amr.html`, 4096 steps:
+
+    active tiles            dense manager      pool manager
+    levels=2                      75                 96      +28%
+    levels=3               [103, 240]         [136, 240]     +32% at L1
+
+That is a differently-shaped refined region, not a 4th-digit perturbation. It
+is strictly MORE refinement, so it costs memory and time rather than accuracy
+-- but `POOL_PEAKS` was measured at block granularity and its 40k-step
+re-measurement is OUTSTANDING. The refusal watch is what would report a wrong
+guess, which is why the next paragraph is part of this stage and not a
+follow-up.
+
+**IT TOOK A GATE VACUOUS AND THE STAGE PUT IT BACK.** Level 1's
+pool-exhaustion counter lived in `amr_manage.wgsl`, so moving level 1 off it
+silently unhooked the starvation gate. Measured side by side on
+`amr-dev-invariants --extra=maxFineBlocks=16&diag=1`:
+
+    dense manager   pool STARVED (2140 refine(s) refused)
+    pool manager    pool OK                                  <- vacuous
+    after the fix   pool STARVED (1028 refine(s) refused)
+
+`amr_manage_pool.wgsl` gained binding 9 -- the same `diag` buffer at the same
+slot as the dense manager's -- and the binding was mirrored into **all five**
+AMR pages' `managePoolBGL` and bind groups, which is CLAUDE.md's own recorded
+trap walked deliberately with the boot smoke run afterwards. The starved sweep
+is back to five-of-seven red with `field` and `quadrants` abstaining, which is
+the discrimination that says the gates read seven different things.
+
+**Gates.**
+
+1. `validate-root-kernels.js`: all 11 gated rungs still bit-identical, all 4
+   controls dirty. The `crit` column needed its roles SWAPPED to stay
+   meaningful -- the pool criterion at parent level 0 is now the live writer of
+   level 1's `blockCriterion`, so the DENSE kernel is the one on a scratch
+   buffer. Left alone, that column would have compared a kernel against its own
+   output, which is a comparison that cannot fail.
+2. Invariants: seven-of-seven green at 8192 steps; five-of-seven red under
+   `--extra=maxFineBlocks=16`, as above.
+3. Reproducibility: `?detslots=1` IDENTICAL at both level counts. New
+   fingerprints, and they SHOULD be new:
+
+        levels=2   f71bce9d33945265     (was 7ac54e170f903ac3)
+        levels=3   71560c03a3d34c21     (was ce1bd4d8a3a1055c)
+
+4. **The default did not move at all**: `?rootpool=0` still returns
+   `7ac54e170f903ac3` / `ce1bd4d8a3a1055c`, so the five-page binding change and
+   everything else in this stage is byte-identical on the shipped path.
+
+**AND THE levels=2 BASELINE RUNG STOPS DISCRIMINATING UNDER THIS MANAGER.**
+4 of 4 runs at `?rootpool=1&levels=2` with `detslots=0` came back not just
+identical to each other but identical to the `detslots=1` hash: the racing free
+list produces the same assignment every time there. So
+`measure-determinism.js --extra=rootpool=1` exits nonzero on that row, and the
+gate is deliberately NOT relaxed for it -- the row is doing its job by saying
+it can no longer tell "the flag worked" from "nothing raced". `levels=3
+detslots=0` still DIFFERS and is the rung that keeps the instrument honest.
+Plausibly the pool manager's dispatch (1024 parent slots, a few dozen sparse
+candidates) simply does not race on this hardware where the dense manager's
+4096 blocks did; that is a scheduling accident, not a guarantee, and it should
+not be relied on.
+
+#### What U5 did NOT do, and what that costs
+
+**`amr_manage.wgsl` cannot retire here.** Four other AMR pages --
+`main-cylinder-amr.js`, `main-tgv-amr.js`, `main-channel-amr.js`,
+`main-reentry-amr.js` -- have no root pool at all, so they still dispatch it.
+U1 through U5 only ever touched `main-amr.js`. Deleting the dense manager
+therefore needs the root pool ported to the other four pages, which is U7's
+"host and tool tail" work rather than this stage's.
+
+**So the Cd/St consequence of U5-4 IS NOT MEASURED, and cannot be yet.** The
+cylinder harness is `index-cylinder-amr.html`, which has no root pool, so
+`amr-N2-diffuse`/`amr-N3-diffuse` run the dense manager whatever this page
+does. The plan's "take a same-build repeat on both sides" protocol has nothing
+to compare. **That is the prerequisite for making `?rootpool=1` the default**,
+and it is a bigger item than it looks: the cylinder page is the only harness
+with literature values attached.
 
 ### U5 — L1 becomes a quad child of the root
 

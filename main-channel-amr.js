@@ -514,6 +514,12 @@ async function init() {
     // binding 8 was childQuadrant (it held `slot % 4`); B2 is what that
     // recovery was for -- this is the child level's WANT array.
     { binding: 8, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    // binding 9 is the shared ?diag=1 counter buffer, same numbering and same
+    // slot as amr_manage.wgsl's (plans/uniform-levels.md U5-4). Bound on every
+    // page: the pool manager's refusal counter is not a level-1 concern, it is
+    // every level's, and a binding added to a shared shader has to reach all
+    // five layouts (CLAUDE.md's own recorded trap).
+    { binding: 9, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
     // bindings 9/10 were childOriginX/Y and 13/14 parentOriginX/Y. All four
     // gone (B3-5): the origin is `block * RB * 2^-(m-1)` in closed form, so
     // the kernel derives it -- see amr_manage_pool.wgsl's parentOriginL0.
@@ -674,6 +680,10 @@ async function init() {
       PARENT_CELL_SIZE_L0: cellSizeL0AtLevel(m),
       ...childParams,
       HAS_BODY: 0,
+      // U5-4: DIAG defaults to 0 in the shader, which is this page's value --
+      // it has no ?diag= flag. Left implicit rather than passed, so the
+      // binding is bound and the counter stays off, which is what a page with
+      // no refusal watch wants.
     };
     criterionPoolPLs[m] = device.createComputePipeline({
       layout: device.createPipelineLayout({ bindGroupLayouts: [criterionPoolBGL] }),
@@ -783,6 +793,7 @@ async function init() {
       { binding: 6, resource: { buffer: cardStateBuf } },
       { binding: 7, resource: { buffer: childPool.parentSlotBuf } },
       { binding: 8, resource: { buffer: childPool.wantBuf } },
+      { binding: 9, resource: { buffer: diagBuf } },
       { binding: 12, resource: { buffer: parentSlotToBlockBuf } },
     ]});
   }

@@ -127,6 +127,24 @@
 // (parentBlockSlot, grandchildBlockSlot -- both dead under the closure) take
 // it to 14.
 @group(0) @binding(8)  var<storage, read_write> childWant         : array<u32>;
+// ── Refinement refusal counter (?diag=1) ─────────────────────────────────────
+//
+// Binding 9, matching amr_manage.wgsl's numbering for the SAME buffer and the
+// same slot within it: diag[5] counts refines refused for want of a pool slot.
+//
+// ADDED AT plans/uniform-levels.md U5-4, because that stage took level 1 off
+// the dense manager and the refusal counter went with it. Measured before and
+// after on `amr-dev-invariants --extra=maxFineBlocks=16&diag=1`: the dense
+// manager reported `pool STARVED (2140 refine(s) refused)` and the pool
+// manager reported `pool OK` on an identically starved run. That is a gate
+// going VACUOUS rather than a gate going green, and CLAUDE.md's own count of
+// how many vacuous gates this project has collected is the reason it is fixed
+// here rather than noticed later.
+//
+// It is also the instrument POOL_PEAKS depends on: the defaults are a measured
+// peak times 1.7, and the refusal watch is what reports a wrong guess.
+@group(0) @binding(9)  var<storage, read_write> diag              : array<atomic<u32>, 8>;
+override DIAG : u32 = 0u;
 // bindings 9/10 WERE childOriginX/childOriginY, written here at refine time,
 // and 13/14 WERE parentOriginX/parentOriginY, read here to write them. All
 // four are gone (plans/2D-backport.md B3-5): a tile's physical origin is
@@ -415,7 +433,10 @@ fn refine(@builtin(global_invocation_id) gid: vec3<u32>) {
     let nParentSlots = arrayLength(&parentSlotToBlock);
     for (var ps = 0u; ps < nParentSlots; ps++) {
       if (!refineWants(ps)) { continue; }
-      if (count <= 0) { continue; } // pool exhausted this round -- stay coarse
+      if (count <= 0) { // pool exhausted this round -- stay coarse
+        if (DIAG != 0u) { atomicAdd(&diag[5], 1u); }
+        continue;
+      }
       count = count - 1;
       grantQuad(ps, childFreeList[u32(count)]);
     }
@@ -431,6 +452,7 @@ fn refine(@builtin(global_invocation_id) gid: vec3<u32>) {
     grantQuad(parentSlot, childFreeList[u32(oldCount - 1)]);
   } else {
     atomicAdd(&childFreeCount, 1); // pool exhausted this round -- undo, stay coarse
+    if (DIAG != 0u) { atomicAdd(&diag[5], 1u); }
   }
 }
 

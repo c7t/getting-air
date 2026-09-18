@@ -25,6 +25,15 @@
 // rung comes back IDENTICAL, the instrument is not measuring what it claims
 // and no other row means anything.
 //
+// AND UNDER `--extra=rootpool=1` THE levels=2 BASELINE RUNG STOPS
+// DISCRIMINATING, MEASURED. With level 1 managed by amr_manage_pool.wgsl
+// (plans/uniform-levels.md U5-4) the racing free list produced the SAME
+// assignment in 4 of 4 runs at `levels=2`, so that row comes back IDENTICAL
+// and this tool exits nonzero on that configuration. The gate is deliberately
+// NOT relaxed for it: the row is doing its job by saying it can no longer tell
+// "the flag worked" from "nothing raced". Read `levels=3 detslots=0` instead,
+// which still DIFFERS and is what keeps the instrument honest there.
+//
 // A FAILURE HERE IS INFORMATION, NOT A BUG TO BE FIXED. If levels=2 still
 // differs with detslots=1, there is a second source of nondeterminism, and
 // plans/uniform-levels.md's sequencing argument needs revisiting before any of

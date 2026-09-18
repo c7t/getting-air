@@ -192,7 +192,15 @@ export async function listActiveBlocks(device, pools, level = 1) {
 // already pays for elsewhere in the same hot path) -- see
 // shaders/amr_interp_pool_parent.wgsl's header for where the derivation
 // actually happens.
-export function allocLevelPool(device, U, m, NBX_m, NBY_m, maxFineBlocks, NCELLS1) {
+// `quadAlloc` chooses the ALLOCATION UNIT, and it is a parameter rather than a
+// function of the level since plans/uniform-levels.md U5-4. Level 1 allocated
+// per BLOCK for as long as its parent was the dense grid -- L0 is not itself
+// decomposed into quads, so there was no quad on that boundary. Once the root
+// is a pool level there is one, and level 1 becomes a quad child like every
+// other level. Default `m !== 1` is exactly the old rule, so a page that does
+// not ask is unchanged.
+export function allocLevelPool(device, U, m, NBX_m, NBY_m, maxFineBlocks, NCELLS1, { quadAlloc } = {}) {
+  const quad = quadAlloc ?? (m !== 1);
   const NBLOCKS_m = NBX_m * NBY_m;
   const fSizePool_m = maxFineBlocks * NCELLS1 * 9 * 4;
   const pool = {
@@ -230,9 +238,11 @@ export function allocLevelPool(device, U, m, NBX_m, NBY_m, maxFineBlocks, NCELLS
     // them against amr2d.mjs's grantAssignment.
     candRankBuf: device.createBuffer({ size: NBLOCKS_m * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC }),
   };
-  if (m === 1) {
-    // Per-block allocation, unchanged from today -- L0 isn't itself
-    // decomposed into quads, so there's no "quad" on this boundary.
+  pool.quadAlloc = quad;
+  if (!quad) {
+    // Per-block allocation: level 1 while its parent is the DENSE grid, which
+    // is not itself decomposed into quads, so there is no quad on that
+    // boundary. See this function's `quadAlloc` note.
     pool.freeListBuf = device.createBuffer({ size: maxFineBlocks * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
   } else {
     // Quad-unit allocation (decision 3, plans/AMR-multilevel.md:10):
@@ -790,7 +800,17 @@ export async function checkRefinementClosureOnGPU(device, pools, nLevels) {
 // SHARED, not per-page: five AMR pages would otherwise carry five copies of a
 // pipeline set and a bind group, which is the shape CLAUDE.md records
 // producing 238e48c.
-export function makeCascadePipelines(device, loadedModule, pools, nLevels) {
+// `quadCompleteFrom` is the shallowest level whose want set must be closed
+// into QUADS, and it is a parameter since plans/uniform-levels.md U5-4. It is
+// 2 while level 1 allocates per block, and 1 once level 1 is a quad child of
+// the root -- at which point a want for one level-1 block is a want for its
+// whole quad, exactly as at every deeper level.
+//
+// Level 1 never gets a `balance` pass either way: balance writes the PARENT
+// level's want set, and the root is always full, so there is nothing there to
+// want. That is the one thing about level 1 that stays special after U5, and
+// it is a consequence of having no parent rather than of being level 1.
+export function makeCascadePipelines(device, loadedModule, pools, nLevels, { quadCompleteFrom = 2 } = {}) {
   const bgl = device.createBindGroupLayout({
     label: 'cascadeBGL',
     entries: [
@@ -803,21 +823,28 @@ export function makeCascadePipelines(device, loadedModule, pools, nLevels) {
   // Levels >= 2 only: level 1's parent is the dense L0 grid, which is present
   // everywhere, so nothing cascades OUT of level 1 -- the same reason
   // cascade21's own loop stops at 2.
-  for (let m = nLevels - 1; m >= 2; m--) {
+  for (let m = nLevels - 1; m >= Math.min(2, quadCompleteFrom); m--) {
     const pool = pools[m];
+    const hasParentLevel = m >= 2;
     const constants = { NBX: pool.NBX, NBY: pool.NBY, QUAD_COMPLETE: 1 };
     byLevel[m] = {
       completeQuads: device.createComputePipeline({
         layout, compute: { module: loadedModule, entryPoint: 'completeQuads', constants },
       }),
-      balance: device.createComputePipeline({
+      balance: hasParentLevel ? device.createComputePipeline({
         layout, compute: { module: loadedModule, entryPoint: 'balance', constants },
-      }),
+      }) : null,
+      // What to encode, in order. Naming it here rather than in encodeCascade
+      // keeps "which passes this level has" next to "why it has them".
+      entries: hasParentLevel ? ['completeQuads', 'balance'] : ['completeQuads'],
       bg: device.createBindGroup({
         layout: bgl,
         entries: [
           { binding: 0, resource: { buffer: pool.wantBuf } },
-          { binding: 1, resource: { buffer: pools[m - 1].wantBuf } },
+          // Level 1's parent-want binding is the ROOT's, which `completeQuads`
+          // never reads and `balance` never runs to write. Bound because the
+          // layout requires it, not because it means anything there.
+          { binding: 1, resource: { buffer: pools[hasParentLevel ? m - 1 : 0].wantBuf } },
         ],
       }),
       workgroups: Math.ceil((pool.NBX * pool.NBY) / 64),
@@ -830,9 +857,10 @@ export function makeCascadePipelines(device, loadedModule, pools, nLevels) {
 // fixed point without iterating: a want at level m forces wants at level m-1
 // only, so the propagation is one-directional down the levels.
 export function encodeCascade(enc, cascade, nLevels) {
-  for (let m = nLevels - 1; m >= 2; m--) {
+  for (let m = nLevels - 1; m >= 1; m--) {
     const c = cascade.byLevel[m];
-    for (const entry of ['completeQuads', 'balance']) {
+    if (!c) continue;
+    for (const entry of c.entries) {
       const p = enc.beginComputePass();
       p.setPipeline(c[entry]);
       p.setBindGroup(0, c.bg);
