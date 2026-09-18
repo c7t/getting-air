@@ -10,6 +10,7 @@
 //   f     the step's populations        amr_step1.wgsl      vs amr_step.wgsl
 //   vel   the step's velocity           (same pair)
 //   crit  the refinement criterion      amr_criterion_pool  vs amr_criterion
+//   force the body force integral        amr_force1          vs amr_force
 //
 // Mirror the dense grid into the root pool, advance both, and compare word for
 // word -- BOTH of the step kernel's outputs, `f` and `vel`. The bar is BIT-IDENTITY, not a tolerance: `amr_step1.wgsl` and
@@ -79,6 +80,41 @@ const {
 } = require('./lib/browser-lifecycle');
 
 const REPO_ROOT = path.resolve(__dirname, '..');
+
+// ── the ONE column that is not gated by exact equality, and why ─────────────
+//
+// The force reduction atomically adds ONE TRUNCATED i32 PER WORKGROUP
+// (FSCALE = 1e7, so one raw unit is 1e-7 of force). The plan predicted bit
+// -identity here on the grounds that the root's workgroup PARTITION is
+// unchanged -- and it is: the dense kernel is one workgroup per 8x8 dense
+// block, and the root at GHOST=0 dispatches (2,2) over a 16-cell tile, the
+// same four 8x8 regions. The partition is identical and the partials are
+// still not, so the prediction is FALSIFIED. Measured residual, deterministic
+// and reproduced bit-for-bit across runs on both sides:
+//
+//     levels=2 / levels=4, res=8   |diff| <= 1      (1024 workgroups)
+//     res=9                        |diff| <= 5      (4096 workgroups)
+//
+// IT CANNOT BE A MIS-GATHERED OR MIS-INCLUDED CELL, which is the argument
+// that makes a bound acceptable here rather than lazy. Totals run ~5e5 raw
+// units over a few hundred cells in the diffuse band, so ONE cell is worth
+// ~1e3 units. A residual of 1 is a thousandth of a single cell -- no cell
+// can be wrong by that little. It also grows with workgroup count (1 at
+// 1024, 5 at 4096), which is what per-workgroup truncation must do.
+//
+// AND THE DEFECT SCALE IS MEASURED, not imagined: disabling the ring-free
+// gather -- clamping at the tile edge as the ringed path does -- reads
+// [-1512, 743, 6477]. So the bound below sits ~13x above the observed
+// residual and ~11x below the smallest component of a real defect.
+//
+// The mechanism is NOT established. The obvious suspect is the root's only
+// structural difference from the dense kernel, `-Fx * areaWeight` where
+// areaWeight is exactly 1.0, changing what the compiler may contract. Testing
+// it by deleting that multiply was CONFOUNDED and the result discarded:
+// amr_force1.wgsl is the LIVE force pass at level 1, so the edit moved the
+// card and the two runs were no longer comparable (dense fy went -486022 to
+// -269736). Recorded so the same experiment is not repeated.
+const FORCE_TOL = 64;
 
 // Deliberately not all the default, for the reason validate-root-mirror.js's
 // rungs are not: `levels` varies the pool count, `f16` varies the packing and
@@ -166,7 +202,8 @@ async function runCase(Runtime, Page, o, q) {
   const after = JSON.parse(await ev(Runtime, 'window.__AMR.debugCheckRootMirror().then(r => JSON.stringify(r))'));
   const vel = JSON.parse(await ev(Runtime, 'window.__AMR.debugCheckRootVel().then(r => JSON.stringify(r))'));
   const crit = JSON.parse(await ev(Runtime, 'window.__AMR.debugCheckRootCriterion().then(r => JSON.stringify(r))'));
-  return { q, seeded, after, vel, crit, health };
+  const force = JSON.parse(await ev(Runtime, 'window.__AMR.debugCheckRootForce().then(r => JSON.stringify(r))'));
+  return { q, seeded, after, vel, crit, force, health };
 }
 
 function fmt(r) {
@@ -178,6 +215,7 @@ function fmt(r) {
   return `f ${String(r.after.mismatched).padStart(7)}/${r.after.checked}  ${abs}  ${rel}` +
     `   vel ${String(r.vel.mismatched).padStart(6)}/${r.vel.checked}` +
     `   crit ${String(r.crit.mismatched).padStart(5)}/${r.crit.checked}` +
+    `   force ${r.force.exact ? '  exact' : '|d|<=' + String(r.force.maxDiff).padStart(2)}` +
     `   seeded ${r.seeded.mismatched}   ${h}`;
 }
 
@@ -200,11 +238,12 @@ async function main() {
   const fails = [];
   try {
     console.log(`  ${o.steps} macro-steps, ${o.page}\n`);
-    console.log('  GATED -- must be bit-identical, on a finite field');
+    console.log('  GATED -- bit-identical, on a finite field (force: to the truncation floor)');
     for (const q of GATED) {
       const r = await runCase(Runtime, Page, o, q);
       const ok = r.after.mismatched === 0 && r.vel.mismatched === 0
         && r.crit.mismatched === 0 && r.crit.nonZero > 0
+        && r.force.nonZero && r.force.maxDiff <= FORCE_TOL
         && r.seeded.mismatched === 0 && r.health.nonFinite === 0;
       if (!ok) fails.push(q);
       console.log(`${ok ? '  ok  ' : ' FAIL '} ${q.padEnd(46)} ${fmt(r)}`);
@@ -213,7 +252,8 @@ async function main() {
     for (const q of CONTROLS) {
       const r = await runCase(Runtime, Page, o, q);
       const ok = r.after.mismatched > 0 && r.vel.mismatched > 0
-        && r.crit.mismatched > 0 && r.health.nonFinite === 0;
+        && r.crit.mismatched > 0 && r.force.maxDiff > FORCE_TOL
+        && r.health.nonFinite === 0;
       if (!ok) fails.push(`${q} (control came back clean)`);
       console.log(`${ok ? '  ok  ' : ' FAIL '} ${q.padEnd(46)} ${fmt(r)}`);
     }
@@ -232,7 +272,7 @@ async function main() {
     console.log(`FAIL: ${fails.join(', ')}`);
     process.exit(1);
   }
-  console.log('PASS: every root-pool kernel reproduces its dense counterpart exactly.');
+  console.log('PASS: every root-pool kernel reproduces its dense counterpart -- exactly, except\n      the force integral, which agrees to the per-workgroup truncation floor (see FORCE_TOL).');
   process.exit(0);
 }
 

@@ -1360,7 +1360,11 @@ async function init() {
     { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
     { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
-    { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }
+    { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    // binding 6: THIS level's blockSlot, for U4-2's ring-free gather. Always
+    // bound, read only when that pipeline's GHOST is 0. Seven bindings against
+    // a 16-per-stage ceiling -- see CLAUDE.md before adding more.
+    { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }
   ]});
 
   const constants = { W, H, SDF_FAR };
@@ -1676,6 +1680,51 @@ async function init() {
     ]});
   }
 
+  // U4-2: the FORCE pass, serving the ROOT.
+  //
+  // amr_force.wgsl IS ALREADY DEAD IN THE SOLVER and this is not what replaces
+  // it there. Only the FINEST level's force pass is dispatched (B4-3), and
+  // every AMR page refuses ?levels<2, so `finestLevel === 0` cannot be reached
+  // -- the dense force kernel has not contributed to a shipped number in a
+  // long time. What keeps it alive is main-cylinder-amr.js's
+  // debugForceBreakdown, which runs each level's pass in isolation and is the
+  // instrument that MEASURED the coarser levels contributing exactly zero
+  // before the masking was deleted. So the dense kernel is a live INSTRUMENT
+  // over a dead code path, and U4 retires it by making the root's own pass
+  // reproduce it rather than by deleting it unmeasured.
+  //
+  // Two scratch accumulators so the comparison never touches the real one:
+  // the body integrator reads forceBuf every macro-step, and a debug pass that
+  // added to it would move the card.
+  let rootForcePL = null, rootForceBG = null, rootForceBuf = null, denseForceBuf = null,
+      denseForceBG = null, rootSlotForceBuf = null;
+  if (ROOT_POOL) {
+    const spec = rootPoolSpec({ dims: { W, H }, rb: RB });
+    const mkForce = () => device.createBuffer({ size: 4 * 4, usage: U.STORAGE | U.COPY_SRC | U.COPY_DST });
+    rootForceBuf = mkForce();
+    denseForceBuf = mkForce();
+    rootSlotForceBuf = device.createBuffer({ size: spec.slots * 2 * 4, usage: U.STORAGE | U.COPY_SRC });
+    rootForcePL = device.createComputePipeline({
+      layout: device.createPipelineLayout({ bindGroupLayouts: [force1BGL] }),
+      compute: { module: force1SM, entryPoint: 'main',
+                 constants: { W, H, RB, F16, GHOST: 0, NO_PARENT: 1 } },
+    });
+    rootForceBG = device.createBindGroup({ layout: force1BGL, entries: [
+      { binding: 0, resource: { buffer: cardStateBuf } },
+      { binding: 1, resource: { buffer: pools[0].finePoolF_a } },
+      { binding: 2, resource: { buffer: rootForceBuf } },
+      { binding: 3, resource: { buffer: pools[0].slotToBlockBuf } },
+      { binding: 4, resource: { buffer: pools[0].levelParamsBuf } },
+      { binding: 5, resource: { buffer: rootSlotForceBuf } },
+      { binding: 6, resource: { buffer: pools[0].blockSlotBuf } },
+    ]});
+    denseForceBG = device.createBindGroup({ layout: frcBGL, entries: [
+      { binding: 0, resource: { buffer: cardStateBuf } },
+      { binding: 1, resource: { buffer: f_a } },
+      { binding: 2, resource: { buffer: denseForceBuf } },
+    ]});
+  }
+
   // D0's candidate scan: two pipelines from one entry point, so the grant and
   // release rules cannot drift into two spellings of "candidate". One
   // workgroup each -- see scanCandidates' header for why that is enough.
@@ -1966,6 +2015,8 @@ async function init() {
       { binding: 3, resource: { buffer: childPool.slotToBlockBuf } },
       { binding: 4, resource: { buffer: childPool.levelParamsBuf } },
       { binding: 5, resource: { buffer: childPool.debugSlotForceBuf } },
+          // Bound but never read at GHOST=2 -- these levels have a ring.
+      { binding: 6, resource: { buffer: childPool.blockSlotBuf } },
     ]});
   }
 
@@ -1983,6 +2034,8 @@ async function init() {
     { binding: 3, resource: { buffer: pools[1].slotToBlockBuf } },
     { binding: 4, resource: { buffer: pools[1].levelParamsBuf } },
     { binding: 5, resource: { buffer: pools[1].debugSlotForceBuf } },
+      // Bound but never read at GHOST=2 -- these levels have a ring.
+    { binding: 6, resource: { buffer: pools[1].blockSlotBuf } },
   ]});
 
   const error = await device.popErrorScope();
@@ -2245,6 +2298,63 @@ async function init() {
     // perfectly and say nothing. The dense kernel must have found some
     // vorticity for the comparison to mean anything.
     return { ok: mismatched === 0 && nonZero > 0, checked: n, mismatched, nonZero, maxAbs, first };
+  }
+
+  // U4-2: the root's FORCE against the dense kernel's, exactly.
+  //
+  // Runs BOTH passes on demand into scratch accumulators -- the solver
+  // dispatches neither (the dense one is unreachable, the root one is inert),
+  // so there is nothing to read after a step and this has to produce its own
+  // numbers.
+  //
+  // THE BAR IS THE RAW i32 ACCUMULATORS, NOT A DERIVED FORCE. The reduction
+  // atomically adds ONE TRUNCATED i32 PER WORKGROUP (FSCALE = 1e7), so the
+  // partition matters: the dense kernel is one workgroup per 8x8 dense block,
+  // and the root at GHOST=0 dispatches (2,2) over a 16-cell tile, which is the
+  // same four 8x8 regions of the domain. Same partition, same partials, and
+  // integer atomicAdd is associative and commutative -- so the sum is
+  // order-independent and exact equality is the right bar rather than an
+  // ambitious one. If the partitions ever diverge, this is where it shows.
+  async function debugCheckRootForce() {
+    if (!rootForcePL) return { ok: null, skipped: 'no root pool (?rootpool=1)' };
+    const zero = new Int32Array(4);
+    device.queue.writeBuffer(rootForceBuf, 0, zero);
+    device.queue.writeBuffer(denseForceBuf, 0, zero);
+    const enc = device.createCommandEncoder();
+    {
+      const p = enc.beginComputePass();
+      p.setPipeline(frcPL); p.setBindGroup(0, denseForceBG);
+      p.dispatchWorkgroups(WGX, WGY); p.end();
+    }
+    {
+      const p = enc.beginComputePass();
+      p.setPipeline(rootForcePL); p.setBindGroup(0, rootForceBG);
+      // (2,2): a ring-free tile is 2*RB = 16 cells, so four 8x8 workgroups --
+      // the dense kernel's own partition. NOT WGX1/WGY1, which is sized for
+      // FB = 20 and would dispatch a third, empty row and column.
+      p.dispatchWorkgroups(2, 2, pools[0].MAX_FINE_BLOCKS); p.end();
+    }
+    const sD = device.createBuffer({ size: 16, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    const sR = device.createBuffer({ size: 16, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    enc.copyBufferToBuffer(denseForceBuf, 0, sD, 0, 16);
+    enc.copyBufferToBuffer(rootForceBuf, 0, sR, 0, 16);
+    device.queue.submit([enc.finish()]);
+    await Promise.all([sD.mapAsync(GPUMapMode.READ), sR.mapAsync(GPUMapMode.READ)]);
+    const d = Array.from(new Int32Array(sD.getMappedRange()).slice(0, 3));
+    const r = Array.from(new Int32Array(sR.getMappedRange()).slice(0, 3));
+    sD.unmap(); sR.unmap(); sD.destroy(); sR.destroy();
+    // VACUITY GUARD: two zero accumulators agree perfectly. The body has to be
+    // in the fluid for this to mean anything, and on a falling card early in a
+    // run it always is -- but "always" is what a guard is for.
+    const nonZero = d.some(v => v !== 0);
+    const diff = [0, 1, 2].map(i => r[i] - d[i]);
+    // `exact` is reported, NOT gated. The caller owns the bound, because the
+    // bound is only defensible next to a measured defect scale and that
+    // measurement lives with the tool. See tools/validate-root-kernels.js.
+    return {
+      exact: diff.every(v => v === 0), nonZero,
+      dense: d, root: r, diff, maxDiff: Math.max(...diff.map(Math.abs)),
+    };
   }
 
   // ── Debug/verification support (window.__AMR) ────────────────────────────
@@ -3897,6 +4007,7 @@ async function init() {
     debugCheckRootMirror,
     debugCheckRootVel,
     debugCheckRootCriterion,
+    debugCheckRootForce,
     getRootPool: () => (ROOT_POOL ? { ...rootPoolSpec({ dims: { W, H }, rb: RB }), stepped: !!ROOT_STEP } : null),
     debugRenderOnce,
     debugPerturbLevelVel,

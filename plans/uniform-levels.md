@@ -25,7 +25,7 @@ it runs on.
 | U1 | The root pool exists, unused | **DONE** — identity proved on live buffers, page provably inert | `checkRootPoolIdentity`; hashes unmoved |
 | U2 | The mirror | **WAS VACUOUS, NOW FIXED** — both "independent" routes wrote `gy*W+gx`; the dense grid is 8x8 block-major, so 98.4% of the pool read the wrong cell | a THIRD route (`field-reconstruct.js`'s `rawIndex`), GPU-free in `make check` |
 | U3 | The step kernel serves the root | **DONE — BIT-IDENTICAL** on 8 rungs, 512 macro-steps; controls saturate at 98.4% | word equality + field health, `?rootstep=0` as control |
-| U4 | criterion, force, digest, conserved totals | **U4-0/U4-1 DONE** — `vel` and the CRITERION are both bit-identical on the root; force, digest and conserved totals remain | `tools/validate-root-kernels.js`, 2 GPU mutants |
+| U4 | criterion, force, digest, conserved totals | **U4-0/1/2 DONE** — `vel` and the criterion bit-identical; the FORCE agrees to the truncation floor and the bit-identity prediction is falsified. digest + conserved totals remain | `tools/validate-root-kernels.js`, 3 GPU mutants |
 | U5 | L1 becomes a quad child of the root | not started | — |
 | U6 | The renderer walks levels | not started; **its gate already exists and already fails** | `tools/validate-render-levels.js` |
 | U7 | Delete the dense path | not started | — |
@@ -1455,6 +1455,68 @@ header says so.
 
 The comparison also carries a VACUITY guard (`nonZero > 0`): two all-zero
 criterion arrays agree perfectly and say nothing.
+
+### U4-2 — DONE (2026-09-17). The force on the root, and the ONE prediction this plan got wrong.
+
+`amr_force1.wgsl` now serves the root: `GHOST = 0`, `NO_PARENT = 1` (the same
+half-cell straddle U3 removed from the step), the ring-free gather, and a (2,2)
+dispatch over the 16-cell tile. It accumulates into a SCRATCH buffer, never
+`forceBuf`, so the body integrator is untouched.
+
+**FIRST, WHAT U4 SAID TO RETIRE IS ALREADY DEAD -- AND IS STILL LOAD-BEARING.**
+`amr_force.wgsl` has not contributed to a shipped number in a long time: only
+the FINEST level's force pass is dispatched (B4-3), `finestLevel === 0` means
+`N_LEVELS === 1`, and every AMR page refuses `?levels<2` at module scope. The
+branch cannot be reached. What keeps the kernel alive is
+`main-cylinder-amr.js`'s `debugForceBreakdown`, which runs each level's pass in
+isolation and is the INSTRUMENT that measured the coarser levels contributing
+exactly zero before the masking was deleted. So it is a live instrument over a
+dead code path, and the way to retire it is to make the root's own pass
+reproduce it -- not to delete it unmeasured.
+
+**THE PREDICTION WAS BIT-IDENTITY AND IT IS FALSIFIED.** U4-as-written argued
+the partials would group identically because "the workgroup partition of the
+root is unchanged". The partition IS unchanged -- the dense kernel is one
+workgroup per 8x8 dense block, and the root at `GHOST = 0` dispatches (2,2)
+over a 16-cell tile, the same four 8x8 regions of the domain. The partials are
+still not identical:
+
+```
+  512 macro-steps, ?benchSkip=avg        |diff| in raw i32 units (FSCALE = 1e7)
+    levels=2 / 3 / 4, res=8                    <= 1        (1024 workgroups)
+    res=9                                      <= 5        (4096 workgroups)
+    f16=1                                       exact
+  CONTROL ?rootstep=0                     <= 1.6e7
+  CONTROL shipped path (avg on)           <= 1.8e5
+```
+
+Deterministic: reproduced bit-for-bit across runs on both sides.
+
+**SO U3's BIT-IDENTITY WAS THE SPECIAL CASE, NOT THE RULE.** The step's per-cell
+expression is spelled identically in both kernels and only the address space
+moves, which is why exact equality held there. The force's is not: the pool
+kernel carries `-Fx * areaWeight` where `areaWeight` is exactly 1.0 at the
+root, and the torque is a mul-sub the compiler may or may not contract. The
+plan's earlier retraction of the bit-identity bar -- "nothing entitles two
+separately written kernels to associate their f32 identically" -- was wrong
+about the step and right about this.
+
+**WHY A BOUND IS ACCEPTABLE HERE AND NOT LAZY.** It cannot be a mis-gathered or
+mis-included CELL. Totals run ~5e5 raw units over a few hundred diffuse-band
+cells, so one cell is worth ~1e3 units; a residual of 1 is a thousandth of a
+single cell, and no cell can be wrong by that little. It also grows with
+workgroup count (1 at 1024, 5 at 4096), which is what per-workgroup truncation
+must do. And the defect scale is MEASURED rather than imagined: disabling the
+ring-free gather -- clamping at the tile edge, as the ringed path does -- reads
+`[-1512, 743, 6477]`. `FORCE_TOL = 64` therefore sits ~13x above the observed
+residual and ~11x below the smallest component of a real defect.
+
+**THE MECHANISM IS NOT ESTABLISHED, AND ONE EXPERIMENT WAS DISCARDED.** Testing
+the `* areaWeight` suspicion by deleting that multiply was CONFOUNDED:
+`amr_force1.wgsl` is the LIVE force pass at level 1, so the edit changed the
+card's motion and the two runs were no longer comparable -- the dense total
+itself moved from -486022 to -269736. Recorded so the same experiment is not
+run again. Isolating it needs a diagnostic that leaves level 1 alone.
 
 ### U4 — criterion, force, digest, conserved totals
 

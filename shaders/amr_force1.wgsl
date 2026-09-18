@@ -95,6 +95,9 @@ struct LevelParams {
 // sign against each tile's own position instead of only ever seeing the
 // grand total (debugReadSlotForces).
 @group(0) @binding(5) var<storage, read_write> debugSlotForce : array<vec2<f32>>;
+// This level's own blockSlot, for the ring-free gather below. Always bound;
+// only read when GHOST == 0.
+@group(0) @binding(6) var<storage, read>       blockSlot      : array<i32>;
 // RENUMBERED CONTIGUOUS by B3-4. The layout had holes: 4/5 were
 // originX/originY (gone -- the origin is derived, see header), 7 was the
 // masking's childBlockSlot (gone in B4-3) and 8 sat past the hole because
@@ -105,7 +108,23 @@ struct LevelParams {
 override W : u32;
 override H : u32;
 override RB : u32;
-const GHOST = 2u;
+// GHOST is an OVERRIDE since plans/uniform-levels.md U4-2: the ROOT level has
+// no ring (amr2d.mjs's ghostDepthAtLevel(0) is 0). Default 2 keeps every
+// existing pipeline byte-identical. It flows into FB = RB*2 + 2*GHOST, into
+// the `isInterior` test -- which at 0 admits every thread, because a ring-free
+// tile IS its interior -- and into the half-cell straddle below.
+override GHOST : u32 = 2u;
+
+// NO_PARENT: this level is the ROOT, so the half-cell straddle goes away.
+//
+// fineToCoarseUnit places cell j at `origin - 0.5*dxL + dxL*j`, where `origin`
+// is the centre of the first PARENT cell the tile covers and the two children
+// straddle it. The root's `origin` is its own first cell's centre -- there is
+// nothing to straddle -- so the term is 0 there. Identical to amr_step1.wgsl's
+// NO_PARENT, and for the identical reason: left in, the body's phi sits half a
+// cell off the grid it is meant to reproduce, and NO SINGLE-KERNEL TEST CAN
+// SEE IT, because the root stays perfectly self-consistent with the offset.
+override NO_PARENT : u32 = 0u;
 // FSCALE: fixed-point scale for the atomic force accumulation. Raised from
 // 1e4 to 1e7 because the reduction below atomicAdds ONE TRUNCATED i32 PER
 // WORKGROUP (safeFixed's i32() cast truncates toward zero), so any workgroup
@@ -128,14 +147,48 @@ override USE_BOUNCEBACK : u32 = 0u;
 // origin - dx/2 + dx*(j - GHOST). amr2d.mjs's fineToCoarseUnit is the host
 // twin. (Both files once hardcoded level 1's own dx=0.5 here, which was a
 // real bug for every deeper level -- see amr_step1.wgsl.)
+fn cellCentreOffset() -> f32 {
+  return select(0.5f * levelParams.dxL, 0.0f, NO_PARENT != 0u);
+}
+
 fn fineToCoarseUnit(fCoord: u32, origin: f32) -> f32 {
   let j = f32(i32(fCoord) - i32(GHOST));
-  return origin - 0.5 * levelParams.dxL + levelParams.dxL * j;
+  return origin - cellCentreOffset() + levelParams.dxL * j;
 }
 
 fn fineToCoarseUnitI(fCoordI: i32, origin: f32) -> f32 {
   let j = f32(fCoordI - i32(GHOST));
-  return origin - 0.5 * levelParams.dxL + levelParams.dxL * j;
+  return origin - cellCentreOffset() + levelParams.dxL * j;
+}
+
+// One gathered source cell, resolved against the OWNING same-level tile when
+// it leaves this one.
+//
+// THE RING-FREE PATH, derived from GHOST rather than flagged -- see
+// amr_criterion_pool.wgsl's tapVel for the full argument, which is the same
+// one. At GHOST == 0 a slot is exactly its own 2*RB x 2*RB cells, so the clamp
+// the ringed path uses would fold a cell back onto itself instead of reaching
+// the neighbour, and the dense kernel it must reproduce wraps periodically
+// over the whole domain.
+//
+// The rule is amr2d.mjs's resolveSource. The `< 0` fallback is unreachable at
+// the root, which is always full; it clamps rather than inventing a value, so
+// a sparse ring-free level would degrade exactly the way the ringed path does
+// rather than in some third way.
+fn srcCellResolved(slot: u32, blockID: i32, sx: i32, sy: i32, FB: u32) -> u32 {
+  var nx = sx; var ny = sy;
+  let bx = u32(blockID) % levelParams.nbx;
+  let by = u32(blockID) / levelParams.nbx;
+  var tbx = bx; var tby = by;
+  if (nx < 0)             { nx += i32(FB); tbx = (bx + levelParams.nbx - 1u) % levelParams.nbx; }
+  else if (nx >= i32(FB)) { nx -= i32(FB); tbx = (bx + 1u) % levelParams.nbx; }
+  if (ny < 0)             { ny += i32(FB); tby = (by + levelParams.nby - 1u) % levelParams.nby; }
+  else if (ny >= i32(FB)) { ny -= i32(FB); tby = (by + 1u) % levelParams.nby; }
+  let s = blockSlot[tby * levelParams.nbx + tbx];
+  if (s < 0) {
+    return slot * (FB * FB) + u32(clamp(sy, 0, i32(FB) - 1)) * FB + u32(clamp(sx, 0, i32(FB) - 1));
+  }
+  return u32(s) * (FB * FB) + u32(ny) * FB + u32(nx);
 }
 
 fn get_chi(phi: f32) -> f32 {
@@ -223,9 +276,12 @@ fn main(
           if (chi >= 1e-6) {
             var rho = 0f; var ux_star = 0f; var uy_star = 0f;
             for (var i = 0u; i < 9u; i++) {
-              let srcX = clamp(i32(fx) - ex[i], 0, i32(FB) - 1);
-              let srcY = clamp(i32(fy) - ey[i], 0, i32(FB) - 1);
-              let srcCell = slot * (FB * FB) + u32(srcY) * FB + u32(srcX);
+              let sx = i32(fx) - ex[i];
+              let sy = i32(fy) - ey[i];
+              var srcCell = slot * (FB * FB)
+                          + u32(clamp(sy, 0, i32(FB) - 1)) * FB
+                          + u32(clamp(sx, 0, i32(FB) - 1));
+              if (GHOST == 0u) { srcCell = srcCellResolved(slot, blockID, sx, sy, FB); }
               let fi = fUnpack(f_in[fIdx(i, poolPlaneStride, srcCell)], i);
               rho     += fi;
               ux_star += fi * f32(ex[i]);
