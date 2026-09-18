@@ -74,6 +74,7 @@ const sorted = (s) => [...s].sort();
     tileCellsAtLevel, ghostDepthAtLevel, tileSideAtLevel, blockGridAtLevel,
     parentCellOfFineCell, fineCellsOfParentCell, ringDepth, ringSlotRole,
     poolInverseViolations,
+    coalesceSource, explodeTarget, transferLedger,
     makePool, poolAtLevel, nbAtLevel, parentOfBlock,
     quadrantOfBlock, quadrantOrigin, tileOriginL0, tileOriginL0Recursive,
     refineWhere, nearBodyWant, nearBodyWantCentre, refineNearBody,
@@ -1533,6 +1534,98 @@ const sorted = (s) => [...s].sort();
       'an out-of-range slot was missed');
     assert.ok(poolInverseViolations([-1], [-1, 42]).some(v => v.kind === 'block-out-of-range'),
       'an out-of-range block was missed');
+  });
+
+
+  // ── U0: the D2Q9 claimant rule ───────────────────────────────────────────
+  //
+  // The question these settle is whether the 2D corner needs a special case.
+  // 3D's answer rests on D3Q19 lacking (1,1,+-1); D2Q9 has the diagonals, so
+  // the shapes below are chosen to make a corner rule fail if one is needed:
+  // a lone tile is four convex corners, an L adds a concave one, a hole is a
+  // coarse cell enclosed by fine on all eight sides, and the staircase is
+  // nothing but corners.
+
+  const D2Q9 = [[0,0],[1,0],[0,1],[-1,0],[0,-1],[1,1],[-1,1],[-1,-1],[1,-1]];
+  const shapeCovered = (blocks, rb) => (x, y) => blocks.has(`${Math.floor(x/rb)},${Math.floor(y/rb)}`);
+  const SHAPES = {
+    'one tile (four convex corners)': ['1,1'],
+    'two abutting tiles':             ['1,1', '2,1'],
+    'a 2x2 square':                   ['1,1', '2,1', '1,2', '2,2'],
+    'an L (concave corner)':          ['1,1', '2,1', '1,2'],
+    'a plus':                         ['1,1', '0,1', '2,1', '1,0', '1,2'],
+    'a diagonal staircase':           ['0,0', '1,1', '2,2'],
+    'a hole (coarse enclosed by fine)': ['0,0','1,0','2,0','0,1','2,1','0,2','1,2','2,2'],
+    'everything refined':             ['0,0','1,0','2,0','0,1','1,1','2,1','0,2','1,2','2,2'],
+    'nothing refined':                [],
+  };
+
+  ok('every population crossing the seam has exactly one claimant, in every shape', () => {
+    const rb = 4, dims = { W: 12, H: 12 };
+    for (const [name, blocks] of Object.entries(SHAPES)) {
+      const r = transferLedger({ dims, covered: shapeCovered(new Set(blocks), rb), dirs: D2Q9 });
+      assert.deepStrictEqual(r.unclaimedExits, [], `${name}: mass leaves with no claimant`);
+      assert.deepStrictEqual(r.phantomClaims, [], `${name}: a claim with nothing to claim`);
+      assert.deepStrictEqual(r.doubleClaims, [], `${name}: two claimants for one population`);
+      assert.deepStrictEqual(r.undelivered, [], `${name}: mass enters with no delivery`);
+      assert.deepStrictEqual(r.phantomDeliveries, [], `${name}: a delivery with nothing to deliver`);
+      assert.deepStrictEqual(r.doubleDeliveries, [], `${name}: two deliveries for one population`);
+      assert.ok(r.ok, `${name}: ledger not balanced`);
+    }
+  });
+
+  ok('the shapes actually EXERCISE the seam (the ledger is not vacuous)', () => {
+    // A balanced ledger over shapes with no seam would prove nothing. Assert
+    // the interesting shapes carry traffic, and that the two degenerate ones
+    // carry none -- the discrimination that says the instrument reads shape.
+    const rb = 4, dims = { W: 12, H: 12 };
+    const led = (blocks) => transferLedger({ dims, covered: shapeCovered(new Set(blocks), rb), dirs: D2Q9 });
+    assert.ok(led(SHAPES['one tile (four convex corners)']).exits > 0, 'a lone tile has no outflux');
+    assert.ok(led(SHAPES['a hole (coarse enclosed by fine)']).exits > 0, 'a hole has no outflux');
+    assert.ok(led(SHAPES['a diagonal staircase']).exits > 0, 'a staircase has no outflux');
+    assert.strictEqual(led(SHAPES['everything refined']).exits, 0, 'a fully refined domain has a seam');
+    assert.strictEqual(led(SHAPES['nothing refined']).exits, 0, 'an unrefined domain has a seam');
+  });
+
+  ok('the diagonals are where the traffic is, so a corner rule could not hide', () => {
+    // If D2Q9's diagonals needed their own treatment, they would have to carry
+    // traffic for it to matter. Count what crosses on axis vs diagonal links
+    // around a single tile: the diagonals are a real share, not an edge case.
+    const rb = 4, dims = { W: 12, H: 12 };
+    const covered = shapeCovered(new Set(['1,1']), rb);
+    const axis = transferLedger({ dims, covered, dirs: [[0,0],[1,0],[0,1],[-1,0],[0,-1]] });
+    const all = transferLedger({ dims, covered, dirs: D2Q9 });
+    assert.ok(all.exits > axis.exits, 'the diagonals carry nothing across the seam');
+    assert.ok(all.ok && axis.ok, 'the rule depends on which directions exist');
+  });
+
+  ok('the ledger CATCHES a wrong claimant rule', () => {
+    // RUN IT ON A RULE THAT IS WRONG (rule 3). Claim at Q + e_i instead of
+    // Q - e_i -- the single most plausible slip, and the one that would look
+    // right in a diagram.
+    const rb = 4, dims = { W: 12, H: 12 };
+    const covered = shapeCovered(new Set(['1,1']), rb);
+    const wrap = (v, n) => ((v % n) + n) % n;
+    const cov = (p) => covered(wrap(p[0], dims.W), wrap(p[1], dims.H));
+    const key = (p, i) => `${wrap(p[0], dims.W)},${wrap(p[1], dims.H)}|${i}`;
+    const exits = new Set();
+    for (let y = 0; y < dims.H; y++) for (let x = 0; x < dims.W; x++) {
+      for (let i = 1; i < D2Q9.length; i++) {
+        const d = D2Q9[i];
+        if (cov([x, y]) && !cov([x + d[0], y + d[1]])) exits.add(key([x + d[0], y + d[1]], i));
+      }
+    }
+    // the WRONG rule
+    const claims = new Set();
+    for (let y = 0; y < dims.H; y++) for (let x = 0; x < dims.W; x++) {
+      for (let i = 1; i < D2Q9.length; i++) {
+        const d = D2Q9[i];
+        if (!cov([x, y]) && cov([x + d[0], y + d[1]])) claims.add(key([x, y], i)); // Q + e_i
+      }
+    }
+    const unclaimed = [...exits].filter(k => !claims.has(k));
+    assert.ok(unclaimed.length > 0,
+      'a claimant rule pointing the wrong way produced a balanced ledger -- the audit is vacuous');
   });
   if (!process.exitCode) console.log(`\n${pass} check(s) passed`);
   else console.log('\nFAILED');

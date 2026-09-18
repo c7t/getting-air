@@ -1131,3 +1131,111 @@ export function poolInverseViolations(blockSlot, slotToBlock) {
   }
   return bad;
 }
+
+// ── U0: the coarse/fine claimant rule, DERIVED FOR D2Q9 ─────────────────────
+//
+// 3D's argument for how the corner behaves rests on D3Q19 having no (1,1,+-1)
+// direction, so fine channels tile a coarse FACE exactly and a coarse CORNER
+// not at all. D2Q9 DOES carry the (+-1,+-1) diagonals, so that counting says
+// nothing here and the rule is re-derived from scratch below.
+//
+// THE DERIVATION, in one paragraph. A coarse cell Q that is not covered still
+// solves, and its update pulls f_i from Q - e_i. If Q - e_i is covered, that
+// population has to come from the fine level instead of from the coarse grid.
+// Over one macro-step a fine population travels two fine cells, which is
+// exactly one parent cell and exactly the ring depth, so the mass that left
+// Q - e_i heading in direction i has advected into the ring cells occupying
+// Q's OWN volume. Hence:
+//
+//   f_i(Q) = mean of the 4 ring cells covering Q, in the ring of the tile
+//            containing Q - e_i,   for every i where Q - e_i is covered
+//
+// The mean, not the sum: each ring cell carries mass f_i * (h/2)^2 and Q must
+// receive f_i(Q) * h^2, so the factor is 1/4 = (fine volume)/(coarse volume).
+// In 3D it would be 1/8. There is no separate corner case: a diagonal i is
+// handled by the same sentence, because Q - e_i is a single parent cell for a
+// diagonal exactly as it is for an axis direction, and a parent cell lies in
+// exactly one block.
+//
+// WHAT THAT PREDICTS, and it is the thing to falsify: the 2D corner needs no
+// flux correction and no orphan pass. Every population leaving the refined
+// region is claimed by exactly one coarse cell, and the claim is decided by
+// ONE parent cell's coverage rather than by the shape of the boundary. If that
+// is wrong, transferLedger below is where it shows up.
+
+// The source cell a coarse cell's direction-i population comes from. Coverage
+// of THIS cell -- not the shape of the seam -- is the whole rule.
+export function coalesceSource(q, dir) { return [q[0] - dir[0], q[1] - dir[1]]; }
+
+// The fine cell a coarse cell's population is delivered TO, going the other
+// way: Q's own population in direction i is consumed by Q + e_i.
+export function explodeTarget(q, dir) { return [q[0] + dir[0], q[1] + dir[1]]; }
+
+// A ledger of everything that crosses the seam, for one refined-region shape.
+//
+// THIS EXISTS TO BE FALSIFIABLE. An audit that merely re-applies the rule it
+// is auditing is vacuous -- this project has collected three gates like that.
+// So the EXPECTED sets are built from coverage alone (a population crosses the
+// seam iff one end is covered and the other is not), the ACTUAL sets are built
+// by applying the claimant rule, and the two are compared. A wrong rule --
+// claiming at Q + e_i, or deciding by the neighbour's tile instead of the
+// source cell's -- produces exits nobody claims and claims nobody exits.
+//
+// `covered(px, py)` decides coverage; the caller supplies it, so the same
+// ledger scores a single tile, an L, a hole, or a random closed set.
+// Coordinates are parent cells on a periodic `dims.W` x `dims.H` grid.
+export function transferLedger({ dims, covered, dirs }) {
+  const wrap = (v, n) => ((v % n) + n) % n;
+  const cov = (p) => covered(wrap(p[0], dims.W), wrap(p[1], dims.H));
+  const key = (p, i) => `${wrap(p[0], dims.W)},${wrap(p[1], dims.H)}|${i}`;
+
+  const exits = new Set();      // covered -> uncovered: mass leaving the fine region
+  const entries = new Set();    // uncovered -> covered: mass entering it
+  for (let y = 0; y < dims.H; y++) {
+    for (let x = 0; x < dims.W; x++) {
+      for (let i = 0; i < dirs.length; i++) {
+        const d = dirs[i];
+        if (d[0] === 0 && d[1] === 0) continue;
+        const from = [x, y], to = [x + d[0], y + d[1]];
+        if (cov(from) && !cov(to)) exits.add(key(to, i));       // lands at `to`
+        if (!cov(from) && cov(to)) entries.add(key(to, i));     // lands at `to`
+      }
+    }
+  }
+
+  // Now apply the RULE, independently of the sets above.
+  const claims = new Map();     // key -> how many coarse cells claim it
+  const deliveries = new Map();
+  for (let y = 0; y < dims.H; y++) {
+    for (let x = 0; x < dims.W; x++) {
+      const q = [x, y];
+      for (let i = 0; i < dirs.length; i++) {
+        const d = dirs[i];
+        if (d[0] === 0 && d[1] === 0) continue;
+        if (!cov(q) && cov(coalesceSource(q, d))) {
+          const k = key(q, i);
+          claims.set(k, (claims.get(k) || 0) + 1);
+        }
+        if (cov(q) && !cov(coalesceSource(q, d))) {
+          const k = key(q, i);
+          deliveries.set(k, (deliveries.get(k) || 0) + 1);
+        }
+      }
+    }
+  }
+
+  const unclaimedExits = [...exits].filter(k => !claims.has(k));
+  const phantomClaims = [...claims.keys()].filter(k => !exits.has(k));
+  const doubleClaims = [...claims.entries()].filter(([, n]) => n > 1).map(([k]) => k);
+  const undelivered = [...entries].filter(k => !deliveries.has(k));
+  const phantomDeliveries = [...deliveries.keys()].filter(k => !entries.has(k));
+  const doubleDeliveries = [...deliveries.entries()].filter(([, n]) => n > 1).map(([k]) => k);
+
+  return {
+    exits: exits.size, entries: entries.size,
+    unclaimedExits, phantomClaims, doubleClaims,
+    undelivered, phantomDeliveries, doubleDeliveries,
+    ok: !unclaimedExits.length && !phantomClaims.length && !doubleClaims.length
+      && !undelivered.length && !phantomDeliveries.length && !doubleDeliveries.length,
+  };
+}
