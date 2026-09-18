@@ -1003,3 +1003,131 @@ export function releaseAssignment({ releases, freeCount }) {
   const writes = ordered.map((id, j) => ({ id, freeIndex: freeCount + j }));
   return { writes, freeCount: freeCount + ordered.length };
 }
+
+// ── U0: the uniform level model (plans/uniform-levels.md) ───────────────────
+//
+// ONE RULE: the root is a level like any other, special only in that it has no
+// parent, is always full, and is never allocated or freed. Everything below is
+// that rule made arithmetic, stated here ONCE so the GPU can be scored against
+// it rather than against a second spelling of it in WGSL.
+//
+// Nothing consumes these yet. They exist first, alone, and mutation-checked,
+// which is the order B0 used and the reason its addressing survived six
+// refactors.
+
+// Every level's tile holds the same number of its OWN cells. Today an L1 tile
+// covers RB x RB L0 cells; making the ROOT's tile 2*RB x 2*RB root cells is
+// what turns level 1 into a quadrant of a root tile -- exactly the relation
+// level 2 already has to level 1 -- and collapses three allocation regimes
+// into one.
+export function tileCellsAtLevel(_m, rb = RB_DEFAULT) { return 2 * rb; }
+
+// THE ROOT HAS NO RING, and that is not an optimisation. A ring exists to hold
+// the parent interface; the root has no parent. It is also always full, so
+// DIRECT_GHOST always resolves an out-of-tile source against the owning
+// same-level tile and never falls back. A ring there would be storage nothing
+// writes and nothing reads -- and skipping it is what keeps root memory at
+// exactly today's W*H rather than paying 56% for padding.
+export function ghostDepthAtLevel(m) { return m === 0 ? 0 : GHOST; }
+
+export function tileSideAtLevel(m, rb = RB_DEFAULT) {
+  return tileCellsAtLevel(m, rb) + 2 * ghostDepthAtLevel(m);
+}
+
+// The block grid at level m, in blocks. The root is the domain divided by a
+// whole tile; every level below doubles both axes.
+//
+// `dims` is the domain in ROOT cells, which are today's L0 cells -- the root
+// stays full, so its cell size does not move.
+export function blockGridAtLevel(dims, m, rb = RB_DEFAULT) {
+  const tile = tileCellsAtLevel(m, rb);
+  if (dims.W % tile !== 0 || dims.H % tile !== 0) {
+    throw new Error(`domain ${dims.W}x${dims.H} does not divide into ${tile}-cell root tiles`);
+  }
+  const s = 1 << m;
+  return [(dims.W / tile) * s, (dims.H / tile) * s];
+}
+
+// ── the coarse/fine mailbox ────────────────────────────────────────────────
+//
+// A tile's ring is GHOST fine cells deep and GHOST is 2, so the ring is
+// EXACTLY ONE PARENT CELL deep, and a 2x2 block of ring cells is exactly one
+// parent cell. That is the whole of the mailbox geometry, and it is also why
+// two fine substeps traverse the ring exactly once: the same 2 buys the inbox
+// reach inward and the outbox accumulation outward.
+
+// Tile-local fine coordinate -> parent-local cell index. Returns -1 across the
+// low ring and `rb` across the high one, which IS the statement that the ring
+// is one parent cell deep -- it is not a clamp or a special case.
+export function parentCellOfFineCell(f, m, rb = RB_DEFAULT) {
+  const g = ghostDepthAtLevel(m);
+  return Math.floor((f - g) / 2);
+}
+
+// The inverse: the two fine coordinates covering one parent-local cell.
+export function fineCellsOfParentCell(p, m, rb = RB_DEFAULT) {
+  const g = ghostDepthAtLevel(m);
+  return [g + 2 * p, g + 2 * p + 1];
+}
+
+// How far outside the interior a tile-local cell sits: 0 interior, 1 or 2 in
+// the ring. Per axis, then the max -- a corner cell is as deep as its deepest
+// axis, which is what makes a diagonal step inward reduce it.
+export function ringDepth(fx, fy, m, rb = RB_DEFAULT) {
+  const g = ghostDepthAtLevel(m);
+  const hi = g + tileCellsAtLevel(m, rb);
+  const axis = (f) => (f < g ? g - f : (f >= hi ? f - hi + 1 : 0));
+  return Math.max(axis(fx), axis(fy));
+}
+
+// What ROLE a ring cell's population in direction (ex, ey) plays.
+//
+// A ring cell is NOT A STATE: its nine numbers do not form a distribution, and
+// they split by DIRECTION, not by cell. The population at R in direction i is
+// consumed by R + e_i, so the direction decides whether this slot is something
+// explode delivers inward (inbox), something the fine step pushes outward for
+// coalesce to collect (outbox), or neither.
+//
+// 'tangential' is HONEST, not a catch-all: whether a direction whose target
+// sits at the same ring depth must be written, zeroed or left alone is open
+// (plans/uniform-levels.md section 7, question 2). Naming it is the point --
+// a function that guessed would hide the question.
+export function ringSlotRole(fx, fy, ex, ey, m, rb = RB_DEFAULT) {
+  const side = tileSideAtLevel(m, rb);
+  const d0 = ringDepth(fx, fy, m, rb);
+  if (d0 === 0) return 'interior';
+  if (ex === 0 && ey === 0) return 'rest';
+  const nx = fx + ex, ny = fy + ey;
+  if (nx < 0 || ny < 0 || nx >= side || ny >= side) return 'offtile';
+  const d1 = ringDepth(nx, ny, m, rb);
+  if (d1 < d0) return 'inbox';
+  if (d1 > d0) return 'outbox';
+  return 'tangential';
+}
+
+// ── the pool's own consistency ─────────────────────────────────────────────
+//
+// blockSlot and slotToBlock are INVERSES. Nothing has ever asserted it.
+//
+// It is written down now because D0 found a reason to doubt it: removing the
+// link passes -- which rewrite blockSlot from slotToBlock every round, and are
+// therefore an idempotent repair -- made a deterministic run diverge, with no
+// mechanism anyone could name (plans/uniform-levels.md 1.2e). If the pool
+// carries a latent inconsistency, that repair has been hiding it, and this is
+// the predicate a GPU checker should score.
+export function poolInverseViolations(blockSlot, slotToBlock) {
+  const bad = [];
+  for (let b = 0; b < blockSlot.length; b++) {
+    const s = blockSlot[b];
+    if (s < 0) continue;
+    if (s >= slotToBlock.length) { bad.push({ kind: 'slot-out-of-range', block: b, slot: s }); continue; }
+    if (slotToBlock[s] !== b) bad.push({ kind: 'block-slot-block', block: b, slot: s, back: slotToBlock[s] });
+  }
+  for (let s = 0; s < slotToBlock.length; s++) {
+    const b = slotToBlock[s];
+    if (b < 0) continue;
+    if (b >= blockSlot.length) { bad.push({ kind: 'block-out-of-range', slot: s, block: b }); continue; }
+    if (blockSlot[b] !== s) bad.push({ kind: 'slot-block-slot', slot: s, block: b, back: blockSlot[b] });
+  }
+  return bad;
+}

@@ -71,6 +71,9 @@ const sorted = (s) => [...s].sort();
   const {
     GHOST, RB_DEFAULT, fineToCoarseUnit, coarseUnitToFine, cellSizeL0AtLevel,
     grantAssignment, releaseAssignment,
+    tileCellsAtLevel, ghostDepthAtLevel, tileSideAtLevel, blockGridAtLevel,
+    parentCellOfFineCell, fineCellsOfParentCell, ringDepth, ringSlotRole,
+    poolInverseViolations,
     makePool, poolAtLevel, nbAtLevel, parentOfBlock,
     quadrantOfBlock, quadrantOrigin, tileOriginL0, tileOriginL0Recursive,
     refineWhere, nearBodyWant, nearBodyWantCentre, refineNearBody,
@@ -1418,6 +1421,118 @@ const sorted = (s) => [...s].sort();
       'refusals changed the free count');
     assert.deepStrictEqual(a.granted, b.granted.slice(0, 2),
       'refusals disturbed the grants that did succeed');
+  });
+
+
+  // ── U0: the uniform level model ──────────────────────────────────────────
+
+  ok('the root has no ring; every level below has two cells of one', () => {
+    assert.strictEqual(ghostDepthAtLevel(0), 0, 'the root was given a ring');
+    for (const m of [1, 2, 3, 4]) assert.strictEqual(ghostDepthAtLevel(m), GHOST, `level ${m}`);
+    assert.strictEqual(tileSideAtLevel(0, 8), 16, 'root tile side');
+    assert.strictEqual(tileSideAtLevel(1, 8), 20, 'level-1 tile side');
+    // The whole point of the root having no ring: its storage is exactly the
+    // domain, not the domain plus padding.
+    const dims = { W: 512, H: 512 };
+    const [nbx, nby] = blockGridAtLevel(dims, 0, 8);
+    assert.strictEqual(nbx * nby * tileCellsAtLevel(0, 8) ** 2, dims.W * dims.H,
+      'root tiles do not tile the domain exactly');
+  });
+
+  ok('the block grid agrees with the convention it replaces, at every level', () => {
+    // INDEPENDENT ROUTE (rule 1): today's grid is "L1 is 1:1 with L0 blocks,
+    // then double per level", derived from W/RB. The new one is "the domain
+    // over a whole root tile, then double per level", derived from W/(2*RB).
+    // They share no arithmetic; agreeing is evidence.
+    const dims = { W: 512, H: 256 }, rb = 8;
+    const legacy = (m) => [(dims.W / rb) * (1 << (m - 1)), (dims.H / rb) * (1 << (m - 1))];
+    for (const m of [1, 2, 3, 4]) {
+      assert.deepStrictEqual(blockGridAtLevel(dims, m, rb), legacy(m),
+        `level ${m} disagrees with the pre-U0 convention`);
+    }
+    // And it extends DOWN, which the old one could not express at all.
+    assert.deepStrictEqual(blockGridAtLevel(dims, 0, rb), [32, 16], 'root grid');
+  });
+
+  ok('a domain that does not tile is refused, not rounded', () => {
+    assert.throws(() => blockGridAtLevel({ W: 500, H: 512 }, 0, 8), /does not divide/,
+      'a ragged domain was silently accepted');
+  });
+
+  ok('fine <-> parent cell is an exact inverse across the ring too', () => {
+    // ROUND TRIP, not eyeballing -- the same discipline dense-to-amr.js and
+    // field-reconstruct.js are scored by.
+    const m = 1, rb = 8;
+    for (let p = -1; p <= rb; p++) {
+      const [a, b] = fineCellsOfParentCell(p, m, rb);
+      assert.strictEqual(parentCellOfFineCell(a, m, rb), p, `low child of parent ${p}`);
+      assert.strictEqual(parentCellOfFineCell(b, m, rb), p, `high child of parent ${p}`);
+      assert.strictEqual(b, a + 1, `parent ${p}'s children are not adjacent`);
+    }
+  });
+
+  ok('the ring is EXACTLY one parent cell deep', () => {
+    // This is the load-bearing geometric fact: it is why GHOST is 2, why two
+    // fine substeps traverse the ring exactly once, and why a 2x2 ring block
+    // is one parent cell in both directions.
+    const m = 1, rb = 8, g = GHOST;
+    for (let f = 0; f < g; f++) {
+      assert.strictEqual(parentCellOfFineCell(f, m, rb), -1, `low ring cell ${f} is not in parent -1`);
+    }
+    const hi = g + 2 * rb;
+    for (let f = hi; f < hi + g; f++) {
+      assert.strictEqual(parentCellOfFineCell(f, m, rb), rb, `high ring cell ${f} is not in parent ${rb}`);
+    }
+  });
+
+  ok('ring depth is 0 inside, 1..2 out, and identically 0 at the root', () => {
+    const rb = 8, g = GHOST, hi = g + 2 * rb;
+    assert.strictEqual(ringDepth(g, g, 1, rb), 0, 'interior corner read as ring');
+    assert.strictEqual(ringDepth(hi - 1, hi - 1, 1, rb), 0, 'far interior corner read as ring');
+    assert.strictEqual(ringDepth(g - 1, g, 1, rb), 1, 'first ring cell');
+    assert.strictEqual(ringDepth(0, g, 1, rb), 2, 'outer ring cell');
+    assert.strictEqual(ringDepth(0, 0, 1, rb), 2, 'ring corner takes its deepest axis');
+    assert.strictEqual(ringDepth(g - 1, 0, 1, rb), 2, 'mixed-depth corner takes the max');
+    // The root has no ring cells at all, at any coordinate it has.
+    for (const f of [0, 1, 7, 15]) {
+      assert.strictEqual(ringDepth(f, f, 0, rb), 0, `root cell ${f} read as ring`);
+    }
+  });
+
+  ok('a ring slot is inbox or outbox by DIRECTION, not by cell', () => {
+    const m = 1, rb = 8, g = GHOST;
+    // One cell, two directions, two different roles -- which is the claim.
+    const fx = g - 1, fy = g + 4;        // depth 1 on the low-x side
+    assert.strictEqual(ringSlotRole(fx, fy, +1, 0, m, rb), 'inbox', 'inward is not inbox');
+    assert.strictEqual(ringSlotRole(fx, fy, -1, 0, m, rb), 'outbox', 'outward is not outbox');
+    assert.strictEqual(ringSlotRole(fx, fy, 0, +1, m, rb), 'tangential', 'along the seam is not tangential');
+    assert.strictEqual(ringSlotRole(fx, fy, 0, 0, m, rb), 'rest', 'the rest population has no direction');
+    // A diagonal that reduces depth is delivery, not a tangent.
+    assert.strictEqual(ringSlotRole(0, 0, +1, +1, m, rb), 'inbox', 'inward diagonal at a corner');
+    assert.strictEqual(ringSlotRole(g, g, +1, 0, m, rb), 'interior', 'an interior cell has no ring role');
+    assert.strictEqual(ringSlotRole(0, 5, -1, 0, m, rb), 'offtile', 'a step off the buffer is not a role');
+  });
+
+  ok('pool inverse violations are caught from BOTH directions', () => {
+    // RUN THE CHECKER ON INPUTS THAT VIOLATE IT (rule 3). A checker only ever
+    // run on valid input is indistinguishable from one that returns nothing.
+    const blockSlot = [-1, 0, -1, 1];
+    const slotToBlock = [1, 3, -1];
+    assert.deepStrictEqual(poolInverseViolations(blockSlot, slotToBlock), [], 'a consistent pool was flagged');
+
+    // block -> slot -> a DIFFERENT block
+    const a = poolInverseViolations([-1, 0, -1, 1], [2, 3, -1]);
+    assert.ok(a.some(v => v.kind === 'block-slot-block'), 'a forward inconsistency was missed');
+
+    // a slot claiming a block that does not claim it back -- the direction a
+    // one-sided check would miss, and the one linkRefine would silently repair
+    const b = poolInverseViolations([-1, -1, -1, -1], [1, -1, -1]);
+    assert.ok(b.some(v => v.kind === 'slot-block-slot'), 'a reverse inconsistency was missed');
+
+    assert.ok(poolInverseViolations([-1, 99], [-1]).some(v => v.kind === 'slot-out-of-range'),
+      'an out-of-range slot was missed');
+    assert.ok(poolInverseViolations([-1], [-1, 42]).some(v => v.kind === 'block-out-of-range'),
+      'an out-of-range block was missed');
   });
   if (!process.exitCode) console.log(`\n${pass} check(s) passed`);
   else console.log('\nFAILED');
