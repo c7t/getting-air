@@ -25,7 +25,7 @@ it runs on.
 | U1 | The root pool exists, unused | **DONE** — identity proved on live buffers, page provably inert | `checkRootPoolIdentity`; hashes unmoved |
 | U2 | The mirror | **WAS VACUOUS, NOW FIXED** — both "independent" routes wrote `gy*W+gx`; the dense grid is 8x8 block-major, so 98.4% of the pool read the wrong cell | a THIRD route (`field-reconstruct.js`'s `rawIndex`), GPU-free in `make check` |
 | U3 | The step kernel serves the root | **DONE — BIT-IDENTICAL** on 8 rungs, 512 macro-steps; controls saturate at 98.4% | word equality + field health, `?rootstep=0` as control |
-| U4 | criterion, force, digest, conserved totals | not started | — |
+| U4 | criterion, force, digest, conserved totals | **U4-0 DONE** — the root's `vel` is the dense `vel` on 8 rungs; the consumers are next | `debugCheckRootVel`, in `tools/validate-root-step.js` |
 | U5 | L1 becomes a quad child of the root | not started | — |
 | U6 | The renderer walks levels | not started; **its gate already exists and already fails** | `tools/validate-render-levels.js` |
 | U7 | Delete the dense path | not started | — |
@@ -1369,6 +1369,36 @@ Then measure: `?bench=1` on the desktop, `?telemetry=1` on the phone, with and
 without `IDENTITY_SLOTS`. Read `plans/perf-characterization.md` first; per-pass
 timestamps are unusable on the PowerVR part and attribution has to be at frame
 scale.
+
+### U4-0 — DONE (2026-09-17). The root's VELOCITY is the dense velocity, bit for bit.
+
+U4's INPUT GATE, and it is not a formality. The criterion differences `vel`,
+the force reduction integrates over it, and the digest summarises it. Score any
+of those on the root while its `vel` is unproven and a difference that belongs
+to the STEP is reported against the consumer -- which is the shape U3 already
+lost a day to, in the other direction.
+
+`debugCheckRootVel`, 512 macro-steps, `?benchSkip=avg` (the U3 isolation: the
+step kernel is then the only writer of the dense L0 buffers):
+
+```
+  levels 2 / 3 / 4, f16=1, f16=2, res=9, ghostcopy=1, dcpre=1
+      all 0 differing words -- 0/131072, and 0/524288 at res=9
+```
+
+**AND THE TWO CONTROLS ARE NOT EQUALLY GOOD, which is worth saying rather than
+reporting two dirty columns.** `?rootstep=0` leaves the root's `vel` UNWRITTEN
+-- the root step is its only writer -- so that column is scored against zeros
+and reads relL2 exactly 1.0. It proves the comparison reads live data, which is
+its job, and nothing more. The SHIPPED-path row is the real stale control:
+there `average` moves the dense `vel` and not the root's, and it reads
+130941/131072 differing. A control that compares against a zero buffer and one
+that compares against a genuinely diverged field are different claims.
+
+One comparator now serves both questions (`compareRootToDense`), differing only
+in the component count and in whether components are PLANE-MAJOR (`f`) or
+INTERLEAVED (`vel`). A second copy of that loop is the shape CLAUDE.md keeps
+recording.
 
 ### U4 — criterion, force, digest, conserved totals
 

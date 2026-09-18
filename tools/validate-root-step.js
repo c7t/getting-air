@@ -3,12 +3,19 @@
 // dense L0 kernel EXACTLY? (plans/uniform-levels.md U3)
 //
 // Mirror the dense grid into the root pool, advance both, and compare word for
-// word. The bar is BIT-IDENTITY, not a tolerance: `amr_step1.wgsl` and
+// word -- BOTH of the step kernel's outputs, `f` and `vel`. The bar is BIT-IDENTITY, not a tolerance: `amr_step1.wgsl` and
 // `amr_step.wgsl` perform the same operations in the same order per cell and
 // only the address space moves, so equality is what "the root pool is a
 // faithful representation of the dense grid" actually means. A tolerance here
 // would pass over an addressing bug worth 2e-3 -- which is exactly what
 // happened before U2's mirror was fixed.
+//
+// `vel` is checked because it is U4's INPUT GATE, not for completeness: the
+// criterion differences it, the force reduction integrates over it and the
+// digest summarises it, and none of those can be scored on the root while its
+// `vel` is unproven -- each would otherwise report a difference that belongs
+// to the step. It is 2 interleaved f32 per cell and stays f32 under ?f16=,
+// which packs `f` only.
 //
 // ── ?benchSkip=avg IS LOAD-BEARING, AND IT IS NOT "TURNING OFF THE HARD PART"
 //
@@ -34,6 +41,15 @@
 // also reads clean is a broken comparison, not a result -- the same
 // discrimination `tools/validate-root-mirror.js` makes for U2, with the
 // opposite expectation on the other side.
+//
+// Be honest about what each control proves. On `f`, ?rootstep=0 leaves a
+// MIRRORED field that the dense grid then walks away from -- a genuine stale
+// comparison. On `vel` it leaves an UNWRITTEN buffer, since the root step is
+// its only writer, so that column is scored against zeros and reads relL2
+// exactly 1.0. It still proves the comparison reads live data, which is its
+// job, but it is not a stale-field control. The SHIPPED-path row below is:
+// there `average` moves the dense `vel` and not the root's, and it reads
+// 130941/131072 differing.
 //
 //     node tools/validate-root-step.js
 //     node tools/validate-root-step.js --baseUrl=https://localhost:4471 --port=9371
@@ -131,7 +147,8 @@ async function runCase(Runtime, Page, o, q) {
   await ev(Runtime, `window.__AMR.debugStepSync(${o.steps})`);
   const health = JSON.parse(await ev(Runtime, HEALTH));
   const after = JSON.parse(await ev(Runtime, 'window.__AMR.debugCheckRootMirror().then(r => JSON.stringify(r))'));
-  return { q, seeded, after, health };
+  const vel = JSON.parse(await ev(Runtime, 'window.__AMR.debugCheckRootVel().then(r => JSON.stringify(r))'));
+  return { q, seeded, after, vel, health };
 }
 
 function fmt(r) {
@@ -140,7 +157,8 @@ function fmt(r) {
   const h = r.health.nonFinite
     ? `FIELD NOT FINITE ${r.health.nonFinite}/${r.health.n}`
     : `max|u| ${r.health.maxU.toFixed(4)}`;
-  return `${String(r.after.mismatched).padStart(8)}/${r.after.checked}  ${abs}  ${rel}   seeded ${r.seeded.mismatched}   ${h}`;
+  return `f ${String(r.after.mismatched).padStart(7)}/${r.after.checked}  ${abs}  ${rel}` +
+    `   vel ${String(r.vel.mismatched).padStart(6)}/${r.vel.checked}   seeded ${r.seeded.mismatched}   ${h}`;
 }
 
 async function main() {
@@ -165,14 +183,15 @@ async function main() {
     console.log('  GATED -- must be bit-identical, on a finite field');
     for (const q of GATED) {
       const r = await runCase(Runtime, Page, o, q);
-      const ok = r.after.mismatched === 0 && r.seeded.mismatched === 0 && r.health.nonFinite === 0;
+      const ok = r.after.mismatched === 0 && r.vel.mismatched === 0
+        && r.seeded.mismatched === 0 && r.health.nonFinite === 0;
       if (!ok) fails.push(q);
       console.log(`${ok ? '  ok  ' : ' FAIL '} ${q.padEnd(46)} ${fmt(r)}`);
     }
     console.log('\n  CONTROL -- must be DIRTY, or the comparison above proves nothing');
     for (const q of CONTROLS) {
       const r = await runCase(Runtime, Page, o, q);
-      const ok = r.after.mismatched > 0 && r.health.nonFinite === 0;
+      const ok = r.after.mismatched > 0 && r.vel.mismatched > 0 && r.health.nonFinite === 0;
       if (!ok) fails.push(`${q} (control came back clean)`);
       console.log(`${ok ? '  ok  ' : ' FAIL '} ${q.padEnd(46)} ${fmt(r)}`);
     }

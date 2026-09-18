@@ -2055,27 +2055,38 @@ async function init() {
     return device.queue.onSubmittedWorkDone();
   }
 
-  // Score the mirrored pool against the dense grid, cell by cell, EXACTLY.
+  // Score a root-pool buffer against its dense counterpart, cell by cell,
+  // EXACTLY.
   //
-  // The comparison is on raw words, so it is bit-exact and layout-agnostic --
+  // ONE comparator for every "is the root pool's X the dense X?" question.
+  // U2/U3 ask it of `f`; U4 asks it of VELOCITY, because the criterion, the
+  // force reduction and the digest all read `vel` and none of them can be
+  // believed on the root until its `vel` is known to be the dense one. The
+  // only real differences are the component count and whether components are
+  // PLANE-MAJOR (`f`: wi*plane + cell) or INTERLEAVED (`vel`: cell*2 + comp),
+  // so a second copy of this loop would be exactly the shape CLAUDE.md keeps
+  // recording -- near-identical blocks, one of which later gets fixed.
+  //
+  // The comparison is on raw WORDS, so it is bit-exact and layout-agnostic --
   // under ?f16= it compares packed halves rather than round-tripped floats,
-  // which is the regime where a mismatch would otherwise be easiest to lose.
+  // which is the regime where a mismatch would be easiest to lose.
   //
   // The host route is amr2d.mjs's rootCellToDense, which derives the dense
-  // index from the spec and blockGridAtLevel. The shader derives it from
-  // slotToBlock and its own overrides. Neither consults the other, which is
-  // what makes agreement evidence rather than a tautology.
-  async function debugCheckRootMirror(maxReport = 8) {
+  // index from the spec, blockGridAtLevel and denseCellIndex. The shader
+  // derives it from slotToBlock and its own overrides. Neither consults the
+  // other -- though see plans/uniform-levels.md U2 for why that is necessary
+  // and not sufficient, and what it cost when the two shared a premise.
+  async function compareRootToDense({ denseBuf, poolBuf, comps, interleaved, asFloat, maxReport = 8 }) {
     if (!pools[0]) return { ok: null, skipped: 'no root pool (?rootpool=1)' };
     const spec = rootPoolSpec({ dims: { W, H }, rb: RB });
-    const nw = fWords(F16);
-    const denseWords = NCELLS * nw;
-    const rootWords = spec.slots * spec.cellsPerSlot * nw;
+    const rootCells = spec.slots * spec.cellsPerSlot;
+    const denseWords = NCELLS * comps;
+    const rootWords = rootCells * comps;
     const stageDense = device.createBuffer({ size: denseWords * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
     const stageRoot = device.createBuffer({ size: rootWords * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
     const enc = device.createCommandEncoder();
-    enc.copyBufferToBuffer(f_a, 0, stageDense, 0, denseWords * 4);
-    enc.copyBufferToBuffer(pools[0].finePoolF_a, 0, stageRoot, 0, rootWords * 4);
+    enc.copyBufferToBuffer(denseBuf, 0, stageDense, 0, denseWords * 4);
+    enc.copyBufferToBuffer(poolBuf, 0, stageRoot, 0, rootWords * 4);
     device.queue.submit([enc.finish()]);
     await Promise.all([stageDense.mapAsync(GPUMapMode.READ), stageRoot.mapAsync(GPUMapMode.READ)]);
     const dense = new Uint32Array(stageDense.getMappedRange()).slice();
@@ -2083,21 +2094,20 @@ async function init() {
     stageDense.unmap(); stageRoot.unmap();
     stageDense.destroy(); stageRoot.destroy();
 
-    const rootPlane = spec.slots * spec.cellsPerSlot;
     // MAGNITUDE, not just inequality.
     //
     // Counting differing WORDS is the right metric for U2, where the mirror
     // must reproduce the dense grid exactly and any difference is an
-    // addressing bug. It is the WRONG metric for U3: two separately written
-    // kernels stepping the same field will differ in the last bits, and after
-    // a hundred macro-steps that seed difference has reached every cell -- so
-    // the count saturates and says nothing about how well they agree.
+    // addressing bug. It is the WRONG metric on its own for U3: a seed
+    // difference reaches every cell within a hundred macro-steps, so the count
+    // saturates and says nothing about how well the two agree.
     //
-    // f32 views only (F16 packs two halves per word, and unpacking here would
-    // duplicate f-pack.mjs for a diagnostic); under ?f16= the word count is
-    // still reported and the magnitude is not.
-    const denseF = F16 ? null : new Float32Array(dense.buffer);
-    const rootF = F16 ? null : new Float32Array(root.buffer);
+    // f32 views only -- F16 packs two halves per word and unpacking here would
+    // duplicate f-pack.mjs for a diagnostic. The word count is still reported.
+    const denseF = asFloat ? new Float32Array(dense.buffer) : null;
+    const rootF = asFloat ? new Float32Array(root.buffer) : null;
+    const dIdx = (ci, cell) => (interleaved ? cell * comps + ci : ci * NCELLS + cell);
+    const rIdx = (ci, cell) => (interleaved ? cell * comps + ci : ci * rootCells + cell);
     let maxAbs = 0, maxRel = 0, sumSq = 0, sumRef = 0;
     const first = [];
     let checked = 0, mismatched = 0;
@@ -2106,13 +2116,13 @@ async function init() {
         for (let lx = 0; lx < spec.side; lx++) {
           const denseCell = rootCellToDense({ dims: { W, H }, rb: RB }, slot, lx, ly);
           const rootCell = slot * spec.cellsPerSlot + ly * spec.side + lx;
-          for (let wi = 0; wi < nw; wi++) {
+          for (let ci = 0; ci < comps; ci++) {
             checked++;
-            const a = root[wi * rootPlane + rootCell];
-            const b = dense[wi * NCELLS + denseCell];
+            const a = root[rIdx(ci, rootCell)];
+            const b = dense[dIdx(ci, denseCell)];
             if (denseF) {
-              const va = rootF[wi * rootPlane + rootCell];
-              const vb = denseF[wi * NCELLS + denseCell];
+              const va = rootF[rIdx(ci, rootCell)];
+              const vb = denseF[dIdx(ci, denseCell)];
               const d = Math.abs(va - vb);
               if (d > maxAbs) maxAbs = d;
               const r = d / Math.max(Math.abs(vb), 1e-12);
@@ -2121,7 +2131,7 @@ async function init() {
             }
             if (a === b) continue;
             mismatched++;
-            if (first.length < maxReport) first.push({ slot, lx, ly, word: wi, root: a, dense: b, denseCell });
+            if (first.length < maxReport) first.push({ slot, lx, ly, comp: ci, root: a, dense: b, denseCell });
           }
         }
       }
@@ -2134,6 +2144,25 @@ async function init() {
       relL2: denseF ? (sumRef > 0 ? Math.sqrt(sumSq / sumRef) : 0) : null,
     };
   }
+
+  // U2/U3: the root pool's POPULATIONS against the dense grid's.
+  const debugCheckRootMirror = (maxReport = 8) => compareRootToDense({
+    denseBuf: f_a, poolBuf: pools[0] && pools[0].finePoolF_a,
+    comps: fWords(F16), interleaved: false, asFloat: !F16, maxReport,
+  });
+
+  // U4: the root pool's VELOCITY against the dense grid's.
+  //
+  // The input gate for everything U4 moves. The criterion differences `vel`,
+  // the force reduction integrates over it, and the digest summarises it --
+  // none of which can be scored on the root while its `vel` is unproven, and
+  // all three would otherwise report a difference that belongs to the step.
+  // `vel` is 2 INTERLEAVED f32 per cell, unlike `f`'s nine planes, and is f32
+  // under every packing (?f16= packs `f` only).
+  const debugCheckRootVel = (maxReport = 8) => compareRootToDense({
+    denseBuf: velBuf, poolBuf: pools[0] && pools[0].finePoolVel,
+    comps: 2, interleaved: true, asFloat: true, maxReport,
+  });
 
   // ── Debug/verification support (window.__AMR) ────────────────────────────
   // Dedicated staging buffers, separate from the triple-buffered readback
@@ -3774,6 +3803,7 @@ async function init() {
     debugCheckRootPool: () => checkRootPoolIdentity(device, pools),
     debugMirrorRoot,
     debugCheckRootMirror,
+    debugCheckRootVel,
     getRootPool: () => (ROOT_POOL ? { ...rootPoolSpec({ dims: { W, H }, rb: RB }), stepped: !!ROOT_STEP } : null),
     debugRenderOnce,
     debugPerturbLevelVel,
