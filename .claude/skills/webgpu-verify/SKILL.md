@@ -1,6 +1,6 @@
 ---
 name: webgpu-verify
-description: Launch this WebGPU app (index.html + main.js/vpm.js) in a real GPU-capable Chrome, drive it via CDP, and capture screenshots to verify changes actually render. Use when asked to run, verify, or screenshot this project, or to confirm a WebGPU/shader change works.
+description: Launch this WebGPU app (index.html + main.js/vpm.js) in a real GPU-capable Chrome, drive it via CDP, and capture screenshots AND error state (status line, fatal overlay, uncaught exceptions, NaN fields) to verify changes actually render. Use when asked to run, verify, screenshot or debug this project, to confirm a WebGPU/shader change works, or to find out why a page refused to boot.
 ---
 
 # Running and screenshotting this app
@@ -68,10 +68,16 @@ const fs = require('fs');
 
 (async () => {
   const client = await CDP({ port: 9333 }); // attaches to the first/only page target
-  const { Page, Runtime } = client;
+  const { Page, Runtime, Network } = client;
   await Page.enable();
   await Runtime.enable();
+  await Network.enable();
+  // NOT optional -- https.py sends no cache headers, so an edited file can
+  // silently not reach the page. See section 4.
+  await Network.setCacheDisabled({ cacheDisabled: true });
 
+  // Necessary, not sufficient: this sees ONE of the five failure shapes in
+  // section 4. Read #status too.
   Runtime.exceptionThrown(e => console.log('[exception]', e.exceptionDetails.text));
 
   await new Promise(r => setTimeout(r, 3000)); // let WebGPU init + a few frames run
@@ -94,6 +100,132 @@ Run with plain `node script.js` (no npm install needed).
 Then use the Read tool on `/tmp/screenshot.png` to actually look at it — a blank/black
 canvas is a failure to render, not success.
 
+**The screenshot is the last thing to trust, not the first.** Section 4 is the
+part that says what actually went wrong: a black canvas, a legible error box and
+a perfectly normal-looking picture over a NaN field are three different
+failures, and only one of them is distinguishable by eye.
+
+## 4. Read the ERROR STATE over CDP — the picture is the weakest signal
+
+Once Chrome is up on the debug port, **attach and ask the page what happened**
+rather than inferring it from a screenshot. A failure on these pages has at
+least five shapes and only one of them reaches `Runtime.exceptionThrown`:
+
+| shape | where it surfaces | does `exceptionThrown` see it? |
+|---|---|---|
+| module-scope config refusal (`?levels=1`) | `#status`, `#fatal-overlay`, **and** an uncaught module error; `window.__AMR` is never defined | yes |
+| anything inside `init()` — adapter, limits, `createBindGroupLayout` | `#status` as `error: ...` + `#fatal-overlay`, via `init().catch(handleErr)` | **no** |
+| a per-frame throw | same, via `frame().catch(handleErr)` | **no** |
+| a WebGPU validation error | same, via `device.popErrorScope()` | **no** |
+| the field goes NaN | **nothing at all** — the page runs, the canvas draws | **no** |
+
+So `Runtime.exceptionThrown` alone misses four of five. Poll the DOM:
+
+```js
+const ERROR_STATE = `(() => JSON.stringify({
+  status:  document.getElementById('status')?.textContent ?? null,
+  fatal:   document.getElementById('fatal-overlay')?.textContent ?? null,
+  ready:   !!window.__AMR || !!window.__LBM,
+}))()`;
+```
+
+`#status` is the one to gate on — `error-overlay.mjs` deliberately writes the
+same `error: ...` text there for every path, *because* the DOM overlay is
+invisible to a poller, and `tools/validate-all.js`'s boot smoke matches
+`/^error:/i` on exactly that string. The overlay is additive, for humans.
+
+**Symptom to recognise: a 60-second `waitForGlobal` timeout is usually a
+refusal, not a hang.** `window.__AMR` is assigned at the end of `init()`, so any
+of the first four rows above leaves it undefined forever. When a wait times out,
+read `#status` before assuming the GPU is wedged — the answer is normally sitting
+there in one line.
+
+**And a green run is not a finite field.** `?benchSkip=interp,avg` on
+`index-amr.html` drives 589824 of 589824 dense populations non-finite; a
+word-equality comparison then reports *zero* differing words and `maxAbs
+0.0e+0`, its most emphatic possible pass, because identical NaN bit patterns are
+identical words. On screen it is bright single cells scattered over the domain —
+which is the only place it shows, and only if someone is looking. Score field
+health FIRST, from `debugSnapshotSave().velB64` (f32 under every packing, unlike
+`fB64`, which holds packed halves under `?f16=`):
+
+```js
+const HEALTH = `(async () => {
+  const s = await window.__AMR.debugSnapshotSave();
+  const b = atob(s.velB64);
+  const u = new Uint8Array(b.length);
+  for (let i = 0; i < b.length; i++) u[i] = b.charCodeAt(i);
+  const v = new Float32Array(u.buffer);
+  let nf = 0, mx = 0;
+  for (let i = 0; i < v.length; i++) {
+    const x = v[i];
+    if (!isFinite(x)) { nf++; continue; }
+    if (Math.abs(x) > mx) mx = Math.abs(x);
+  }
+  return JSON.stringify({ nonFinite: nf, n: v.length, maxU: mx });
+})()`;
+```
+
+A row whose field is not finite is a FAILURE, never a pass. See
+`tools/validate-root-step.js`, which gates on this.
+
+**Measured 2026-09-17, all three snippets above, on `index-amr.html`:**
+
+```
+?levels=1                      status "error: ?levels=1 invalid -- must be >= 2 ..."
+                               fatal  same + stack      ready false   exceptionThrown: Uncaught
+?levels=2                      status "[AMR-dev] step 760  y=7.9 ... vy=0.0183"
+                               fatal  null              ready true    exceptionThrown: nothing
+                               health nonFinite 0/131072   max|u| 0.0182
+?levels=2&benchSkip=interp,avg status "[AMR-dev] step 752  y=-15.9 ... vy=0.3000"
+                               fatal  null              ready true    exceptionThrown: nothing
+                               health nonFinite 131072/131072   max|u| 0
+```
+
+**Read the third row's status line again.** It is a perfectly ordinary telemetry
+line over a field that is 100% NaN. It is not even obviously wrong: `vy=0.3000`
+is `v_max` exactly, because `amr_physics.wgsl` clamps the integrated velocity,
+and `amr_force1.wgsl`'s `safeFixed` maps NaN to 0 — the rigid body's five
+numbers are laundered into something finite and plausible no matter what the
+fluid does. CLAUDE.md records the same thing about the invariant sweep's `field`
+column. **Nothing on the page tells you.** The health check is the whole signal.
+
+### Disable the HTTP cache on every CDP session
+
+```js
+await Network.enable();
+await Network.setCacheDisabled({ cacheDisabled: true });
+```
+
+**`https.py` sends no cache headers**, so Chrome applies heuristic caching to
+`main-amr.js`, `amr2d.mjs` and every `shaders/*.wgsl`. A `Page.navigate` that
+only changes the query string then re-runs the **previous build** — the file on
+disk is edited, `curl` confirms the server is serving it, and the page is not
+using it.
+
+Measured 2026-09-17: a one-line pipeline-constant fix (pinning `DIRECT_GHOST` on
+the root-pool step) read as completely inert across a whole measurement — the
+before and after numbers were identical to the word — and the fix was about to
+be written up as "not the cause". With the cache disabled the same build went
+from 580623 differing words to 0.
+
+**If a change appears to do nothing, check this before believing it.** A stale
+build and a genuinely inert change are indistinguishable from the numbers alone,
+and the cache is the far more common explanation.
+
+### Two smaller ones
+
+- **`--ignore-certificate-errors` is why this Chrome can load the page at all.**
+  `https.py`'s cert is self-signed, so pointing the user's normal browser at
+  `https://localhost:<port>` gets an interstitial, and CDP against that tab fails
+  with `Cannot attach to this target` / `Frame with ID 0 is showing error page`.
+  That is the certificate, not the app.
+- **`debugStepSync(n)` advances in whole frames of `STEPS_PER_FRAME = 64`** — its
+  loop is `for (k = 0; k < n; k += STEPS_PER_FRAME)`, so `debugStepSync(1)` and
+  `debugStepSync(2)` return the *identical* field. If two step counts give
+  bit-identical results, check this before concluding the solver is insensitive
+  to them.
+
 ## Gotchas
 
 - **`Runtime.evaluate` calls share one global JS scope.** Declaring `const x = ...` or
@@ -109,6 +241,12 @@ canvas is a failure to render, not success.
   and drive everything through `Runtime.evaluate` / `Page.captureScreenshot` from
   there. If you do need a fresh load, close the tab and open a genuinely new one
   (`curl -X PUT http://localhost:9333/json/new?<url>`) rather than re-navigating.
+  **Navigating between DIFFERENT urls is fine and is what the Node tools do** --
+  `validate-all.js`, `validate-root-mirror.js` and `validate-root-step.js` all
+  reuse one tab across every config via `Page.navigate`, precisely so no more
+  than one WebGPU context is ever alive. The flaky case is re-navigating to the
+  SAME url. Whenever you do navigate, disable the cache first (section 4): two
+  configs that differ only in the query string will otherwise share a build.
 - **This app runs two independent WebGPU pipelines at once** (`main.js` for the LBM
   sim, `vpm.js` for the vortex-particle sim) — check `console --errors`-equivalent
   (the `Runtime.exceptionThrown` listener above) for either one; a validation error in
