@@ -25,6 +25,14 @@
 // rung comes back IDENTICAL, the instrument is not measuring what it claims
 // and no other row means anything.
 //
+// READ THE BASELINE RUNG AT `--runs=4`, NOT `--runs=2`. Measured 2026-09-18 on
+// the DEFAULT configuration: two runs came back identical (`b21dba4e...`
+// twice), and four runs of the same build immediately gave three distinct
+// hashes. The race lands the same way twice often enough that a 2-run baseline
+// is not evidence it has stopped racing. That matters because the next
+// paragraph is a case where four runs DID all agree -- the two observations
+// look the same at --runs=2 and are not the same thing at all.
+//
 // AND UNDER `--extra=rootpool=1` THE levels=2 BASELINE RUNG STOPS
 // DISCRIMINATING, MEASURED. With level 1 managed by amr_manage_pool.wgsl
 // (plans/uniform-levels.md U5-4) the racing free list produced the SAME

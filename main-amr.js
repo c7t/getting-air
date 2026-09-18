@@ -22,7 +22,7 @@ import {
   tauAtLevel as tauAtLevelOf,
 } from './card-params.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
-import { check21BalanceOnGPU, allocLevelPool, checkRootPoolIdentity, readConservedTotals, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState, checkGeometryCoverageOnGPU, makeRefusalWatch , checkRefinementClosureOnGPU , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU, makeRenderBindGroup, renderPoolLevels, MAX_RENDER_POOL_LEVELS } from './amr2d-gpu.mjs';
+import { check21BalanceOnGPU, allocLevelPool, checkRootPoolIdentity, readConservedTotals, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState, checkGeometryCoverageOnGPU, makeRefusalWatch , checkRefinementClosureOnGPU , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU, makeRenderBindGroup, renderPoolLevels, MAX_RENDER_POOL_LEVELS, makeAMRLayouts } from './amr2d-gpu.mjs';
 import { poolSlotsFor, tauChainSingularity, tauSingularityMessage, rootPoolSpec, rootCellToDense, rootCellIndex } from './amr2d.mjs';
 import { EX, EY, WT } from './lattice-2d.mjs';
 import { makeCanvasFit } from './canvas-fit.mjs';
@@ -1230,210 +1230,14 @@ async function init() {
     loadShader(device, 'shaders/amr_mirror_root.wgsl'),
   ]);
 
-  const stepBGL = device.createBindGroupLayout({ label: 'stepBGL', entries: [
-    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-    { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }
-  ]});
-  // Milestone 8: binding 3 (blockSlot1) is the finest-wins masking check --
-  // see amr_force.wgsl's header.
-  const frcBGL = device.createBindGroupLayout({ label: 'frcBGL', entries: [
-    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }
-  ]});
-  const phyBGL = device.createBindGroupLayout({ label: 'phyBGL', entries: [
-    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }
-  ]});
-  // Milestone 10: bindings 5/6 (level 2's own vel_pool/blockSlot) are for
-  // finest-active-level-wins compositing -- harmless dummies when
-  // N_LEVELS<3, see amr_render.wgsl's header.
-  const renBGL = device.createBindGroupLayout({ label: 'renBGL', entries: [
-    { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
-    { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
-    { binding: 2, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
-    { binding: 3, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
-    { binding: 4, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
-    { binding: 5, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
-    { binding: 6, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
-    { binding: 7, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
-    // U6: levels 3 and 4. One velocity/indirection pair per pool level, up to
-    // MAX_RENDER_POOL_LEVELS -- see shaders/amr_render.wgsl, which walks them.
-    // Bound unconditionally; N_POOL_LEVELS is what stops the walk, because a
-    // dummy blockSlot read out of bounds is not safe on every WebGPU stack.
-    { binding: 8, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
-    { binding: 9, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
-    { binding: 10, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
-    { binding: 11, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } }
-  ]});
-
-  // Milestone 4: interp (coarse->fine ghosts), fine step, average (fine->coarse),
-  // all pool-aware (an extra read-only slotToBlock/blockSlot binding vs. M2).
-  // Binding 4 (newlyActivated) is Milestone 4b: only read by the GHOST_ONLY=0
-  // init pipeline, but must still be present in the layout both pipelines share.
-  // Milestone 4c: binding 5 (blockSlot) added so a ghost cell can check
-  // whether its edge-adjacent neighbor block is also currently refined (see
-  // amr_interp_c2f.wgsl's file header on fine-fine ghost consultation).
-  const interpBGL = device.createBindGroupLayout({ label: 'interpBGL', entries: [
-    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-    { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }
-  ]});
-  // Milestone 6: L(m)->L(m+1) (m>=1) ghost interpolation, shared by every
-  // pool-to-pool level pair (decision 2 -- one pipeline, many levels, only
-  // the bind group's buffers/uniform differ). Binding 0 is a small per-
-  // child-level uniform (this level's own NBX/NBY + its parent's tau --
-  // see shaders/amr_interp_pool_parent.wgsl's LevelParams), not the whole
-  // CardState struct the dense layout uses -- a parent mid-chain doesn't
-  // have a single domain-wide tau to read off CardState the way L0 does.
-  // Bindings 6/7 (parentSlot/quadrant) are the only structurally new
-  // per-slot fields vs. interpBGL, both this level's own.
-  const interpPoolParentBGL = device.createBindGroupLayout({ label: 'interpPoolParentBGL', entries: [
-    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
-    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-    { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }
-  ]});
-  // Milestone 4b: criterion (per-block vorticity max) and manage (refine/coarsen decision).
-  const criterionBGL = device.createBindGroupLayout({ label: 'criterionBGL', entries: [
-    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }
-  ]});
-  const manageBGL = device.createBindGroupLayout({ label: 'manageBGL', entries: [
-    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-    { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-    { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-    { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-    // Milestone 4c: geometry-forced refinement needs the card's pose/velocity.
-    { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    // bindings 7/8 were level 2's blockCriterion/blockSlot, for the per-pass
-    // cascade. Gone with it (B2-2d) -- the closure needs no cross-level read
-    // here. Holes, not renumbered.
-    // binding 9: ?diag=1 convergence counters. Always bound; never touched at DIAG=0.
-    // binding 7: D0's candidate rank -- one of B2-2d's two holes, reclaimed
-    // rather than renumbering. Always bound; only written when ?detslots=1.
-    { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-    { binding: 9, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-    // binding 10: level 1's WANT array (B2). Always bound; only read when
-    // CASCADE != 0, and only written by the decide() entry point.
-    { binding: 10, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }
-  ]});
-  // Milestone 9: per-quadrant criterion for any level-(m+1) decision,
-  // parent=level m -- see amr_criterion_pool.wgsl's header (one pipeline
-  // per parent level, not shared, unlike the M6-M8 pool-parent shaders).
-  const criterionPoolBGL = device.createBindGroupLayout({ label: 'criterionPoolBGL', entries: [
-    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-    // binding 3: the PARENT level's blockSlot, for U4-1's ring-free stencil.
-    // Always bound, read only when that pipeline's GHOST is 0. Four bindings,
-    // against a 16-per-stage ceiling -- see CLAUDE.md before adding a fifth.
-    { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }
-  ]});
-  // Milestone 9: quad allocator + 2:1 balance for any level-(m+1) decision,
-  // parent=level m>=1 -- see amr_manage_pool.wgsl's header. 16 bindings
-  // (15 original + grandchildBlockSlot, added for the N>=4 2:1-balance
-  // cascade fix -- both refine() and coarsen() only ever need EXISTENCE,
-  // never level (m+2)'s criterion, so one shared buffer/layout covers
-  // both) -- exactly this adapter's real maxStorageBuffersPerShaderStage,
-  // not just the WebGPU spec minimum other buffer limits in this file hit.
-  const managePoolBGL = device.createBindGroupLayout({ label: 'managePoolBGL', entries: [
-    { binding: 0,  visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    { binding: 1,  visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-    { binding: 2,  visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-    { binding: 3,  visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-    { binding: 4,  visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-    { binding: 5,  visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-    { binding: 6,  visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    { binding: 7,  visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-    // binding 8 was childQuadrant (it held `slot % 4`); B2 is what that
-    // recovery was for -- this is the child level's WANT array.
-    { binding: 8, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-    // binding 9 is the shared ?diag=1 counter buffer, same numbering and same
-    // slot as amr_manage.wgsl's (plans/uniform-levels.md U5-4). Bound on every
-    // page: the pool manager's refusal counter is not a level-1 concern, it is
-    // every level's, and a binding added to a shared shader has to reach all
-    // five layouts (CLAUDE.md's own recorded trap).
-    { binding: 9, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-    // bindings 9/10 were childOriginX/Y and 13/14 parentOriginX/Y. All four
-    // gone (B3-5): the origin is `block * RB * 2^-(m-1)` in closed form, so
-    // the kernel derives it -- see amr_manage_pool.wgsl's parentOriginL0.
-    // binding 11 was parentBlockSlot, for the neighbour-active veto.
-    // Gone with it (B2-2d).
-    { binding: 12, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    // binding 15 was grandchildBlockSlot, for hasGrandchild.
-    // Gone with it (B2-2d).
-  ]});
-  const avgBGL = device.createBindGroupLayout({ label: 'avgBGL', entries: [
-    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-    { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }
-  ]});
-  // THE fine step, one layout for every pool level since B3-1 (there was a
-  // second, level-1-only step1BGL here until then). Binding 5 is the
-  // per-level uniform -- parentTau, dxL and nbx/nby, all four read by the
-  // kernel: dxL and nbx/nby are what place the tile, now that its origin is
-  // derived rather than loaded per slot. Shared verbatim with
-  // interpPoolParentBGL/avgPoolBGL.
-  const step1BGL = device.createBindGroupLayout({ label: 'step1BGL', entries: [
-    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-    { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-    { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
-    // binding 6: blockSlot -- neighbour-addressed streaming (see the
-    // DIRECT_GHOST override in shaders/amr_step1.wgsl). Present in the layout
-    // even under ?ghostcopy=1, where the shader simply never reads it.
-    { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }
-  ]});
-  // Milestone 7: level>=2 average, writing into a parent POOL tile via
-  // parentSlot/quadrant instead of cellIndex(). Since B3-2 that difference
-  // IS the whole difference: both average entry files are their bindings
-  // plus shaders/common_average.wgsl, with the destination and the parent's
-  // tau behind common_avg_parent_{dense,pool}.wgsl.
-  const avgPoolBGL = device.createBindGroupLayout({ label: 'avgPoolBGL', entries: [
-    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
-    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-    { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }
-  ]});
-  // Milestone 8: level 1's own force pass. Binding 4 (childBlockSlot) is
-  // level 2's blockSlot when HAS_CHILD=1, or a harmless dummy buffer when
-  // HAS_CHILD=0 (N_LEVELS==2) -- see amr_force1.wgsl's header.
-  // Milestone 8: level>=2's own force pass, one pipeline shared across every
-  // such level (hasChild is a runtime LevelParams field here, not a
-  // compile-time override -- see amr_force1.wgsl's header).
-  // THE force pass, one layout for every pool level since B3-4 (there was a
-  // second, level-1-only force1BGL here until then), and renumbered
-  // contiguous now that the origin buffers and the masking's childBlockSlot
-  // are both gone -- see shaders/amr_force1.wgsl's binding block.
-  const force1BGL = device.createBindGroupLayout({ label: 'force1BGL', entries: [
-    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-    { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
-    { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-    // binding 6: THIS level's blockSlot, for U4-2's ring-free gather. Always
-    // bound, read only when that pipeline's GHOST is 0. Seven bindings against
-    // a 16-per-stage ceiling -- see CLAUDE.md before adding more.
-    { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }
-  ]});
+  // U7-0: the fourteen bind group layouts, from ONE place. They were spelled
+  // out inline here and in four other pages, byte-identical in all of them --
+  // see makeAMRLayouts for why that mattered more than the line count.
+  const {
+    stepBGL, frcBGL, phyBGL, renBGL, interpBGL, interpPoolParentBGL,
+    avgBGL, avgPoolBGL, criterionBGL, criterionPoolBGL, manageBGL,
+    managePoolBGL, step1BGL, force1BGL,
+  } = makeAMRLayouts(device);
 
   const constants = { W, H, SDF_FAR };
   // Same, plus the packed-f layout selector. Separate object because

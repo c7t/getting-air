@@ -28,7 +28,7 @@ it runs on.
 | U4 | criterion, force, digest, conserved totals | **DONE** — all four consumers on the root. Exact on the criterion, digest max and conserved totals; the force to the truncation floor | `tools/validate-root-kernels.js`, 8 rungs + 2 controls |
 | U5 | L1 becomes a quad child of the root | **U5-0…U5-4 DONE under `?rootpool=1`** — both hops of the coupling and the manager. Level 1 is quad-allocated and quad-managed; tiles +28-32%; new fingerprints, default unmoved. `amr_manage.wgsl` cannot retire until the other four AMR pages get a root pool, and Cd/St is unmeasurable until then | `validate-root-kernels.js` (11 rungs, 4 controls); `validate-all.js` invariants ± starved pool; `measure-determinism.js` |
 | U6 | The renderer walks levels | **DONE** — and it found that three of the five pages never drew level 2 either. Level 1 bit-identical to before; gate green on two pages and in the default sweep | `tools/validate-render-levels.js`, `tools/lib/render-levels.js` |
-| U7 | One implementation across the five pages, then delete the dense path | not started, **split into U7-0…U7-6** — U1–U5 all landed on `main-amr.js` alone, so the remaining work is propagation before deletion. Measured: all 14 bind group layouts are byte-identical across five pages, and `S_Advance` is byte-identical across the other four | each rung byte-identical on the default path (`measure-determinism.js`), except U7-5 which is the one that moves numbers |
+| U7 | One implementation across the five pages, then delete the dense path | **U7-0 DONE** (layouts shared, net −590 lines, every gate unmoved); U7-1…U7-6 remain. **Split into U7-0…U7-6** — U1–U5 all landed on `main-amr.js` alone, so the remaining work is propagation before deletion. Measured: all 14 bind group layouts are byte-identical across five pages, and `S_Advance` is byte-identical across the other four | each rung byte-identical on the default path (`measure-determinism.js`), except U7-5 which is the one that moves numbers |
 
 **Where the risk actually sits.** U0–U2 went in clean and each found something
 (a half-cell convention, an f16 stride, a window-convention split between L0 and
@@ -2246,10 +2246,14 @@ byte-identical scheduler. The estimate does not have to be right for the
 ordering to be: the measured half (14 identical layouts, one identical
 `S_Advance`) already says the sharing is free and the copying is not.
 
-#### U7-0 — the bind group layouts become one function
+#### U7-0 — DONE (2026-09-18). The bind group layouts are one function.
 
-`makeAMRLayouts(device)` in `amr2d-gpu.mjs`, returning the fourteen layouts;
-five pages call it and delete their own. ~520 lines of pure duplication go.
+`makeAMRLayouts(device)` in `amr2d-gpu.mjs` returns the fourteen layouts; five
+pages call it and deleted their own. **865 lines removed, 278 added, a net
+−590.** Every page destructures only what it uses, so the two bodyless pages
+name eleven and the three with a body name fourteen -- the function builds all
+fourteen regardless, because a layout nobody binds costs nothing and selecting
+a subset there would reintroduce exactly the per-page variation this removes.
 
 **THIS IS THE RUNG THAT PERMANENTLY KILLS THE BINDING-MIRROR TRAP**, and that
 is worth more than the line count. CLAUDE.md records it producing 238e48c; U4-1
@@ -2263,10 +2267,18 @@ function grows per-page parameters it becomes five copies with extra steps. If
 a page ever genuinely needs a different layout, that is a signal the SHADER
 should not be shared either -- take that conversation rather than adding a flag.
 
-*Gate:* `make check`; boot smoke on all seven configs; `measure-determinism.js`
-returns `7ac54e170f903ac3` / `ce1bd4d8a3a1055c` on the default; one cylinder
-config (`amr-N2-diffuse`) unmoved to four digits. All four are cheap and the
-last one is the only one that takes ten minutes.
+*Gate, all four green:* `make check`; boot smoke on all seven configs plus both
+render-reachability configs; `measure-determinism.js` returned
+`7ac54e170f903ac3` / `ce1bd4d8a3a1055c` on the default, unmoved;
+`amr-N2-diffuse` read **Cd 1.631 / St 0.1466**, unmoved to four digits.
+
+**One instrument caveat, measured while running it.** The `levels=2 detslots=0`
+baseline rung came back IDENTICAL over TWO runs and then gave three distinct
+hashes over FOUR runs of the same build. The race lands the same way twice
+often enough that a 2-run baseline is not evidence it has stopped racing --
+which matters because U5-4 recorded a case where four runs DID all agree, and
+the two look identical at `--runs=2`. The tool's header now says to read that
+rung at `--runs=4`.
 
 #### U7-1 — the pipelines
 
