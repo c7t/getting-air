@@ -241,6 +241,29 @@ invariants the AMR machinery depends on:
   1:1 onto the dense grid, so injection is an exact copy); the tool warns if
   it is not, and that means the injection/reconstruction path is at fault,
   not the solver.
+- **`tools/validate-snapshot-roundtrip.js`** — standalone/opt-in. Steps N from
+  `reset()`, saves, loads what it just saved, steps N more, and requires the
+  result to be BIT-IDENTICAL to an uninterrupted 2N. The second N is what makes
+  it a gate rather than a restore check: it contains refinement rounds, so
+  anything the format failed to carry about the ALLOCATOR shows up as a
+  different slot handout. `tools/lib/render-levels.js` also round-trips a
+  snapshot but renders immediately after the load, so it scores only what the
+  renderer reads and passed while the format was still wrong.
+      node tools/validate-snapshot-roundtrip.js
+      node tools/validate-snapshot-roundtrip.js --steps=1024
+  Three controls, and none is decoration: `alive` (the capture at N must differ
+  from the one at 2N — every row is an EQUALITY, so a capture that carries
+  nothing passes them all), `stale` (loading a snapshot 64 steps later must
+  MOVE the outcome, which is what proves the load is load-bearing), and
+  `refuse` (a level-1 per-block/QUAD granularity mismatch must THROW). The
+  `stale` control is the one that caught a save bug three gated rows had gone
+  green on — see plans/uniform-levels.md U7-6a.
+  **A COMMAND-ENCODER VALIDATION ERROR DROPS THE WHOLE COMMAND BUFFER**, which
+  is how that bug presented: one over-long `copyBufferToBuffer` discarded every
+  other copy in the same submit, and `debugSnapshotSave` returned an all-zero
+  dense grid at `?levels>=3` while the page itself ran perfectly. If a readback
+  comes back all zeros, suspect a sibling copy in the same encoder before you
+  suspect the sim.
 - Shared analysis code lives in `tools/lib/` (`cylinder-metrics.js`,
   `amr-invariants.js`, `field-reconstruct.js`, `amr-resolution-mapping.js`,
   `amr-cost.js`, `browser-lifecycle.js`, `dense-to-amr.js`) — both the leaf

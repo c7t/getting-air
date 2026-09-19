@@ -1425,6 +1425,30 @@ async function init() {
     enc.copyBufferToBuffer(pools[1].blockSlotBuf, 0, stagingBlockSlot, 0, NBLOCKS * 4);
     enc.copyBufferToBuffer(pools[1].slotToBlockBuf, 0, stagingSlotToBlock, 0, MAX_FINE_BLOCKS * 4);
 
+    // U7-6a: level 1's QUAD indirection, when it has one. Level 1 keeps its
+    // fixed staging buffers for f/vel/blockSlot/slotToBlock above; these two
+    // are the pair the format only ever captured from level 2 up, and without
+    // them a quad-allocated level 1 could be saved but never correctly
+    // restored (see debugSnapshotLoad's own note).
+    // U7-6a: level 1's FREE LIST, which is state and not bookkeeping -- see
+    // debugSnapshotLoad's note on why rebuilding it from slotToBlock is a
+    // valid stack but not the RUN's stack.
+    const l1Free = {
+      freeList: device.createBuffer({ size: pools[1].freeListBuf.size, usage: U.MAP_READ | U.COPY_DST }),
+      freeCount: device.createBuffer({ size: 4, usage: U.MAP_READ | U.COPY_DST }),
+    };
+    enc.copyBufferToBuffer(pools[1].freeListBuf, 0, l1Free.freeList, 0, pools[1].freeListBuf.size);
+    enc.copyBufferToBuffer(pools[1].freeCountBuf, 0, l1Free.freeCount, 0, 4);
+
+    const l1Quad = ROOT_MANAGED ? {
+      parentSlot: device.createBuffer({ size: MAX_FINE_BLOCKS * 4, usage: U.MAP_READ | U.COPY_DST }),
+      quadrant:   device.createBuffer({ size: MAX_FINE_BLOCKS * 4, usage: U.MAP_READ | U.COPY_DST }),
+    } : null;
+    if (l1Quad) {
+      enc.copyBufferToBuffer(pools[1].parentSlotBuf, 0, l1Quad.parentSlot, 0, MAX_FINE_BLOCKS * 4);
+      enc.copyBufferToBuffer(pools[1].quadrantBuf, 0, l1Quad.quadrant, 0, MAX_FINE_BLOCKS * 4);
+    }
+
     const levelStaging = [];
     for (let m = 2; m < N_LEVELS; m++) {
       const pool = pools[m];
@@ -1435,6 +1459,13 @@ async function init() {
         slotToBlock: device.createBuffer({ size: pool.MAX_FINE_BLOCKS * 4, usage: U.MAP_READ | U.COPY_DST }),
         parentSlot: device.createBuffer({ size: pool.MAX_FINE_BLOCKS * 4, usage: U.MAP_READ | U.COPY_DST }),
         quadrant: device.createBuffer({ size: pool.MAX_FINE_BLOCKS * 4, usage: U.MAP_READ | U.COPY_DST }),
+        // Sized FROM THE POOL'S OWN BUFFER, not from MAX_FINE_BLOCKS: a
+        // quad-allocated level's free list holds one i32 per QUAD (see
+        // allocLevelPool), so recomputing the length here would overrun the
+        // source and invalidate the whole encoder -- taking every other copy
+        // in this submit down with it, silently, as an all-zero snapshot.
+        freeList: device.createBuffer({ size: pool.freeListBuf.size, usage: U.MAP_READ | U.COPY_DST }),
+        freeCount: device.createBuffer({ size: 4, usage: U.MAP_READ | U.COPY_DST }),
       };
       enc.copyBufferToBuffer(pool.finePoolF_a, 0, st.f, 0, pool.fSizePool);
       enc.copyBufferToBuffer(pool.finePoolVel, 0, st.vel, 0, pool.MAX_FINE_BLOCKS * NCELLS1 * 2 * 4);
@@ -1442,12 +1473,16 @@ async function init() {
       enc.copyBufferToBuffer(pool.slotToBlockBuf, 0, st.slotToBlock, 0, pool.MAX_FINE_BLOCKS * 4);
       enc.copyBufferToBuffer(pool.parentSlotBuf, 0, st.parentSlot, 0, pool.MAX_FINE_BLOCKS * 4);
       enc.copyBufferToBuffer(pool.quadrantBuf, 0, st.quadrant, 0, pool.MAX_FINE_BLOCKS * 4);
+      enc.copyBufferToBuffer(pool.freeListBuf, 0, st.freeList, 0, pool.freeListBuf.size);
+      enc.copyBufferToBuffer(pool.freeCountBuf, 0, st.freeCount, 0, 4);
       levelStaging.push(st);
     }
 
     device.queue.submit([enc.finish()]);
     const allBuffers = [stagingF, stagingVel, stagingCard, stagingFPool, stagingVelPool, stagingBlockSlot, stagingSlotToBlock];
-    for (const st of levelStaging) allBuffers.push(st.f, st.vel, st.blockSlot, st.slotToBlock, st.parentSlot, st.quadrant);
+    for (const st of levelStaging) allBuffers.push(st.f, st.vel, st.blockSlot, st.slotToBlock, st.parentSlot, st.quadrant, st.freeList, st.freeCount);
+    if (l1Quad) allBuffers.push(l1Quad.parentSlot, l1Quad.quadrant);
+    allBuffers.push(l1Free.freeList, l1Free.freeCount);
     await Promise.all(allBuffers.map(b => b.mapAsync(GPUMapMode.READ)));
 
     const f = readF(stagingF.getMappedRange(), NCELLS);
@@ -1464,12 +1499,31 @@ async function init() {
     stagingVelPool.unmap();
     stagingBlockSlot.unmap();
     stagingSlotToBlock.unmap();
+    const l1FreeOut = {
+      freeList: Array.from(new Int32Array(l1Free.freeList.getMappedRange()).slice()),
+      freeCount: new Int32Array(l1Free.freeCount.getMappedRange())[0],
+    };
+    for (const b of [l1Free.freeList, l1Free.freeCount]) { b.unmap(); b.destroy(); }
+    let l1QuadOut = {};
+    if (l1Quad) {
+      l1QuadOut = {
+        quadAlloc: true,
+        parentSlot: Array.from(new Int32Array(l1Quad.parentSlot.getMappedRange()).slice()),
+        quadrant: Array.from(new Uint32Array(l1Quad.quadrant.getMappedRange()).slice()),
+      };
+      for (const b of [l1Quad.parentSlot, l1Quad.quadrant]) { b.unmap(); b.destroy(); }
+    }
 
     const poolsOut = [
       null, // index 0 unused -- L0 is the dense grid, matches the live pools[] convention
       {
         level: 1, RB, GHOST, FB, MAX_FINE_BLOCKS, NBLOCKS, NBX, NBY,
         blockSlot: blockSlotArr, slotToBlock: slotToBlockArr,
+        // U7-6a: present ONLY when level 1 is quad-allocated, and the marker
+        // the load side checks. Its absence on an older snapshot therefore
+        // reads correctly as "this was a per-block level 1".
+        ...l1QuadOut,
+        ...l1FreeOut,
         fB64: bytesToB64(new Uint8Array(fPool.buffer, fPool.byteOffset, fPool.byteLength)),
         velB64: bytesToB64(new Uint8Array(velPool.buffer, velPool.byteOffset, velPool.byteLength)),
       },
@@ -1484,11 +1538,14 @@ async function init() {
       const slotToBlockArr_m = Array.from(new Int32Array(st.slotToBlock.getMappedRange()).slice());
       const parentSlotArr = Array.from(new Int32Array(st.parentSlot.getMappedRange()).slice());
       const quadrantArr = Array.from(new Uint32Array(st.quadrant.getMappedRange()).slice());
-      for (const b of [st.f, st.vel, st.blockSlot, st.slotToBlock, st.parentSlot, st.quadrant]) { b.unmap(); b.destroy(); }
+      const freeListArr = Array.from(new Int32Array(st.freeList.getMappedRange()).slice());
+      const freeCountVal = new Int32Array(st.freeCount.getMappedRange())[0];
+      for (const b of [st.f, st.vel, st.blockSlot, st.slotToBlock, st.parentSlot, st.quadrant, st.freeList, st.freeCount]) { b.unmap(); b.destroy(); }
       poolsOut.push({
         level: m, RB, GHOST, FB, MAX_FINE_BLOCKS: pool.MAX_FINE_BLOCKS, NBLOCKS: pool.NBLOCKS, NBX: pool.NBX, NBY: pool.NBY,
         blockSlot: blockSlotArr_m, slotToBlock: slotToBlockArr_m,
         parentSlot: parentSlotArr, quadrant: quadrantArr,
+        freeList: freeListArr, freeCount: freeCountVal,
         fB64: bytesToB64(new Uint8Array(fPool_m.buffer, fPool_m.byteOffset, fPool_m.byteLength)),
         velB64: bytesToB64(new Uint8Array(velPool_m.buffer, velPool_m.byteOffset, velPool_m.byteLength)),
       });
@@ -1513,6 +1570,22 @@ async function init() {
     return snapshot;
   }
 
+  // U7-6a: one statement of "restore this level's free list", used by both
+  // granularities. `rebuilt` is the fallback the caller derived from
+  // slotToBlock for a pre-U7-6a capture; `adopt` hands the CPU mirror back the
+  // list that actually reached the GPU, so the two cannot disagree -- which
+  // the old rebuild did not guarantee either, since it produced ascending
+  // order whatever the GPU had.
+  function restoreFreeList(pool, snapPool, rebuilt, adopt) {
+    const list = Array.isArray(snapPool.freeList)
+      ? snapPool.freeList.slice(0, snapPool.freeCount)
+      : rebuilt;
+    adopt(list);
+    device.queue.writeBuffer(pool.freeListBuf, 0, new Int32Array(
+      Array.isArray(snapPool.freeList) ? snapPool.freeList : rebuilt));
+    device.queue.writeBuffer(pool.freeCountBuf, 0, new Int32Array([list.length]));
+  }
+
   async function debugSnapshotLoad(snapshot) {
     if (snapshot.W !== W || snapshot.H !== H) {
       throw new Error(`snapshot is ${snapshot.W}x${snapshot.H}, page is ${W}x${H} -- reload with ?res=${Math.log2(snapshot.W)}`);
@@ -1526,16 +1599,24 @@ async function init() {
     if (snapshot.layout !== 'block8') {
       throw new Error(`snapshot layout is '${snapshot.layout}', this build expects 'block8'`);
     }
-    // REFUSED RATHER THAN DEGRADED. Under quad allocation level 1 carries a
-    // parentSlot/quadrant pair and a QUAD-indexed free list, and the format
-    // records neither -- it only ever saved those from level 2 up. Restoring
-    // this snapshot would rebuild a block-indexed free list over a quad pool,
-    // where slot `q` and quad `q` are different things, and corrupt the pool
-    // with no thrown error. Porting the format is U7-6's (plans/
-    // uniform-levels.md names it in that stage's host-and-tool tail).
-    if (ROOT_MANAGED) {
-      throw new Error('debugSnapshotLoad: the snapshot format does not carry the root pool '
-        + "or level 1's quad indirection yet (plans/uniform-levels.md U7-6) -- reload with ?rootpool=0");
+    // U7-6a: the format now carries level 1's quad indirection, so what is
+    // refused is a MISMATCH -- a per-block snapshot restored into a
+    // quad-allocated pool, or the reverse. Either writes an indirection at the
+    // wrong granularity and corrupts the allocator silently, which is what the
+    // blanket refusal here existed to prevent before the format could say
+    // which kind of level 1 it held.
+    //
+    // A capture from before U7-6a simply has no `quadAlloc` key, which reads
+    // correctly as "per-block", so old snapshots still load on a page with no
+    // root pool. There is no correct QUAD capture from before this change for
+    // it to be incompatible with: save never wrote those fields.
+    {
+      const snapQuad1 = !!(snapshot.pools && snapshot.pools[1] && snapshot.pools[1].quadAlloc);
+      if (snapQuad1 !== !!ROOT_MANAGED) {
+        throw new Error(`debugSnapshotLoad: the snapshot's level 1 is ${snapQuad1 ? 'QUAD' : 'per-block'}-allocated `
+          + `but this page's is ${ROOT_MANAGED ? 'QUAD' : 'per-block'} -- `
+          + `reload with ?rootpool=${snapQuad1 ? 1 : 0}, or re-capture`);
+      }
     }
     // Milestone 10: formatVersion 4's singular `pool` key (level 1 only)
     // is REJECTED explicitly, not silently reinterpreted as pools[1] --
@@ -1578,7 +1659,13 @@ async function init() {
       device.queue.writeBuffer(pool.blockSlotBuf, 0, new Int32Array(snapPool.blockSlot));
       device.queue.writeBuffer(pool.slotToBlockBuf, 0, new Int32Array(snapPool.slotToBlock));
 
-      if (m === 1) {
+      // U7-6a: WHICH BRANCH IS A QUESTION ABOUT THE ALLOCATOR, NOT ABOUT THE
+      // LEVEL. Every level >= 2 has always been quad-allocated, and level 1
+      // joins them under a root pool (U5-4), so the restore splits on how this
+      // level is allocated rather than on `m === 1`. Getting it wrong is
+      // silent: a block-indexed free list over a quad pool hands out
+      // overlapping quads on the next refine, with no error and no NaN.
+      if (m === 1 && !ROOT_MANAGED) {
         // Sync the CPU-side mirrors debugActivateBlock/debugDeactivateBlock
         // rely on -- omitting this would leave them reflecting whatever was
         // active before the load, not what the loaded snapshot actually has,
@@ -1590,31 +1677,50 @@ async function init() {
         for (let slot = 0; slot < MAX_FINE_BLOCKS; slot++) {
           if (slotToBlockCPU[slot] === -1) freeSlots.push(slot);
         }
-        // Milestone 4b: the GPU-side freeList/freeCount (which the automatic
-        // management pass owns) aren't part of the snapshot -- rebuild them
-        // from the loaded slotToBlock instead of restoring a captured copy.
-        // Free-list ORDER doesn't affect correctness (any permutation of the
-        // free slots works equally as a stack), so this is exact, not an
-        // approximation, and avoids growing the snapshot format for state
-        // that's fully redundant with slotToBlock.
-        device.queue.writeBuffer(pool.freeListBuf, 0, new Int32Array(freeSlots));
-        device.queue.writeBuffer(pool.freeCountBuf, 0, new Int32Array([freeSlots.length]));
+        // U7-6a: THE FREE LIST IS STATE, NOT BOOKKEEPING, and it is restored
+        // verbatim when the snapshot has it.
+        //
+        // This used to be rebuilt ASCENDING from slotToBlock, on the argument
+        // that "free-list ORDER doesn't affect correctness (any permutation of
+        // the free slots works equally as a stack)". Every word of that is
+        // true and the conclusion does not follow: the order decides WHICH
+        // slot the next grant hands out, so a rebuilt list gives the run a
+        // different -- equally correct, not equal -- pool layout from the one
+        // it had. Measured by tools/validate-snapshot-roundtrip.js: a save +
+        // load in the middle of an otherwise identical run moved 2 blockSlot
+        // entries at levels=2 and 25 at levels=3, with the field payloads
+        // following the permutation, so the round trip was not reproducible
+        // against an uninterrupted run and `?detslots=1` stopped meaning
+        // anything across a load.
+        //
+        // The rebuild stays as the FALLBACK for a capture from before this,
+        // which has no `freeList` key -- that is the old behaviour exactly,
+        // for the snapshots that were taken under it.
+        restoreFreeList(pool, snapPool, freeSlots, (v) => { freeSlots = v; });
       } else {
+        if (m === 1) {
+          // Quad-allocated level 1: `quadCPU[1]` below is the authority. The
+          // bare per-block mirrors are cleared rather than left stale, so the
+          // refusing debugActivateBlock path cannot observe state from before
+          // the load -- the same reasoning resetSim's own guard carries.
+          blockSlotCPU.fill(-1);
+          slotToBlockCPU.fill(-1);
+          freeSlots = [];
+        }
         device.queue.writeBuffer(pool.parentSlotBuf, 0, new Int32Array(snapPool.parentSlot));
         device.queue.writeBuffer(pool.quadrantBuf, 0, new Uint32Array(snapPool.quadrant));
 
         const qc = quadCPU[m];
         qc.blockSlotCPU.set(snapPool.blockSlot);
         qc.slotToBlockCPU.set(snapPool.slotToBlock);
-        // Same free-list-is-redundant-with-slotToBlock reasoning as level 1
-        // above, at quad granularity: quadrant 0's own slot stands for the
-        // whole quad (decision 3's all-or-nothing invariant).
+        // Same rule as level 1 above, at quad granularity: quadrant 0's own
+        // slot stands for the whole quad (decision 3's all-or-nothing
+        // invariant), so the fallback rebuild walks quads and not slots.
         qc.freeQuads = [];
         for (let quadIdx = 0; quadIdx < pool.MAX_FINE_BLOCKS / 4; quadIdx++) {
           if (qc.slotToBlockCPU[quadIdx * 4] === -1) qc.freeQuads.push(quadIdx);
         }
-        device.queue.writeBuffer(pool.freeListBuf, 0, new Int32Array(qc.freeQuads));
-        device.queue.writeBuffer(pool.freeCountBuf, 0, new Int32Array([qc.freeQuads.length]));
+        restoreFreeList(pool, snapPool, qc.freeQuads, (v) => { qc.freeQuads = v; });
       }
     }
 

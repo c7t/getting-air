@@ -28,7 +28,7 @@ it runs on.
 | U4 | criterion, force, digest, conserved totals | **DONE** — all four consumers on the root. Exact on the criterion, digest max and conserved totals; the force to the truncation floor | `tools/validate-root-kernels.js`, 8 rungs + 2 controls |
 | U5 | L1 becomes a quad child of the root | **U5-0…U5-4 DONE under `?rootpool=1`** — both hops of the coupling and the manager. Level 1 is quad-allocated and quad-managed; tiles +28-32%; new fingerprints, default unmoved. `amr_manage.wgsl` cannot retire until the other four AMR pages get a root pool, and Cd/St is unmeasurable until then | `validate-root-kernels.js` (11 rungs, 4 controls); `validate-all.js` invariants ± starved pool; `measure-determinism.js` |
 | U6 | The renderer walks levels | **DONE** — and it found that three of the five pages never drew level 2 either. Level 1 bit-identical to before; gate green on two pages and in the default sweep | `tools/validate-render-levels.js`, `tools/lib/render-levels.js` |
-| U7 | One implementation across the five pages, then delete the dense path | **U7-0…U7-4 DONE** (layouts, coupling pipelines, per-level bind groups, both orderings, and now the root pool itself shared — net −1559 lines through U7-3, every gate unmoved; U7-4 puts a root pool on all five pages behind `?rootpool=1` and MEASURES U5-4's Cd/St, which U5 could not); U7-5…U7-6 remain, and U7-6's snapshot half must go FIRST — see U7-4b. **Split into U7-0…U7-6** — U1–U5 all landed on `main-amr.js` alone, so the remaining work is propagation before deletion. Measured: all 14 bind group layouts are byte-identical across five pages, and `S_Advance` is byte-identical across the other four | each rung byte-identical on the default path (`measure-determinism.js`), except U7-5 which is the one that moves numbers |
+| U7 | One implementation across the five pages, then delete the dense path | **U7-0…U7-4 DONE** (layouts, coupling pipelines, per-level bind groups, both orderings, and now the root pool itself shared — net −1559 lines through U7-3, every gate unmoved; U7-4 puts a root pool on all five pages behind `?rootpool=1` and MEASURES U5-4's Cd/St, which U5 could not); **U7-6a DONE** — the snapshot format now carries level 1's quad indirection AND the free list, which it never did; U7-5…U7-6 remain. **Split into U7-0…U7-6** — U1–U5 all landed on `main-amr.js` alone, so the remaining work is propagation before deletion. Measured: all 14 bind group layouts are byte-identical across five pages, and `S_Advance` is byte-identical across the other four | each rung byte-identical on the default path (`measure-determinism.js`), except U7-5 which is the one that moves numbers |
 
 **Where the risk actually sits.** U0–U2 went in clean and each found something
 (a half-cell convention, an f16 stride, a window-convention split between L0 and
@@ -85,7 +85,7 @@ at the end.
     U7-0..3   share the layouts, pipelines, bind groups and scheduler
     U6        the renderer walks levels -- ride it on U7-2
     U7-4      the root pool everywhere (4a: share the solver half; 4b: call it)
-    U7-6a     the snapshot format -- a PREREQUISITE for the flip, not a follower
+    U7-6a     the snapshot format -- a PREREQUISITE for the flip, DONE
     U7-5..6   flip the default, delete the dense path
     --   the sponge seam INVARIANT (gate only)
     B6   explode/coalesce
@@ -2702,8 +2702,131 @@ through `debugSnapshotLoad`. That is the sequencing finding: at U7-5 the flag
 becomes the default, and on that day the render-levels gate, `amr-diff.js`,
 `validate-divergence.js` and every snapshot round-trip go with it. So the
 snapshot half of U7-6's host-and-tool tail moves BEFORE U7-5. The two render
-configs are consequently scoped out of this rung's `?rootpool=1` leg, and say
-so rather than being quietly dropped.
+configs were consequently scoped out of THIS rung's `?rootpool=1` leg; **U7-6a
+below does that work and they pass there**, along with a second format gap
+nobody had predicted.
+
+#### U7-6a — DONE (2026-09-18). The snapshot format carries what a load needs.
+
+Split out of U7-6 and moved AHEAD of U7-5 for the reason U7-4b found: at U7-5
+`?rootpool=1` becomes the default, and on that day every snapshot round trip
+goes with it. Two things were missing from the format, and only the first was
+the one U7-4b predicted.
+
+**1. Level 1's quad indirection.** The format captured `parentSlot`/`quadrant`
+from level 2 up and rebuilt level 1's free list at BLOCK granularity. Under a
+root pool level 1 is quad-allocated (U5-4), so the restore wrote an indirection
+at the wrong granularity over a quad pool. Level 1's entry now carries the pair
+plus a `quadAlloc` marker, the restore splits on HOW THE LEVEL IS ALLOCATED
+rather than on `m === 1`, and a marker mismatch is refused loudly instead of
+loading. A capture from before this has no marker, which reads correctly as
+"per-block", and there is no correct QUAD capture from before it to be
+incompatible with -- save never wrote those fields.
+
+**2. THE FREE LIST IS STATE, NOT BOOKKEEPING, and that one was not predicted.**
+The load rebuilt it ASCENDING from `slotToBlock`, on a comment that argued:
+"Free-list ORDER doesn't affect correctness (any permutation of the free slots
+works equally as a stack), so this is exact, not an approximation, and avoids
+growing the snapshot format for state that's fully redundant with slotToBlock."
+Every clause of that is true and the conclusion does not follow. The order
+decides WHICH slot the next grant hands out, so a rebuilt list gives the run an
+equally-correct-but-different pool layout from the one it had. Measured on a
+save+load in the middle of an otherwise identical run:
+
+```
+  levels=2   2 blockSlot + 2 slotToBlock entries moved
+  levels=3   25 + 25, and 20 parentSlot entries
+  both       fB64 and velB64 followed the permutation
+```
+
+So the round trip was never reproducible against an uninterrupted run, and
+`?detslots=1` -- D0's whole point -- stopped meaning anything across a load.
+The list is now saved and restored verbatim, with the old rebuild kept as the
+fallback for captures that predate this.
+
+#### `tools/validate-snapshot-roundtrip.js` — the gate, and why render-levels could not be it
+
+`tools/lib/render-levels.js` already round-trips a snapshot and requires the
+restore to return to baseline bit-for-bit. That check is real and it is not
+this one: it renders IMMEDIATELY after the load, so it scores only what the
+RENDERER reads -- the velocity pools and the indirection -- and never asks the
+ALLOCATOR anything. Both defects above need a refine round to express
+themselves, so render-levels passed through all of it on both pages. **It
+passed under `?rootpool=1` on both pages while the format was still wrong.**
+
+The new tool steps N, saves, loads, steps N more, and requires the result to be
+bit-identical to an uninterrupted 2N. The second N is what makes it a gate:
+it contains refinement rounds, so a wrong free list lands different slots and
+moves the fingerprint. Three controls, all of which earned their place:
+
+```
+  alive     the capture at N must differ from the one at 2N
+  stale     loading a snapshot 64 steps later must MOVE the outcome
+  refuse    a level-1 granularity mismatch must THROW, not load
+```
+
+#### The self-inflicted bug this rung's own controls caught, which is the part worth keeping
+
+The first cut of the save copied a quad-allocated level's free list at
+per-SLOT length. `allocLevelPool` sizes `freeListBuf` as `maxFineBlocks * 4`
+for a per-block level but `(maxFineBlocks / 4) * 4` for a quad one -- one i32
+per QUAD. So the copy overran its source.
+
+**A COMMAND-ENCODER VALIDATION ERROR DROPS THE WHOLE COMMAND BUFFER, NOT THE
+ONE BAD COPY.** Every other `copyBufferToBuffer` in the same submit was
+discarded with it, so `debugSnapshotSave` returned a snapshot whose dense `f`,
+`vel` and `cardState` were ALL ZEROS -- at `?levels>=3` only, because that is
+when the per-level loop runs. The page itself was fine throughout: refinement
+ran, tiles were allocated, the card fell. Only the instrument was blind.
+
+**Three of the four gated rows went GREEN on it**, because zeros equal zeros.
+What did not go green was the `stale` control, which said the outcome at 1088
+steps was identical to the outcome at 1024 -- an impossible claim, and the only
+reason the defect was found at all. That is the case for controls in one
+paragraph: the gate reported a pass, and the control reported something that
+could not be true.
+
+The guard that would have caught it directly is now in the tool: the reference
+leg fingerprints at N as well as 2N and ABORTS the row if they are equal,
+because every row below is an EQUALITY and a capture that carries nothing
+passes all of them. The copy length now comes from `freeListBuf.size` rather
+than being recomputed from `MAX_FINE_BLOCKS` at the call site -- the free
+list's SIZE is granularity-dependent the same way its CONTENTS are, and that
+is one rule, in one place, in the allocator that owns it.
+
+#### The determinism fingerprints move ONCE, and the solver does not
+
+`measure-determinism.js` hashes the whole snapshot, so adding the free list to
+the format moves every recorded value. Re-baselined on the default path:
+
+```
+  levels=2 detslots=1    b2b4d310a03ab626    (was 7ac54e170f903ac3)
+  levels=3 detslots=1    d799e95d23ea47f0    (was ce1bd4d8a3a1055c)
+```
+
+**The tile counts are unchanged** -- `[75]` and `[103,240]`, the same numbers
+U7-0…U7-4 recorded -- and the four analytic AMR configs and both cylinder
+Cd/St readings are unmoved, which is the evidence that what changed is the
+fingerprint's SUBJECT and not the solver. A snapshot field cannot affect a run
+that never loads one.
+
+And the new subject is the better one: the fingerprint now also gates that slot
+handout state is reproducible, which is exactly what D0 is about.
+
+*Gate, all green:* `make check`; `validate-snapshot-roundtrip.js` 12 of 12
+(4 gated x {levels 2,3} x {rootpool 0,1}, plus 4 stale and 4 refusal controls);
+boot smoke on seven configs plus both render configs, default and
+`?rootpool=1`; both render configs PASS under `?rootpool=1`, which they could
+not before this rung; the four analytic AMR configs PASS; `amr-N2-diffuse` and
+`amr-N3-diffuse` unmoved.
+
+#### What is LEFT in U7-6 after this
+
+The snapshot's own remaining item is the one that belongs with the deletion,
+not before it: **the format gains the root pool and loses the dense arrays.**
+Until U7-6 the root is a byte-identical second copy of the dense L0 and
+`seedRootFromDense` reconstructs it exactly on load, so the format does not
+need to carry it yet. The rest of the host-and-tool tail is unchanged.
 
 #### U7-5 — flip the default
 
@@ -2724,6 +2847,18 @@ Remember the default sweep is **not** all-green on `main` today
 issue), and that this branch's own `amr-N2-diffuse` baseline is **Cd 1.631 /
 St 0.1466**, not CLAUDE.md's 1.642 -- D0 moved slot assignment. Re-baseline
 against a pristine reading of the branch, not against the file.
+
+**AND THE DETERMINISM FINGERPRINTS ARE U7-6a's, NOT U7-3's.** The default path
+now reads `b2b4d310a03ab626` / `d799e95d23ea47f0`; `7ac54e170f903ac3` /
+`ce1bd4d8a3a1055c` appear throughout the stages above and are the PRE-U7-6a
+subject. The solver did not move -- the snapshot the fingerprint hashes gained
+the free list. Under `?rootpool=1` the same applies to U5-4's
+`f71bce9d33945265` / `71560c03a3d34c21`.
+
+**U7-4b's Cd/St readings under `?rootpool=1` are the input to this rung and
+they are SINGLE readings**: `amr-N2-diffuse` Cd 1.607 / St 0.1446 and
+`amr-N3-diffuse` Cd 1.473 / St 0.1571. Same-build repeats on both sides are
+this rung's job, not that one's.
 
 #### U7-6 — delete the dense path
 
