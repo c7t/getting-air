@@ -3056,11 +3056,11 @@ Two consequences, both worth acting on:
   in force, and cross-table comparison is what made U7-4b's 0.024 look like an
   allocator effect when most of it was not.
 
-OPEN: whether 0.008 is the true scale of regrouping or whether a second
-mechanism is involved. The clean experiment is a pool-size sweep at fixed
-allocator and fixed demand -- `?maxFineBlocks=` over a range well above demand,
-Cd each time. It needs no code change and it would put a number on this
-solver's sensitivity to a constant nobody thought was physical.
+RESOLVED, and it opened something larger -- see "The pool-capacity sweep"
+below. Short version: it is scatter of about +/-0.009, the ALLOCATOR is not the
+variable at all (matched capacities agree to <= 0.001), and the refined BLOCK
+SET genuinely differs between capacities on a page where force cannot feed
+back. The mechanism is not established.
 
 #### One instrument caught a flip consequence, which is the argument for its assertion
 
@@ -3086,6 +3086,96 @@ name `?rootpool=` explicitly.
   it DIFFERS, so the instrument keeps its discrimination. That is the tool's
   own header being right about itself.
 
+
+#### The pool-capacity sweep, and what it found instead (2026-09-18)
+
+U7-5 left open "whether 0.008 is the true scale of slot regrouping or whether a
+second mechanism is involved". Swept `?maxFineBlocks=` on `amr-N2-diffuse`
+(`index-cylinder-amr.html?levels=2`), where measured level-1 demand is 61 tiles
+dense and 104 quad, so every capacity below is far above demand and nothing is
+ever refused. Only the pool's SIZE varies.
+
+```
+  maxFineBlocks     rootpool=0            rootpool=1
+        128      Cd 1.641  St 0.1475
+        164      Cd 1.631  St 0.1466          <- the OLD POOL_PEAKS value
+        228      Cd 1.623  St 0.1458      Cd 1.623  St 0.1449   <- the NEW one
+        320      Cd 1.639  St 0.1474
+        512      Cd 1.638  St 0.1473
+       1024      Cd 1.639  St 0.1474      Cd 1.640  St 0.1480
+```
+
+**THREE THINGS, AND THE THIRD IS THE ONE THAT MATTERS.**
+
+**1. It is scatter, not a trend.** The first three points fall monotonically
+and that is a coincidence; 320, 512 and 1024 come back up. Range 1.623-1.641,
+about +/-0.009 around 1.633. So it is not a systematic count-of-truncations
+effect.
+
+**2. THE ALLOCATOR IS NOT THE VARIABLE; CAPACITY IS.** At matched capacity the
+two allocators agree to <= 0.001 (228: 1.623 vs 1.623; 1024: 1.639 vs 1.640).
+That settles U7-5's headline independently: flipping `?rootpool=` does not move
+Cd. It also means the capacity sensitivity is NOT something U5-4 or U7-5
+introduced -- it is on the dense path too, and predates all of this.
+
+**AND IT RE-SCOPES CLAUDE.md's REPRODUCIBILITY NOTE.** "AMR Cd is only
+reproducible to ~+/-0.001" holds WITHIN a fixed configuration. Against any
+perturbation that regroups slots -- capacity, allocator, plausibly refine
+cadence -- the nuisance spread is ~+/-0.01, ten times larger. `amr-N2-diffuse`
+therefore cannot resolve a physics difference below roughly 0.02, and U7-5's
+"+0.010 at N=3, real" should be read as "inside the nuisance band", not as a
+physics result.
+
+**3. St MOVES WITH Cd, AND THE REFINED SET ACTUALLY DIFFERS.** Strouhal is a
+frequency and is robust to offsets in force magnitude, so its tracking Cd
+argues against a pure force-integration artifact. Checked directly, comparing
+ACTIVE BLOCK SETS (slot-independent) at a fixed step:
+
+```
+  index-cylinder-amr.html?levels=2&detslots=1&rootpool=0, 20000 steps
+    CONTROL  cap 228 vs cap 228    SAME    44 blocks, 0 differences
+    QUESTION cap 228 vs cap 1024   DIFFER  44 vs 46 blocks, 1 only-A, 3 only-B
+             the differing blocks are bx=63 -- NBX is 64, so the LAST block
+             column, the downstream outflow edge
+```
+
+So refinement itself depends on pool capacity with the pool nowhere near full.
+The control is what makes that readable: the same capacity twice gives the
+identical 44-block set, so `?detslots=1` is pinning the page and the difference
+is not the racing free list.
+
+**THE MECHANISM IS NOT ESTABLISHED, and the cylinder being PINNED rules out the
+easy explanation.** Force cannot feed back into the flow on this page, so a
+force-rounding difference cannot move the refinement. Something else is
+capacity-dependent. Two candidates, neither verified:
+
+- a pass reading INACTIVE slots -- their stale contents differ when there are
+  978 of them instead of 184. `plans/2D-backport.md` B6-9c is this class, and
+  makeRootPool's `unread` sentinel exists because of it.
+- an order-dependent float accumulation not yet located.
+
+**THE DISCRIMINATING EXPERIMENT IS A BISECT ON STEP COUNT.** Compare the two
+capacities' active sets (and a reconstructed, slot-independent field) at
+increasing step counts and find the FIRST divergence. Diverging at the very
+first refine round is structural -- something reads capacity directly.
+Diverging later and growing is amplification of a tiny numerical difference,
+which points at the inactive-slot candidate. The probe is small enough to
+restate:
+
+```js
+  // per capacity: navigate ?levels=2&detslots=1&rootpool=0&maxFineBlocks=CAP,
+  // reset, debugStepSync(N), then
+  debugListActiveBlocks(1).then(a => a.map(b => b.bx + ',' + b.by).sort())
+  // KEY ON (bx,by), NOT the object: listActiveBlocks returns {bx,by,slot} and
+  // stringifying it gives "[object Object]" for every entry, which collapses
+  // the comparison to SAME. The first run of this probe did exactly that and
+  // was caught only because it printed SAME next to |A|=44 |B|=46.
+```
+
+**THIS IS NOT A U7 BLOCKER.** It is on the dense path too, it long predates the
+root pool, and U7-6 deletes neither the pool allocator nor the criterion. But
+U7-6 DOES delete the dense path, which is the control this comparison uses, so
+the bisect is cheaper before it than after.
 
 #### U7-6 — delete the dense path
 

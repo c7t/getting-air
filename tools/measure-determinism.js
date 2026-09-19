@@ -42,6 +42,36 @@
 // "the flag worked" from "nothing raced". Read `levels=3 detslots=0` instead,
 // which still DIFFERS and is what keeps the instrument honest there.
 //
+// ── WHAT "IDENTICAL" CAN AND CANNOT ESTABLISH ──────────────────────────────
+//
+// IT CANNOT ESTABLISH DETERMINISM, AT ANY NUMBER OF RUNS. A nondeterministic
+// process can land the same way N times for any N; more runs only shrink the
+// probability of missing a rare divergence, and never to zero. The two row
+// types here are one-sided, in OPPOSITE directions, and it is worth being
+// precise about which way each cuts:
+//
+//   detslots=1, expected IDENTICAL   REFUTABLE ONLY. One DIFFERS disproves the
+//                                    claim outright. No number of IDENTICALs
+//                                    proves it.
+//   detslots=0, expected DIFFERS     CONFIRMABLE ONLY. One DIFFERS proves
+//                                    nondeterminism outright. IDENTICAL proves
+//                                    nothing -- see the paragraph above about
+//                                    reading that rung at --runs=4.
+//
+// So this tool is a REGRESSION DETECTOR and a refutation test, not a proof.
+// What actually supports "the deterministic handout is deterministic" is the
+// ARGUMENT ABOUT THE KERNEL -- amr_manage.wgsl's DET_SLOTS path is one thread,
+// in dispatch order, with no atomics in the decision -- and this run's job is
+// to fail to contradict it. Treat a green run as "no divergence observed under
+// these conditions", and say that rather than "it is deterministic".
+//
+// AND THESE CONDITIONS ARE THE LOW-POWER ONES, which is the part most worth
+// knowing. The repeats run back to back, on an idle GPU, each from a fresh
+// navigate -- i.e. as nearly identical as the harness can make them. A race
+// whose outcome depends on scheduling is LEAST likely to show up that way. If
+// you need more power, vary something that moves timing (contend the GPU,
+// interleave other work between runs) rather than only raising --runs.
+//
 // A FAILURE HERE IS INFORMATION, NOT A BUG TO BE FIXED. If levels=2 still
 // differs with detslots=1, there is a second source of nondeterminism, and
 // plans/uniform-levels.md's sequencing argument needs revisiting before any of
@@ -240,8 +270,12 @@ async function main() {
     console.log('of D0 is engineered. Do not "fix" it by widening the comparison.');
     process.exit(1);
   }
-  console.log('PASS: deterministic handout makes repeated runs bit-identical, and the');
-  console.log('baseline still differs. Slot assignment is the source.');
+  console.log('NOT REFUTED: the deterministic handout produced bit-identical runs, and the');
+  console.log('baseline still differs, so the comparison can still see nondeterminism.');
+  console.log('');
+  console.log('That is the strongest thing this run can say. IDENTICAL over N runs does not');
+  console.log('establish determinism at any N -- see this file\'s header. What it rules out is');
+  console.log('a REGRESSION large enough to surface in N tries under these conditions.');
   process.exit(0);
 }
 
