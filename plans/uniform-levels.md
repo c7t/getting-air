@@ -2555,6 +2555,8 @@ outstanding; `?rootpool=1` is still opt-in on every page after U7-4, so that
 demand is not yet anybody's shipped demand. It belongs with **U7-5**, which is
 the rung that makes it one. The refusal watch reports a wrong guess either way,
 and nothing refused over the 8192-step invariant sweep at the current defaults.
+**DONE as U7-5a below** -- and the answer is narrower than U5-4's figure: the
+rise is level 1's alone.
 
 #### U7-4a — DONE (2026-09-18). The root pool's solver half is one function.
 
@@ -2900,6 +2902,77 @@ moves measured so far are 1.630 -> 1.607 at N=2 (toward the literature 1.35)
 and 1.463 -> 1.473 at N=3 (away from it), both small and both single readings.
 That is a question for a measurement, not for this note.
 
+#### U7-5a — DONE (2026-09-18). Pool demand re-measured at quad granularity.
+
+`tools/measure-pool-peaks.js`, the persisted form of the ad hoc scan that
+produced each page's `POOL_PEAKS` on 2026-09-15. Both pages, both allocators,
+40000 steps, every level's cap lifted.
+
+```
+  index-amr.html (chaotic -- read the ABSOLUTE peaks, not the ratio)
+                 rootpool=0                rootpool=1
+    levels=3     230  412                  288  408
+    levels=4     267  512  684             324  468  632
+    levels=5     268  564  660  872        356  564  784  1184
+
+  index-cylinder-amr.html (pinned, steady -- read the RATIO here)
+                 rootpool=0                rootpool=1
+    levels=3      83  100                  132  100
+    levels=4     101  164  208             132  160  208
+```
+
+**THE COST IS LEVEL 1 AND NOTHING ELSE.** On the steady page L2 is 100 against
+100 and L3 is 208 against 208 -- identical to the tile across the allocator
+change -- while L1 goes +59% at levels=3 and +31% at levels=4. Under quad
+allocation L1 lands on 132 at BOTH depths, because level 1's tile set is
+decided by which root quads are wanted (geometry plus 2:1 closure) and that
+does not depend on how deep the hierarchy goes below it.
+
+That is narrower than U5-4's "+28-32% tiles", which averaged the rise over the
+whole hierarchy and therefore understated it at level 1 and overstated it
+everywhere else. It is also what the mechanism predicts: level 1 is the only
+level whose allocator changed.
+
+**AND U7-5 IS NOT BLOCKED BY POOL SIZING, WHICH CORRECTS THIS PLAN'S OWN
+WORRY.** The concern was that flipping without re-sizing risks refusals.
+Measured against the CURRENTLY SHIPPED defaults, nothing refuses at any depth
+on either page; what happens is that the 1.7x headroom convention erodes:
+
+```
+  index-amr.html   levels=3  L1 288/444 = 1.54x   L2 408/680 = 1.67x
+                   levels=4  L1 324/444 = 1.37x   ...
+                   levels=5  L1 356/444 = 1.25x   L4 1184/1537 = 1.30x
+```
+
+So the sizing change is a margin restoration, not a rescue.
+
+**THE CONSTANTS ARE NOT CHANGED ON THIS RUNG, and that is the measurement
+being honest about its own resolution.** The rootpool=0 control leg reproduces
+the shipped table to within ~9% on the card and ~6% on the cylinder, which is
+this instrument's precision on each page; every rootpool=0 delta is inside it.
+Adopting them would be fitting noise and paying VRAM for it. The quad numbers
+go in WITH the flip at U7-5, because a peak table belongs to the allocator it
+describes:
+
+```
+  main-amr.js          finest { 2: 412, 3: 684, 4: 1184 }
+                       parent { 1: 356, 2: 564, 3:  784 }
+  main-cylinder-amr.js finest { 2: 100, 3:  208 }
+                       parent { 1: 132, 2:  164 }
+```
+
+Max over both legs, since `?rootpool=` stays selectable until U7-6. At 1.7x
+that moves the shipped card configuration from L1 444 / L2 680 to L1 608 /
+L2 704 -- **about +2 MB, which is the whole memory cost of the flip.**
+
+**One instrument note worth carrying.** The peak is a SAMPLED max: nothing in
+the page tracks a high-water mark, so the tool polls every `--sample=` steps
+and a spike between samples is missed. The 1.7x convention absorbs that, and
+the numbers being replaced were obtained the same way, so the comparison is
+like for like. A level sitting at its cap is reported as a CLIP rather than a
+demand and exits nonzero -- a clipped peak is the one number this measurement
+must not hand on.
+
 #### U7-5 — flip the default
 
 `?rootpool=1` becomes the default; `?rootcouple` and `?rootmanage` collapse
@@ -2926,6 +2999,10 @@ now reads `b2b4d310a03ab626` / `d799e95d23ea47f0`; `7ac54e170f903ac3` /
 subject. The solver did not move -- the snapshot the fingerprint hashes gained
 the free list. Under `?rootpool=1` the same applies to U5-4's
 `f71bce9d33945265` / `71560c03a3d34c21`.
+
+**U7-5a's peak tables are the other input, and the flip must carry them** --
+the `POOL_PEAKS` literals it prints, on both pages, in the same commit as the
+default change. A peak table belongs to the allocator it describes.
 
 **U7-4b's Cd/St readings under `?rootpool=1` are the input to this rung and
 they are SINGLE readings**: `amr-N2-diffuse` Cd 1.607 / St 0.1446 and

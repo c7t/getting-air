@@ -61,7 +61,7 @@ function parseArgs(argv) {
   const o = {
     baseUrl: 'https://localhost:4444', port: 9345,
     page: 'index-amr.html', steps: 40000, sample: 256, cap: 2048,
-    levels: [3, 4, 5], rootpool: null, extra: '',
+    levels: [3, 4, 5], rootpool: null, extra: '', global: null,
   };
   for (const a of argv) {
     if (a.startsWith('--baseUrl=')) o.baseUrl = a.slice(10);
@@ -73,7 +73,20 @@ function parseArgs(argv) {
     else if (a.startsWith('--levels=')) o.levels = a.slice(9).split(',').map(Number);
     else if (a.startsWith('--rootpool=')) o.rootpool = a.slice(11);
     else if (a.startsWith('--extra=')) o.extra = a.slice(8);
+    else if (a.startsWith('--global=')) o.global = a.slice(9);
     else { console.error(`unknown argument: ${a}`); process.exit(2); }
+  }
+  // THE DEBUG SURFACE IS NOT THE SAME NAME ON EVERY PAGE, and it does not
+  // follow the page name either: index-amr and index-reentry-amr expose
+  // `window.__AMR`, while index-cylinder-amr, index-tgv-amr and
+  // index-channel-amr expose `window.__CYL` -- the harness pages kept the
+  // cylinder harness's original name as they were derived from it. Defaulted
+  // from a table rather than guessed from the URL, and overridable, because a
+  // wrong guess here reads as "WebGPU init failed" and sends you looking at
+  // the page.
+  if (!o.global) {
+    const AMR_PAGES = ['index-amr.html', 'index-reentry-amr.html'];
+    o.global = AMR_PAGES.includes(o.page) ? 'window.__AMR' : 'window.__CYL';
   }
   // Quad allocation refuses a cap that is not a multiple of 4 (allocLevelPool),
   // and under ?rootpool=1 that now includes LEVEL 1.
@@ -101,36 +114,37 @@ async function measureOne(Runtime, Page, o, nLevels, rootpool) {
   if (rootpool !== null) q.push(`rootpool=${rootpool}`);
   if (o.extra) q.push(o.extra.replace(/^&/, ''));
   const url = `${o.baseUrl}/${o.page}?${q.join('&')}`;
+  const G = o.global;
   await navigateTo(Page, url);
-  await waitForGlobal(Runtime, 'window.__AMR', 60000);
+  await waitForGlobal(Runtime, G, 60000);
 
   // Assert the configuration took. A cap the page silently ignored, or a flag
   // that did not apply, would read as a clean low peak -- the failure mode this
   // whole measurement exists to prevent.
-  const got = await ev(Runtime, 'window.__AMR.getNumLevels()');
+  const got = await ev(Runtime, `${G}.getNumLevels()`);
   if (got !== nLevels) throw new Error(`asked for levels=${nLevels}, page reports ${got}`);
-  const sizes = await ev(Runtime, 'JSON.stringify(window.__AMR.getLevelPoolSizes())');
+  const sizes = await ev(Runtime, `JSON.stringify(${G}.getLevelPoolSizes())`);
   const caps = JSON.parse(sizes).map(p => p.MAX_FINE_BLOCKS);
   if (caps.some(c => c !== o.cap)) {
     throw new Error(`cap not applied: levels report MAX_FINE_BLOCKS ${caps.join(',')} against --cap=${o.cap}`);
   }
   if (rootpool !== null) {
-    const rp = await ev(Runtime, 'window.__AMR.getRootPool() ? 1 : 0');
+    const rp = await ev(Runtime, `${G}.getRootPool() ? 1 : 0`);
     if (String(rp) !== String(rootpool)) throw new Error(`asked for rootpool=${rootpool}, page reports ${rp}`);
   }
 
-  await ev(Runtime, 'window.__AMR.reset()', 120000);
+  await ev(Runtime, `${G}.reset()`, 120000);
   const peaks = new Array(nLevels).fill(0);
   const peakAt = new Array(nLevels).fill(0);
   let done = 0;
   let refused = false;
   while (done < o.steps) {
     const chunk = Math.min(o.sample, o.steps - done);
-    await ev(Runtime, `window.__AMR.debugStepSync(${chunk})`, 900000);
+    await ev(Runtime, `${G}.debugStepSync(${chunk})`, 900000);
     done += chunk;
     const counts = JSON.parse(await ev(Runtime, `(async () => {
       const out = [];
-      for (let m = 1; m < ${nLevels}; m++) out.push((await window.__AMR.debugListActiveBlocks(m)).length);
+      for (let m = 1; m < ${nLevels}; m++) out.push((await ${G}.debugListActiveBlocks(m)).length);
       return JSON.stringify(out);
     })()`, 300000));
     for (let m = 1; m < nLevels; m++) {

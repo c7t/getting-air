@@ -204,6 +204,34 @@ if (N_LEVELS - 1 > MAX_RENDER_POOL_LEVELS) {
 // wants 656 and was given 512. Raising ?maxFineBlocks= could not fix it --
 // that parameter sizes level 1 only, which is also what the refusal message
 // used to recommend (fixed alongside this).
+//
+// ── RE-MEASURED AT QUAD GRANULARITY (2026-09-18, U7-5a) ─────────────────────
+//
+// tools/measure-pool-peaks.js, same protocol, both allocators. The rootpool=0
+// leg is the CONTROL for the instrument, and it reproduces the table above to
+// within ~9% -- which also sets this page's resolution: it is chaotic, so
+// differences smaller than about 10% here are not readable.
+//
+//              rootpool=0 (per-block L1)      rootpool=1 (quad L1)
+//   levels=3   230  412                       288  408
+//   levels=4   267  512  684                  324  468  632
+//   levels=5   268  564  660  872             356  564  784  1184
+//
+// THE CONSTANTS BELOW ARE NOT CHANGED, and that is deliberate. Every
+// rootpool=0 delta is inside the scatter just described, so adopting them
+// would be fitting noise and paying VRAM for it. What the quad allocator
+// actually costs is LEVEL 1 AND NOTHING ELSE -- the steady cylinder page
+// measures L1 +59% with L2 and L3 unchanged TO THE TILE, which is the
+// controlled version of this table (see main-cylinder-amr.js's own copy).
+//
+// U7-5 adopts these WITH the flip, because the peaks belong to the allocator
+// they describe (max over both legs, since ?rootpool= stays selectable):
+//
+//   finest: { 2: 412, 3: 684, 4: 1184 },
+//   parent: { 1: 356, 2: 564, 3: 784 },
+//
+// At 1.7x that is levels=3 -> L1 608, L2 704 (from 444, 680): about +2 MB on
+// the shipped configuration, which is the whole memory cost of the flip.
 const POOL_PEAKS = {
   finest: { 2: 400, 3: 656, 4: 904 },
   parent: { 1: 261, 2: 516, 3: 628 },

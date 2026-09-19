@@ -228,6 +228,41 @@ if (N_LEVELS - 1 > MAX_RENDER_POOL_LEVELS) {
 // 128/128 with 20 coverage violations" is level 3 wanting 208 and being given
 // 128. Level 4 is not measured on this page; poolSlotsFor extrapolates and
 // says so, and the refusal watch remains the thing that reports it wrong.
+//
+// ── RE-MEASURED AT QUAD GRANULARITY (2026-09-18, U7-5a) ─────────────────────
+//
+// tools/measure-pool-peaks.js, same protocol, both allocators. THIS PAGE IS
+// THE ONE THAT CAN ANSWER THE QUESTION: the body is pinned and the flow is
+// statistically steady, so the two legs are the same problem and the
+// difference between them is the allocator rather than a trajectory. The card
+// page cannot say this -- it is chaotic, and its two legs are two different
+// tumbles.
+//
+//              rootpool=0 (per-block L1)      rootpool=1 (quad L1)
+//   levels=3    83  100                       132  100
+//   levels=4   101  164  208                  132  160  208
+//
+// THE COST IS LEVEL 1 AND NOTHING ELSE. L2 is 100 against 100 at levels=3 and
+// L3 is 208 against 208 at levels=4 -- identical to the tile, across the
+// allocator change. Only L1 moves, +59% at levels=3 and +31% at levels=4, and
+// under quad allocation it lands on 132 at BOTH depths: level 1's tile set is
+// decided by which root quads are wanted (geometry plus 2:1 closure), which
+// does not care how deep the hierarchy goes below it.
+//
+// That is narrower than U5-4's "+28-32% tiles", which averaged the rise across
+// the whole hierarchy and so understated it at L1 and overstated it everywhere
+// else.
+//
+// The rootpool=0 leg reproduces the table above to within ~6% (83 vs 78, 100
+// vs 96, 101 vs 95, 164 vs 160, 208 exactly), which is the instrument's
+// control. The constants are NOT changed for it -- see main-amr.js's copy for
+// why. U7-5 adopts, with the flip (max over both legs):
+//
+//   finest: { 2: 100, 3: 208 },
+//   parent: { 1: 132, 2: 164 },
+//
+// At 1.7x: levels=3 -> L1 228, L2 172 (from 162, 164); levels=4 -> L1 228,
+// L2 280, L3 356 (from 162, 272, 354).
 const POOL_PEAKS = {
   finest: { 2: 96, 3: 208 },
   parent: { 1: 95, 2: 160 },
