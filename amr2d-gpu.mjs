@@ -1090,6 +1090,15 @@ export function makeCouplingPipelines(device, layouts, modules, { W, H, RB, F16,
 //   That is a larger move than the plan's "Cd in the 4th digit", which only
 //   anticipated slot regrouping -- see U5-4.
 //
+//   AND THE QUAD IS A CONVENTION, NOT SOMETHING THE ADDRESSING COMPELS. Under
+//   a root parent common_interp_parent_pool.wgsl derives a child's parent slot
+//   and quadrant from its own BLOCK COORDINATES (the root is always full), not
+//   from its slot index, so a level-1 child need not sit in an aligned group
+//   of four for the coupling to reach it. What the grouping buys is uniformity
+//   with every deeper level -- and one storage binding, since `quadrant ==
+//   slot % 4` only holds under it (B2-2b0). See plans/uniform-levels.md, "The
+//   quad granularity: what it is, and what actually forces it".
+//
 // `managed` is derived HERE, once, because it has to agree with the allocator,
 // the reset, the cascade and the dispatch, and a condition recomputed in four
 // places is how those drift.

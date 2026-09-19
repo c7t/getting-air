@@ -2828,6 +2828,78 @@ Until U7-6 the root is a byte-identical second copy of the dense L0 and
 `seedRootFromDense` reconstructs it exactly on load, so the format does not
 need to carry it yet. The rest of the host-and-tool tail is unchanged.
 
+#### The quad granularity: what it is, and what actually forces it (2026-09-18)
+
+U5-4 and U7-4b both state "level 1's refinement granularity goes from one
+8-cell block to a 16-cell quad" as a fact without the mechanism, and the
+mechanism turns out to matter for U7-5's decision. Traced through the shaders:
+
+**The two managers are dispatched over different things.**
+
+```
+  amr_manage.wgsl        one thread per level-1 BLOCK; grants ONE slot from a
+  (dense L0 parent)      per-SLOT free list. Unit of refinement: one block,
+                         RB = 8 cells per axis.
+
+  amr_manage_pool.wgsl   one thread per PARENT SLOT; grantQuad() hands out
+  (pool parent)          FOUR slots at once, from a per-QUAD free list.
+                         refineWants tests quadrant 0 only ("quadrant 0 stands
+                         for all 4"); coarsen releases all four together.
+```
+
+`rootPoolSpec` makes a root tile `2*RB` = 16 cells per axis and level 1's block
+grid exactly twice the root's, so one root tile carries four level-1 blocks:
+
+```
+  root tile (16 cells/axis)        its four level-1 children (8 cells/axis each)
+  +---------------+                +-------+-------+
+  |               |                |  q0   |  q1   |
+  |               |      -->       +-------+-------+
+  |               |                |  q2   |  q3   |
+  +---------------+                +-------+-------+
+      dense manager grants any ONE of these; the pool manager grants all FOUR
+```
+
+The want-set closure agrees with the allocator rather than fighting it:
+`quadCompleteFrom` goes 2 -> 1 at U5-4, so the 2:1 cascade promotes "I want
+this block" into "I want this quad" before the manager ever sees it. A region
+that used to earn one 8-cell block now earns a 16-cell quad. That is the
++28-32% tiles, and it is why Cd moves.
+
+**AND IT IS A CONVENTION, NOT SOMETHING THE ADDRESSING FORCES.** This is the
+part worth having written down, because both earlier stages read as though the
+quad were structural. `shaders/common_interp_parent_pool.wgsl`:
+
+```wgsl
+fn quadrantOf(slot, bx, by)   { if (PARENT_GHOST == 0u) { return ((by & 1u) << 1u) | (bx & 1u); } return quadrant[slot]; }
+fn parentSlotOf(slot, bx, by) { if (PARENT_GHOST == 0u) { return (by >> 1u) * parentNbx() + (bx >> 1u); } return u32(parentSlot[slot]); }
+```
+
+Under a ROOT parent (`PARENT_GHOST == 0`) a child derives its parent slot and
+its quadrant from its OWN BLOCK COORDINATES, because the root is always full --
+not from its slot index. So a level-1 child does not have to sit in an aligned
+group of four for the coupling to address it. At levels >= 2 those two values
+come from `parentSlot[]` / `quadrant[]` BUFFERS, which would tolerate any
+grouping just as well.
+
+What the quad grouping actually is: "decision 3, all-or-nothing" from
+plans/AMR-multilevel.md (not in this tree), which the code then EXPLOITS --
+B2-2b0 recovered a storage binding from the 16-buffer ceiling precisely because
+`quadrant == slot % 4` holds under it. `allocLevelPool`'s own comment names the
+trigger: per-block allocation is "level 1 while its parent is the DENSE grid,
+which is not itself decomposed into quads, so there is no quad on that
+boundary." Once L0 becomes tiles, level 1 inherits the sibling convention every
+deeper level already follows.
+
+**So the coarser granularity is the price of UNIFORMITY -- one manager, one
+allocator, `amr_manage.wgsl` retires -- and not a consequence the scheme
+compels.** If the tile cost or the Cd move turns out to matter, "quad-allocate
+level 1" is negotiable in a way U5-4 and U7-4b both implied it was not. What is
+NOT established either way is whether per-block granularity is BETTER: the
+moves measured so far are 1.630 -> 1.607 at N=2 (toward the literature 1.35)
+and 1.463 -> 1.473 at N=3 (away from it), both small and both single readings.
+That is a question for a measurement, not for this note.
+
 #### U7-5 — flip the default
 
 `?rootpool=1` becomes the default; `?rootcouple` and `?rootmanage` collapse
