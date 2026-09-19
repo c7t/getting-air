@@ -3,6 +3,17 @@
 // @include "common_geometry.wgsl"
 // @include "common_vortcolor.wgsl"
 
+// BINDING 0 IS LEVEL 0'S VELOCITY, AND WHAT THAT BUFFER *IS* DEPENDS ON
+// ROOT_IS_POOL (plans/uniform-levels.md U7-6b).
+//
+//   ROOT_IS_POOL = 0   the dense L0 grid, addressed by `cellIndex`'s block8
+//                      layout. The pre-U7-6 path, kept live under ?rootpool=0.
+//   ROOT_IS_POOL = 1   the ROOT POOL's velocity, addressed by `rootCellIndex`
+//                      through binding 12's indirection. The default, and what
+//                      lets U7-6f delete the dense grid.
+//
+// Both are a velocity per L0 cell; only the addressing differs, which is why
+// this is one binding and not two.
 @group(0) @binding(0) var<storage, read> vel         : array<f32>;
 @group(0) @binding(1) var<storage, read> state       : CardState;
 // ONE VELOCITY/INDIRECTION PAIR PER POOL LEVEL, AND THE WALK OVER THEM IS A
@@ -39,6 +50,10 @@
 @group(0) @binding(9) var<storage, read> blockSlot3  : array<i32>;
 @group(0) @binding(10) var<storage, read> vel_pool4  : array<f32>;
 @group(0) @binding(11) var<storage, read> blockSlot4 : array<i32>;
+// The ROOT pool's block->slot indirection. Read only when ROOT_IS_POOL != 0;
+// bound to level 1's under ?rootpool=0 for the same reason the unused deeper
+// levels are -- an out-of-range read is not safe on every stack.
+@group(0) @binding(12) var<storage, read> blockSlot0 : array<i32>;
 // Quadtree outline opacity [0,1] -- optional, off (0) by default. Separate
 // uniform from overlayOpacity (the coverage FILL) so the two can be toggled
 // independently -- an outline-only view is useful precisely when the fill
@@ -55,6 +70,10 @@ const BLOCK = 8u;
 // Milestone 2's single-fixed-region version.
 override RB : u32;
 const GHOST = 2u;
+
+// Is level 0 a pool level? See binding 0's note. Default 0 so a build that
+// does not pass it is byte-identical to the pre-U7-6 renderer.
+override ROOT_IS_POOL : u32 = 0u;
 
 // How many POOL levels this configuration actually has, i.e. N_LEVELS - 1.
 // The walk below runs m = 1 .. N_POOL_LEVELS and never touches a deeper
@@ -75,6 +94,35 @@ fn cellIndex(cx: u32, cy: u32) -> u32 {
   let lx = cx % BLOCK; let ly = cy % BLOCK;
   let blockID = by * nbx + bx;
   return blockID * (BLOCK * BLOCK) + ly * BLOCK + lx;
+}
+
+// The same buffer cell, addressed through the ROOT POOL.
+//
+// THE ROOT TILE HAS NO GHOST RING, and that is the one thing that stops level
+// 0 from simply joining `poolVel`'s ladder below. `amr2d.mjs`'s
+// ghostDepthAtLevel(0) is 0 -- a ring exists to hold a parent interface and
+// the root has no parent -- so the root tile is 2*RB cells square where every
+// other level's is 2*RB + 2*GHOST, and there is no GHOST offset to add to the
+// local coordinate. Writing this as `poolVel(0, ...)` would have silently
+// applied level>=1's geometry to it.
+//
+// The root is also ALWAYS FULL (slots == nblocks, every block active), which
+// is why there is no "is this level active here" test: level 0 covers every
+// pixel, which is exactly what makes it the base case of the walk rather than
+// one more iteration of it.
+fn rootCellIndex(cx: u32, cy: u32) -> u32 {
+  let tile = RB * 2u;
+  let nbx = W / tile;
+  let blockID = (cy / tile) * nbx + (cx / tile);
+  let slot = u32(blockSlot0[blockID]);
+  return slot * (tile * tile) + (cy % tile) * tile + (cx % tile);
+}
+
+// Level 0's velocity at a BUFFER cell, from whichever representation is live.
+fn rootVel(bx: u32, by: u32) -> vec2<f32> {
+  var i = cellIndex(bx, by);
+  if (ROOT_IS_POOL != 0u) { i = rootCellIndex(bx, by); }
+  return vec2<f32>(vel[i * 2u], vel[i * 2u + 1u]);
 }
 
 struct VSOut {
@@ -116,19 +164,19 @@ fn get_chi(phi: f32) -> f32 {
 }
 
 fn get_uy(x: i32, y: i32) -> f32 {
-    let wx = (u32(x) + W) % W;
-    let wy = (u32(y) + H) % H;
-    let bx = (wx + u32(state.off_x)) % W;
-    let by = (wy + u32(state.off_y)) % H;
-    return vel[cellIndex(bx, by) * 2u + 1u];
+  let wx = (u32(x) + W) % W;
+  let wy = (u32(y) + H) % H;
+  let bx = (wx + u32(state.off_x)) % W;
+  let by = (wy + u32(state.off_y)) % H;
+  return rootVel(bx, by).y;
 }
 
 fn get_ux(x: i32, y: i32) -> f32 {
-    let wx = (u32(x) + W) % W;
-    let wy = (u32(y) + H) % H;
-    let bx = (wx + u32(state.off_x)) % W;
-    let by = (wy + u32(state.off_y)) % H;
-    return vel[cellIndex(bx, by) * 2u];
+  let wx = (u32(x) + W) % W;
+  let wy = (u32(y) + H) % H;
+  let bx = (wx + u32(state.off_x)) % W;
+  let by = (wy + u32(state.off_y)) % H;
+  return rootVel(bx, by).x;
 }
 
 // wrapf lives in common_geometry.wgsl (B5-1), included above.

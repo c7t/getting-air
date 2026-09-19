@@ -25,7 +25,7 @@
 import { reportFatal, refuseConfig, setStatus, reportNoWebGPU, reportNoAdapter } from './error-overlay.mjs';
 import { loadShader } from './shader-loader.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
-import { check21BalanceOnGPU, allocLevelPool, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState, checkGeometryCoverageOnGPU, makeRefusalWatch , checkRefinementClosureOnGPU , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU, makeRenderBindGroup, renderPoolLevels, MAX_RENDER_POOL_LEVELS, makeAMRLayouts, makeCouplingPipelines, makeLevelBindGroups, makeManageBindGroups, makeScheduler, makeRefineRound, readRootFlags, allocRootPool, makeRootPool } from './amr2d-gpu.mjs';
+import { check21BalanceOnGPU, allocLevelPool, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState, checkGeometryCoverageOnGPU, makeRefusalWatch , checkRefinementClosureOnGPU , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU, makeRenderBindGroup, renderRootIsPool, renderPoolLevels, MAX_RENDER_POOL_LEVELS, makeAMRLayouts, makeCouplingPipelines, makeLevelBindGroups, makeManageBindGroups, makeScheduler, makeRefineRound, readRootFlags, allocRootPool, makeRootPool } from './amr2d-gpu.mjs';
 // tauAtLevel: extracted to card-params.mjs by B3a-1, which landed the CALL
 // in all five AMR pages and this IMPORT in only main-amr.js. The other four
 // threw `ReferenceError: tauAtLevelOf is not defined` at init -- but only at
@@ -471,6 +471,17 @@ const K_EPS_POOL = urlParams.has('kEpsPool') ? parseFloat(urlParams.get('kEpsPoo
 const rootFlags = readRootFlags(urlParams, { staging: false });
 const ROOT_POOL = rootFlags.pool;
 const ROOT_MANAGED = rootFlags.managed;
+
+// ?rootIsPool=0|1 -- draw level 0 from the DENSE grid or the ROOT POOL
+// (plans/uniform-levels.md U7-6b). Default: the root pool when one exists.
+// Both representations hold the same field while `?rootpool=1` keeps the dense
+// grid stepped, so this is a ONE-BUILD A/B of the two addressings: the picture
+// must be IDENTICAL either way, and `tools/validate-all.js
+// --configs=render-levels-* --extra=rootIsPool=0` is what checks it.
+const RENDER_ROOT_IS_POOL = urlParams.has('rootIsPool')
+  ? (parseInt(urlParams.get('rootIsPool')) ? 1 : 0)
+  : null;
+
 
 // ?detslots=1 -- deterministic pool slot handout (plans/uniform-levels.md D0,
 // ported to this page by D1-a).
@@ -1250,7 +1261,9 @@ async function init() {
       // U6: THIS PAGE NEVER PASSED A LEVEL OVERRIDE AT ALL, so the shader's
       // HAS_LEVEL2 default of 0 meant level 2 was solved, stepped, force-reduced
       // -- and never drawn. Three of the five AMR pages were in that state.
-      constants: { ...fineConstants, N_POOL_LEVELS: renderPoolLevels(N_LEVELS) } },
+      // U7-6b: ROOT_IS_POOL must match what makeRenderBindGroup put on binding
+      // 0 -- see renderRootIsPool, which is the single statement of that rule.
+      constants: { ...fineConstants, N_POOL_LEVELS: renderPoolLevels(N_LEVELS), ROOT_IS_POOL: renderRootIsPool(pools, RENDER_ROOT_IS_POOL) } },
     primitive: { topology: 'triangle-list' },
   });
   // Milestone 7: level>=2 fine step / average -- one pipeline object each,
@@ -1377,7 +1390,8 @@ async function init() {
   // built this inline and three of which never passed the level-2 override at
   // all -- see makeRenderBindGroup.
   const renBG = makeRenderBindGroup(device, renBGL, pools,
-    { velBuf, cardStateBuf, overlayOpacityBuf, outlineOpacityBuf });
+    { velBuf, cardStateBuf, overlayOpacityBuf, outlineOpacityBuf,
+      rootIsPool: renderRootIsPool(pools, RENDER_ROOT_IS_POOL) });
   // Milestone 4 bind groups (pool-aware, superseding M2's single-region ones).
   // interp always WRITES pools[1].finePoolF_a (the pool's current-at-macro-step-
   // boundary buffer, mirroring f_a's own invariant -- 2 fine substeps per
@@ -2780,7 +2794,11 @@ async function init() {
   function debugPerturbLevelVel(level, ux, uy) {
     const pool = pools[level];
     if (!pool) throw new Error(`debugPerturbLevelVel: no pool at level ${level} (N_LEVELS=${N_LEVELS}, pools 1..${N_LEVELS - 1})`);
-    const cells = pool.MAX_FINE_BLOCKS * NCELLS1;
+    // pool.cellsPerSlot, NOT the page's NCELLS1: the root tile is ringless and
+    // smaller, and an oversized writeBuffer is a validation error that
+    // discards the write silently -- so the picture does not change and the
+    // gate reads "this level has no path into the renderer". See U7-6b.
+    const cells = pool.MAX_FINE_BLOCKS * pool.cellsPerSlot;
     const a = new Float32Array(cells * 2);
     for (let i = 0; i < cells; i++) { a[2 * i] = ux; a[2 * i + 1] = uy; }
     device.queue.writeBuffer(pool.finePoolVel, 0, a.buffer, a.byteOffset, a.byteLength);

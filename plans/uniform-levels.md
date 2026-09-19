@@ -3620,7 +3620,197 @@ page and no green row means anything -- the same guard the card page's
 here is 69888 steps. If it is expensive that is a fact to record next to the
 gate, not a reason to skip it.
 
-#### D1-b — the dense manager, i.e. the control
+#### D1-b — SKIPPED, deliberately, 2026-09-18. The decision the rung asked to be made explicitly.
+
+The rung says: "If D1-b is judged not worth doing on a path scheduled for
+deletion, that is a defensible call -- but it has to be made explicitly and
+written down." Made, and here is the reasoning.
+
+**D1-b is not worth doing, and D1-a is why -- not the deletion schedule.**
+The rung's argument FOR it was "an unpinned control is not a control": pin the
+dense manager so U7-6's before/after A/B has a pinned baseline on both legs.
+D1-a measured that `?detslots=1` DOES NOT PIN THIS PAGE. The force diverges at
+step 128 into two attractors with the handout serial and the want set
+identical. So four new pipelines on `amr_manage.wgsl` would buy an
+*equally unpinned* control, on a file the next rung deletes. The premise the
+rung rested on did not survive the rung before it.
+
+**What replaces it as U7-6's gate**, because "inherits the +/-0.009" is a real
+consequence and needs an answer rather than a shrug:
+
+- `index-cylinder.html` (`dense-reference`) is NOT touched by U7-6 -- it has no
+  pool, no slots and no per-workgroup partials, and it reproduces BIT-EXACTLY
+  run to run. It is a true bit-exact control and it is already in the sweep.
+- The four analytic AMR configs (`channel-*-amr-N2`, `tgv-amr-N2/N3`) were
+  bit-identical across B1's rescale flip and are the solver gate. Their known
+  limitation -- they hold ZERO active tiles, so they do not exercise the seam
+  -- is unchanged by U7-6 and is why they are not the whole gate.
+- `validate-snapshot-roundtrip.js` is a BIT-IDENTICAL gate with three live
+  controls, and U7-6 changes the snapshot format, so it is directly on point.
+- `validate-amr-invariants.js`'s seven gates are structural and do not care
+  about Cd's spread at all.
+
+So U7-6's Cd/St cells are read as BAND membership against the literature, which
+is what they were always for, and the bit-exact claims come from the four
+instruments above. That is a better gate than a pinned-Cd A/B would have been,
+and it does not depend on a pin that does not exist.
+
+#### D1-c — BLOCKED on the force, not deferred. 2026-09-18.
+
+Its three items were: Cd/St on both legs at `?detslots=1`; re-run the capacity
+sweep under it, predicting the 1.623-1.641 spread collapses to the repeat
+floor; and decide whether `validate-all.js` adopts the flag.
+
+**Item 2 cannot be run at the precision it needs, and item 3 answers itself.**
+The prediction was that pinning the handout collapses the spread. D1-a measured
+the force diverging at step 128 WITH the handout pinned, so the flag does not
+deliver the floor the prediction is stated against -- a sweep run now would be
+measuring the residual, not the capacity, and would read exactly like the
+result it is supposed to refute.
+
+So: **`validate-all.js` does NOT adopt `?detslots=1`.** It costs +10-20% on
+every cylinder case (measured, D1-a) and buys a pin that is not a pin. Revisit
+when the force source is closed, at which point item 2 becomes runnable and is
+worth running.
+
+The retraction ("pool capacity is inert; the cylinder page's allocator races")
+therefore stands on the CARD page's evidence alone, as it did before. That is
+where it was established and it has not weakened; it is only the cylinder-page
+confirmation that is still owed.
+
+---
+
+### U7-6 — staged, because it is not one rung
+
+The rung as written is "delete the dense path", and its own text is honest that
+the deletion is small only because U7-0..U7-3 made each thing named once. But
+the deletion cannot happen until every CONSUMER of the dense L0 is ported, and
+the survey says that is the larger half:
+
+```
+  f_a / f_b references     37 / 30 / 17 / 14 / 30  across the five AMR pages
+  velBuf references        16 / 14 /  8 /  9 / 12
+  ROOT_POOL/ROOT_MANAGED   31 / 21 / 14 / 14 / 21  guards to collapse
+```
+
+and the renderer still reads the dense `velBuf` at binding 0 for level 0 --
+`makeRenderBindGroup` takes it as a parameter, and `amr_render.wgsl` walks
+`m = 1 .. N_POOL_LEVELS` with level 0 handled by separate flat-array
+accessors. U6 made levels 1..4 uniform and deliberately left the root alone.
+
+Sub-rungs, in dependency order. Every one of them is "port a consumer"; only
+the last deletes anything:
+
+```
+  U7-6b  the RENDERER's level 0 becomes a pool level, like 1..4 already are
+         -- DONE 2026-09-18
+  U7-6c  debugSnapshotSave/Load carry the root pool and drop the dense arrays
+  U7-6d  the remaining host consumers -- readConservedTotals,
+         readPoolUniformDeviation, the dense criterion read, the dense force
+  U7-6e  tools/lib/field-reconstruct.js and tools/lib/dense-to-amr.js, which
+         are inverses by construction and have a round-trip test already
+  U7-6f  THE DELETION: the shaders, the f_a/f_b/velBuf buffers and their bind
+         groups, `?rootpool=`, and the dense-only checkers retired in the same
+         commit as their subjects
+```
+
+**The ordering is not arbitrary and the last one is last for a reason.** While
+`?rootpool=0` still exists, every sub-rung above can be A/B'd against the path
+it is replacing IN ONE BUILD. After U7-6f there is nothing to compare against
+-- which is the same argument that put D1 ahead of U7-6, and it applies with
+more force to the consumers than it did to the allocator.
+
+#### U7-6b — DONE (2026-09-18). The renderer's level 0, and the gate row that never existed.
+
+`amr_render.wgsl` binding 0 is still "level 0's velocity"; what it CONTAINS is
+now chosen by a `ROOT_IS_POOL` override -- the dense L0 grid addressed by
+`cellIndex`'s block8 layout, or the ROOT POOL addressed by a new
+`rootCellIndex` through binding 12's indirection.
+
+**LEVEL 0 DID NOT JOIN `poolVel`'s LADDER, and that was the one real trap.**
+`ghostDepthAtLevel(0)` is 0 -- a ring holds a parent interface and the root has
+no parent -- so the root tile is `2*RB` cells square where every other level's
+is `2*RB + 2*GHOST`, with no GHOST offset on the local coordinate. Writing it
+as `poolVel(0, ...)` would have applied level>=1's geometry to it silently.
+The root is also always FULL, which is why level 0 stays the BASE CASE of the
+walk (`coarseOmegaCell`) rather than becoming one more iteration of it.
+
+`renBGL` gained one binding, in ONE place, because U7-0 made the layouts
+shared. Five pages needed one constant each.
+
+##### The gate: one build, two addressings, same picture
+
+Both representations hold the same field while `?rootpool=1` keeps the dense
+grid stepped, so `?rootIsPool=0|1` points the renderer at one state through
+each addressing IN ONE BUILD. It moves the BUFFER and the arithmetic together
+(`renderRootIsPool` is the single statement of that rule; switching one without
+the other draws garbage, not the other representation).
+
+```
+  index-amr.html         874a14e804705e8e   IDENTICAL on both legs,
+                                            and identical to the pre-U7-6b build
+```
+
+That card-page hash is the trustworthy one: the page is deterministic, and it
+has read `874a14e804705e8e` in every run of this rung, before and after.
+
+**THE CYLINDER PAGE'S BASELINE HASH IS NOT A CROSS-RUN COMPARATOR, and this
+rung nearly drew a wrong conclusion from treating it as one.** It read
+`ff93b070db8ddc9d` before the change, `cdbcb1e9d5efb375` after -- stable across
+three consecutive runs, which looked like a real move. It is the attractor:
+both values recur on both legs, and three runs is three draws from the dominant
+one. D1-a measured that residue directly; the mistake here was forgetting it
+applied to pictures too. Score this page's render against the CARD page's
+invariance, or against a same-build A/B, never against a hash from another run.
+
+##### The level-0 row, and the instrument bug it immediately found
+
+`tools/lib/render-levels.js` walked `m = 1 .. nLevels-1` and had never scored
+level 0 -- it could not, before this rung. It does now, and the first thing it
+reported was FAIL on BOTH legs:
+
+```
+  level 0  FAIL  picture UNCHANGED after overwriting 102400 cells
+```
+
+102400 = 256 blocks x 400, and 400 is `(2*RB + 2*GHOST)^2` -- level>=1's
+geometry. The ringless root slot holds 256. `debugPerturbLevelVel` reached for
+the page's module-level `NCELLS1`, so it wrote 400 cells per root block into a
+buffer holding 256, and **an oversized `writeBuffer` is a validation error that
+discards the write** -- so the picture did not change and the gate read "this
+level has no path into the renderer". A correct-looking red cell, from the
+instrument, about a path that was fine.
+
+Fixed by giving each pool its own `cellsPerSlot` and having the perturb read
+it. That is the same shape as this rung's own trap, one layer up: the root's
+geometry is not level 1's, and anything that assumes otherwise is wrong exactly
+at the root.
+
+*Gate, all green:*
+```
+  index-amr.html            L1 PASS  L2 PASS  L3 PASS  L0 PASS
+  index-cylinder-amr.html   L1 PASS  L2 PASS           L0 PASS
+  ?rootIsPool=0 control     L0 FAIL on both  <- REQUIRED. The renderer reads
+                            the dense grid there, so perturbing the root pool
+                            must NOT reach the picture. Without this row the
+                            L0 PASS above is consistent with the flag doing
+                            nothing.
+```
+plus `make check`, `make test` (8 suites), and the full `validate-all.js`
+sweep: every boot, refusal, invariant, render and analytic config PASS, with
+only `dense-reference` and `amr-N2-diffuse` red for the diffuse-band reason.
+
+##### One thing this rung uncovered and did NOT fix
+
+Running level 0 FIRST produced one PASS and three `ABSTAIN  restore did not
+return to baseline`. The restore is `debugSnapshotLoad`, and it carries each
+POOL level's velocity but not the ROOT pool's -- so a level-0 perturbation
+survives it and poisons every later row. **The ABSTAIN was correct and the gate
+was right to refuse to score**, which is the behaviour that makes it worth
+having. Level 0 now runs LAST so the rows stay independent; U7-6c is where the
+snapshot gains the root pool, and that ordering comment goes with it.
+
+#### D1-b — the original statement, for reference
 
 Only reachable under `?rootpool=0`, which after U7-5 exists solely as the A/B
 escape -- and an unpinned control is not a control. Four pipelines and their
@@ -3646,7 +3836,7 @@ once.
 
 *Gate:* `detslots=1` IDENTICAL over 4 runs under `?rootpool=0` as well.
 
-#### D1-c — the measurement D1 exists for
+#### D1-c — the original statement, for reference
 
 1. Cd/St on both legs at `?detslots=1`, with repeats. These become the
    comparable numbers.

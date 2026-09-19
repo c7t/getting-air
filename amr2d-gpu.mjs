@@ -207,6 +207,14 @@ export function allocLevelPool(device, U, m, NBX_m, NBY_m, maxFineBlocks, NCELLS
     level: m,
     NBX: NBX_m, NBY: NBY_m, NBLOCKS: NBLOCKS_m,
     MAX_FINE_BLOCKS: maxFineBlocks,
+    // THIS LEVEL'S OWN cells-per-slot, and it is NOT the same at every level.
+    // The root tile has no ghost ring (amr2d.mjs's ghostDepthAtLevel(0) is 0),
+    // so it is (2*RB)^2 where every other level's is (2*RB + 2*GHOST)^2. A
+    // caller that reaches for the page's module-level NCELLS1 is right for
+    // levels >= 1 and wrong for the root -- which is exactly what
+    // debugPerturbLevelVel did, writing 400 cells per root block into a buffer
+    // holding 256 and having the whole oversized write discarded (U7-6b).
+    cellsPerSlot: NCELLS1,
     fSizePool: fSizePool_m,
     finePoolF_a: device.createBuffer({ size: fSizePool_m, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC }),
     finePoolF_b: device.createBuffer({ size: fSizePool_m, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC }),
@@ -1507,7 +1515,11 @@ export function makeAMRLayouts(device) {
     { binding: 8, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
     { binding: 9, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
     { binding: 10, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
-    { binding: 11, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } }
+    { binding: 11, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
+    // U7-6b: the ROOT pool's indirection, so level 0 can be drawn from the
+    // pool rather than the dense grid. Read only when the render pipeline's
+    // ROOT_IS_POOL override is set; see renderRootIsPool.
+    { binding: 12, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } }
   ]});
 
   // Milestone 4: interp (coarse->fine ghosts), fine step, average (fine->coarse),
@@ -1701,9 +1713,42 @@ const RENDER_LEVEL_BINDINGS = { 1: [2, 3], 2: [5, 6], 3: [8, 9], 4: [10, 11] };
 // (Dawn clamps to element 0, other stacks need not), and a positive slot there
 // would falsely activate a level. That hazard is exactly what the old
 // `HAS_LEVEL2` override existed to gate, and the loop bound now carries it.
-export function makeRenderBindGroup(device, layout, pools, { velBuf, cardStateBuf, overlayOpacityBuf, outlineOpacityBuf }) {
+// U7-6b: IS LEVEL 0 DRAWN FROM THE ROOT POOL? One rule, stated once, because
+// TWO SITES MUST AGREE ABOUT IT AND THEY ARE BUILT AT DIFFERENT TIMES -- the
+// render PIPELINE takes it as the ROOT_IS_POOL override (constructed early,
+// with the other constants) and the BIND GROUP picks binding 0's buffer from
+// it (constructed later, once the pools exist). Binding 0 carries a dense L0
+// grid or a root pool depending on this, and the two addressings are not
+// interchangeable: disagreement is not a validation error, it is a picture
+// drawn from the wrong index arithmetic.
+//
+// Derived from the pools rather than from the page's `ROOT_POOL` flag, so the
+// authority is the thing that actually got allocated.
+//
+// `?rootIsPool=0|1` OVERRIDES IT, AND THAT IS THIS RUNG'S INSTRUMENT. With a
+// root pool allocated, the dense L0 grid and the root pool hold the SAME field
+// -- U5-3 keeps them byte-identical, which is the whole reason the dense grid
+// is still stepped. So the two addressings can be pointed at one state in ONE
+// BUILD and required to draw the SAME PICTURE. That is a far better gate for
+// U7-6b than comparing a hash across commits, where the page's own
+// run-to-run residue is the same size as the thing being measured.
+//
+// It moves the BUFFER as well as the arithmetic, because switching only one of
+// them draws garbage rather than the other representation.
+export function renderRootIsPool(pools, override = null) {
+  if (override !== null) return override ? 1 : 0;
+  return pools[0] ? 1 : 0;
+}
+
+export function makeRenderBindGroup(device, layout, pools, { velBuf, cardStateBuf, overlayOpacityBuf, outlineOpacityBuf, rootIsPool }) {
+  // THE CALLER PASSES THE SAME VALUE IT GAVE THE PIPELINE. Defaulting it here
+  // instead would put the rule in two places and let them disagree, which is
+  // the one failure this whole arrangement exists to prevent.
+  if (rootIsPool === undefined) throw new Error('makeRenderBindGroup: pass rootIsPool (see renderRootIsPool) -- binding 0 and the ROOT_IS_POOL override must agree');
+  const root = rootIsPool ? pools[0] : null;
+  if (rootIsPool && !root) throw new Error('makeRenderBindGroup: rootIsPool=1 but no root pool is allocated');
   const entries = [
-    { binding: 0, resource: { buffer: velBuf } },
+    { binding: 0, resource: { buffer: root ? root.finePoolVel : velBuf } },
     { binding: 1, resource: { buffer: cardStateBuf } },
     { binding: 4, resource: { buffer: overlayOpacityBuf } },
     { binding: 7, resource: { buffer: outlineOpacityBuf } },
@@ -1714,6 +1759,13 @@ export function makeRenderBindGroup(device, layout, pools, { velBuf, cardStateBu
     entries.push({ binding: velBinding, resource: { buffer: pool.finePoolVel } });
     entries.push({ binding: slotBinding, resource: { buffer: pool.blockSlotBuf } });
   }
+  // Level 1's indirection stands in when there is no root pool, for the same
+  // reason the unused deeper levels get level 1's: ROOT_IS_POOL is what stops
+  // it being read, and an out-of-range read is not safe on every stack.
+  entries.push({ binding: 12, resource: { buffer: (root || pools[1]).blockSlotBuf } });
+  // velBuf is still REQUIRED when rootIsPool is 0 -- the dense grid is the
+  // only L0 velocity there is on that path.
+  if (!root && !velBuf) throw new Error('makeRenderBindGroup: rootIsPool=0 needs velBuf');
   return device.createBindGroup({ layout, entries });
 }
 

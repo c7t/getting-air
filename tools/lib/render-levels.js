@@ -65,9 +65,15 @@ async function runRenderLevels({ Page, Runtime, global, steps = 4096, log = () =
   await evalOrThrow(Runtime, `${global}.debugStepSync(${steps})`, 600000);
   await evalOrThrow(Runtime, `${global}.setLive(false)`);
 
+  // FROM LEVEL 0, since U7-6b. The root is a pool level and the renderer draws
+  // it through the same indirection as every other level, so it is scoreable
+  // the same way -- and it never was before, which is why this gate could not
+  // have caught an L0 render defect at all. The root pool is always FULL, so
+  // its count is every block rather than a refinement result.
   const active = {};
-  for (let m = 1; m < nLevels; m++) {
-    active[m] = await evalOrThrow(Runtime, `${global}.debugListActiveBlocks(${m}).then(a => a.length)`, 120000);
+  for (let m = 0; m < nLevels; m++) {
+    active[m] = await evalOrThrow(Runtime,
+      `(async () => { try { return (await ${global}.debugListActiveBlocks(${m})).length; } catch (e) { return -1; } })()`, 120000);
   }
   log(`[setup] active tiles by level: ${Object.entries(active).map(([m, n]) => `L${m}=${n}`).join(' ')}`);
 
@@ -88,7 +94,27 @@ async function runRenderLevels({ Page, Runtime, global, steps = 4096, log = () =
   log(`[setup] baseline reproducible: ${base1.hash} (${base1.bytes} B)`);
 
   // ── 2. one level at a time ─────────────────────────────────────────────────
-  for (let m = 1; m < nLevels; m++) {
+  //
+  // LEVEL 0 GOES LAST, and the reason is a real gap rather than tidiness.
+  // Every row restores the snapshot before perturbing, and that restore is
+  // what lets the rows be independent. `debugSnapshotLoad` carries each pool
+  // level's velocity -- but NOT the root pool's, which is still reconstructed
+  // from the dense grid (plans/uniform-levels.md U7-6c is where that changes).
+  // So a level-0 perturbation survives the restore and poisons every row after
+  // it, which is exactly what this gate reported when level 0 ran first: one
+  // PASS followed by three ABSTAINs reading "the reference is moving".
+  //
+  // The ABSTAIN was right and is worth keeping in view -- when U7-6c puts the
+  // root pool in the snapshot, this ordering stops mattering and the comment
+  // can go with it.
+  const order = [];
+  for (let m = 1; m < nLevels; m++) order.push(m);
+  order.push(0);
+  for (const m of order) {
+    if (active[m] === -1) {
+      rows.push({ level: m, verdict: 'ABSTAIN', note: 'no pool at this level on this page/configuration' });
+      continue;
+    }
     if (active[m] === 0) {
       rows.push({ level: m, verdict: 'ABSTAIN', note: 'no active tiles at this level -- nothing to draw, so nothing to prove' });
       continue;

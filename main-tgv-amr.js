@@ -62,7 +62,7 @@ import { reportFatal, refuseConfig, reportNoWebGPU, reportNoAdapter } from './er
 import { tauChainSingularity, tauSingularityMessage } from './amr2d.mjs';
 import { loadShader } from './shader-loader.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
-import { check21BalanceOnGPU, readConservedTotals, allocLevelPool, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState , checkRefinementClosureOnGPU , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU, makeRenderBindGroup, renderPoolLevels, MAX_RENDER_POOL_LEVELS, makeAMRLayouts, makeCouplingPipelines, makeLevelBindGroups, makeManageBindGroups, makeScheduler, makeRefineRound, readRootFlags, allocRootPool, makeRootPool } from './amr2d-gpu.mjs';
+import { check21BalanceOnGPU, readConservedTotals, allocLevelPool, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState , checkRefinementClosureOnGPU , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU, makeRenderBindGroup, renderRootIsPool, renderPoolLevels, MAX_RENDER_POOL_LEVELS, makeAMRLayouts, makeCouplingPipelines, makeLevelBindGroups, makeManageBindGroups, makeScheduler, makeRefineRound, readRootFlags, allocRootPool, makeRootPool } from './amr2d-gpu.mjs';
 // tauAtLevel: extracted to card-params.mjs by B3a-1, which landed the CALL
 // in all five AMR pages and this IMPORT in only main-amr.js. The other four
 // threw `ReferenceError: tauAtLevelOf is not defined` at init -- but only at
@@ -113,6 +113,17 @@ const DC_PRE = urlParams.has('dcpre') ? (parseInt(urlParams.get('dcpre')) || 0) 
 const rootFlags = readRootFlags(urlParams, { staging: false });
 const ROOT_POOL = rootFlags.pool;
 const ROOT_MANAGED = rootFlags.managed;
+
+// ?rootIsPool=0|1 -- draw level 0 from the DENSE grid or the ROOT POOL
+// (plans/uniform-levels.md U7-6b). Default: the root pool when one exists.
+// Both representations hold the same field while `?rootpool=1` keeps the dense
+// grid stepped, so this is a ONE-BUILD A/B of the two addressings: the picture
+// must be IDENTICAL either way, and `tools/validate-all.js
+// --configs=render-levels-* --extra=rootIsPool=0` is what checks it.
+const RENDER_ROOT_IS_POOL = urlParams.has('rootIsPool')
+  ? (parseInt(urlParams.get('rootIsPool')) ? 1 : 0)
+  : null;
+
 
 // ── ?ghostcopy=1 -- legacy materialized same-level ghost cells ───────────────
 // Default 0: the fine step resolves a source cell that falls outside its tile
@@ -568,7 +579,9 @@ async function init() {
       // U6: THIS PAGE NEVER PASSED A LEVEL OVERRIDE AT ALL, so the shader's
       // HAS_LEVEL2 default of 0 meant level 2 was solved, stepped, force-reduced
       // -- and never drawn. Three of the five AMR pages were in that state.
-      constants: { ...fineConstants, N_POOL_LEVELS: renderPoolLevels(N_LEVELS) } },
+      // U7-6b: ROOT_IS_POOL must match what makeRenderBindGroup put on binding
+      // 0 -- see renderRootIsPool, which is the single statement of that rule.
+      constants: { ...fineConstants, N_POOL_LEVELS: renderPoolLevels(N_LEVELS), ROOT_IS_POOL: renderRootIsPool(pools, RENDER_ROOT_IS_POOL) } },
     primitive: { topology: 'triangle-list' },
   });
   // plans/2D-backport.md B2: the 2:1 closure's own pipelines. Built but
@@ -660,7 +673,8 @@ async function init() {
   // built this inline and three of which never passed the level-2 override at
   // all -- see makeRenderBindGroup.
   const renBG = makeRenderBindGroup(device, renBGL, pools,
-    { velBuf, cardStateBuf, overlayOpacityBuf, outlineOpacityBuf });
+    { velBuf, cardStateBuf, overlayOpacityBuf, outlineOpacityBuf,
+      rootIsPool: renderRootIsPool(pools, RENDER_ROOT_IS_POOL) });
   const interpBG_readA = device.createBindGroup({ layout: interpBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_a } }, { binding: 2, resource: { buffer: pools[1].finePoolF_a } }, { binding: 3, resource: { buffer: pools[1].slotToBlockBuf } }, { binding: 4, resource: { buffer: pools[1].newlyActivatedBuf } }, { binding: 5, resource: { buffer: pools[1].blockSlotBuf } }]});
   const interpBG_readB = device.createBindGroup({ layout: interpBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_b } }, { binding: 2, resource: { buffer: pools[1].finePoolF_a } }, { binding: 3, resource: { buffer: pools[1].slotToBlockBuf } }, { binding: 4, resource: { buffer: pools[1].newlyActivatedBuf } }, { binding: 5, resource: { buffer: pools[1].blockSlotBuf } }]});
   const interpFFBG_b = device.createBindGroup({ layout: interpBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_a } }, { binding: 2, resource: { buffer: pools[1].finePoolF_b } }, { binding: 3, resource: { buffer: pools[1].slotToBlockBuf } }, { binding: 4, resource: { buffer: pools[1].newlyActivatedBuf } }, { binding: 5, resource: { buffer: pools[1].blockSlotBuf } }]});

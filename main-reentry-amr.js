@@ -39,7 +39,7 @@ import { tauChainSingularity, tauSingularityMessage } from './amr2d.mjs';
 import { createTotalUnwrapper } from './card-total.mjs';
 import { loadShader } from './shader-loader.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
-import { check21BalanceOnGPU, allocLevelPool, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState, checkGeometryCoverageOnGPU, makeRefusalWatch , checkRefinementClosureOnGPU , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU, makeRenderBindGroup, renderPoolLevels, MAX_RENDER_POOL_LEVELS, makeAMRLayouts, makeCouplingPipelines, makeLevelBindGroups, makeManageBindGroups, makeScheduler, makeRefineRound, readRootFlags, allocRootPool, makeRootPool } from './amr2d-gpu.mjs';
+import { check21BalanceOnGPU, allocLevelPool, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState, checkGeometryCoverageOnGPU, makeRefusalWatch , checkRefinementClosureOnGPU , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU, makeRenderBindGroup, renderRootIsPool, renderPoolLevels, MAX_RENDER_POOL_LEVELS, makeAMRLayouts, makeCouplingPipelines, makeLevelBindGroups, makeManageBindGroups, makeScheduler, makeRefineRound, readRootFlags, allocRootPool, makeRootPool } from './amr2d-gpu.mjs';
 // tauAtLevel: extracted to card-params.mjs by B3a-1, which landed the CALL
 // in all five AMR pages and this IMPORT in only main-amr.js. The other four
 // threw `ReferenceError: tauAtLevelOf is not defined` at init -- but only at
@@ -84,6 +84,17 @@ const K_EPS = urlParams.has('kEps') ? parseFloat(urlParams.get('kEps')) : 1.5;
 const rootFlags = readRootFlags(urlParams, { staging: false });
 const ROOT_POOL = rootFlags.pool;
 const ROOT_MANAGED = rootFlags.managed;
+
+// ?rootIsPool=0|1 -- draw level 0 from the DENSE grid or the ROOT POOL
+// (plans/uniform-levels.md U7-6b). Default: the root pool when one exists.
+// Both representations hold the same field while `?rootpool=1` keeps the dense
+// grid stepped, so this is a ONE-BUILD A/B of the two addressings: the picture
+// must be IDENTICAL either way, and `tools/validate-all.js
+// --configs=render-levels-* --extra=rootIsPool=0` is what checks it.
+const RENDER_ROOT_IS_POOL = urlParams.has('rootIsPool')
+  ? (parseInt(urlParams.get('rootIsPool')) ? 1 : 0)
+  : null;
+
 if (!(K_EPS > 0)) throw new Error(`?kEps=${urlParams.get('kEps')} must be > 0`);
 // ?f16=1 / ?f16=2: real packed-half storage for `f` -- see shaders/common_fpack.wgsl
 // and f-pack.mjs. Wired on EVERY page that consumes those shaders, including
@@ -835,7 +846,9 @@ async function init() {
   // U6: how many pool levels the renderer walks. renderPoolLevels() REFUSES a
   // configuration deeper than the shader binds, rather than drawing it without
   // its finest level -- which is what this override replaced HAS_LEVEL2 for.
-  const renderConstants = { W, H, RB, N_POOL_LEVELS: renderPoolLevels(N_LEVELS), K_EPS };
+  // U7-6b: ROOT_IS_POOL must match what makeRenderBindGroup put on binding 0 --
+// see renderRootIsPool, which is the single statement of that rule.
+  const renderConstants = { W, H, RB, N_POOL_LEVELS: renderPoolLevels(N_LEVELS), K_EPS, ROOT_IS_POOL: renderRootIsPool(pools, RENDER_ROOT_IS_POOL) };
   const step1Constants = { W, H, RB, F16, DIRECT_GHOST: GHOST_COPY ? 0 : 1 };
   const manageConstants = { DIAG, W, H, REFINE_THRESH, COARSEN_THRESH, FORCE_REFINE_MARGIN, FORCE_REFINE_LOOKAHEAD, SPONGE_EXCLUDE_W, BOX_REFINE };
 
@@ -1005,7 +1018,8 @@ async function init() {
   // built this inline and three of which never passed the level-2 override at
   // all -- see makeRenderBindGroup.
   const renBG = makeRenderBindGroup(device, renBGL, pools,
-    { velBuf, cardStateBuf, overlayOpacityBuf, outlineOpacityBuf });
+    { velBuf, cardStateBuf, overlayOpacityBuf, outlineOpacityBuf,
+      rootIsPool: renderRootIsPool(pools, RENDER_ROOT_IS_POOL) });
   // Milestone 4 bind groups (pool-aware, superseding M2's single-region ones).
   // interp always WRITES pools[1].finePoolF_a (the pool's current-at-macro-step-
   // boundary buffer, mirroring f_a's own invariant -- 2 fine substeps per
