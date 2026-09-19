@@ -3441,11 +3441,10 @@ What differs is the same shape every time, and it is NOT the field first:
 A uniform one-quad shift in the handout means the free list was one quad
 different at some grant round. `DET_SLOTS` makes `refine()` and `coarsen()`
 single-threaded in dispatch order with no atomics in the decision, so the
-handout cannot reorder itself -- which leaves the WANT SET differing by one
-tile at some round. The 2:1-closure cascade is the candidate worth opening
-first: it propagates to a fixed point in a bounded iteration count
-(`?refineIters=`), and a propagation that is not run to convergence can depend
-on intra-pass ordering. That is a hypothesis, not a measurement.
+handout cannot reorder itself -- which suggested the WANT SET differed by one
+tile at some round, with the 2:1-closure cascade as the first candidate.
+**MEASURED, AND THAT GUESS WAS WRONG** -- see "One more shot at the residual"
+below: the want set never diverges, and the force does, from step 128.
 
 **THIS IS THE OUTCOME THE RUNG SAID WOULD BE THE MOST VALUABLE THING D1 COULD
 FIND, AND IT SHOULD NOT BE PAPERED OVER.** Note what it does NOT say: D0's
@@ -3480,6 +3479,59 @@ runnable yet at the precision it needs. `?detslots=1` cuts the variation from
 four-distinct-in-four to one-in-six, which is a large improvement and not a
 pin, and the 1.623-1.641 spread it was meant to collapse is the same order as
 what remains. Finding the want-set source comes first.
+
+##### One more shot at the residual: the want set is exonerated, the FORCE is not
+
+Bisected with a small-payload probe rather than 20 MB snapshots -- per level,
+every 128 steps, 8 runs of `?levels=3&detslots=1` from the now-fixed-point
+reset: the active block list (sorted -> the want SET) and the card state.
+
+```
+  WANT SET   (which blocks are refined)   never diverges, 8 runs x 32 checkpoints
+  CARD STATE (the force accumulators)     diverges at step 128, 2 attractors, 3/5
+```
+
+**So the criterion and the 2:1 cascade are exonerated**, which also matches
+reading them: `completeQuads` writes the same four entries any wanting sibling
+would write, and `balance` writes `1u` into a parent -- both idempotent, so
+neither has a race that can change an OUTCOME however the threads interleave.
+The earlier guess in D1-a that the want set differs upstream was wrong.
+
+What is left is the force path, and it diverges EARLY and OFTEN -- step 128,
+not step 4000, and 3/5 rather than 1/6. `amr_force1.wgsl` atomicAdds one
+TRUNCATED i32 per WORKGROUP, and CLAUDE.md already records that regrouping the
+slots regroups those partials. The open question this leaves is the sharp one:
+with `DET_SLOTS` pinning the handout, what regroups them? Either the handout is
+not as pinned as the serial loop implies, or the per-workgroup reduction itself
+is not deterministic.
+
+**THE SNAPSHOT SAYS THE HANDOUT STILL PERMUTES**: the diverging pair differed
+in `pools[1].blockSlot` / `slotToBlock` / `parentSlot` by exactly 4 -- one quad
+-- on the same block set. That is the thread to pull next.
+
+*Two limits on the above, stated because the probe nearly hid both:*
+
+- **The probe's "handout" channel was a duplicate, not a measurement.**
+  `debugListActiveBlocks` returns block IDs already sorted, so hashing it
+  unsorted gives the same string as sorting it, and it CANNOT see a
+  permutation. It printed "never diverges" and that verdict is worth nothing.
+  A real handout channel has to read `blockSlot` itself.
+- **The first version of this probe had a vacuous card channel** --
+  `debugReadCardState` returns an object, `Array.from` of it is `[]`, and the
+  hash was constant. It reported "never diverges" over 8 runs at both 2048 and
+  4096 steps, which read as a clean negative and was nothing at all. The
+  liveness control (distinct values ACROSS checkpoints within one run) now
+  prints next to every verdict, and it is what caught it.
+
+**And this is where determinism work stops for now.** The point of it was to
+make AMR comparable against the flat baseline; the flat baseline has no pool,
+no slots and no per-workgroup partials, which is exactly why `dense-reference`
+is bit-exact and why it is the thing AMR has to be scored against. But the
+flat baseline is itself only as good as its agreement with the literature, and
+it currently MISSES at Re=100 (Cd 1.951 against 1.35+/-0.15, St 0.1260 against
+0.165+/-0.015) for the diffuse-band reason. Closing a +/-0.009 attractor spread
+underneath a baseline that is 45% off its own reference buys little. The band
+width is the higher-value target.
 
 ##### The re-baseline, and the sweep that says nothing else moved
 
