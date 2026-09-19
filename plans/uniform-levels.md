@@ -28,7 +28,7 @@ it runs on.
 | U4 | criterion, force, digest, conserved totals | **DONE** — all four consumers on the root. Exact on the criterion, digest max and conserved totals; the force to the truncation floor | `tools/validate-root-kernels.js`, 8 rungs + 2 controls |
 | U5 | L1 becomes a quad child of the root | **U5-0…U5-4 DONE under `?rootpool=1`** — both hops of the coupling and the manager. Level 1 is quad-allocated and quad-managed; tiles +28-32%; new fingerprints, default unmoved. `amr_manage.wgsl` cannot retire until the other four AMR pages get a root pool, and Cd/St is unmeasurable until then | `validate-root-kernels.js` (11 rungs, 4 controls); `validate-all.js` invariants ± starved pool; `measure-determinism.js` |
 | U6 | The renderer walks levels | **DONE** — and it found that three of the five pages never drew level 2 either. Level 1 bit-identical to before; gate green on two pages and in the default sweep | `tools/validate-render-levels.js`, `tools/lib/render-levels.js` |
-| U7 | One implementation across the five pages, then delete the dense path | **U7-0…U7-4 DONE** (layouts, coupling pipelines, per-level bind groups, both orderings, and now the root pool itself shared — net −1559 lines through U7-3, every gate unmoved; U7-4 puts a root pool on all five pages behind `?rootpool=1` and MEASURES U5-4's Cd/St, which U5 could not); **U7-6a DONE** — the snapshot format now carries level 1's quad indirection AND the free list, which it never did; U7-5…U7-6 remain. **Split into U7-0…U7-6** — U1–U5 all landed on `main-amr.js` alone, so the remaining work is propagation before deletion. Measured: all 14 bind group layouts are byte-identical across five pages, and `S_Advance` is byte-identical across the other four | each rung byte-identical on the default path (`measure-determinism.js`), except U7-5 which is the one that moves numbers |
+| U7 | One implementation across the five pages, then delete the dense path | **U7-0…U7-4 DONE** (layouts, coupling pipelines, per-level bind groups, both orderings, and now the root pool itself shared — net −1559 lines through U7-3, every gate unmoved; U7-4 puts a root pool on all five pages behind `?rootpool=1` and MEASURES U5-4's Cd/St, which U5 could not); **U7-5, U7-5a and U7-6a DONE** — `?rootpool=1` is the DEFAULT, pool demand re-measured at quad granularity, and the snapshot format now carries level 1's quad indirection AND the free list. The flip moved published Cd by +0.010 at N=3 and not at all at N=2; what DID move numbers is pool CAPACITY, which turns out not to be inert. U7-6 (delete the dense path) remains. **Split into U7-0…U7-6** — U1–U5 all landed on `main-amr.js` alone, so the remaining work is propagation before deletion. Measured: all 14 bind group layouts are byte-identical across five pages, and `S_Advance` is byte-identical across the other four | each rung byte-identical on the default path (`measure-determinism.js`), except U7-5 which is the one that moves numbers |
 
 **Where the risk actually sits.** U0–U2 went in clean and each found something
 (a half-cell convention, an f16 stride, a window-convention split between L0 and
@@ -86,7 +86,9 @@ at the end.
     U6        the renderer walks levels -- ride it on U7-2
     U7-4      the root pool everywhere (4a: share the solver half; 4b: call it)
     U7-6a     the snapshot format -- a PREREQUISITE for the flip, DONE
-    U7-5..6   flip the default, delete the dense path
+    U7-5a     pool demand at quad granularity, DONE
+    U7-5      flip the default, DONE
+    U7-6      delete the dense path
     --   the sponge seam INVARIANT (gate only)
     B6   explode/coalesce
     --   sponge refinement policy, then section 8's ladders
@@ -2973,41 +2975,117 @@ like for like. A level sitting at its cap is reported as a CLIP rather than a
 demand and exits nonzero -- a clipped peak is the one number this measurement
 must not hand on.
 
-#### U7-5 — flip the default
+#### U7-5 — DONE (2026-09-18). The default is flipped.
 
-`?rootpool=1` becomes the default; `?rootcouple` and `?rootmanage` collapse
-into it or go. **This is where the published numbers move for real, and it is
-the first point at which they CAN be measured** -- U5-4 moved them on the dev
-page only, where no literature value lives.
+`readRootFlags` defaults `rootpool` to 1. The root is a pool level, level 1 is
+its quad child, `amr_manage.wgsl` is not dispatched. `?rootpool=0` survives as
+the ESCAPE and goes with the dense path at U7-6. Both `POOL_PEAKS` tables
+adopted in the same commit, because a peak table belongs to the allocator it
+describes.
 
-*Gate:* the full `validate-all.js` sweep, re-baselined against measured numbers
-and not against a memory of them, with **same-build repeats on both sides** for
-every AMR config (CLAUDE.md's reproducibility note is the calibration, and
-`?detslots=1` now makes the repeat exact rather than statistical). The analytic
-configs must be bit-identical. The invariant sweep and its starved-pool control
-must still discriminate five-of-seven.
+**THE STAGING FLAGS DID NOT COLLAPSE, AND THE GATES ARE WHY.** This rung was
+written as "`?rootcouple` and `?rootmanage` collapse into it or go". Measured
+against what reads them, that is wrong for two of the three: ALL FOUR of
+`validate-root-kernels.js`'s CONTROL rows are `?rootstep=0` / `?rootcouple=0`,
+and those controls are what make its eleven gated rows mean anything. Deleting
+an instrument to satisfy a plan line is how this project collected vacuous
+gates. They go at U7-6 with the dense path they compare against. `rootmanage`
+has no tool reading it and could have gone; it stays because U7-5a made its
+question live -- it is the only handle on whether the quad convention is the
+better one.
 
-Remember the default sweep is **not** all-green on `main` today
-(`dense-reference` and `amr-N2-diffuse` fail at Re=100, the diffuse-band-width
-issue), and that this branch's own `amr-N2-diffuse` baseline is **Cd 1.631 /
-St 0.1466**, not CLAUDE.md's 1.642 -- D0 moved slot assignment. Re-baseline
-against a pristine reading of the branch, not against the file.
+#### The published numbers barely moved, which is the opposite of the prediction
 
-**AND THE DETERMINISM FINGERPRINTS ARE U7-6a's, NOT U7-3's.** The default path
-now reads `b2b4d310a03ab626` / `d799e95d23ea47f0`; `7ac54e170f903ac3` /
-`ce1bd4d8a3a1055c` appear throughout the stages above and are the PRE-U7-6a
-subject. The solver did not move -- the snapshot the fingerprint hashes gained
-the free list. Under `?rootpool=1` the same applies to U5-4's
-`f71bce9d33945265` / `71560c03a3d34c21`.
+This rung was billed as "where the published numbers move for real". With each
+path properly sized they mostly do not. Same build, same `POOL_PEAKS`,
+same-build repeats on both sides:
 
-**U7-5a's peak tables are the other input, and the flip must carry them** --
-the `POOL_PEAKS` literals it prints, on both pages, in the same commit as the
-default change. A peak table belongs to the allocator it describes.
+```
+                     run A            run B           floor
+  rootpool=1   N2    1.624 / 0.1450   1.623 / 0.1450  +/-0.001
+               N3    1.473 / 0.1570   1.473 / 0.1570  +/-0.002
+  rootpool=0   N2    1.623 / 0.1458   1.623 / 0.1458
+               N3    1.463 / 0.1565   1.463 / 0.1565
+```
 
-**U7-4b's Cd/St readings under `?rootpool=1` are the input to this rung and
-they are SINGLE readings**: `amr-N2-diffuse` Cd 1.607 / St 0.1446 and
-`amr-N3-diffuse` Cd 1.473 / St 0.1571. Same-build repeats on both sides are
-this rung's job, not that one's.
+`amr-N2-diffuse`'s Cd does not move at all (1.623 against 1.6235, inside its
+own floor). `amr-N3-diffuse` moves +0.010 against a +/-0.002 floor, which is
+real and is the whole measured Cd consequence of the flip. Every St shift is
+<= 0.0008.
+
+**BOTH SIDES ARE THE SAME BUILD, which is better than the protocol asked for.**
+The gate called for same-build repeats against a re-baselined sweep; after the
+flip `?rootpool=0` IS the old path, so the A/B needs no second checkout and a
+difference cannot be a build difference.
+
+#### POOL CAPACITY IS NOT INERT, and nothing recorded that before
+
+The finding that cost the most to get to, and the one to carry forward.
+
+U7-4b measured `?rootpool=1` at Cd 1.607 and the dense path at 1.631 -- a 0.024
+spread it reported as U5-4's Cd consequence. Those two readings were taken on
+the OLD `POOL_PEAKS`. On the adopted ones the same two configurations read
+1.624 and 1.623. So the pool table moved BOTH legs, including the dense one,
+whose allocator did not change at all:
+
+```
+                   rootpool=0   rootpool=1
+  old POOL_PEAKS   1.631        1.607
+  new POOL_PEAKS   1.623        1.624
+```
+
+**It is not starvation.** Measured directly at the depth `amr-N2-diffuse` runs,
+which U7-5a's sweep had skipped: level-1 demand at `levels=2` is 61 tiles on
+the dense path and 104 under quad, against a pool that went 164 -> 228. Neither
+path was ever close to binding, and nothing was refused.
+
+So the mechanism is slot REGROUPING: `MAX_FINE_BLOCKS` sets the free-list length
+and the dispatch depth, and CLAUDE.md's own note says regrouping slots regroups
+`amr_force1.wgsl`'s truncated per-workgroup partials. What is new is the SIZE
+of it. CLAUDE.md records that as a 4th-digit effect, "+/-0.001, a build-vs-build
+claim needs a same-build repeat"; here changing ONE capacity constant, with
+demand untouched, moved Cd by **0.008** -- eight times that.
+
+Two consequences, both worth acting on:
+
+- **A capacity constant chosen for headroom is a physics parameter.** Any
+  future `POOL_PEAKS` retune moves the published Cd, and nothing in the repo
+  said so. It is recorded at both pages' tables now.
+- **Cd readings are only comparable within one pool table.** The plan's earlier
+  figures (1.631, 1.607, 1.642 in CLAUDE.md) each belong to whatever table was
+  in force, and cross-table comparison is what made U7-4b's 0.024 look like an
+  allocator effect when most of it was not.
+
+OPEN: whether 0.008 is the true scale of regrouping or whether a second
+mechanism is involved. The clean experiment is a pool-size sweep at fixed
+allocator and fixed demand -- `?maxFineBlocks=` over a range well above demand,
+Cd each time. It needs no code change and it would put a number on this
+solver's sensitivity to a constant nobody thought was physical.
+
+#### One instrument caught a flip consequence, which is the argument for its assertion
+
+`validate-snapshot-roundtrip.js`'s `rootpool=0` rows relied on the flag
+DEFAULTING to 0, so after the flip both of its legs were the quad allocator and
+the suite would have gone green on four copies of one configuration. `open()`'s
+"assert the flags took" check turned that into an error instead. Both legs now
+name `?rootpool=` explicitly.
+
+*Gate, all green:*
+- `make check`, `make test` (8 suites).
+- Boot smoke on seven configs plus both render configs.
+- All four analytic AMR configs PASS.
+- `amr-dev-invariants` seven-of-seven; the starved-pool control still
+  discriminates **five-of-seven**, with `field` and `quadrants` abstaining.
+- `validate-snapshot-roundtrip.js` 12 of 12, both legs genuinely different
+  allocators, all four `stale` controls moving.
+- `measure-determinism.js` re-baselined on the new default:
+  `8ddd3ff2f84a697f` (levels=2) / `3d80fa737af6bf9e` (levels=3), IDENTICAL over
+  FOUR runs each. **Read at `--runs=4`, and that mattered**: at two runs the
+  `levels=3 detslots=0` baseline came back IDENTICAL, which would have left
+  every row in the tool reading IDENTICAL and the claim unfalsifiable. At four
+  it DIFFERS, so the instrument keeps its discrimination. That is the tool's
+  own header being right about itself.
+
 
 #### U7-6 — delete the dense path
 

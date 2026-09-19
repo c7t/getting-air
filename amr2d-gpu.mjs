@@ -1043,13 +1043,20 @@ export function makeCouplingPipelines(device, layouts, modules, { W, H, RB, F16,
 // REASON THIS IS SHARED: copied into five pages it would be five places to
 // update when a flag's meaning moves, and U7-5 moves all four of them at once.
 //
-// ?rootpool=1 -- allocate the ROOT as a pool level (U1).
+// ?rootpool=0 -- keep the DENSE L0 and the per-block level-1 allocator (U1,
+//   flipped to on by default at U7-5).
 //
-//   Default 0 and byte-identical when absent: with the flag off nothing is
-//   allocated at all, so this cannot cost the phone ~21 MB for a buffer no
-//   kernel reads. With it on the pool exists, carries the identity
-//   indirection, and every stage below decides how far the solver actually
-//   uses it.
+//   DEFAULT 1 SINCE U7-5. The root is a pool level like every other, level 1
+//   is its quad child, and `amr_manage.wgsl` is not dispatched at all. The
+//   flag survives the flip only as the ESCAPE -- `?rootpool=0` restores the
+//   dense path for an A/B -- and goes with that path at U7-6.
+//
+//   It was default 0 through U1..U7-4 for a reason worth keeping in view: with
+//   the flag off nothing was allocated at all, so an unused root pool could
+//   not cost the phone ~21 MB for a buffer no kernel read. That is no longer
+//   hypothetical relief, it is a measured cost -- U7-5a puts the flip at about
+//   +2 MB on the shipped configuration, because the pool sizes move with the
+//   demand and the demand rose at level 1 only.
 //
 // ?rootstep=0 -- allocate and mirror the root pool but do NOT step it (U3).
 //
@@ -1103,15 +1110,27 @@ export function makeCouplingPipelines(device, layouts, modules, { W, H, RB, F16,
 // the reset, the cascade and the dispatch, and a condition recomputed in four
 // places is how those drift.
 //
-// THE THREE STAGING FLAGS ARE SCHEDULED FOR DELETION. U7-5 collapses
-// `rootcouple` and `rootmanage` into the default and `rootpool` goes with the
-// dense path at U7-6; a page that never A/B's a staging rung has no reason to
-// read them off its URL. `readRootFlags(urlParams, { staging: false })` is
-// that page: `?rootpool=` still selects, and the other three are pinned on.
+// THE THREE STAGING FLAGS SURVIVED U7-5, AND THE GATES ARE WHY. The plan had
+// this rung "collapse `rootcouple` and `rootmanage` into the default or drop
+// them", and measured against what actually reads them that is wrong for two:
+// ALL FOUR of tools/validate-root-kernels.js's CONTROL rows are
+// `?rootstep=0` / `?rootcouple=0`, and those controls are what make its eleven
+// gated rows mean anything. Deleting an instrument to satisfy a plan line is
+// how this project collected vacuous gates; they go at U7-6, with the dense
+// path they compare against.
+//
+// `rootmanage` has no tool reading it and could have gone. It stays because
+// U7-5a made its question live: quad-vs-per-block level 1 is a CONVENTION
+// (see the flag note above), and `?rootmanage=0` is the only handle on
+// measuring whether the convention is the better one.
+//
+// `readRootFlags(urlParams, { staging: false })` is still the shipped pages'
+// call: `?rootpool=` selects, the other three are pinned on. A page that never
+// A/B's a staging rung has no reason to read them off its URL.
 export function readRootFlags(urlParams, { staging = true } = {}) {
   const flag = (name, dflt) =>
     urlParams.has(name) ? (parseInt(urlParams.get(name)) ? 1 : 0) : dflt;
-  const pool = flag('rootpool', 0);
+  const pool = flag('rootpool', 1);
   const step   = staging ? flag('rootstep', 1)   : 1;
   const couple = staging ? flag('rootcouple', 1) : 1;
   const manage = staging ? flag('rootmanage', 1) : 1;

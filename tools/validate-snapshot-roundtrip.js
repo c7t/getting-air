@@ -71,9 +71,15 @@ const REPO_ROOT = path.resolve(__dirname, '..');
 
 // `quad` is what level 1's allocator is under each configuration, and it is
 // the thing the cross-granularity control pairs rows on.
+// BOTH LEGS NAME THE FLAG EXPLICITLY, and that is not redundancy. These rows
+// leaned on `?rootpool=` defaulting to 0 until U7-5 flipped it, at which point
+// the "rootpool=0" legs were silently running the quad allocator and testing
+// the same thing twice. `open()`'s assertion caught it rather than the suite
+// going green on four copies of one configuration -- which is the whole reason
+// that assertion is there.
 const CONFIGS = [
-  { name: 'levels=2 rootpool=0', q: 'levels=2&detslots=1',            quad: false },
-  { name: 'levels=3 rootpool=0', q: 'levels=3&detslots=1',            quad: false },
+  { name: 'levels=2 rootpool=0', q: 'levels=2&detslots=1&rootpool=0', quad: false },
+  { name: 'levels=3 rootpool=0', q: 'levels=3&detslots=1&rootpool=0', quad: false },
   { name: 'levels=2 rootpool=1', q: 'levels=2&detslots=1&rootpool=1', quad: true  },
   { name: 'levels=3 rootpool=1', q: 'levels=3&detslots=1&rootpool=1', quad: true  },
 ];

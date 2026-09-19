@@ -217,24 +217,36 @@ if (N_LEVELS - 1 > MAX_RENDER_POOL_LEVELS) {
 //   levels=4   267  512  684                  324  468  632
 //   levels=5   268  564  660  872             356  564  784  1184
 //
-// THE CONSTANTS BELOW ARE NOT CHANGED, and that is deliberate. Every
-// rootpool=0 delta is inside the scatter just described, so adopting them
-// would be fitting noise and paying VRAM for it. What the quad allocator
-// actually costs is LEVEL 1 AND NOTHING ELSE -- the steady cylinder page
-// measures L1 +59% with L2 and L3 unchanged TO THE TILE, which is the
-// controlled version of this table (see main-cylinder-amr.js's own copy).
+// ADOPTED AT U7-5, max over both legs since `?rootpool=` stays selectable
+// until U7-6. The rootpool=0 deltas alone would not have been worth taking --
+// every one is inside the scatter just described, so adopting them by
+// themselves would be fitting noise and paying VRAM for it. What justifies the
+// change is the ALLOCATOR: the quad path costs LEVEL 1 AND NOTHING ELSE, which
+// the steady cylinder page measures as L1 +59% with L2 and L3 unchanged TO THE
+// TILE (see main-cylinder-amr.js's own copy for the controlled version).
 //
-// U7-5 adopts these WITH the flip, because the peaks belong to the allocator
-// they describe (max over both legs, since ?rootpool= stays selectable):
-//
-//   finest: { 2: 412, 3: 684, 4: 1184 },
-//   parent: { 1: 356, 2: 564, 3: 784 },
-//
-// At 1.7x that is levels=3 -> L1 608, L2 704 (from 444, 680): about +2 MB on
+// At 1.7x this is levels=3 -> L1 608, L2 704, from 444 and 680: about +2 MB on
 // the shipped configuration, which is the whole memory cost of the flip.
+//
+// ── POOL CAPACITY IS NOT INERT (2026-09-18, U7-5) ───────────────────────────
+//
+// CHANGING A NUMBER IN THIS TABLE MOVES THE PUBLISHED Cd, even when the pool
+// was never close to binding. Measured on index-cylinder-amr.html at levels=2:
+// raising level 1's pool from 164 to 228 slots moved Cd 1.631 -> 1.623 on the
+// DENSE path, whose allocator did not change at all, with demand at 61 tiles
+// and nothing refused.
+//
+// The mechanism is slot REGROUPING -- MAX_FINE_BLOCKS sets the free-list length
+// and the dispatch depth, and amr_force1.wgsl atomicAdds one TRUNCATED i32 per
+// workgroup, so regrouping the slots regroups the partials. CLAUDE.md records
+// that as a 4th-digit effect; this is 0.008, eight times it, from one constant.
+//
+// So: a Cd reading is only comparable to another taken under the SAME table.
+// Cross-table comparison is what made U7-4b read a 0.024 spread as an
+// allocator effect when most of it was this. Re-baseline when you retune here.
 const POOL_PEAKS = {
-  finest: { 2: 400, 3: 656, 4: 904 },
-  parent: { 1: 261, 2: 516, 3: 628 },
+  finest: { 2: 412, 3: 684, 4: 1184 },
+  parent: { 1: 356, 2: 564, 3: 784 },
 };
 
 const MAX_FINE_BLOCKS = urlParams.has('maxFineBlocks')
@@ -1986,7 +1998,7 @@ async function init() {
   seedRootFromDense();
 
   function debugMirrorRoot() {
-    if (!rootGpu) throw new Error('debugMirrorRoot: no root pool (?rootpool=1)');
+    if (!rootGpu) throw new Error('debugMirrorRoot: no root pool (running ?rootpool=0)');
     return rootGpu.seedRootFromDense();
   }
 
@@ -2027,7 +2039,7 @@ async function init() {
   };
 
   async function compareRootToDense({ denseBuf, poolBuf, comps, interleaved, asFloat, maxReport = 8 }) {
-    if (!pools[0]) return { ok: null, skipped: 'no root pool (?rootpool=1)' };
+    if (!pools[0]) return { ok: null, skipped: 'no root pool (running ?rootpool=0)' };
     const spec = rootPoolSpec({ dims: { W, H }, rb: RB });
     const rootCells = spec.slots * spec.cellsPerSlot;
     const denseWords = NCELLS * comps;
@@ -2126,7 +2138,7 @@ async function init() {
   // order to differ over, which is why exactness is the right bar and not an
   // ambitious one.
   async function debugCheckRootCriterion(maxReport = 8) {
-    if (!rootCritBuf) return { ok: null, skipped: 'no root pool (?rootpool=1)' };
+    if (!rootCritBuf) return { ok: null, skipped: 'no root pool (running ?rootpool=0)' };
     const n = pools[1].NBLOCKS;
     const mk = () => device.createBuffer({ size: n * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
     const sDense = mk(), sRoot = mk();
@@ -2179,7 +2191,7 @@ async function init() {
   // order-independent and exact equality is the right bar rather than an
   // ambitious one. If the partitions ever diverge, this is where it shows.
   async function debugCheckRootForce() {
-    if (!rootForcePL) return { ok: null, skipped: 'no root pool (?rootpool=1)' };
+    if (!rootForcePL) return { ok: null, skipped: 'no root pool (running ?rootpool=0)' };
     const zero = new Int32Array(4);
     device.queue.writeBuffer(rootForceBuf, 0, zero);
     device.queue.writeBuffer(denseForceBuf, 0, zero);
@@ -2223,7 +2235,7 @@ async function init() {
   // U4-3: the root's DIGEST against the dense grid's, on the one component
   // that can be exact. See digestFullPL above for why only max qualifies.
   async function debugCheckRootDigest() {
-    if (!digestFullPL) return { ok: null, skipped: 'no root pool (?rootpool=1)' };
+    if (!digestFullPL) return { ok: null, skipped: 'no root pool (running ?rootpool=0)' };
     const enc = device.createCommandEncoder();
     for (const [pl, bg] of [[digestFullPL, digestDenseFullBG], [digestFullPL, digestRootFullBG]]) {
       const p = enc.beginComputePass();
@@ -2265,7 +2277,7 @@ async function init() {
   // differs). Three consumers, three different answers to "can this be exact",
   // and each one has a reason.
   async function debugCheckRootConserved() {
-    if (!pools[0]) return { ok: null, skipped: 'no root pool (?rootpool=1)' };
+    if (!pools[0]) return { ok: null, skipped: 'no root pool (running ?rootpool=0)' };
     const spec = rootPoolSpec({ dims: { W, H }, rb: RB });
     const common = { W, H, ex: EX, ey: EY, decode: (m, n) => readF(m, n) };
     const dense = await readConservedTotals(device, {
@@ -2331,7 +2343,7 @@ async function init() {
   // agree by construction -- and a rate diluted to meaninglessness is how a
   // checker stops being read.
   async function debugCheckRootInterp(maxReport = 8) {
-    if (!rootInterpPL) return { ok: null, skipped: 'no root pool (?rootpool=1)' };
+    if (!rootInterpPL) return { ok: null, skipped: 'no root pool (running ?rootpool=0)' };
     const pool = pools[1];
     const planeStride = pool.MAX_FINE_BLOCKS * NCELLS1;
     const nw = fWords(F16);
@@ -2425,7 +2437,7 @@ async function init() {
   // rest of the domain is untouched by both legs and would agree by
   // construction.
   async function debugCheckRootAverage(maxReport = 8) {
-    if (!rootAvgPL) return { ok: null, skipped: 'no root pool (?rootpool=1)' };
+    if (!rootAvgPL) return { ok: null, skipped: 'no root pool (running ?rootpool=0)' };
     const spec = rootPoolSpec({ dims: { W, H }, rb: RB });
     const nw = fWords(F16);
     const rootCells = spec.slots * spec.cellsPerSlot;

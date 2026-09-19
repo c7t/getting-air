@@ -255,17 +255,29 @@ if (N_LEVELS - 1 > MAX_RENDER_POOL_LEVELS) {
 //
 // The rootpool=0 leg reproduces the table above to within ~6% (83 vs 78, 100
 // vs 96, 101 vs 95, 164 vs 160, 208 exactly), which is the instrument's
-// control. The constants are NOT changed for it -- see main-amr.js's copy for
-// why. U7-5 adopts, with the flip (max over both legs):
+// control. ADOPTED AT U7-5, max over both legs since `?rootpool=` stays
+// selectable until U7-6. At 1.7x: levels=3 -> L1 228, L2 172 (from 162, 164);
+// levels=4 -> L1 228, L2 280, L3 356 (from 162, 272, 354).
 //
-//   finest: { 2: 100, 3: 208 },
-//   parent: { 1: 132, 2: 164 },
+// ── POOL CAPACITY IS NOT INERT (2026-09-18, U7-5) ───────────────────────────
 //
-// At 1.7x: levels=3 -> L1 228, L2 172 (from 162, 164); levels=4 -> L1 228,
-// L2 280, L3 356 (from 162, 272, 354).
+// CHANGING A NUMBER IN THIS TABLE MOVES THE PUBLISHED Cd, even when the pool
+// was never close to binding. Measured on index-cylinder-amr.html at levels=2:
+// raising level 1's pool from 164 to 228 slots moved Cd 1.631 -> 1.623 on the
+// DENSE path, whose allocator did not change at all, with demand at 61 tiles
+// and nothing refused.
+//
+// The mechanism is slot REGROUPING -- MAX_FINE_BLOCKS sets the free-list length
+// and the dispatch depth, and amr_force1.wgsl atomicAdds one TRUNCATED i32 per
+// workgroup, so regrouping the slots regroups the partials. CLAUDE.md records
+// that as a 4th-digit effect; this is 0.008, eight times it, from one constant.
+//
+// So: a Cd reading is only comparable to another taken under the SAME table.
+// Cross-table comparison is what made U7-4b read a 0.024 spread as an
+// allocator effect when most of it was this. Re-baseline when you retune here.
 const POOL_PEAKS = {
-  finest: { 2: 96, 3: 208 },
-  parent: { 1: 95, 2: 160 },
+  finest: { 2: 100, 3: 208 },
+  parent: { 1: 132, 2: 164 },
 };
 
 const MAX_FINE_BLOCKS = urlParams.has('maxFineBlocks')
