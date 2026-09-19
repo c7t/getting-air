@@ -71,10 +71,21 @@ invariants the AMR machinery depends on:
   can be swept across the whole suite without a second copy of the table.
 
   **The default sweep is not currently all-green on `main`.**
-  `dense-reference` and `amr-N2-diffuse` fail at Re=100 (Cd 1.951 and 1.642
+  `dense-reference` and `amr-N2-diffuse` fail at Re=100 (Cd 1.951 and 1.652
   against 1.35±0.15). That is the diffuse-interface-width issue, not a
   regression. Re-baseline against these numbers rather than assuming a red
   cell is yours.
+  **`amr-N2-diffuse` READ 1.642 UNTIL 2026-09-18 AND THE INITIAL CONDITION
+  MOVED UNDER IT.** D1-a fixed two defects in `main-cylinder-amr.js`'s
+  `resetSim` -- a module-scoped perturbation RNG that was never re-seeded, so
+  every reset drew a different field, and velocity/parentSlot buffers reset
+  never wrote, so the first refine round after every reset ran against page
+  history (plans/uniform-levels.md D1-a). `reset()` is now a bit-exact fixed
+  point, which it was not before, and the whole AMR cylinder table shifted:
+  N2-diffuse 1.652/0.1484, N2-bounceback 1.356/0.1642, N3-diffuse
+  1.473/0.1570, N3-bounceback 1.365/0.1645. `dense-reference` is UNCHANGED at
+  1.951/0.1260 -- `main-cylinder.js` seeds its rng inside `initF()` and never
+  had either defect, which is why it is the control.
   **`amr-N2-diffuse` READ 1.620 HERE UNTIL 2026-09-15 AND THAT NUMBER WAS
   STALE.** Measured that day on a pristine checkout of the then-HEAD, twice:
   1.642, 1.642 (stable to four digits). Some earlier stage moved it and did

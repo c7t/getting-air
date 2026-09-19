@@ -33,14 +33,22 @@
 // paragraph is a case where four runs DID all agree -- the two observations
 // look the same at --runs=2 and are not the same thing at all.
 //
-// AND UNDER `--extra=rootpool=1` THE levels=2 BASELINE RUNG STOPS
-// DISCRIMINATING, MEASURED. With level 1 managed by amr_manage_pool.wgsl
-// (plans/uniform-levels.md U5-4) the racing free list produced the SAME
-// assignment in 4 of 4 runs at `levels=2`, so that row comes back IDENTICAL
-// and this tool exits nonzero on that configuration. The gate is deliberately
+// AND ON index-amr.html THE levels=2 BASELINE RUNG NO LONGER DISCRIMINATES,
+// MEASURED -- IN THE DEFAULT CONFIGURATION. With level 1 managed by
+// amr_manage_pool.wgsl (plans/uniform-levels.md U5-4) the racing free list
+// produced the SAME assignment in 4 of 4 runs at `levels=2`, so that row comes
+// back IDENTICAL and this tool exits nonzero. That was first seen under
+// `--extra=rootpool=1`; U7-5 then made rootpool=1 the DEFAULT, so
+// `node tools/measure-determinism.js` with no arguments is now that
+// configuration and now exits 1 on a healthy build. The gate is deliberately
 // NOT relaxed for it: the row is doing its job by saying it can no longer tell
 // "the flag worked" from "nothing raced". Read `levels=3 detslots=0` instead,
 // which still DIFFERS and is what keeps the instrument honest there.
+//
+// `--page=index-cylinder-amr.html` HAS NO SUCH PROBLEM, measured 2026-09-18:
+// both detslots=0 rungs differ there, `levels=2` with four distinct hashes in
+// four runs. If you want a run of this tool whose baseline rung still means
+// something, that is the page to point it at.
 //
 // ── WHAT "IDENTICAL" CAN AND CANNOT ESTABLISH ──────────────────────────────
 //
@@ -79,7 +87,15 @@
 //
 //     node tools/measure-determinism.js
 //     node tools/measure-determinism.js --steps=8192 --runs=3
+//     node tools/measure-determinism.js --page=index-cylinder-amr.html --runs=4
 //     node tools/measure-determinism.js --baseUrl=https://localhost:4455 --port=9444 --keep=/tmp/d0
+//
+// `--page=` carries `--global=` with it from a table (index-amr and
+// index-reentry-amr expose `window.__AMR`, the cylinder/TGV/channel harnesses
+// expose `window.__CYL`), and it carries the SCORING with it too: only a page
+// listed in GATES_BY_PAGE is gated, because the expectations below are
+// index-amr.html's measured behaviour and not a law. Everything else reports
+// and exits 0.
 //
 // VERIFY WHICH TREE THE DEV SERVER IS SERVING first -- `ensureServer` reuses
 // whatever already answers on the port, and this repo has twice discarded a
@@ -96,6 +112,14 @@ const {
 const REPO_ROOT = path.resolve(__dirname, '..');
 
 // gate: null means "report only, do not score".
+//
+// THE GATE COLUMN IS index-amr.html's, AND IT IS NOT A UNIVERSAL PROPERTY.
+// Every entry below was MEASURED on the falling-card page; "levels=2 without
+// detslots DIFFERS" in particular is a fact about that page's allocator under
+// that page's flow, and U5-4 already recorded it ceasing to hold there once
+// level 1 became quad-managed. On a page this tool has not been run against,
+// the predictions are unknown -- see GATES_BY_PAGE, which reports rather than
+// scores until someone has measured the page and written its row down.
 const CONFIGS = [
   { name: 'levels=2 detslots=1', q: 'levels=2&detslots=1', det: 1, gate: 'IDENTICAL' },
   { name: 'levels=3 detslots=1', q: 'levels=3&detslots=1', det: 1, gate: 'IDENTICAL' },
@@ -103,8 +127,33 @@ const CONFIGS = [
   { name: 'levels=3 detslots=0', q: 'levels=3',            det: 0, gate: null        },
 ];
 
+// Which pages have had their rows measured, and therefore may be SCORED.
+// A page absent from this table runs report-only: every row prints, nothing
+// FAILs, and the exit code is 0 with a loud note saying why. Measure first,
+// gate after -- adding a page here without a measurement behind it is exactly
+// how this project collected three vacuous gates.
+//
+// index-cylinder-amr.html: MEASURED 2026-09-18 (D1-a), 4 runs x 4096 steps on
+// the shipped default configuration, and it satisfies the WHOLE column above:
+//
+//   levels=2 detslots=1   IDENTICAL  77797c55ff9a04d7  (4 of 4)
+//   levels=3 detslots=1   IDENTICAL  0c7f6ebeb91d10fe  (4 of 4)
+//   levels=2 detslots=0   DIFFERS    four distinct hashes in four runs
+//   levels=3 detslots=0   DIFFERS    two attractors, 3+1
+//
+// THIS PAGE DISCRIMINATES BETTER THAN index-amr.html DOES TODAY, which is the
+// opposite of what D1 expected and is worth stating plainly. The card page's
+// `levels=2 detslots=0` rung came back IDENTICAL over 4 runs on the same build
+// -- the vacuity its own header predicted for quad-managed level 1, now that
+// U7-5 has made that the default -- so on THAT page only `levels=3` still
+// keeps the instrument honest. Here both rungs race, visibly.
+const GATES_BY_PAGE = {
+  'index-amr.html': true,
+  'index-cylinder-amr.html': true,
+};
+
 function parseArgs(argv) {
-  const o = { baseUrl: 'https://localhost:4444', port: 9333, page: 'index-amr.html', steps: 4096, runs: 2, keep: null, only: null };
+  const o = { baseUrl: 'https://localhost:4444', port: 9333, page: 'index-amr.html', steps: 4096, runs: 2, keep: null, only: null, global: null, gate: null };
   for (const a of argv) {
     if (a.startsWith('--baseUrl=')) o.baseUrl = a.slice(10);
     else if (a.startsWith('--port=')) o.port = parseInt(a.slice(7));
@@ -114,8 +163,24 @@ function parseArgs(argv) {
     else if (a.startsWith('--keep=')) o.keep = a.slice(7);
     else if (a.startsWith('--only=')) o.only = a.slice(7);
     else if (a.startsWith('--extra=')) o.extra = a.slice(8);
+    else if (a.startsWith('--global=')) o.global = a.slice(9);
+    else if (a === '--gate') o.gate = true;
+    else if (a === '--no-gate') o.gate = false;
     else { console.error(`unknown argument: ${a}`); process.exit(2); }
   }
+  // THE DEBUG SURFACE IS NOT THE SAME NAME ON EVERY PAGE, and it does not
+  // follow the page name either: index-amr and index-reentry-amr expose
+  // `window.__AMR`, while index-cylinder-amr, index-tgv-amr and
+  // index-channel-amr expose `window.__CYL` -- the harness pages kept the
+  // cylinder harness's original name as they were derived from it. Defaulted
+  // from a table rather than guessed from the URL, and overridable, because a
+  // wrong guess here reads as "WebGPU init failed" and sends you looking at
+  // the page. Same table, same reasoning, as tools/measure-pool-peaks.js.
+  if (!o.global) {
+    const AMR_PAGES = ['index-amr.html', 'index-reentry-amr.html'];
+    o.global = AMR_PAGES.includes(o.page) ? 'window.__AMR' : 'window.__CYL';
+  }
+  if (o.gate === null) o.gate = !!GATES_BY_PAGE[o.page];
   return o;
 }
 
@@ -147,6 +212,7 @@ function fingerprint(snap) {
 }
 
 async function captureOne(Runtime, Page, o, cfg, runIdx) {
+  const G = o.global;
   // --extra= appends to every configuration's URL, so a flag can be swept
   // across the whole table without a second copy of it -- the same shape as
   // validate-all.js's own --extra=.
@@ -159,14 +225,29 @@ async function captureOne(Runtime, Page, o, cfg, runIdx) {
   // waitForGlobal THROWS on timeout and returns undefined on success -- do not
   // test its return value. (Testing it inverts the check and reports a boot
   // failure on every healthy page, which cost one wrong diagnosis here.)
-  await waitForGlobal(Runtime, 'window.__AMR', 60000);
+  await waitForGlobal(Runtime, G, 60000);
   // Assert the flag actually took. A URL typo would otherwise read as a clean
   // negative result.
-  const det = await ev(Runtime, 'window.__AMR.getDetSlots()');
+  const det = await ev(Runtime, `${G}.getDetSlots()`);
   if (det !== cfg.det) throw new Error(`${cfg.name}: page reports detslots=${det}, expected ${cfg.det}`);
-  const levels = await ev(Runtime, 'window.__AMR.getNumLevels()');
+  const levels = await ev(Runtime, `${G}.getNumLevels()`);
 
-  await ev(Runtime, 'window.__AMR.reset()', 120000);
+  // PAUSE THE PAGE BEFORE reset(), and this is load-bearing rather than tidy.
+  // Every AMR page boots with `liveMode = true` and an rAF loop that steps
+  // STEPS_PER_FRAME at a time, so between the reset() round trip and the
+  // debugStepSync() one, an uncontrolled number of live frames can land --
+  // stepping the sim, advancing macroStepCounter and running refine rounds
+  // that this tool did not ask for and does not count.
+  //
+  // IT WAS ACTIVE, MEASURED 2026-09-18: index-cylinder-amr.html reported
+  // `steps=4160` for a 4096-step request (exactly one 64-step frame of
+  // uncounted stepping) while index-amr.html reported 4096. The two pages were
+  // NOT being measured the same way, and reading a detslots=1 DIFFERS on the
+  // cylinder page as "a second source of nondeterminism in the solver" would
+  // have been a conclusion about the harness. The step count in each run line
+  // is the guard: it must equal the request.
+  await ev(Runtime, `${G}.setLive(false)`);
+  await ev(Runtime, `${G}.reset()`, 120000);
   // Timed IN THE PAGE, not around the CDP call: the round trip is noise at
   // this step count but there is no reason to measure it. This is what decides
   // whether a deterministic handout can be the DEFAULT or has to stay a
@@ -174,8 +255,8 @@ async function captureOne(Runtime, Page, o, cfg, runIdx) {
   // refine round, and whether that is affordable is a measurement.
   const timed = await ev(Runtime, `(async () => {
     const t0 = performance.now();
-    await window.__AMR.debugStepSync(${o.steps});
-    return { ms: performance.now() - t0, step: window.__AMR.getStep() };
+    await ${G}.debugStepSync(${o.steps});
+    return { ms: performance.now() - t0, step: ${G}.getStep() };
   })()`, 900000);
   const stepsDone = timed.step;
   // Active tiles per level. A deterministic handout can land on a DIFFERENT
@@ -184,10 +265,17 @@ async function captureOne(Runtime, Page, o, cfg, runIdx) {
   // not read the ms column without this one.
   const tiles = [];
   for (let m = 1; m < levels; m++) {
-    tiles.push(await ev(Runtime, `window.__AMR.debugListActiveBlocks(${m}).then(a => a.length)`, 120000));
+    tiles.push(await ev(Runtime, `${G}.debugListActiveBlocks(${m}).then(a => a.length)`, 120000));
   }
-  const snap = await ev(Runtime, 'window.__AMR.debugSnapshotSave()', 300000);
+  const snap = await ev(Runtime, `${G}.debugSnapshotSave()`, 300000);
   const fp = fingerprint(snap);
+  // See setLive(false) above. An over-count here means live frames stepped the
+  // sim behind this tool's back and every hash below is of an uncontrolled
+  // state, so it is an error rather than a note.
+  if (stepsDone !== o.steps) {
+    throw new Error(`${cfg.name}: asked for ${o.steps} steps, page reports ${stepsDone}` +
+      ` -- the page stepped behind the harness (live rAF frames?), so the capture is not comparable`);
+  }
   console.log(`  run ${runIdx + 1}: levels=${levels} steps=${stepsDone} ${timed.ms.toFixed(0).padStart(6)} ms  tiles=[${tiles.join(',')}]  hash=${fp.hash.slice(0, 16)}`);
   if (o.keep) {
     fs.mkdirSync(o.keep, { recursive: true });
@@ -223,16 +311,16 @@ async function main() {
                   msMin: Math.min(...caps.map(c => c.ms)),
                   tiles: caps[0].tiles,
                   tileSum: caps.map(c => c.tiles.reduce((a, b) => a + b, 0)) });
-      console.log(`  -> ${verdict}${cfg.gate ? ` (expected ${cfg.gate})` : ' (reported, not gated)'}`);
+      console.log(`  -> ${verdict}${o.gate && cfg.gate ? ` (expected ${cfg.gate})` : ' (reported, not gated)'}`);
     }
   } finally {
     await client.close();
     await teardown({ port: o.port, tabId, chrome, server });
   }
 
-  console.log(`\nD0 determinism, ${o.steps} steps, ${o.runs} runs each\n`);
+  console.log(`\nD0 determinism, ${o.page}, ${o.steps} steps, ${o.runs} runs each\n`);
   for (const r of rows) {
-    const mark = r.cfg.gate === null ? '  --  ' : (r.verdict === r.cfg.gate ? '  ok  ' : ' FAIL ');
+    const mark = (!o.gate || r.cfg.gate === null) ? '  --  ' : (r.verdict === r.cfg.gate ? '  ok  ' : ' FAIL ');
     console.log(`${mark} ${r.cfg.name.padEnd(22)} ${r.verdict.padEnd(10)} ${r.msMin.toFixed(0).padStart(6)} ms  ${r.hashes.join(' ')}`);
   }
 
@@ -250,10 +338,25 @@ async function main() {
       `     tiles [${off.tiles.join(',')}] -> [${on.tiles.join(',')}]   ${tPct >= 0 ? '+' : ''}${tPct.toFixed(1)}%`);
   }
 
-  const gated = rows.filter(r => r.cfg.gate !== null);
+  const gated = o.gate ? rows.filter(r => r.cfg.gate !== null) : [];
   const bad = gated.filter(r => r.verdict !== r.cfg.gate);
 
   console.log('');
+
+  // REPORT-ONLY, because CONFIGS' predictions are index-amr.html's and this is
+  // not that page. Printing the rows and exiting 0 is the honest outcome: the
+  // alternative is to score a page against another page's measured behaviour,
+  // which produces a red cell that means nothing and a green one that means
+  // less. Write the page's rows into GATES_BY_PAGE once they are measured.
+  if (!o.gate) {
+    console.log(`  REPORTED, NOT GATED: ${o.page} has no measured row in GATES_BY_PAGE.`);
+    console.log('  The expectations in CONFIGS were measured on index-amr.html and do not');
+    console.log('  transfer -- U5-4 records them ceasing to hold on that page itself when the');
+    console.log('  allocator changed. Read the verdicts above, record what this page does, then');
+    console.log('  add it to GATES_BY_PAGE. `--gate` forces scoring for the measuring run.');
+    process.exit(0);
+  }
+
   const discrim = rows.find(r => r.cfg.q === 'levels=2');
   if (discrim && discrim.verdict === 'IDENTICAL') {
     console.log('  THE DISCRIMINATION RUNG CAME BACK IDENTICAL. `levels=2` without detslots is');

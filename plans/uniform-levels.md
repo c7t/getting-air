@@ -3303,7 +3303,217 @@ The bind group needs nothing either way: `candRankBuf` is already bound at
 binding 7 on every page, because U7-0 made the fourteen layouts shared. That is
 the rung paying back exactly as it promised.
 
-#### D1-0 — the instrument has to be able to address another page
+#### D1-0 — DONE (2026-09-18). The instrument addresses any page, and gates only where it has measured.
+
+`tools/measure-determinism.js` gained `--global=`, defaulted from the same page
+table `tools/measure-pool-peaks.js` uses (`index-amr` / `index-reentry-amr` ->
+`window.__AMR`, the cylinder/TGV/channel harnesses -> `window.__CYL`), and the
+six hardcoded `window.__AMR` references became one `G`.
+
+The gate table moved with it. `CONFIGS`' expectations are `index-amr.html`'s
+MEASURED behaviour, so `GATES_BY_PAGE` now decides whether a page is SCORED at
+all: a page not in that table prints every verdict, says why it is not gated,
+and exits 0. `--gate` / `--no-gate` override by hand, which is what the
+measuring run itself uses.
+
+*Gate, met:* the tool reproduced `8ddd3ff2f84a697f` (levels=2) and
+`3d80fa737af6bf9e` (levels=3) on `index-amr.html` at `--runs=4`, bit for bit,
+after the refactor.
+
+**AND THE CARD PAGE'S OWN DISCRIMINATION RUNG IS NOW VACUOUS IN THE DEFAULT
+CONFIGURATION.** `levels=2 detslots=0` came back IDENTICAL over 4 runs
+(`8ddd3ff2f84a697f`, the same hash as `detslots=1`). The tool's header
+predicted exactly this for quad-managed level 1 and recorded it under
+`--extra=rootpool=1`; U7-5 then made `rootpool=1` the default, so the header's
+"under that flag" is now "with no arguments at all". `node
+tools/measure-determinism.js` therefore exits 1 on a healthy build, by design.
+`levels=3 detslots=0` still DIFFERS (three distinct hashes in four runs) and is
+what keeps that page honest. The header now says so; the gate was NOT relaxed.
+
+#### D1-a — DONE (2026-09-18). Three edits, as predicted. And then the page had two defects and a third source.
+
+The port itself was exactly the three edits the rung specified -- `DET_SLOTS`
+from `?detslots=`, into `poolConstants`, and `getDetSlots` on `window.__CYL` --
+because `amr_manage_pool.wgsl` carries the serial handout in-shader and U7-5
+made that the path level 1 runs on. No pipelines, no bindings.
+
+*Gate:* NOT MET, and the reason is the second of the two outcomes the rung
+said not to paper over. It took two page fixes to find out which.
+
+##### The first measurement, and the harness confound under it
+
+Reported, not gated (D1-0's rule), 4 runs x 4096 steps:
+
+```
+  levels=2 detslots=1   IDENTICAL
+  levels=3 detslots=1   IDENTICAL
+  levels=2 detslots=0   DIFFERS   four distinct hashes in four runs
+  levels=3 detslots=0   DIFFERS   two attractors, 3+1
+```
+
+On that reading this page DISCRIMINATES BETTER THAN THE CARD PAGE DOES TODAY --
+both baseline rungs race here, where `index-amr.html`'s `levels=2` no longer
+does. So `GATES_BY_PAGE` gained the page and the run was repeated with scoring
+on. **It then failed, and the repeat is the only reason any of the rest of this
+was found.** One green sweep would have closed the rung on a wrong result.
+
+The first thing the repeat exposed was the harness's own: every run line read
+`steps=4160` for a 4096-step request, against `4096` on the card page. Both
+pages boot `liveMode = true`, so an uncounted 64-step rAF frame was landing
+between the `reset()` round trip and the `debugStepSync()` one. The tool now
+calls `setLive(false)` before `reset()` and ERRORS if the returned step count
+is not the one it asked for. **The two pages had not been being measured the
+same way, and reading the failure before fixing that would have been a
+conclusion about the harness.**
+
+##### Defect 1: `resetSim()` was not reproducible, and not even a fixed point
+
+With the step counts clean the failure survived, so the initial state was the
+next thing to doubt. Three consecutive `reset()` calls in one page load, no
+stepping at all between them, then `debugSnapshotSave`:
+
+```
+  resets  1        2        3          each internally stable to the bit,
+  state   A        B        C          all three DIFFERENT
+```
+
+`reset()` was not idempotent. The snapshot localised the difference to `fB64`
+and `pools[1].fB64` and NOTHING else -- the field, never the allocator.
+
+Cause: `const rng = mulberry32(SEED)` is MODULE-SCOPED on this page. That is
+deliberate and the comment says why (the coarse and pool inits draw one stream,
+not two copies of one), but it was created once at load and never re-seeded, so
+`initF()`'s draws were a function of how many times `initF`/`initFPool` had
+already been called. `main-cylinder.js` -- the dense reference whose Cd
+CLAUDE.md records as bit-exact across every run -- builds its rng INSIDE
+`initF()` and never had this. Note also that boot draws pool-then-coarse while
+`resetSim` draws coarse-then-pool, so the booted field and the post-reset field
+are different patterns either way; every tool resets before measuring, so the
+reset one is the one that matters.
+
+Fixed: `let rng` plus `reseedRng()`, called first thing in `resetSim()`.
+
+##### Defect 2: the velocity fields are state, and reset did not write them
+
+`reset()` became a fixed point within a page load and STILL differed BETWEEN
+navigates. The same probe, diffing navigate-to-navigate at reset 1:
+
+```
+  .velB64 x1, .pools[].velB64 x1, .pools[].parentSlot[] x8
+```
+
+`velBuf`, `finePoolVel` and `parentSlotBuf` were never written by `resetSim`,
+so they held whatever ran before it. That is not cosmetic: `dispatchMacroStep`
+runs the refinement round BEFORE `S_Advance`, reading "each level's own
+velocity field as populated by the PREVIOUS macro-step", and `macroStepCounter
+= 0` means **the first macro-step after a reset IS a refinement round**. So the
+first refinement after every reset was against page history.
+
+Fixed: `initF`/`initFPool` fill a velocity array from the SAME draw (`f` is an
+equilibrium distribution, so its velocity is exactly `(U0, uy)` and no moment
+has to be taken), `resetSim` writes it, and `parentSlotBuf` goes back to the
+zero fill `allocLevelPool` left. `quadrantBuf` is deliberately not cleared --
+it holds `slot % 4`, a constant, not allocator state.
+
+After both fixes, three navigates x three resets: **ONE hash, `4e8eb1f5a4c02158`,
+everywhere.** Reset is a complete fixed point, cold start included.
+
+**BOTH FIXES MOVE THIS PAGE'S PUBLISHED Cd/St.** The initial condition changed:
+the perturbation field is now the one `SEED` names rather than one further down
+the stream, and the first refine round now sees the IC rather than a leftover.
+Re-baseline against a fresh measurement, not against the numbers in CLAUDE.md.
+`index-cylinder.html`, the dense reference, is untouched and is the control.
+
+##### And the gate still fails, which is the finding
+
+From a provably bit-identical initial state, 6 runs x 4096 steps,
+`?levels=3&detslots=1`: five runs agree, one does not. The outlier is no longer
+the first navigate, so it is not the cold-start artefact either.
+
+What differs is the same shape every time, and it is NOT the field first:
+
+```
+  pools[1].blockSlot / slotToBlock / parentSlot   shifted by exactly 4 -- ONE QUAD
+  fB64, velB64, pools[].fB64, pools[].velB64      downstream of that
+  cardState[6..8]                                 the force accumulators
+```
+
+A uniform one-quad shift in the handout means the free list was one quad
+different at some grant round. `DET_SLOTS` makes `refine()` and `coarsen()`
+single-threaded in dispatch order with no atomics in the decision, so the
+handout cannot reorder itself -- which leaves the WANT SET differing by one
+tile at some round. The 2:1-closure cascade is the candidate worth opening
+first: it propagates to a fixed point in a bounded iteration count
+(`?refineIters=`), and a propagation that is not run to convergence can depend
+on intra-pass ordering. That is a hypothesis, not a measurement.
+
+**THIS IS THE OUTCOME THE RUNG SAID WOULD BE THE MOST VALUABLE THING D1 COULD
+FIND, AND IT SHOULD NOT BE PAPERED OVER.** Note what it does NOT say: D0's
+claim is about SLOT ASSIGNMENT, and slot assignment is still pinned -- the
+divergence enters upstream of it. Note also it is rare (1 in 6 at levels=3, and
+`levels=2` showed the same 1-in-6 shape), which is why `--runs=2` cannot see it
+and why every rung above was measured at 4 or more.
+
+##### The cost, measured, since the rung asked for it
+
+```
+                       detslots=0   detslots=1
+  levels=2                 319 ms      381 ms    +19.5%
+  levels=3                 552 ms      612 ms    +10.8%
+```
+
+4096 steps, min of 4 runs, identical tile counts on both legs (so this is
+overhead, not a different topology). The card page measured +0.7% / +3.4% on
+the same build -- D0's original +28.7% / +0.9% no longer reproduces there
+either. A Cd run is 69888 steps, so this is a real 10-20% on the wall clock of
+every cylinder case.
+
+##### Where this leaves D1-b and D1-c
+
+`GATES_BY_PAGE` keeps `index-cylinder-amr.html` scored and RED. That is
+correct: the rung's own prediction is that `detslots=1` is IDENTICAL, one run
+refutes it, and the red cell is the refutation standing until the want-set
+source is found. Do not add the page to a report-only list to make it green.
+
+D1-c's capacity sweep (the direct confirmation of the retraction) is NOT
+runnable yet at the precision it needs. `?detslots=1` cuts the variation from
+four-distinct-in-four to one-in-six, which is a large improvement and not a
+pin, and the 1.623-1.641 spread it was meant to collapse is the same order as
+what remains. Finding the want-set source comes first.
+
+##### The re-baseline, and the sweep that says nothing else moved
+
+Full `validate-all.js` after both fixes. Every boot, refusal, render,
+invariant and analytic config PASS; the only red cells are the two CLAUDE.md
+already records as the diffuse-band issue.
+
+```
+  config              Cd      St        was (CLAUDE.md)   note
+  dense-reference     1.951   0.1260    1.951 / 0.1260    UNCHANGED -- the control.
+                                                          main-cylinder.js was not
+                                                          touched, and it is bit-exact
+                                                          run to run, so this agreeing
+                                                          is what says the sweep itself
+                                                          did not move.
+  amr-N2-diffuse      1.652   0.1484    1.642 / 0.1485    +0.010
+  amr-N2-bounceback   1.356   0.1642
+  amr-N3-diffuse      1.473   0.1570
+  amr-N3-bounceback   1.365   0.1645
+```
+
+`amr-N2-diffuse` moving +0.010 is the size of the attractor spread CLAUDE.md
+records for this page (+/-0.009), which is what an initial-condition change
+should look like here and is NOT evidence either way about the fixes. Both red
+cells are red for the reason they were before -- the diffuse band width, still
+first order, still `K_EPS * dx_level`.
+
+**These are the numbers to compare against from here, and the comparison is
+still only valid within one configuration** until the want-set source above is
+closed. `?detslots=1` was NOT adopted for the sweep: D1-c's decision is
+deliberately left open, and pinning to a handout that is not yet a pin would
+buy nothing.
+
+#### D1-0 — the original statement, for reference
 
 `tools/measure-determinism.js` hardcodes `window.__AMR` in six places and
 asserts `getDetSlots()`. Before any of D1 can be scored it needs `--global=`,
@@ -3323,7 +3533,7 @@ first, gate after, which is this project's order everywhere else.
 `8ddd3ff2f84a697f` / `3d80fa737af6bf9e`. A refactor of the harness that moves
 the card page's numbers is a refactor that broke something.
 
-#### D1-a — the pool manager, which is the shipped path
+#### D1-a — the original statement, for reference
 
 1. `const DET_SLOTS = urlParams.has('detslots') ? ... : 0` on
    `main-cylinder-amr.js`, pointing at `shaders/amr_manage.wgsl`'s DET_SLOTS

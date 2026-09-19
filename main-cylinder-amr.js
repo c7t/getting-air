@@ -284,8 +284,10 @@ if (N_LEVELS - 1 > MAX_RENDER_POOL_LEVELS) {
 // understates the real uncertainty of an AMR Cd on that page by about 10x.
 // Anything that perturbs the race -- this table, the allocator, the refine
 // cadence -- can move Cd by up to 0.018 with no physics change at all. Porting
-// DET_SLOTS to main-cylinder-amr.js would remove the nuisance outright; until
-// then, compare Cd only within one configuration.
+// DET_SLOTS to main-cylinder-amr.js would remove the nuisance outright, and
+// D1 is that port -- see `DET_SLOTS` below and use `?detslots=1` when
+// comparing Cd across configurations. Without it, compare Cd only within one
+// configuration.
 const POOL_PEAKS = {
   finest: { 2: 100, 3: 208 },
   parent: { 1: 132, 2: 164 },
@@ -469,6 +471,33 @@ const K_EPS_POOL = urlParams.has('kEpsPool') ? parseFloat(urlParams.get('kEpsPoo
 const rootFlags = readRootFlags(urlParams, { staging: false });
 const ROOT_POOL = rootFlags.pool;
 const ROOT_MANAGED = rootFlags.managed;
+
+// ?detslots=1 -- deterministic pool slot handout (plans/uniform-levels.md D0,
+// ported to this page by D1-a).
+//
+// Default 0 is the shipped atomic free-list race and is byte-identical to not
+// having this flag. 1 replaces the handout with a single-threaded serial pass,
+// which makes block->slot assignment a deterministic function of the run from
+// resetSim() onward.
+//
+// THIS PAGE IS WHY IT MATTERS. Every published Cd/St number comes from here,
+// and the racing free list gives those numbers an ATTRACTOR spread of about
+// +/-0.009 -- ten times the +/-0.001 same-build repeat the gates quote. See
+// POOL_PEAKS' own note above: sweeping ?maxFineBlocks= over 128..1024 moved
+// Cd over 1.623-1.641 with nothing ever refused and no physics change at all,
+// because regrouping slots regroups amr_force1.wgsl's TRUNCATED per-workgroup
+// partials. Pinning the handout removes that nuisance.
+//
+// IT REMOVES VARIANCE, NOT BIAS. The serial handout selects ONE attractor --
+// the dispatch-order one -- so its Cd is a single sample from the set, not the
+// set's mean. Strictly better for build-vs-build comparison; NOT more
+// "correct" against literature. That is why it is a flag and not the default.
+//
+// See shaders/amr_manage.wgsl's DET_SLOTS header for why the serial loop is
+// the right shape for a MEASUREMENT and the wrong shape for a default.
+// amr_manage_pool.wgsl -- the manager this page runs by default -- carries the
+// same override entirely in-shader, which is why D1-a is three edits.
+const DET_SLOTS = urlParams.has('detslots') ? (parseInt(urlParams.get('detslots')) ? 1 : 0) : 0;
 
 const REFINE_EVERY = urlParams.has('refineEvery') ? parseInt(urlParams.get('refineEvery')) : 16;
 const REFINE_THRESH = urlParams.has('refineThresh') ? parseFloat(urlParams.get('refineThresh')) : -8;
@@ -722,6 +751,37 @@ function feq(rho, ux, uy, i) {
 // symmetric, so shedding onset needs a deliberate, resolution-independent
 // seed rather than relying on grid-dependent round-off. One rng, drawn
 // across coarse init then pool init, both deterministic from SEED.
+//
+// ── THE STREAM IS RE-SEEDED PER resetSim(), AND IT WAS NOT UNTIL D1-a ──────
+//
+// `rng` is module-scoped ON PURPOSE -- that is what makes the coarse and pool
+// inits draw from ONE stream rather than two copies of the same one. But it
+// was created once at module load and never re-seeded, so `initF()`'s draws
+// depended on how many times initF/initFPool had already been called. The
+// consequence, measured 2026-09-18 on index-cylinder-amr.html:
+//
+//   resetSim() WAS NOT REPRODUCIBLE, and not even a fixed point. One, two and
+//   three consecutive reset() calls produced three DIFFERENT initial fields
+//   (and so three different 4096-step states, each internally stable to the
+//   bit). `debugSnapshotSave` localised the difference to `fB64` and
+//   `pools[1].fB64` alone -- the field, never the allocator.
+//
+// That made it the residual run-to-run variation left on this page under
+// `?detslots=1`, which is what D1-a was measuring: the very first navigate
+// after a cold Chrome launch disagreed with every later one (4 of 5 fresh
+// Chromes), because the harness's first reset() races the page's own boot
+// sequence and lands on a different position in the stream.
+//
+// IT IS NOT A GPU RACE AND NOT A SECOND ALLOCATOR SOURCE. D0's hypothesis --
+// slot assignment is the only nondeterminism in the SOLVER -- survives this
+// intact; the defect was in the initial condition. main-cylinder.js, the
+// dense reference whose Cd CLAUDE.md records as bit-exact across every run,
+// builds its rng INSIDE initF() and so never had it.
+//
+// Note the boot path and resetSim() also draw in opposite orders (boot does
+// pool-then-coarse, resetSim does coarse-then-pool), so the booted field and
+// the post-reset field are different perturbation patterns either way. Every
+// tool resets before measuring, so the reset one is the one that matters.
 const PERTURB = parseFloat(urlParams.get('perturb')) || 0.02;
 const SEED    = parseInt(urlParams.get('seed'))      || 12345;
 
@@ -734,12 +794,22 @@ function mulberry32(seed) {
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
 }
-const rng = mulberry32(SEED);
+let rng = mulberry32(SEED);
+// Called by resetSim() before any initF()/initFPool(), so a reset always draws
+// the same stream from the same place. See the note above PERTURB.
+function reseedRng() { rng = mulberry32(SEED); }
 
-function initF() {
+// `velOut`, when given, receives the velocity this f IS -- `f` here is an
+// equilibrium distribution at (U0, uy), so its velocity is exactly (U0, uy)
+// and no moment has to be taken to recover it. Filled from the SAME draw, in
+// the same pass, because a second pass would advance the stream and hand back
+// a velocity belonging to a different field. See resetSim for why reset has
+// to write it at all.
+function initF(velOut) {
   const f = new Float32Array(NCELLS * 9);
   for (let c = 0; c < NCELLS; c++) {
     const uy = (rng() * 2 - 1) * PERTURB * U0;
+    if (velOut) { velOut[c * 2] = U0; velOut[c * 2 + 1] = uy; }
     for (let i = 0; i < 9; i++) {
       f[i * NCELLS + c] = feq(1, U0, uy, i);
     }
@@ -753,11 +823,12 @@ function initF() {
 // `maxBlocks` generalizes this beyond level 1's own capacity, same as
 // main-amr.js's own generalization (Milestone 6) -- levels >=2 need the
 // identical pre-fill for the same reason.
-function initFPool(maxBlocks = MAX_FINE_BLOCKS) {
+function initFPool(maxBlocks = MAX_FINE_BLOCKS, velOut) {
   const NPOOL = maxBlocks * NCELLS1;
   const f = new Float32Array(NPOOL * 9);
   for (let c = 0; c < NPOOL; c++) {
     const uy = (rng() * 2 - 1) * PERTURB * U0;
+    if (velOut) { velOut[c * 2] = U0; velOut[c * 2 + 1] = uy; }
     for (let i = 0; i < 9; i++) {
       f[i * NPOOL + c] = feq(1, U0, uy, i);
     }
@@ -1262,6 +1333,7 @@ async function init() {
       // is, and for the same reason -- at DIAG=0 every counter stays 0 and the
       // pool-starvation gate would read TRUE VACUOUSLY.
       DIAG,
+      DET_SLOTS,
     };
     criterionPoolPLs[m] = device.createComputePipeline({
       layout: device.createPipelineLayout({ bindGroupLayouts: [criterionPoolBGL] }),
@@ -1956,7 +2028,32 @@ async function init() {
   }
 
   function resetSim() {
-    writeF(f_a, initF(), NCELLS);
+    // FIRST, before any initF()/initFPool() below: the perturbation stream is
+    // module-scoped so the coarse and pool inits share it, which also means
+    // its POSITION is page history unless this call puts it back. Without
+    // this, two reset()s in one page load seed two different flows -- see the
+    // note above PERTURB for the measurement.
+    reseedRng();
+    // THE VELOCITY FIELDS ARE PART OF THE STATE reset() OWNS, and they were
+    // not written here until D1-a. dispatchMacroStep runs the refinement round
+    // BEFORE S_Advance, reading "each level's own velocity field as populated
+    // by the PREVIOUS macro-step" -- and `macroStepCounter = 0` below means
+    // the first macro-step after a reset IS a refinement round. With velBuf
+    // left holding whatever ran before the reset, that first round refined
+    // against page history: measured 2026-09-18, the first navigate after a
+    // cold Chrome launch disagreed with every later one even under
+    // `?detslots=1`, and `debugSnapshotSave` localised the post-reset
+    // difference to `velB64` / `pools[].velB64` and eight stale `parentSlot`
+    // entries -- nothing else.
+    //
+    // Written from initF()'s OWN draw rather than zeroed: `f` here is an
+    // equilibrium distribution, so the velocity it represents is exactly
+    // (U0, uy), and writing that keeps the first criterion reading the
+    // initial condition it is supposed to read. Zeroing would also be
+    // reproducible and would quietly hide the IC from that round.
+    const vel0 = new Float32Array(NCELLS * 2);
+    writeF(f_a, initF(vel0), NCELLS);
+    device.queue.writeBuffer(velBuf, 0, vel0);
     device.queue.writeBuffer(cardStateBuf, 0, initCardState());
     device.queue.writeBuffer(forceBuf, 0, new Int32Array([0, 0, 0, 0]));
     // Level 1's PER-BLOCK reset. Under quad allocation it is reset by the loop
@@ -1967,7 +2064,9 @@ async function init() {
     slotToBlockCPU.fill(-1);
     freeSlots = Array.from({ length: MAX_FINE_BLOCKS }, (_, i) => i);
     if (!ROOT_MANAGED) {
-      writeF(pools[1].finePoolF_a, initFPool(), MAX_FINE_BLOCKS * NCELLS1);
+      const v1 = new Float32Array(MAX_FINE_BLOCKS * NCELLS1 * 2);
+      writeF(pools[1].finePoolF_a, initFPool(MAX_FINE_BLOCKS, v1), MAX_FINE_BLOCKS * NCELLS1);
+      device.queue.writeBuffer(pools[1].finePoolVel, 0, v1);
       device.queue.writeBuffer(pools[1].blockSlotBuf, 0, blockSlotCPU);
       device.queue.writeBuffer(pools[1].slotToBlockBuf, 0, slotToBlockCPU);
       device.queue.writeBuffer(pools[1].freeListBuf, 0, new Int32Array(MAX_FINE_BLOCKS).map((_, i) => i));
@@ -1978,11 +2077,21 @@ async function init() {
     for (let c = (ROOT_MANAGED ? 1 : 2); c < N_LEVELS; c++) {
       const pool = pools[c];
       const qc = quadCPU[c];
-      writeF(pool.finePoolF_a, initFPool(pool.MAX_FINE_BLOCKS), pool.MAX_FINE_BLOCKS * NCELLS1);
+      const vc = new Float32Array(pool.MAX_FINE_BLOCKS * NCELLS1 * 2);
+      writeF(pool.finePoolF_a, initFPool(pool.MAX_FINE_BLOCKS, vc), pool.MAX_FINE_BLOCKS * NCELLS1);
+      device.queue.writeBuffer(pool.finePoolVel, 0, vc);
       qc.blockSlotCPU.fill(-1);
       qc.slotToBlockCPU.fill(-1);
       device.queue.writeBuffer(pool.blockSlotBuf, 0, qc.blockSlotCPU);
       device.queue.writeBuffer(pool.slotToBlockBuf, 0, qc.slotToBlockCPU);
+      // Back to the zero-filled state allocLevelPool left it in. Written only
+      // at grant time, so a free slot's entry is stale rather than wrong --
+      // but "stale" is page history, which is exactly what reset is for.
+      // quadrantBuf is NOT cleared: allocLevelPool writes `slot % 4` into it
+      // once and it is a constant (CLAUDE.md, B2-2b0), not allocator state.
+      if (pool.parentSlotBuf) {
+        device.queue.writeBuffer(pool.parentSlotBuf, 0, new Int32Array(pool.MAX_FINE_BLOCKS));
+      }
       qc.freeQuads = Array.from({ length: pool.MAX_FINE_BLOCKS / 4 }, (_, i) => i);
       device.queue.writeBuffer(pool.freeListBuf, 0, new Int32Array(qc.freeQuads));
       device.queue.writeBuffer(pool.freeCountBuf, 0, new Int32Array([qc.freeQuads.length]));
@@ -2720,6 +2829,10 @@ async function init() {
       perLevel: Array.from({ length: N_LEVELS - 1 }, (_, i) => ({ childLevel: i + 1, ...paramsForChildLevel(i + 1) })),
     }),
     getNumLevels: () => N_LEVELS,
+    // tools/measure-determinism.js asserts this against the URL it asked for,
+    // so a typo'd flag reads as a failed assertion and not as a clean
+    // negative result.
+    getDetSlots: () => DET_SLOTS,
     getRootPool: () => (rootGpu ? { ...rootGpu.spec, stepped: true } : null),
     getLevelPoolSizes,
     tauAtLevel,
