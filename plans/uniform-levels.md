@@ -28,7 +28,7 @@ it runs on.
 | U4 | criterion, force, digest, conserved totals | **DONE** — all four consumers on the root. Exact on the criterion, digest max and conserved totals; the force to the truncation floor | `tools/validate-root-kernels.js`, 8 rungs + 2 controls |
 | U5 | L1 becomes a quad child of the root | **U5-0…U5-4 DONE under `?rootpool=1`** — both hops of the coupling and the manager. Level 1 is quad-allocated and quad-managed; tiles +28-32%; new fingerprints, default unmoved. `amr_manage.wgsl` cannot retire until the other four AMR pages get a root pool, and Cd/St is unmeasurable until then | `validate-root-kernels.js` (11 rungs, 4 controls); `validate-all.js` invariants ± starved pool; `measure-determinism.js` |
 | U6 | The renderer walks levels | **DONE** — and it found that three of the five pages never drew level 2 either. Level 1 bit-identical to before; gate green on two pages and in the default sweep | `tools/validate-render-levels.js`, `tools/lib/render-levels.js` |
-| U7 | One implementation across the five pages, then delete the dense path | **U7-0…U7-4 DONE** (layouts, coupling pipelines, per-level bind groups, both orderings, and now the root pool itself shared — net −1559 lines through U7-3, every gate unmoved; U7-4 puts a root pool on all five pages behind `?rootpool=1` and MEASURES U5-4's Cd/St, which U5 could not); **U7-5, U7-5a and U7-6a DONE** — `?rootpool=1` is the DEFAULT, pool demand re-measured at quad granularity, and the snapshot format now carries level 1's quad indirection AND the free list. The flip moved published Cd by +0.010 at N=3 and not at all at N=2; what DID move numbers is pool CAPACITY, which turns out not to be inert. U7-6 (delete the dense path) remains. **Split into U7-0…U7-6** — U1–U5 all landed on `main-amr.js` alone, so the remaining work is propagation before deletion. Measured: all 14 bind group layouts are byte-identical across five pages, and `S_Advance` is byte-identical across the other four | each rung byte-identical on the default path (`measure-determinism.js`), except U7-5 which is the one that moves numbers |
+| U7 | One implementation across the five pages, then delete the dense path | **U7-0…U7-4 DONE** (layouts, coupling pipelines, per-level bind groups, both orderings, and now the root pool itself shared — net −1559 lines through U7-3, every gate unmoved; U7-4 puts a root pool on all five pages behind `?rootpool=1` and MEASURES U5-4's Cd/St, which U5 could not); **U7-5, U7-5a and U7-6a DONE** — `?rootpool=1` is the DEFAULT, pool demand re-measured at quad granularity, and the snapshot format now carries level 1's quad indirection AND the free list. The flip moved published Cd within the noise -- and that noise turned out to be the cylinder page's RACING allocator, whose attractor spread (~±0.009) is 10x the same-build repeat the gates quote. **D1 (port DET_SLOTS to the cylinder page) is now sequenced ahead of U7-6**, which deletes its control. U7-6 (delete the dense path) remains. **Split into U7-0…U7-6** — U1–U5 all landed on `main-amr.js` alone, so the remaining work is propagation before deletion. Measured: all 14 bind group layouts are byte-identical across five pages, and `S_Advance` is byte-identical across the other four | each rung byte-identical on the default path (`measure-determinism.js`), except U7-5 which is the one that moves numbers |
 
 **Where the risk actually sits.** U0–U2 went in clean and each found something
 (a half-cell convention, an f16 stride, a window-convention split between L0 and
@@ -88,6 +88,8 @@ at the end.
     U7-6a     the snapshot format -- a PREREQUISITE for the flip, DONE
     U7-5a     pool demand at quad granularity, DONE
     U7-5      flip the default, DONE
+    D1        DET_SLOTS on the cylinder page -- the Cd gate cannot resolve
+              anything below ~0.02 without it, and U7-6 deletes its control
     U7-6      delete the dense path
     --   the sponge seam INVARIANT (gate only)
     B6   explode/coalesce
@@ -3236,7 +3238,8 @@ inside the attractor spread, and this harness cannot currently resolve it.
 is the one change that would make that page's Cd genuinely reproducible and
 retire the nuisance instead of budgeting for it. D0 already did the work once;
 U7-1 deliberately left the scan/link pipelines on the dev page because nothing
-else needed them yet. This is the thing that needs them.
+else needed them yet. This is the thing that needs them. **Staged as D1 below**,
+ahead of U7-6, which deletes both its subject and its control.
 
 #### Three instrument errors this cost, all worth keeping
 
@@ -3271,6 +3274,169 @@ throughout. So something slot-indexed and transient is not pinned by
 ORDER, which U7-6a put into the snapshot. It heals, and it does not touch the
 physics, but it means the snapshot fingerprint is very slightly stronger than
 "the solution" and could produce a spurious DIFFERS at a fine checkpoint.
+
+### D1 — the deterministic handout on the cylinder page
+
+**WHY, in one line:** `index-cylinder-amr.html` is where every published Cd/St
+number comes from, and its allocator races, so those numbers carry an attractor
+spread of about +/-0.009 -- ten times the +/-0.001 same-build repeat the gates
+quote. See "The bisect, and the retraction it forced". D0 already built the
+deterministic handout; U7-1 deliberately left it on `main-amr.js` because
+nothing else needed it yet. This needs it.
+
+**IT IS SMALLER THAN IT SOUNDS, and the split is along the path U7-5 made the
+default.** Measured against the two managers:
+
+```
+  amr_manage_pool.wgsl   DET_SLOTS is ENTIRELY IN-SHADER -- refine() and
+  (the default path      coarsen() each carry a serial one-thread branch. No
+   after U7-5)           new pipelines, no new bindings. The port is an
+                         override and a flag.
+
+  amr_manage.wgsl        DET_SLOTS needs FOUR extra pipelines host-side --
+  (only under            scanCandidates x2 (grant/release) and linkCoarsen /
+   ?rootpool=0)          linkRefine -- plus their encoding around coarsen and
+                         refine, in an order that is load-bearing.
+```
+
+The bind group needs nothing either way: `candRankBuf` is already bound at
+binding 7 on every page, because U7-0 made the fourteen layouts shared. That is
+the rung paying back exactly as it promised.
+
+#### D1-0 — the instrument has to be able to address another page
+
+`tools/measure-determinism.js` hardcodes `window.__AMR` in six places and
+asserts `getDetSlots()`. Before any of D1 can be scored it needs `--global=`,
+defaulted from a page table the way `tools/measure-pool-peaks.js` does it --
+`index-amr` and `index-reentry-amr` expose `window.__AMR`, the cylinder/TGV/
+channel harnesses expose `window.__CYL`, and that does NOT follow from the page
+name.
+
+**AND ITS GATE TABLE IS THE CARD PAGE'S, NOT A UNIVERSAL ONE.** `CONFIGS`
+predicts `levels=2 detslots=0 -> DIFFERS`; that is a measured property of
+`index-amr.html`, and U5-4 already recorded it ceasing to hold there under quad
+management. On a new page the predictions are unknown. So: report, do not gate,
+until the page's own behaviour is measured -- then record it and gate. Measure
+first, gate after, which is this project's order everywhere else.
+
+*Gate:* the tool runs unchanged against `index-amr.html` and reproduces
+`8ddd3ff2f84a697f` / `3d80fa737af6bf9e`. A refactor of the harness that moves
+the card page's numbers is a refactor that broke something.
+
+#### D1-a — the pool manager, which is the shipped path
+
+1. `const DET_SLOTS = urlParams.has('detslots') ? ... : 0` on
+   `main-cylinder-amr.js`, pointing at `shaders/amr_manage.wgsl`'s DET_SLOTS
+   header for why the serial loop is the right shape for a MEASUREMENT and the
+   wrong shape for a default.
+2. `DET_SLOTS` into `poolConstants` (it already carries `DIAG` for the same
+   opt-in reason).
+3. `getDetSlots` on `window.__CYL`.
+
+Three edits, and after U7-5 they cover the default configuration completely,
+because level 1 is quad-managed.
+
+*Gate:* `measure-determinism --page=index-cylinder-amr.html`, `--runs=4`.
+`detslots=1` IDENTICAL at levels 2 and 3. `detslots=0` must DIFFER **on at
+least one level count**, or the instrument cannot see nondeterminism on this
+page and no green row means anything -- the same guard the card page's
+`levels=2` rung provides.
+
+**TWO OUTCOMES TO EXPECT AND NOT PAPER OVER:**
+
+- **`levels=2 detslots=0` may come back IDENTICAL.** U5-4 measured exactly that
+  on the card page once the pool manager owned level 1: the racing free list
+  produced the same assignment in 4 of 4 runs. If it happens here, `levels=3`
+  carries the discrimination and that gets recorded, not relaxed away.
+- **`detslots=1` may NOT come back IDENTICAL.** Then there is a second source
+  of nondeterminism on this page that the card page does not have, and that is
+  the most valuable thing D1 could find. It is information, not a bug to widen
+  the comparison around -- D0's own stance on its own failure mode.
+
+*Also measure, do not assume:* the cost. D0 measured the serial handout at
++28.7% (levels=2) and +0.9% (levels=3) on the card page at 4096 steps. A Cd run
+here is 69888 steps. If it is expensive that is a fact to record next to the
+gate, not a reason to skip it.
+
+#### D1-b — the dense manager, i.e. the control
+
+Only reachable under `?rootpool=0`, which after U7-5 exists solely as the A/B
+escape -- and an unpinned control is not a control. Four pipelines and their
+encoding:
+
+1. `DET_SLOTS` into `manageConstants`.
+2. `manageScanGrantPL` / `manageScanReleasePL` (one entry point,
+   `SCAN_RELEASE` 0/1) and `manageLinkCoarsenPL` / `manageLinkRefinePL`.
+3. Encode them in `refinePasses.denseCoarsen` and `denseRefine`.
+
+**THE ORDER IS LOAD-BEARING AND main-amr.js RECORDS WHY.** The release scan
+runs BEFORE coarsen, because it reads `blockSlot` as coarsen finds it -- and
+after the previous round's refine link, which is where `blockSlot` was last
+settled. The grant scan runs AFTER coarsen, so blocks released this round are
+visible as candidates in the same round. Copy the reasoning with the code; a
+mis-ordered pass here is a physics difference that still produces a field.
+
+**AND D0's "KEPT ON EVIDENCE, NOT ON ARGUMENT" TRAVELS WITH THEM.** The link
+passes looked redundant once `scanCandidates` owned the ranking, were removed,
+and three runs later one configuration had diverged. The mechanism is still not
+understood. Do not drop them here on the same reasoning that was already wrong
+once.
+
+*Gate:* `detslots=1` IDENTICAL over 4 runs under `?rootpool=0` as well.
+
+#### D1-c — the measurement D1 exists for
+
+1. Cd/St on both legs at `?detslots=1`, with repeats. These become the
+   comparable numbers.
+2. **Re-run the capacity sweep with `?detslots=1`.** Prediction: the
+   1.623-1.641 spread collapses to the repeat floor. That is the direct
+   confirmation of the retraction on the page where it was observed -- so far
+   capacity has only been shown inert on the CARD page, and this closes it.
+3. Decide whether `validate-all.js`'s cylinder configs adopt `?detslots=1`.
+
+**THE DECISION IN 3 IS A REAL ONE AND SHOULD NOT BE PRE-EMPTED. Pinning removes
+VARIANCE, NOT BIAS.** The deterministic handout selects ONE attractor -- the
+serial, dispatch-order one -- and its Cd is one sample from the set, possibly
+~0.009 from the set's centre. So:
+
+```
+  build vs build        strictly better pinned: both sides on the same
+                        attractor, and the +/-0.001 floor becomes real
+  against literature    it is ONE SAMPLE, not a mean. Adopting it moves the
+                        recorded Cd once, and the new number is not more
+                        "correct" -- only reproducible
+```
+
+The alternative worth naming rather than dismissing: run N attractors and
+report the SPREAD, which measures the uncertainty instead of hiding it. Almost
+certainly too expensive for the default sweep at 69888 steps a case; possibly
+right for a once-per-release characterisation.
+
+#### Sequencing, and why this order
+
+```
+  D1-0   the tool can address the page          (nothing is scoreable before it)
+  D1-a   pool manager  -- the DEFAULT path      (3 edits, covers what ships)
+  D1-b   dense manager -- the CONTROL           (only while ?rootpool=0 exists)
+  D1-c   re-measure, and decide about the gate
+```
+
+**ALL OF IT BEFORE U7-6.** That rung deletes `amr_manage.wgsl`, which is D1-b's
+entire subject, and `?rootpool=0`, which is the control D1-c's comparison uses.
+After U7-6 there is no dense path to pin and nothing to A/B against. This is
+the same sequencing argument that moved U7-6a ahead of U7-5, and that one held.
+
+If D1-b is judged not worth doing on a path scheduled for deletion, that is a
+defensible call -- but it has to be made explicitly and written down, because
+the consequence is that U7-6's own before/after comparison runs against an
+unpinned baseline and inherits the +/-0.009.
+
+#### What this does NOT cover
+
+`main-reentry-amr.js`, `main-tgv-amr.js` and `main-channel-amr.js` also lack
+DET_SLOTS. They carry no Cd/St gate, and the analytic configs hold zero active
+tiles so their allocator never runs -- the nondeterminism has nothing to bite.
+Port it there when something needs it, not before.
 
 #### U7-6 — delete the dense path
 
