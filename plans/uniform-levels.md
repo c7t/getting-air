@@ -2998,7 +2998,9 @@ better one.
 
 This rung was billed as "where the published numbers move for real". With each
 path properly sized they mostly do not. Same build, same `POOL_PEAKS`,
-same-build repeats on both sides:
+same-build repeats on both sides -- though see "The bisect, and the retraction
+it forced" below for why +/-0.001 is a WITHIN-ATTRACTOR figure on this page and
+understates the real uncertainty by about ten times:
 
 ```
                      run A            run B           floor
@@ -3019,6 +3021,13 @@ flip `?rootpool=0` IS the old path, so the A/B needs no second checkout and a
 difference cannot be a build difference.
 
 #### POOL CAPACITY IS NOT INERT, and nothing recorded that before
+
+> **RETRACTED.** The heading is wrong and is kept for the trail. Capacity IS
+> inert once slot assignment is deterministic -- measured bit-identical on
+> `index-amr.html?detslots=1` for 444 against 1024. What varies below is the
+> cylinder page's racing allocator. See "The bisect, and the retraction it
+> forced". The practical consequence is REPLACED by a sharper one: that page's
+> Cd carries an attractor spread of ~+/-0.009, ten times the same-build repeat.
 
 The finding that cost the most to get to, and the one to carry forward.
 
@@ -3088,6 +3097,11 @@ name `?rootpool=` explicitly.
 
 
 #### The pool-capacity sweep, and what it found instead (2026-09-18)
+
+> **SUPERSEDED IN ITS CONCLUSION by "The bisect, and the retraction it forced"
+> below.** Capacity is NOT a physics parameter; this section measured the
+> cylinder page's RACING allocator, which has no `detslots` implementation. The
+> measurements here are sound and the reasoning from them was not.
 
 U7-5 left open "whether 0.008 is the true scale of slot regrouping or whether a
 second mechanism is involved". Swept `?maxFineBlocks=` on `amr-N2-diffuse`
@@ -3176,6 +3190,87 @@ restate:
 root pool, and U7-6 deletes neither the pool allocator nor the criterion. But
 U7-6 DOES delete the dense path, which is the control this comparison uses, so
 the bisect is cheaper before it than after.
+
+#### The bisect, and the retraction it forced (2026-09-18)
+
+The pool-capacity section above concluded "pool capacity is not inert" and
+"a constant chosen for headroom is a physics parameter". **BOTH ARE WRONG, and
+the bisect is what showed it.** Left in place above because the route to the
+right answer is the useful part; read this section as its correction.
+
+**CAPACITY IS INERT WHEN THE HANDOUT IS DETERMINISTIC.** On `index-amr.html`
+under `?detslots=1&levels=3`, capacities 444 against 1024 -- both far above the
+~230-tile demand -- are BIT-IDENTICAL in the dense L0 field AND in `cardState`
+at every checkpoint from step 16 through 4096. Not close: identical.
+
+```
+  cap  444 A dense: 16:1b75dd 32:2c8908 ... 2048:61ed8d 4096:00fdd3
+  cap  444 B dense: 16:1b75dd 32:2c8908 ... 2048:61ed8d 4096:00fdd3
+  cap 1024   dense: 16:1b75dd 32:2c8908 ... 2048:61ed8d 4096:00fdd3
+  (cardState likewise identical on all three)
+```
+
+**WHAT THE CYLINDER SWEEP ACTUALLY MEASURED IS THE RACE.**
+`main-cylinder-amr.js` HAS NO `detslots` IMPLEMENTATION -- D0's deterministic
+handout is main-amr.js-only, which U7-1 records and which this investigation
+forgot. So `?detslots=1` there is an inert URL parameter and the `atomicSub`
+free list races. Changing the capacity changes the race's outcome; slot
+assignment regroups; `amr_force1.wgsl`'s TRUNCATED per-workgroup partials
+regroup with it. That is CLAUDE.md's own mechanism, and its "several
+attractors, each bit-exact" is the same observation from the other side: the
+same capacity lands in the same attractor and repeats to +/-0.001, a different
+capacity can land in one 0.018 away.
+
+**THE CONSEQUENCE THAT SURVIVES, AND IT IS THE VALUABLE ONE.** The +/-0.001
+same-build repeat that CLAUDE.md records, and that U7-5's gate leaned on, is a
+WITHIN-ATTRACTOR figure. It understates the real uncertainty of an AMR Cd on
+`index-cylinder-amr.html` by roughly TEN TIMES. Anything that perturbs the race
+-- pool capacity, the allocator, the refine cadence -- can move Cd by up to
+0.018 with no physics change whatsoever. That is the page every published Cd/St
+number in this project comes from.
+
+So U7-5's "+0.010 at N=3" is NOT a measured consequence of the flip. It is
+inside the attractor spread, and this harness cannot currently resolve it.
+
+**THE FIX IS NAMED AND NOT DONE: port DET_SLOTS to main-cylinder-amr.js.** It
+is the one change that would make that page's Cd genuinely reproducible and
+retire the nuisance instead of budgeting for it. D0 already did the work once;
+U7-1 deliberately left the scan/link pipelines on the dev page because nothing
+else needed them yet. This is the thing that needs them.
+
+#### Three instrument errors this cost, all worth keeping
+
+They are recorded because each one produced a confident wrong reading first.
+
+1. **A flag that the page does not implement reads as a clean negative.**
+   `?detslots=1` on the cylinder page. The control diverging was interpreted as
+   "the cylinder is anomalously nondeterministic" before the grep. Tools that
+   assert their flags took -- `measure-pool-peaks.js`, `validate-snapshot-
+   roundtrip.js` -- exist because of exactly this, and this probe did not.
+
+2. **A whole-snapshot fingerprint is SLOT-SENSITIVE and cannot answer a
+   slot-regrouping question.** Two capacities hand out different slots by
+   construction (the free list starts `[0..cap-1]` and refine takes the top),
+   so the pool's `f`/`vel`/`blockSlot`/`slotToBlock` differ even when the
+   physics is bit-identical. The first bisect reported "diverges at every
+   checkpoint" on that basis. The dense L0 grid is indexed by (x,y) and carries
+   level 1's restriction, so it is the state with the bookkeeping projected
+   out; `cardState` separates the force path from the flow.
+
+3. **`listActiveBlocks` returns `{bx, by, slot}`, and stringifying the object
+   gives `"[object Object]"` for every entry** -- which collapses a Set to one
+   element and makes every comparison come back SAME. Caught only because the
+   probe printed SAME next to `|A|=44 |B|=46`. Key on `bx + ',' + by`, which is
+   also the slot-independent thing to compare.
+
+**AND ONE REAL, SMALL FINDING ON THE SIDE.** With the whole-snapshot
+fingerprint, two same-capacity runs on `index-amr.html?detslots=1` differed at
+step 16 and were identical from 32 onward. Dense-only, they are identical
+throughout. So something slot-indexed and transient is not pinned by
+`?detslots=1` in the first refine round -- most likely the free list's residual
+ORDER, which U7-6a put into the snapshot. It heals, and it does not touch the
+physics, but it means the snapshot fingerprint is very slightly stronger than
+"the solution" and could produce a spurious DIFFERS at a fine checkpoint.
 
 #### U7-6 — delete the dense path
 

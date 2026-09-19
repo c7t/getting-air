@@ -259,22 +259,33 @@ if (N_LEVELS - 1 > MAX_RENDER_POOL_LEVELS) {
 // selectable until U7-6. At 1.7x: levels=3 -> L1 228, L2 172 (from 162, 164);
 // levels=4 -> L1 228, L2 280, L3 356 (from 162, 272, 354).
 //
-// ── POOL CAPACITY IS NOT INERT (2026-09-18, U7-5) ───────────────────────────
+// ── RETUNING THIS TABLE MOVES THE CYLINDER'S PUBLISHED Cd, AND THE REASON IS
+//    THE RACING ALLOCATOR, NOT THE CAPACITY (2026-09-18, U7-5) ──────────────
 //
-// CHANGING A NUMBER IN THIS TABLE MOVES THE PUBLISHED Cd, even when the pool
-// was never close to binding. Measured on index-cylinder-amr.html at levels=2:
-// raising level 1's pool from 164 to 228 slots moved Cd 1.631 -> 1.623 on the
-// DENSE path, whose allocator did not change at all, with demand at 61 tiles
-// and nothing refused.
+// Measured on index-cylinder-amr.html at levels=2, demand 61 tiles, nothing
+// ever refused: sweeping ?maxFineBlocks= over 128..1024 moved Cd over
+// 1.623-1.641, about +/-0.009, NON-monotonically.
 //
-// The mechanism is slot REGROUPING -- MAX_FINE_BLOCKS sets the free-list length
-// and the dispatch depth, and amr_force1.wgsl atomicAdds one TRUNCATED i32 per
-// workgroup, so regrouping the slots regroups the partials. CLAUDE.md records
-// that as a 4th-digit effect; this is 0.008, eight times it, from one constant.
+// IT IS NOT A CAPACITY EFFECT. The same A/B on index-amr.html under
+// ?detslots=1 -- which pins slot assignment -- is BIT-IDENTICAL in both the
+// dense field and cardState at every checkpoint from step 16 to 4096, for
+// capacities 444 against 1024. Capacity is inert once the handout is
+// deterministic.
 //
-// So: a Cd reading is only comparable to another taken under the SAME table.
-// Cross-table comparison is what made U7-4b read a 0.024 spread as an
-// allocator effect when most of it was this. Re-baseline when you retune here.
+// What the cylinder page has instead is a RACING atomicSub free list (D0's
+// deterministic handout is main-amr.js-only). Changing the capacity changes
+// that race's outcome, slot assignment regroups, and amr_force1.wgsl's
+// TRUNCATED per-workgroup partials regroup with it. CLAUDE.md's "several
+// attractors, each bit-exact" is the same observation: same capacity lands in
+// the same attractor and repeats to +/-0.001, a different capacity can land in
+// another one 0.018 away.
+//
+// SO THE +/-0.001 SAME-BUILD REPEAT IS A WITHIN-ATTRACTOR FIGURE and
+// understates the real uncertainty of an AMR Cd on that page by about 10x.
+// Anything that perturbs the race -- this table, the allocator, the refine
+// cadence -- can move Cd by up to 0.018 with no physics change at all. Porting
+// DET_SLOTS to main-cylinder-amr.js would remove the nuisance outright; until
+// then, compare Cd only within one configuration.
 const POOL_PEAKS = {
   finest: { 2: 100, 3: 208 },
   parent: { 1: 132, 2: 164 },
