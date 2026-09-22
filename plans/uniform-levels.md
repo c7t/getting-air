@@ -3807,6 +3807,102 @@ So the earlier entry's "U7-6a's record does not reproduce" was the right
 observation and the wrong conclusion: the record was real, the gate was simply
 never measuring only what it claimed to.
 
+#### The reset defect, closed structurally (2026-09-22)
+
+Three instances in three days -- D1-a on the cylinder page, U7-6c on the root
+pool, U7-6c-fix on the card page -- all of one false inference:
+
+> **"WebGPU zero-initialises buffers, so this one needs no write."**
+> True at ALLOCATION. False at RESET. A fresh buffer is zeros; a buffer being
+> reset holds the last run's history.
+
+The first response was to write the rule down. A rule relies on the next person
+remembering it, and this project has three data points saying that does not
+work. Replaced with two structures and an audit.
+
+##### 1. One statement of a pool's initial state
+
+`amr2d-gpu.mjs`'s **`writePoolInitialState(device, pool, { velFill })`**,
+called by `allocLevelPool` AND by every page's `resetSim`. **Allocation is just
+the first reset.** The two were hand-written copies of one list living far
+apart in six files, and they had drifted in four different ways:
+
+```
+  blockSlot / slotToBlock   both wrote it
+  freeList / freeCount      alloc wrote it for QUAD levels only; the per-block
+                            level got an eager caller-side write on one page
+  quadrant                  alloc only (it is a constant -- but "constant" was
+                            a fact to remember rather than one to enforce)
+  parentSlot                NEITHER wrote it -- the comment said zero-init was
+                            enough, which was true where it was written
+  finePoolVel               NEITHER wrote it -- and the refine round reads it
+  wantBuf / newlyActivated / candRank / blockCriterion
+                            neither; each rewritten-before-read WITHIN a round,
+                            which is the per-buffer reasoning that failed
+```
+
+`f` stays the caller's, and that is the boundary the function draws: everything
+inside it is a statement about the ALLOCATOR and is identical on every page;
+`initF`/`initFPool` are the scenario's subject and differ.
+
+`velFill` takes a constant `[ux, uy]` or a `Float32Array`. The array form is
+not a convenience -- the cylinder's perturbation is per-cell and must come from
+the SAME rng draw as the `f` it describes, so that page builds both in one pass
+and hands the velocity in. A function that re-derived it would silently
+disagree.
+
+##### 2. A test that fails when someone adds a buffer and does not decide
+
+`tools/test-pool-initial-state.js`, GPU-free, in `make test`. It runs
+`allocLevelPool` against a recording stand-in for `GPUDevice`, enumerates every
+buffer-valued key the pool declares, and requires each to be either WRITTEN by
+`writePoolInitialState` or named in an explicit `NOT_RESET_STATE` list with a
+reason. Two entries are on that list today (`finePoolF_a`, `finePoolF_b`), and
+a second test fails if a name on it stops being a buffer, so the exemptions
+cannot go stale either.
+
+**Mutation-checked, against the exact buffer that caused the bug.** Deleting
+the `parentSlotBuf` write turns three of the four cases red and names
+`parentSlotBuf` in the failure text. A reviewer cannot be relied on to notice a
+buffer MISSING from a list; this makes the omission the thing that fails.
+
+##### 3. `tools/validate-reset-fixed-point.js` -- the property itself, on the GPU
+
+The abstraction covers the pools. This covers whatever a page adds next to
+them, which is where the dense `velBuf` instance lived.
+
+```
+  A   navigate, pause, reset, snapshot
+  B   step N, reset, snapshot
+  require A == B
+```
+
+Five configurations -- card, cylinder and reentry, at two level counts --
+because every defect was in per-level reset code. It reports the SHAPE of the
+difference (`.pools[].parentSlot x44`), which names the offending buffer
+directly. A control requires that stepping moved the state at all, since A == B
+is also what a comparison that cannot see anything produces.
+
+*All five PASS.* `reentry` passes without ever having been fixed by hand -- it
+inherited the shared call, which is the point.
+
+##### The audit, and what it found beyond the three known sites
+
+Five `resetSim` implementations. Beyond the pools, the DENSE `velBuf` was
+unwritten on **all five** pages; it is now written on all five and goes with
+the dense grid at U7-6f. `main-tgv-amr.js` and `main-channel-amr.js` had never
+been touched by any of the three fixes -- their pools hold zero active tiles so
+nothing bit, which is exactly the kind of latency that makes an audit worth
+more than a rule.
+
+*Gate:* `make check`; `make test` (9 suites, the new one included);
+`validate-reset-fixed-point` 5/5; `validate-snapshot-roundtrip` **12 of 12**;
+`measure-determinism` on the card page **unchanged** at `e0b1b22bbe47cbfb` /
+`4705ea2b06226c8b`, which is what says the refactor is behaviour-preserving;
+and the full `validate-all.js` sweep unchanged from baseline -- `dense-reference`
+exactly 1.951/0.1260 and `amr-N2-diffuse` 1.652/0.1485, the two known
+diffuse-band cells and nothing else.
+
 #### D1-b — SKIPPED, deliberately, 2026-09-18. The decision the rung asked to be made explicitly.
 
 The rung says: "If D1-b is judged not worth doing on a path scheduled for

@@ -25,7 +25,7 @@
 import { reportFatal, refuseConfig, setStatus, reportNoWebGPU, reportNoAdapter } from './error-overlay.mjs';
 import { loadShader } from './shader-loader.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
-import { check21BalanceOnGPU, allocLevelPool, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState, checkGeometryCoverageOnGPU, makeRefusalWatch , checkRefinementClosureOnGPU , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU, makeRenderBindGroup, renderRootIsPool, renderPoolLevels, MAX_RENDER_POOL_LEVELS, makeAMRLayouts, makeCouplingPipelines, makeLevelBindGroups, makeManageBindGroups, makeScheduler, makeRefineRound, readRootFlags, allocRootPool, makeRootPool, encodeRootCapture, readRootCapture, restoreRootCapture } from './amr2d-gpu.mjs';
+import { check21BalanceOnGPU, allocLevelPool, writePoolInitialState, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState, checkGeometryCoverageOnGPU, makeRefusalWatch , checkRefinementClosureOnGPU , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU, makeRenderBindGroup, renderRootIsPool, renderPoolLevels, MAX_RENDER_POOL_LEVELS, makeAMRLayouts, makeCouplingPipelines, makeLevelBindGroups, makeManageBindGroups, makeScheduler, makeRefineRound, readRootFlags, allocRootPool, makeRootPool, encodeRootCapture, readRootCapture, restoreRootCapture } from './amr2d-gpu.mjs';
 // tauAtLevel: extracted to card-params.mjs by B3a-1, which landed the CALL
 // in all five AMR pages and this IMPORT in only main-amr.js. The other four
 // threw `ReferenceError: tauAtLevelOf is not defined` at init -- but only at
@@ -2101,14 +2101,16 @@ async function init() {
     blockSlotCPU.fill(-1);
     slotToBlockCPU.fill(-1);
     freeSlots = Array.from({ length: MAX_FINE_BLOCKS }, (_, i) => i);
+    // THE DRAW ORDER IS LOAD-BEARING, which is why the velocity arrays are
+    // built here and handed to writePoolInitialState afterwards rather than
+    // letting it invent them: `rng` is one stream shared by initF and every
+    // initFPool, so each pool's velocity must come from the SAME draw as the
+    // `f` it describes, in this order.
+    const poolVel = [];
     if (!ROOT_MANAGED) {
       const v1 = new Float32Array(MAX_FINE_BLOCKS * NCELLS1 * 2);
       writeF(pools[1].finePoolF_a, initFPool(MAX_FINE_BLOCKS, v1), MAX_FINE_BLOCKS * NCELLS1);
-      device.queue.writeBuffer(pools[1].finePoolVel, 0, v1);
-      device.queue.writeBuffer(pools[1].blockSlotBuf, 0, blockSlotCPU);
-      device.queue.writeBuffer(pools[1].slotToBlockBuf, 0, slotToBlockCPU);
-      device.queue.writeBuffer(pools[1].freeListBuf, 0, new Int32Array(MAX_FINE_BLOCKS).map((_, i) => i));
-      device.queue.writeBuffer(pools[1].freeCountBuf, 0, new Int32Array([MAX_FINE_BLOCKS]));
+      poolVel[1] = v1;
     }
     // Milestone 6: levels >=2 reset the same way, at quad granularity -- and
     // level 1 too, once it is one of them (U5-4).
@@ -2117,22 +2119,26 @@ async function init() {
       const qc = quadCPU[c];
       const vc = new Float32Array(pool.MAX_FINE_BLOCKS * NCELLS1 * 2);
       writeF(pool.finePoolF_a, initFPool(pool.MAX_FINE_BLOCKS, vc), pool.MAX_FINE_BLOCKS * NCELLS1);
-      device.queue.writeBuffer(pool.finePoolVel, 0, vc);
+      poolVel[c] = vc;
+      // The HOST mirrors only; their GPU counterparts are written below.
       qc.blockSlotCPU.fill(-1);
       qc.slotToBlockCPU.fill(-1);
-      device.queue.writeBuffer(pool.blockSlotBuf, 0, qc.blockSlotCPU);
-      device.queue.writeBuffer(pool.slotToBlockBuf, 0, qc.slotToBlockCPU);
-      // Back to the zero-filled state allocLevelPool left it in. Written only
-      // at grant time, so a free slot's entry is stale rather than wrong --
-      // but "stale" is page history, which is exactly what reset is for.
-      // quadrantBuf is NOT cleared: allocLevelPool writes `slot % 4` into it
-      // once and it is a constant (CLAUDE.md, B2-2b0), not allocator state.
-      if (pool.parentSlotBuf) {
-        device.queue.writeBuffer(pool.parentSlotBuf, 0, new Int32Array(pool.MAX_FINE_BLOCKS));
-      }
       qc.freeQuads = Array.from({ length: pool.MAX_FINE_BLOCKS / 4 }, (_, i) => i);
-      device.queue.writeBuffer(pool.freeListBuf, 0, new Int32Array(qc.freeQuads));
-      device.queue.writeBuffer(pool.freeCountBuf, 0, new Int32Array([qc.freeQuads.length]));
+    }
+    // EVERY POOL'S ALLOCATOR STATE, from the one function allocLevelPool
+    // itself uses -- see writePoolInitialState's header for the defects the
+    // hand-written copies of this list produced.
+    //
+    // THE ROOT GETS THE UNPERTURBED FREESTREAM, and that is a deliberate
+    // approximation rather than an oversight. Its `f` is mirrored from the
+    // dense grid by seedRootFromDense below and so carries the perturbation;
+    // its velocity would need that same field re-laid-out from block8 into
+    // root tiles to match exactly. The two disagree for exactly ONE criterion
+    // evaluation -- the first refine round -- after which the step recomputes
+    // velocity from `f`. Before this, the root's velocity at reset was not
+    // written at all, so this is strictly more defined than what it replaces.
+    for (const pool of pools) {
+      if (pool) writePoolInitialState(device, pool, { velFill: poolVel[pool.level] || [U0, 0] });
     }
     autoRefine = true; // matches the on-by-default initial state -- reset shouldn't silently disable it
     macroStepCounter = 0;

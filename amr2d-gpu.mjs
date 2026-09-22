@@ -199,6 +199,115 @@ export async function listActiveBlocks(device, pools, level = 1) {
 // is a pool level there is one, and level 1 becomes a quad child like every
 // other level. Default `m !== 1` is exactly the old rule, so a page that does
 // not ask is unchanged.
+// --- WHAT A POOL LOOKS LIKE BEFORE ANYTHING HAS HAPPENED --------------------
+//
+// ONE statement of a level pool's initial state, called from TWO places that
+// must agree and previously did not: `allocLevelPool` below, and every page's
+// `resetSim`. That is the whole point -- the two were hand-written copies of
+// the same list, and they drifted, three times.
+//
+// ── THE BUG CLASS THIS EXISTS TO MAKE UNREPRESENTABLE ───────────────────────
+//
+// "WebGPU zero-initialises buffers, so this one needs no write" is TRUE AT
+// ALLOCATION AND FALSE AT RESET, and that one sentence is the whole of it. A
+// fresh buffer is zeros; a buffer being reset holds the last run's history.
+// Every instance found so far is that reasoning surviving into a reset path:
+//
+//   D1-a    main-cylinder-amr.js  velBuf / finePoolVel / parentSlotBuf never
+//                                 written by resetSim -> the first refinement
+//                                 round after every reset ran on page history
+//   U7-6c   the root pool         seedRootFromDense writes f_root ONLY, so a
+//                                 snapshot load left root velocity stale
+//   U7-6c-fix  main-amr.js        the same three buffers, same consequence --
+//                                 and it is what made the snapshot round-trip
+//                                 gate red for as long as that gate existed
+//
+// The comment this function replaces said parentSlot was "left at WebGPU's own
+// zero-initialized default" and that this was "harmless filler, not a
+// correctness requirement". Correct about allocation. The reset path inherited
+// the conclusion without the premise.
+//
+// ── WHY VELOCITY IS HERE AND `f` IS NOT ────────────────────────────────────
+//
+// `finePoolVel` LOOKS derived -- the step kernel rewrites it from `f` every
+// macro-step -- but `dispatchMacroStep` runs the REFINEMENT ROUND FIRST,
+// reading "each level's own velocity field as populated by the PREVIOUS
+// macro-step". With `macroStepCounter = 0` after a reset, the first
+// macro-step IS a refinement round, so velocity is read before anything
+// writes it. It is state. `velFill` is the page's, because the value depends
+// on the scenario's initial condition: (0,0) for a card at rest, the perturbed
+// freestream for the cylinder.
+//
+// `velFill` is EITHER a constant `[ux, uy]` OR a Float32Array of the pool's
+// own length. The array form exists because a perturbed IC is per-cell and
+// must come from the SAME rng draw as the `f` it describes -- the caller
+// builds both in one pass and hands the velocity here, rather than this
+// function re-deriving something that would silently disagree.
+//
+// `f` is NOT here, and that is the boundary: it is the scenario's subject
+// (initF/initFPool differ per page), so the caller writes it. Everything in
+// this function is the same on every page because it is a statement about the
+// ALLOCATOR, not about the physics.
+export function writePoolInitialState(device, pool, { velFill = [0, 0] } = {}) {
+  const slots = pool.MAX_FINE_BLOCKS;
+  const blocks = pool.NBLOCKS;
+
+  // The indirection. The ROOT is always full, so its map is the identity;
+  // every other level starts empty, and -1 is this pool's "unassigned" (0 is a
+  // valid slot id, which is the bug the -1 fill exists to prevent).
+  if (pool.level === 0) {
+    const identity = new Int32Array(blocks).map((_, i) => i);
+    device.queue.writeBuffer(pool.blockSlotBuf, 0, identity);
+    device.queue.writeBuffer(pool.slotToBlockBuf, 0, identity);
+  } else {
+    device.queue.writeBuffer(pool.blockSlotBuf, 0, new Int32Array(blocks).fill(-1));
+    device.queue.writeBuffer(pool.slotToBlockBuf, 0, new Int32Array(slots).fill(-1));
+  }
+
+  // The free list, in the pool's OWN allocation unit -- quads when
+  // quad-allocated, slots otherwise. Seeded for every level, including the
+  // per-block one, which used to depend on an eager caller-side write placed
+  // after the pools loop on one page.
+  const units = pool.quadAlloc ? slots / 4 : slots;
+  device.queue.writeBuffer(pool.freeListBuf, 0, new Int32Array(units).map((_, i) => i));
+  device.queue.writeBuffer(pool.freeCountBuf, 0, new Int32Array([units]));
+
+  // Quad bookkeeping. `quadrant` is `slot % 4` for the life of the pool -- a
+  // constant, rewritten here only so that "everything this function touches is
+  // fully defined afterwards" has no exceptions to remember.
+  if (pool.parentSlotBuf) device.queue.writeBuffer(pool.parentSlotBuf, 0, new Int32Array(slots));
+  if (pool.quadrantBuf) {
+    device.queue.writeBuffer(pool.quadrantBuf, 0, new Uint32Array(slots).map((_, slot) => quadrantOfSlot(slot)));
+  }
+
+  // Per-round scratch. All of it is rewritten before it is read DURING a
+  // round, so none of it is state in the velocity sense -- but a reset that
+  // leaves it holding the previous run's values is a reset that did not
+  // happen, and proving "rewritten before read" for each one separately is
+  // exactly the reasoning that failed above. Cheap; write them.
+  device.queue.writeBuffer(pool.newlyActivatedBuf, 0, new Uint32Array(slots));
+  device.queue.writeBuffer(pool.wantBuf, 0, new Uint32Array(blocks));
+  device.queue.writeBuffer(pool.blockCriterionBuf, 0, new Uint32Array(blocks));
+  device.queue.writeBuffer(pool.candRankBuf, 0, new Int32Array(blocks));
+
+  // STATE. See the header.
+  const cells = slots * pool.cellsPerSlot;
+  let vel;
+  if (ArrayBuffer.isView(velFill)) {
+    if (velFill.length !== cells * 2) {
+      throw new Error(`writePoolInitialState: level ${pool.level} velFill has ${velFill.length} floats, `
+        + `expected ${cells * 2} (${slots} slots x ${pool.cellsPerSlot} cells x 2)`);
+    }
+    vel = velFill;
+  } else {
+    vel = new Float32Array(cells * 2);
+    if (velFill[0] !== 0 || velFill[1] !== 0) {
+      for (let i = 0; i < cells; i++) { vel[2 * i] = velFill[0]; vel[2 * i + 1] = velFill[1]; }
+    }
+  }
+  device.queue.writeBuffer(pool.finePoolVel, 0, vel.buffer, vel.byteOffset, vel.byteLength);
+}
+
 export function allocLevelPool(device, U, m, NBX_m, NBY_m, maxFineBlocks, NCELLS1, { quadAlloc } = {}) {
   const quad = quadAlloc ?? (m !== 1);
   const NBLOCKS_m = NBX_m * NBY_m;
@@ -275,9 +384,9 @@ export function allocLevelPool(device, U, m, NBX_m, NBY_m, maxFineBlocks, NCELLS
     // allocation time, and nothing calls resetSim() automatically on page
     // load, so a fresh page (or any driver script that steps without
     // calling reset() first) saw permanent level>=2 refinement failure.
-    const freeQuads_m = maxFineBlocks / 4;
-    device.queue.writeBuffer(pool.freeListBuf, 0, new Int32Array(freeQuads_m).map((_, i) => i));
-    device.queue.writeBuffer(pool.freeCountBuf, 0, new Int32Array([freeQuads_m]));
+    // (the free list, freeCount and quadrant are seeded by
+    // writePoolInitialState at the end of this function -- one statement,
+    // shared with every page's resetSim)
     // New vs. level 1: a quadtree child needs its own parent lookup --
     // which parent-level slot it was carved from (parentSlot) and which
     // of the 4 quadrants it occupies (quadrant) -- see
@@ -301,8 +410,7 @@ export function allocLevelPool(device, U, m, NBX_m, NBY_m, maxFineBlocks, NCELLS
     // done here: several other shaders read this buffer, and with nothing
     // writing it per-refine any longer, a zero-initialised or reset copy
     // would be silently wrong for all of them.
-    device.queue.writeBuffer(pool.quadrantBuf, 0,
-      new Uint32Array(maxFineBlocks).map((_, slot) => quadrantOfSlot(slot)));
+
     // NO originX/originY BUFFERS (plans/2D-backport.md B3-5). Milestone 7
     // allocated a per-slot cached origin on the argument that it was not
     // cheaply re-derivable -- it required walking the parent chain, a
@@ -313,9 +421,11 @@ export function allocLevelPool(device, U, m, NBX_m, NBY_m, maxFineBlocks, NCELLS
     // derive it now (amr_step1.wgsl, amr_force1.wgsl, amr_manage_pool.wgsl's
     // parentOriginL0) and nothing stores it.
     // parentSlot has no meaningful "unset" value read anywhere unless
-    // slotToBlock already says active (initialized below) -- 0 is harmless
-    // filler, not a correctness requirement, so left at WebGPU's own
-    // zero-initialized default.
+    // slotToBlock already says active, so 0 is filler rather than a
+    // correctness requirement -- but it is WRITTEN, by writePoolInitialState,
+    // and the reasoning that it need not be is what this project got wrong
+    // three times. "WebGPU zero-initialises it" is true of a fresh buffer and
+    // false of a reset one; see that function's header.
   }
   // BUGFIX: WebGPU zero-initializes new buffers by default -- 0 is a VALID
   // slot/blockID, not "unassigned" (that's -1, this pool's own convention
@@ -331,8 +441,8 @@ export function allocLevelPool(device, U, m, NBX_m, NBY_m, maxFineBlocks, NCELLS
   // defaulted to 0). Fixed at the source (every level, not just level 1)
   // rather than special-cased, so this can't recur if a future level's
   // caller-side init is ever forgotten again.
-  device.queue.writeBuffer(pool.blockSlotBuf, 0, new Int32Array(NBLOCKS_m).fill(-1));
-  device.queue.writeBuffer(pool.slotToBlockBuf, 0, new Int32Array(maxFineBlocks).fill(-1));
+  // (blockSlot/slotToBlock, and the root's identity, are written by
+  // writePoolInitialState at the end of this function.)
   // THE ROOT IS ALWAYS FULL, so its indirection is the identity and is written
   // once, here, over the -1 fill above. plans/uniform-levels.md U1.
   //
@@ -350,11 +460,14 @@ export function allocLevelPool(device, U, m, NBX_m, NBY_m, maxFineBlocks, NCELLS
     if (maxFineBlocks !== NBLOCKS_m) {
       throw new Error(`root pool must have exactly one slot per block (${maxFineBlocks} slots, ${NBLOCKS_m} blocks)`);
     }
-    const identity = new Int32Array(NBLOCKS_m).map((_, i) => i);
-    device.queue.writeBuffer(pool.blockSlotBuf, 0, identity);
-    device.queue.writeBuffer(pool.slotToBlockBuf, 0, identity);
     pool.isRoot = true;
   }
+  // THE SAME CALL EVERY resetSim MAKES. Allocation is just the first reset,
+  // which is what stops the two lists from drifting -- see the function's
+  // header for the three times they did. `velFill` is the caller's at reset
+  // time; at allocation the buffer is about to be overwritten by the page's
+  // own initial condition anyway, so the default is fine here.
+  writePoolInitialState(device, pool);
   return pool;
 }
 
