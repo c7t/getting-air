@@ -2241,18 +2241,19 @@ async function init() {
       throw new Error(`level ${level} block (${bx},${by}) out of range [0,${pool.NBX})x[0,${pool.NBY})`);
     }
 
-    // U5-4: this path is the PER-BLOCK allocator's, and it is refused rather
-    // than half-ported once level 1 allocates in quads. A manual grant that
-    // handed out one slot from a quad-indexed free list would corrupt the pool
-    // silently -- the free list's entries are quad indices, and slot `q` and
-    // quad `q` are different things. Levels >= 2 have always taken the quad
-    // branch below; level 1 now joins them there.
-    if (level === 1 && ROOT_MANAGED) {
-      throw new Error('debugActivateBlock: level 1 is quad-allocated under ?rootpool=1 -- '
-        + 'use ?rootpool=0 for the per-block manual path, or activate a level >= 2 block');
-    }
-
-    if (level === 1) {
+    // U5-4 refused level 1 here once it allocated in quads, on the grounds
+    // that a manual grant from a quad-indexed free list would corrupt the pool
+    // silently. That was right, and "refuse" was meant to be temporary: U7-5
+    // then made `?rootpool=1` the DEFAULT, and this refusal took three opt-in
+    // tools down with it (validate-divergence.js, validate-amr-vs-dense.js,
+    // analyze-reentry-seam.js all drive full refinement through here) without
+    // anything going red, because none of the three is in validate-all's
+    // sweep. Level 1 now takes the quad branch below, like every other level.
+    //
+    // THE PER-BLOCK BRANCH BELOW IS THE ONE WITH A DEATH DATE. It is reachable
+    // only under `?rootpool=0`, which U7-6f deletes along with the dense path;
+    // the quad branch is what survives, and is what is worth testing.
+    if (level === 1 && !ROOT_MANAGED) {
       const blockID = by * NBX + bx;
       if (blockSlotCPU[blockID] !== -1) return { slot: blockSlotCPU[blockID], alreadyActive: true };
       if (freeSlots.length === 0) throw new Error(`pool exhausted (MAX_FINE_BLOCKS=${MAX_FINE_BLOCKS})`);
@@ -2297,8 +2298,15 @@ async function init() {
     const parentPool = pools[level - 1];
     const parentBX = bx >> 1, parentBY = by >> 1;
     const parentBlockID = parentBY * parentPool.NBX + parentBX;
-    const parentSlotVal = blockSlotCPUAtLevel(level - 1)[parentBlockID];
-    if (parentSlotVal === -1) {
+    // THE ROOT IS ALWAYS FULL AND ITS MAP IS THE IDENTITY, so a level-1 quad's
+    // parent slot is its parent block id and there is no "activate it first".
+    // `blockSlotCPUAtLevel` cannot answer for level 0 -- `quadCPU` starts at 1,
+    // because the root is never granted or released and has no host mirror.
+    const parentIsRoot = (level === 1);
+    const parentSlotVal = parentIsRoot
+      ? parentBlockID
+      : blockSlotCPUAtLevel(level - 1)[parentBlockID];
+    if (!parentIsRoot && parentSlotVal === -1) {
       throw new Error(`level ${level} block (${bx},${by}): parent level ${level - 1} block (${parentBX},${parentBY}) is not active -- activate it first`);
     }
 
@@ -2325,10 +2333,20 @@ async function init() {
       }
     }
 
+    // LEVEL 1 HAS ITS OWN COUPLED PIPELINES and does not share level>=2's.
+    // `l1InterpInitPL`/`l1InterpFFPL` come out of makeRootPool's coupleL1,
+    // which selects the ROOT-parent variants once (see its note on why
+    // choosing per dispatch site is the trap). Using interpPoolParentInitPL
+    // here would interpolate level 1's ghosts from the wrong parent
+    // representation.
+    const initPL = (level === 1) ? l1InterpInitPL : interpPoolParentInitPL;
+    const initBG = (level === 1) ? l1InterpInitBG(useB) : pool.interpPoolParentBG_readA;
+    const ffPL = (level === 1) ? l1InterpFFPL : interpPoolParentPL;
+    const ffBG = (level === 1) ? l1InterpFFBG : pool.interpPoolParentBG_readA;
     const enc = device.createCommandEncoder();
     const init = enc.beginComputePass();
-    init.setPipeline(interpPoolParentInitPL);
-    init.setBindGroup(0, pool.interpPoolParentBG_readA);
+    init.setPipeline(initPL);
+    init.setBindGroup(0, initBG);
     init.dispatchWorkgroups(WGX1, WGY1, pool.MAX_FINE_BLOCKS);
     init.end();
     // Reconcile the quad's own 4 mutually-adjacent siblings' shared ghost
@@ -2341,8 +2359,8 @@ async function init() {
     // instead of the exact neighbor-interior copy the steady-state pass
     // (and, once Milestone 7 wires it up, every live macro-step) produces.
     const steady = enc.beginComputePass();
-    steady.setPipeline(interpPoolParentPL);
-    steady.setBindGroup(0, pool.interpPoolParentBG_readA);
+    steady.setPipeline(ffPL);
+    steady.setBindGroup(0, ffBG);
     steady.dispatchWorkgroups(WGX1, WGY1, pool.MAX_FINE_BLOCKS);
     steady.end();
     device.queue.submit([enc.finish()]);

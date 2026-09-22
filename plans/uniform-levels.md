@@ -4075,6 +4075,92 @@ rung rather than a footnote to this one.
 *Also green:* `make check`; `validate-reset-fixed-point` 5/5;
 `validate-snapshot-roundtrip` 12 of 12.
 
+#### U7-6e-fix — `debugActivateBlock` activates a QUAD, and three tools run again (2026-09-22)
+
+U7-6e found `validate-divergence.js`, `validate-amr-vs-dense.js` and
+`analyze-reentry-seam.js` all dead since U7-5 (940cf9f) -- they drive full
+refinement through `debugActivateBlock`, which REFUSED level 1 under quad
+allocation, and `?rootpool=1` became the default that day. Fixed.
+
+**AND THIS IS DELIBERATELY THE CODE THAT SURVIVES U7-6f, not code about to be
+deleted.** The function has two branches:
+
+```
+  level 1 per-BLOCK   reachable only under ?rootpool=0, which U7-6f deletes
+                      along with the dense path. DIES.
+  quad                every level >= 2 today, and level 1 from now on. It is
+                      what the shipped allocator does. SURVIVES, and is the
+                      only branch anything here tests.
+```
+
+U5-4's refusal was correct when written -- a manual grant from a quad-indexed
+free list would corrupt the pool silently, since the free list holds QUAD
+indices and slot `q` and quad `q` are different things. It was meant to be
+temporary and outlived its reason by four days.
+
+Two things level 1 needs that levels >= 2 do not:
+
+- **Its parent is the ROOT, whose map is the identity and which is always
+  full**, so the parent slot is the parent block id with no "activate it
+  first" check. `blockSlotCPUAtLevel` cannot answer for level 0 at all --
+  `quadCPU` starts at 1, because the root is never granted or released and has
+  no host mirror.
+- **Its interp goes through the root-COUPLED pipelines** (`l1InterpInitPL` /
+  `l1InterpFFPL`, from `makeRootPool`'s `coupleL1`), not level>=2's
+  `interpPoolParentInitPL`. Using the latter would interpolate level 1's
+  ghosts from the wrong parent representation -- the trap `coupleL1`'s own
+  note warns about, which is that selecting the parent per dispatch site is
+  how the two get out of step.
+
+*Gate -- `validate-divergence.js --mode=fullrefine`, which could not start
+before:*
+
+```
+    AMRstep   relL2(ux)  relL2(uy)  relL2(rho)   meanErr
+          0     0.00e+0    0.00e+0     0.00e+0     0.00e+0
+```
+
+**The seeding error at step 0 is EXACTLY ZERO**, which that tool's own header
+requires of `fullrefine` ("the finest level maps 1:1 onto the dense grid, so
+injection is an exact copy... if it is not, the injection/reconstruction path
+is at fault, not the solver"). That is simultaneously the end-to-end proof of
+U7-6e's injector fix: dense state -> `dense-to-amr` -> the ROOT pool ->
+`debugSnapshotLoad` -> a reconstruction that matches the dense grid bit for
+bit. The unit tests tie the injector to the reconstructor; this ties both to
+the actual GPU.
+
+##### `validate-amr-vs-dense.js` runs again, and reproduces its OWN open finding
+
+```
+                      recorded 2026-07-11 (res=9)   this run (res=8)
+  ux    relL2               9.7e-3                    1.04e-2
+  rho   relL2               5.1e-5                    6.13e-5
+  uy    relL2               0.22                      0.259
+  omega relL2               0.70                      0.368
+  Cd    dense/amr       2.180 / 2.191             2.243 / 2.190
+```
+
+Same shape, same order, at one resolution coarser. That tool's header
+documents the uy/omega FAIL at Re=20 as **"a real, open finding, not a tuning
+target"** -- a handful of cells at the peak shear layer dominating the norm of
+an otherwise-tiny field -- and says the tolerances are deliberately left
+un-loosened so it keeps reporting it. So the red is the one it is designed to
+show, reproduced, not something this change caused.
+
+**The honest limit on that claim:** the tool could not RUN before this fix, so
+there is no before/after on the same build. What supports it is the agreement
+with the numbers its own header recorded in July, which is corroboration and
+not proof.
+
+*Also green:* `make check`; `make test` (10 suites); the full `validate-all.js`
+sweep unchanged from baseline -- `dense-reference` 1.951/0.1260 and
+`amr-N2-diffuse` 1.652/0.1485, the two known diffuse-band cells and nothing
+else.
+
+*Left for U7-6f:* delete the per-block branch with `?rootpool=0`, and the
+`blockSlotCPU`/`slotToBlockCPU`/`freeSlots` host mirrors that exist only to
+serve it.
+
 #### D1-b — SKIPPED, deliberately, 2026-09-18. The decision the rung asked to be made explicitly.
 
 The rung says: "If D1-b is judged not worth doing on a path scheduled for
@@ -4166,8 +4252,9 @@ the last deletes anything:
          existed. The real content was that the dense L0 still STEPS.
   U7-6e  tools/lib/field-reconstruct.js and tools/lib/dense-to-amr.js
          -- DONE 2026-09-22. Also found three opt-in tools broken since U7-5
-         (debugActivateBlock refuses under the quad default); NOT fixed here,
-         and a blocker for U7-6f's re-validation.
+         (debugActivateBlock refused under the quad default) and FIXED that
+         in U7-6e-fix: level 1 now activates as a quad, which is the branch
+         that survives U7-6f.
   U7-6f  THE DELETION: the shaders, the f_a/f_b/velBuf buffers and their bind
          groups, `?rootpool=`, and the dense-only checkers retired in the same
          commit as their subjects
