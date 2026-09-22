@@ -199,7 +199,67 @@ function loadDenseFields(snapshot) {
 // target cell maps to exactly one source cell at exactly one level).
 // fineToCoarseUnit(fCoord, origin, dxL) = origin - 0.5*dxL + dxL*(fCoord - GHOST)
 
-function reconstructAMRToResolution(snapshot, targetResLog2) {
+
+// --- LEVEL 0, FROM THE ROOT POOL (plans/uniform-levels.md U7-6e) ------------
+//
+// Decodes `snapshot.root` -- the root pool, carried by the format since U7-6c
+// -- into the same flat, BUFFER-space row-major arrays the dense `fB64`/
+// `velB64` used to supply. Same output, different source, so the walk below is
+// untouched.
+//
+// LEVEL 0 STAYS THE BASE CASE AND DOES NOT JOIN `levelData`. The root tile is
+// RINGLESS -- `amr2d.mjs`'s ghostDepthAtLevel(0) is 0, because a ring holds a
+// parent interface and the root has no parent -- so its side is 2*RB where
+// every other level's is FB = 2*RB + 2*GHOST, and `paintSlotSubblock` /
+// `paintSlotFull` index with GHOST offsets that do not apply to it. The plan
+// expected the root to become "one more level of the same quadtree walk"; it
+// cannot, for the same reason U7-6b could not put it in `amr_render.wgsl`'s
+// `poolVel` ladder. What it IS is the always-full base case, which is what the
+// outer loop already treats it as.
+//
+// THE ROOT'S INDIRECTION IS THE IDENTITY (allocLevelPool writes it once and
+// nothing grants or releases at a level with no parent), so the slot for block
+// `b` is `b`. That is asserted rather than assumed -- a snapshot whose root
+// carried a permuted map would silently mis-place every tile.
+function rootToFlatL0(root, W0, H0, RB) {
+  const side = 2 * RB;              // ringless: no GHOST on either axis
+  const nbx = W0 / side, nby = H0 / side;
+  if (!Number.isInteger(nbx) || !Number.isInteger(nby)) {
+    throw new Error(`rootToFlatL0: ${W0}x${H0} does not divide into ${side}-cell root tiles`);
+  }
+  const slots = nbx * nby;
+  if (root.MAX_FINE_BLOCKS !== slots || root.NBLOCKS !== slots) {
+    throw new Error(`rootToFlatL0: root reports ${root.MAX_FINE_BLOCKS} slots / ${root.NBLOCKS} blocks, `
+      + `but ${W0}x${H0} in ${side}-cell tiles is ${slots} of each`);
+  }
+  if (root.cellsPerSlot !== side * side) {
+    throw new Error(`rootToFlatL0: root cellsPerSlot=${root.cellsPerSlot}, expected ${side * side} `
+      + '(a root tile is ringless -- see ghostDepthAtLevel)');
+  }
+  const cells = slots * root.cellsPerSlot;
+  const velRoot = b64ToFloat32(root.velB64, cells * 2);
+  const fRoot = b64ToFloat32(root.fB64, cells * 9);
+  const NCELLS0 = W0 * H0;
+  const vel = new Float32Array(NCELLS0 * 2);
+  const f = new Float32Array(NCELLS0 * 9);
+  for (let by = 0; by < nby; by++) {
+    for (let bx = 0; bx < nbx; bx++) {
+      const slot = by * nbx + bx;   // the identity map; see above
+      for (let ly = 0; ly < side; ly++) {
+        for (let lx = 0; lx < side; lx++) {
+          const src = slot * root.cellsPerSlot + ly * side + lx;
+          const dst = (by * side + ly) * W0 + (bx * side + lx);
+          vel[dst * 2] = velRoot[src * 2];
+          vel[dst * 2 + 1] = velRoot[src * 2 + 1];
+          for (let i = 0; i < 9; i++) f[i * NCELLS0 + dst] = fRoot[i * cells + src];
+        }
+      }
+    }
+  }
+  return { vel, f };
+}
+
+function reconstructAMRToResolution(snapshot, targetResLog2, opts = {}) {
   const { W: W0, H: H0, numLevels, pools } = snapshot;
   if (!pools || numLevels == null) throw new Error('reconstructAMRToResolution: snapshot missing pools[]/numLevels -- not an AMR debugSnapshotSave payload');
   const targetW = 1 << targetResLog2;
@@ -229,16 +289,41 @@ function reconstructAMRToResolution(snapshot, targetResLog2) {
   // fixed-off_x=off_y=0 case this function used to be restricted to.
   const offXTarget = offX * (targetW / W0), offYTarget = offY * (targetW / W0);
   const NCELLS0 = W0 * H0;
-  const velRawL0 = unshiftField(b64ToFloat32(snapshot.velB64, NCELLS0 * 2), W0, H0, 2, 0, 0, 'block8');
-  const fRawL0raw = b64ToFloat32(snapshot.fB64, NCELLS0 * 9);
-  const fL0 = new Float32Array(NCELLS0 * 9);
-  for (let i = 0; i < 9; i++) {
-    const plane = fRawL0raw.subarray(i * NCELLS0, (i + 1) * NCELLS0);
-    fL0.set(unshiftField(plane, W0, H0, 1, 0, 0, 'block8'), i * NCELLS0);
+  const RB = pools[1].RB, GHOST = pools[1].GHOST, FB = pools[1].FB;
+
+  // U7-6e: LEVEL 0 COMES FROM THE ROOT POOL when the snapshot carries one.
+  //
+  // `l0Source` forces the other path, and exists for the A/B rather than for
+  // callers: while both representations are in the format they hold the SAME
+  // field (U5-3 keeps them byte-identical), so the two decoders must produce
+  // identical arrays, and that is the gate for this rung. Under `?densel0=0`
+  // they legitimately diverge -- the dense grid is frozen there -- which is
+  // also why 'root' is the default the moment a root is present: it is the
+  // one that is still being stepped.
+  const l0Source = opts.l0Source || (snapshot.root ? 'root' : 'dense');
+  if (l0Source === 'root' && !snapshot.root) {
+    throw new Error("reconstructAMRToResolution: l0Source='root' but this snapshot carries no root pool "
+      + `(formatVersion ${snapshot.formatVersion ?? '?'}; the root arrived at version 6)`);
+  }
+  let velRawL0, fL0;
+  if (l0Source === 'root') {
+    const flat = rootToFlatL0(snapshot.root, W0, H0, RB);
+    // Already buffer-space row-major, which is the layout the walk wants --
+    // the dense branch below only calls unshiftField to get block8 OUT of the
+    // way, with offX=offY=0, and the root has no block8 to undo.
+    velRawL0 = flat.vel;
+    fL0 = flat.f;
+  } else {
+    velRawL0 = unshiftField(b64ToFloat32(snapshot.velB64, NCELLS0 * 2), W0, H0, 2, 0, 0, 'block8');
+    const fRawL0raw = b64ToFloat32(snapshot.fB64, NCELLS0 * 9);
+    fL0 = new Float32Array(NCELLS0 * 9);
+    for (let i = 0; i < 9; i++) {
+      const plane = fRawL0raw.subarray(i * NCELLS0, (i + 1) * NCELLS0);
+      fL0.set(unshiftField(plane, W0, H0, 1, 0, 0, 'block8'), i * NCELLS0);
+    }
   }
   const rhoL0 = rhoFromF(fL0, W0, H0);
 
-  const RB = pools[1].RB, GHOST = pools[1].GHOST, FB = pools[1].FB;
   const NBX0 = pools[1].NBX, NBY0 = pools[1].NBY;
   const INTERIOR = 2 * RB; // interior fine cells per axis per pool slot
 

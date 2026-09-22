@@ -261,6 +261,30 @@ function injectDenseIntoAMRSnapshot({ denseSnapshot, amrSnapshot, tau0 = null, f
   const NCELLS0 = W0 * H0;
   const fL0 = new Float32Array(NCELLS0 * 9);
   const velL0 = new Float32Array(NCELLS0 * 2);
+  // U7-6e: THE ROOT POOL IS L0 TOO, and since U7-6c it is the one
+  // `debugSnapshotLoad` actually reads. Writing only the dense arrays would
+  // leave the root holding the template's own field -- the injection would
+  // load, report no error, and seed the run with the state it was supposed to
+  // replace. Both are written here, from the same sample, in their own
+  // layouts.
+  //
+  // The root tile is RINGLESS (2*RB on a side, no GHOST) and its indirection
+  // is the identity -- see field-reconstruct.js's rootToFlatL0, of which this
+  // is the exact inverse. Absent on a pre-U7-6c template, in which case there
+  // is nothing to write.
+  const rootTpl = amrSnapshot.root || null;
+  const rootSide = 2 * pools[1].RB;   // RB itself is declared with the pool section below
+  let fRoot = null, velRoot = null, rootCells = 0;
+  if (rootTpl) {
+    const nbxR = W0 / rootSide, nbyR = H0 / rootSide;
+    if (rootTpl.MAX_FINE_BLOCKS !== nbxR * nbyR || rootTpl.cellsPerSlot !== rootSide * rootSide) {
+      throw new Error(`injectDenseIntoAMRSnapshot: root geometry (${rootTpl.MAX_FINE_BLOCKS} slots of `
+        + `${rootTpl.cellsPerSlot}) does not match ${W0}x${H0} in ${rootSide}-cell ringless tiles`);
+    }
+    rootCells = rootTpl.MAX_FINE_BLOCKS * rootTpl.cellsPerSlot;
+    fRoot = new Float32Array(rootCells * 9);
+    velRoot = new Float32Array(rootCells * 2);
+  }
   const rescale0 = fneqRescale(TAU0, finestLevel, 0);
   for (let cy = 0; cy < H0; cy++) {
     for (let cx = 0; cx < W0; cx++) {
@@ -274,6 +298,15 @@ function injectDenseIntoAMRSnapshot({ denseSnapshot, amrSnapshot, tau0 = null, f
       velL0[cell * 2] = s.ux; velL0[cell * 2 + 1] = s.uy;
       for (let i = 0; i < 9; i++) {
         fL0[i * NCELLS0 + cell] = feq(s.rho, s.ux, s.uy, i) + rescale0 * acc[i];
+      }
+      if (rootTpl) {
+        const nbxR = W0 / rootSide;
+        const slot = Math.floor(cy / rootSide) * nbxR + Math.floor(cx / rootSide);
+        const rc = slot * rootTpl.cellsPerSlot + (cy % rootSide) * rootSide + (cx % rootSide);
+        velRoot[rc * 2] = s.ux; velRoot[rc * 2 + 1] = s.uy;
+        for (let i = 0; i < 9; i++) {
+          fRoot[i * rootCells + rc] = feq(s.rho, s.ux, s.uy, i) + rescale0 * acc[i];
+        }
       }
     }
   }
@@ -355,6 +388,8 @@ function injectDenseIntoAMRSnapshot({ denseSnapshot, amrSnapshot, tau0 = null, f
     ...amrSnapshot,
     fB64: float32ToB64(fL0),
     velB64: float32ToB64(velL0),
+    // U7-6e: and the root, which is what a post-U7-6c load actually reads.
+    ...(rootTpl ? { root: { ...rootTpl, fB64: float32ToB64(fRoot), velB64: float32ToB64(velRoot) } } : {}),
     pools: outPools,
     // Provenance, so a snapshot that has been injected into is identifiable
     // after the fact rather than looking like an ordinary captured run.

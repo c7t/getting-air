@@ -96,7 +96,7 @@ function buildDenseSnapshot() {
 // L1 active on L0 block (0,0) only -> blocks (1,0),(0,1),(1,1) stay
 // L0-authoritative. Under that L1 tile, two of the four L2 quadrants are
 // active -> the other two are served by L1 standing in.
-function buildAMRSnapshot() {
+function buildAMRSnapshot({ withRoot = false } = {}) {
   const NCELLS0 = W0 * H0;
   // Poison: every cell the injector is responsible for must be overwritten.
   const fL0 = new Float32Array(NCELLS0 * 9).fill(-999);
@@ -123,9 +123,23 @@ function buildAMRSnapshot() {
   l2BlockSlot[1 * 4 + 1] = 1;
   const l2SlotToBlock = [0, 5, -1, -1];
 
+  // U7-6e: the ROOT POOL, poisoned like everything else. Ringless: 2*RB on a
+  // side, so W0=16/RB=8 is exactly one tile. `withRoot` off reproduces a
+  // pre-U7-6c template, which must still inject.
+  const ROOT_SIDE = 2 * RB;
+  const rootSlots = (W0 / ROOT_SIDE) * (H0 / ROOT_SIDE);
+  const rootCells = rootSlots * ROOT_SIDE * ROOT_SIDE;
+  const fRoot = new Float32Array(rootCells * 9).fill(-999);
+  const velRoot = new Float32Array(rootCells * 2).fill(-999);
+
   return {
-    formatVersion: 5, layout: 'block8', W: W0, H: H0, step: 777, cardState,
+    formatVersion: withRoot ? 6 : 5, layout: 'block8', W: W0, H: H0, step: 777, cardState,
     fB64: b64(fL0), velB64: b64(velL0), params: {}, numLevels: NUM_LEVELS,
+    ...(withRoot ? { root: {
+      level: 0, MAX_FINE_BLOCKS: rootSlots, NBLOCKS: rootSlots,
+      NBX: W0 / ROOT_SIDE, NBY: H0 / ROOT_SIDE, cellsPerSlot: ROOT_SIDE * ROOT_SIDE,
+      fB64: b64(fRoot), velB64: b64(velRoot),
+    } } : {}),
     pools: [
       null,
       {
@@ -380,6 +394,59 @@ function main() {
     bad.cardState[19] = 0.4;
     assert.throws(() => injectDenseIntoAMRSnapshot({ denseSnapshot: buildDenseSnapshot(), amrSnapshot: bad }),
       /BGK floor/);
+  });
+
+  // ── U7-6e: the ROOT POOL is L0 too, and it is the one a load reads ──────
+  //
+  // `injectDenseIntoAMRSnapshot` returns `{ ...amrSnapshot, fB64, velB64 }`.
+  // Since U7-6c the snapshot also carries `root`, and `debugSnapshotLoad`
+  // restores L0 FROM IT -- so an injector that wrote only the dense arrays
+  // would produce a snapshot that loads cleanly and seeds the run with the
+  // TEMPLATE'S field, silently. That is what these cover.
+
+  test('the root pool is overwritten, not passed through from the template', () => {
+    const amr = buildAMRSnapshot({ withRoot: true });
+    const out = injectDenseIntoAMRSnapshot({ denseSnapshot: buildDenseSnapshot(), amrSnapshot: amr });
+    assert.ok(out.root, 'output carries no root at all');
+    assert.notStrictEqual(out.root.fB64, amr.root.fB64, 'root f is the template\'s -- not injected');
+    assert.notStrictEqual(out.root.velB64, amr.root.velB64, 'root vel is the template\'s -- not injected');
+    // The poison must be gone from every cell, not merely from some.
+    const cells = out.root.MAX_FINE_BLOCKS * out.root.cellsPerSlot;
+    const vel = new Float32Array(Buffer.from(out.root.velB64, 'base64').buffer.slice(0), 0, cells * 2);
+    assert.ok(!vel.includes(-999), 'the root still holds poisoned cells after injection');
+  });
+
+  test('the injected root and the injected dense L0 carry the SAME field', () => {
+    // The strongest form: the injector writes two layouts of one field, and
+    // field-reconstruct decodes both. They are inverses by construction, so a
+    // layout mistake in either shows up here rather than as a plausible
+    // picture. Same reasoning as this file's round-trip tests.
+    const out = injectDenseIntoAMRSnapshot({
+      denseSnapshot: buildDenseSnapshot(),
+      amrSnapshot: buildAMRSnapshot({ withRoot: true }),
+    });
+    const resLog2 = Math.log2(W0 * (1 << (NUM_LEVELS - 1)));
+    const viaRoot = reconstructAMRToResolution(out, resLog2, { l0Source: 'root' });
+    const viaDense = reconstructAMRToResolution(out, resLog2, { l0Source: 'dense' });
+    for (const k of ['ux', 'uy', 'rho']) {
+      assert.deepStrictEqual(Array.from(viaRoot[k]), Array.from(viaDense[k]),
+        `${k}: the injector's root and dense L0 disagree`);
+    }
+  });
+
+  test('a pre-U7-6c template without a root still injects, and gains none', () => {
+    const out = injectDenseIntoAMRSnapshot({
+      denseSnapshot: buildDenseSnapshot(),
+      amrSnapshot: buildAMRSnapshot({ withRoot: false }),
+    });
+    assert.strictEqual(out.root, undefined, 'invented a root the template did not have');
+  });
+
+  test('a root whose geometry disagrees with the domain is refused', () => {
+    const amr = buildAMRSnapshot({ withRoot: true });
+    amr.root.cellsPerSlot = 400; // a RINGED tile -- wrong for the root
+    assert.throws(() => injectDenseIntoAMRSnapshot({ denseSnapshot: buildDenseSnapshot(), amrSnapshot: amr }),
+      /root geometry/);
   });
 
   console.log();

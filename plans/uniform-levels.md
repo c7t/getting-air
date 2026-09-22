@@ -3991,6 +3991,90 @@ representations against each other, so they need it stepping and are why
 `validate-reset-fixed-point` 5/5; `validate-snapshot-roundtrip` 12 of 12; the
 full default sweep unchanged from baseline.
 
+#### U7-6e — DONE (2026-09-22). The two libs read the root, and the injector had a live regression.
+
+##### `field-reconstruct.js`
+
+`reconstructAMRToResolution` decodes level 0 from `snapshot.root` when the
+capture carries one (formatVersion 6, U7-6c), falling back to the dense
+`fB64`/`velB64` otherwise. `{ l0Source: 'root' | 'dense' }` forces either.
+
+**THE PLAN EXPECTED THIS TO MAKE IT SIMPLER -- "the root becomes one more level
+of the same quadtree walk" -- AND IT CANNOT.** The root tile is RINGLESS
+(`ghostDepthAtLevel(0)` is 0: a ring holds a parent interface and the root has
+no parent), so its side is `2*RB` where every other level's is
+`FB = 2*RB + 2*GHOST`, and `paintSlotSubblock`/`paintSlotFull` index with GHOST
+offsets that do not apply to it. **Same refusal U7-6b hit in
+`amr_render.wgsl`'s `poolVel` ladder, for the same reason.** What level 0 IS is
+the always-full BASE CASE of the walk, which is what the outer loop already
+treated it as -- so the change is its SOURCE, not the walk. `rootToFlatL0`
+decodes the root's tile-major layout into the flat buffer-space array the walk
+already wanted.
+
+##### `dense-to-amr.js` -- and the regression U7-6c introduced
+
+`injectDenseIntoAMRSnapshot` returns `{ ...amrSnapshot, fB64, velB64, pools }`.
+Since U7-6c the snapshot also carries `root`, and **`debugSnapshotLoad`
+restores L0 FROM IT** -- so the spread passed the TEMPLATE'S root through
+untouched while the dense arrays were replaced. An injected snapshot would have
+loaded cleanly, reported nothing, and seeded the run with the state the
+injection was supposed to replace.
+
+Not hypothetical and not caught by any existing gate: `validate-divergence.js`
+exists precisely to seed both solvers from one state, and that is the property
+this broke. The injector now writes both layouts from the same sample.
+
+*Gate -- `make test`, 10 suites:*
+- `tools/test-root-l0-reconstruct.js` (new, 6 cases): the root decode equals
+  the dense decode cell for cell on a fixture that fills BOTH layouts from one
+  logical field; a perturbed root must NOT match (so the row above cannot pass
+  by both paths reading the same bytes); the root is the default when present;
+  a pre-U7-6c snapshot still decodes; `l0Source: 'root'` without a root, and a
+  ringed `cellsPerSlot`, both REFUSE.
+- `tools/test-dense-to-amr.js` gains 4 (12 -> 16): the root is overwritten
+  rather than passed through, with no poison cells left; **the injected root
+  and the injected dense L0 decode to the SAME field** -- which ties the
+  injector to the reconstructor, the two being inverses by construction; a
+  rootless template still injects and gains none; a mismatched root is refused.
+- **Mutation-checked**: transposing the injector's root local index
+  (`ly`/`lx`) turns the same-field row red. The layout is the entire risk here
+  and it is the thing under test.
+
+##### FOUND, NOT FIXED: three tools have been broken since U7-5
+
+`validate-divergence.js --mode=fullrefine` fails before it reaches any of the
+above:
+
+```
+  ERROR: debugActivateBlock: level 1 is quad-allocated under ?rootpool=1 --
+         use ?rootpool=0 for the per-block manual path
+```
+
+The refusal is deliberate and arrived with quad allocation (U5-4). It became a
+DEFAULT failure at **U7-5 (940cf9f, 2026-09-18)**, which flipped `?rootpool=1`
+on. Three tools drive full refinement through that per-block path and **none of
+them pins `?rootpool=0`**:
+
+```
+  tools/validate-divergence.js       measured failing, 2026-09-22
+  tools/validate-amr-vs-dense.js     same call site
+  tools/analyze-reentry-seam.js      same call site
+```
+
+All three are standalone/opt-in and outside `validate-all.js`'s sweep, which is
+why four days passed with nothing red. **Two of them are named in U7-6's own
+tail as things to port**, so this is on the path: they cannot be re-validated
+after the deletion while they cannot run at all.
+
+Deliberately NOT fixed here. `?rootpool=0` would make them run today and is the
+wrong answer -- that path disappears at U7-6f. The right fix is for
+`debugActivateBlock` to activate a QUAD under quad allocation, which is a page
+change with its own CPU-mirror and free-list bookkeeping, and it is its own
+rung rather than a footnote to this one.
+
+*Also green:* `make check`; `validate-reset-fixed-point` 5/5;
+`validate-snapshot-roundtrip` 12 of 12.
+
 #### D1-b — SKIPPED, deliberately, 2026-09-18. The decision the rung asked to be made explicitly.
 
 The rung says: "If D1-b is judged not worth doing on a path scheduled for
@@ -4080,8 +4164,10 @@ the last deletes anything:
   U7-6d  the remaining host consumers  -- DONE 2026-09-22, and the
          itemisation was stale: two of the four were already done or never
          existed. The real content was that the dense L0 still STEPS.
-  U7-6e  tools/lib/field-reconstruct.js and tools/lib/dense-to-amr.js, which
-         are inverses by construction and have a round-trip test already
+  U7-6e  tools/lib/field-reconstruct.js and tools/lib/dense-to-amr.js
+         -- DONE 2026-09-22. Also found three opt-in tools broken since U7-5
+         (debugActivateBlock refuses under the quad default); NOT fixed here,
+         and a blocker for U7-6f's re-validation.
   U7-6f  THE DELETION: the shaders, the f_a/f_b/velBuf buffers and their bind
          groups, `?rootpool=`, and the dense-only checkers retired in the same
          commit as their subjects
