@@ -147,6 +147,17 @@ const CONFIGS = [
 // -- the vacuity its own header predicted for quad-managed level 1, now that
 // U7-5 has made that the default -- so on THAT page only `levels=3` still
 // keeps the instrument honest. Here both rungs race, visibly.
+//
+// THESE HASHES MOVE WHEN THE SNAPSHOT FORMAT MOVES, and that is not a
+// regression. `fingerprint` walks the WHOLE snapshot object, so a new key
+// changes every hash in the table while changing no physics. U7-6c added
+// `root` (formatVersion 6) and did exactly that:
+//
+//   levels=2 detslots=1   8ddd3ff2f84a697f (v5)  ->  e0b1b22bbe47cbfb (v6)
+//   levels=3 detslots=1   3d80fa737af6bf9e (v5)  ->  4705ea2b06226c8b (v6)
+//
+// Both re-measured 2026-09-22, IDENTICAL over four runs each. Check the
+// format version before treating a moved hash here as a physics change.
 const GATES_BY_PAGE = {
   'index-amr.html': true,
   'index-cylinder-amr.html': true,

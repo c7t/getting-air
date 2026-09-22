@@ -95,22 +95,14 @@ async function runRenderLevels({ Page, Runtime, global, steps = 4096, log = () =
 
   // ── 2. one level at a time ─────────────────────────────────────────────────
   //
-  // LEVEL 0 GOES LAST, and the reason is a real gap rather than tidiness.
-  // Every row restores the snapshot before perturbing, and that restore is
-  // what lets the rows be independent. `debugSnapshotLoad` carries each pool
-  // level's velocity -- but NOT the root pool's, which is still reconstructed
-  // from the dense grid (plans/uniform-levels.md U7-6c is where that changes).
-  // So a level-0 perturbation survives the restore and poisons every row after
-  // it, which is exactly what this gate reported when level 0 ran first: one
-  // PASS followed by three ABSTAINs reading "the reference is moving".
-  //
-  // The ABSTAIN was right and is worth keeping in view -- when U7-6c puts the
-  // root pool in the snapshot, this ordering stops mattering and the comment
-  // can go with it.
-  const order = [];
-  for (let m = 1; m < nLevels; m++) order.push(m);
-  order.push(0);
-  for (const m of order) {
+  // NATURAL ORDER, INCLUDING LEVEL 0. U7-6b had to run level 0 LAST: every row
+  // restores the snapshot before perturbing, and the snapshot did not carry
+  // the root pool, so a level-0 perturbation survived the restore and poisoned
+  // every row after it (one PASS, then "the reference is moving" for the rest).
+  // U7-6c put the root in the format, and this ordering going back to the
+  // obvious one is that rung's gate: if the restore did not now undo a
+  // level-0 perturbation, the rows below it would ABSTAIN again and say so.
+  for (let m = 0; m < nLevels; m++) {
     if (active[m] === -1) {
       rows.push({ level: m, verdict: 'ABSTAIN', note: 'no pool at this level on this page/configuration' });
       continue;

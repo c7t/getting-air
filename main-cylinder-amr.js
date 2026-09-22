@@ -25,7 +25,7 @@
 import { reportFatal, refuseConfig, setStatus, reportNoWebGPU, reportNoAdapter } from './error-overlay.mjs';
 import { loadShader } from './shader-loader.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
-import { check21BalanceOnGPU, allocLevelPool, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState, checkGeometryCoverageOnGPU, makeRefusalWatch , checkRefinementClosureOnGPU , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU, makeRenderBindGroup, renderRootIsPool, renderPoolLevels, MAX_RENDER_POOL_LEVELS, makeAMRLayouts, makeCouplingPipelines, makeLevelBindGroups, makeManageBindGroups, makeScheduler, makeRefineRound, readRootFlags, allocRootPool, makeRootPool } from './amr2d-gpu.mjs';
+import { check21BalanceOnGPU, allocLevelPool, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState, checkGeometryCoverageOnGPU, makeRefusalWatch , checkRefinementClosureOnGPU , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU, makeRenderBindGroup, renderRootIsPool, renderPoolLevels, MAX_RENDER_POOL_LEVELS, makeAMRLayouts, makeCouplingPipelines, makeLevelBindGroups, makeManageBindGroups, makeScheduler, makeRefineRound, readRootFlags, allocRootPool, makeRootPool, encodeRootCapture, readRootCapture, restoreRootCapture } from './amr2d-gpu.mjs';
 // tauAtLevel: extracted to card-params.mjs by B3a-1, which landed the CALL
 // in all five AMR pages and this IMPORT in only main-amr.js. The other four
 // threw `ReferenceError: tauAtLevelOf is not defined` at init -- but only at
@@ -1593,6 +1593,8 @@ async function init() {
       enc.copyBufferToBuffer(pools[1].quadrantBuf, 0, l1Quad.quadrant, 0, MAX_FINE_BLOCKS * 4);
     }
 
+    // U7-6c: the ROOT pool, as a level. See encodeRootCapture.
+    const rootStaging = encodeRootCapture(device, U, enc, pools);
     const levelStaging = [];
     for (let m = 2; m < N_LEVELS; m++) {
       const pool = pools[m];
@@ -1627,6 +1629,7 @@ async function init() {
     for (const st of levelStaging) allBuffers.push(st.f, st.vel, st.blockSlot, st.slotToBlock, st.parentSlot, st.quadrant, st.freeList, st.freeCount);
     if (l1Quad) allBuffers.push(l1Quad.parentSlot, l1Quad.quadrant);
     allBuffers.push(l1Free.freeList, l1Free.freeCount);
+    if (rootStaging) allBuffers.push(rootStaging.f, rootStaging.vel);
     await Promise.all(allBuffers.map(b => b.mapAsync(GPUMapMode.READ)));
 
     const f = readF(stagingF.getMappedRange(), NCELLS);
@@ -1657,6 +1660,8 @@ async function init() {
       };
       for (const b of [l1Quad.parentSlot, l1Quad.quadrant]) { b.unmap(); b.destroy(); }
     }
+
+    const rootOut = readRootCapture(rootStaging, pools, { readF, bytesToB64 });
 
     const poolsOut = [
       null, // index 0 unused -- L0 is the dense grid, matches the live pools[] convention
@@ -1696,7 +1701,11 @@ async function init() {
     }
 
     const snapshot = {
-      formatVersion: 5,
+      // U7-6c: 6 adds `root`. A version-5 capture still loads -- the load
+      // falls back to seedRootFromDense() and says what that does not carry.
+      formatVersion: 6,
+      // The ROOT POOL, or null when this page has none (?rootpool=0).
+      root: rootOut,
       // 'block8': f/vel are laid out in fixed 8x8 buffer-space cell-blocks
       // (see shaders/amr_step.wgsl's cellIndex, Milestone 1 of
       // plans/AMR.md), not flat row-major -- tools/amr-diff.js needs this
@@ -1786,7 +1795,22 @@ async function init() {
     // snapshot format does not carry it yet (that is U7-6's); mirroring the
     // just-restored dense grid is exact by U2's proof, so a load lands both
     // representations in the same state rather than one.
-    if (rootGpu) rootGpu.seedRootFromDense();
+    // U7-6c: the root pool comes from the snapshot when the capture has one.
+    // restoreRootCapture REFUSES a mismatch rather than loading a wrong shape.
+    if (!restoreRootCapture(device, pools, snapshot.root, { writeF, b64ToFloat32 })) {
+      // Pre-U7-6c capture (formatVersion <= 5). Mirroring the just-restored
+      // dense grid is exact for `f` by U2's proof -- but amr_mirror_root.wgsl
+      // writes f_root ONLY, so the root's VELOCITY is whatever the page had
+      // before the load. The refinement round runs BEFORE the step, so the
+      // first one after this reads that stale velocity and the load is not
+      // reproducible. Say so rather than letting it look clean.
+      if (rootGpu) {
+        rootGpu.seedRootFromDense();
+        console.warn('debugSnapshotLoad: formatVersion ' + (snapshot.formatVersion ?? '?')
+          + ' carries no root pool; seeded f from the dense grid and left the root VELOCITY stale. '
+          + 'The next refinement round reads that velocity -- re-save at version 6 for a reproducible load.');
+      }
+    }
     device.queue.writeBuffer(cardStateBuf, 0, new Float32Array(snapshot.cardState));
 
     for (let m = 1; m < N_LEVELS; m++) {

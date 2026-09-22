@@ -3320,6 +3320,12 @@ measuring run itself uses.
 `3d80fa737af6bf9e` (levels=3) on `index-amr.html` at `--runs=4`, bit for bit,
 after the refactor.
 
+**THOSE TWO HASHES ARE FORMAT-v5 AND ARE SUPERSEDED.** `fingerprint` walks the
+whole snapshot object, so U7-6c adding a `root` key moved every hash in the
+table without moving any physics: `e0b1b22bbe47cbfb` / `4705ea2b06226c8b` at
+formatVersion 6, re-measured 2026-09-22, IDENTICAL over four runs each. Check
+the format version before reading a moved hash here as a regression.
+
 **AND THE CARD PAGE'S OWN DISCRIMINATION RUNG IS NOW VACUOUS IN THE DEFAULT
 CONFIGURATION.** `levels=2 detslots=0` came back IDENTICAL over 4 runs
 (`8ddd3ff2f84a697f`, the same hash as `detslots=1`). The tool's header
@@ -3620,6 +3626,98 @@ page and no green row means anything -- the same guard the card page's
 here is 69888 steps. If it is expensive that is a fact to record next to the
 gate, not a reason to skip it.
 
+#### U7-6c — DONE (2026-09-22). The snapshot carries the root pool, and the round-trip suite turns out to be RED for another reason.
+
+`debugSnapshotSave`/`Load` on the three pages that have them now carry
+`pools[0]`'s field and velocity, at `formatVersion: 6`.
+
+**SHARED, unlike the rest of those two functions.** CLAUDE.md's rule is that
+they stay per-page because "they serialise whatever state that page owns" --
+and the root pool is the one part that is NOT page state. Its shape comes from
+`rootPoolSpec` and is identical everywhere, so `encodeRootCapture` /
+`readRootCapture` / `restoreRootCapture` live in `amr2d-gpu.mjs`. Three copies
+of a format is three chances to carry a different one.
+
+**WHAT IS SAVED IS `f` AND `vel`, AND NOTHING ELSE.** The root's
+blockSlot/slotToBlock are the IDENTITY, written once by `allocLevelPool` and
+never touched -- there is no grant or release at a level with no parent -- so
+they are shape, not state, and `checkRootPoolIdentity` already scores them
+against that rule. The free list is allocated and left alone for the same
+reason.
+
+**THE VELOCITY IS STATE, AND THAT IS THE WHOLE RUNG.** It looks derived, since
+the step kernel rewrites it from `f` every macro-step. But `dispatchMacroStep`
+runs the REFINEMENT ROUND FIRST, reading "each level's own velocity field as
+populated by the PREVIOUS macro-step" -- so the first refine round after a load
+reads velocity the load must have put there. **This is the identical defect
+D1-a found in `resetSim`, at a second site**: a buffer rewritten every step is
+still state if something reads it before the first step. Worth stating as a
+rule rather than as two coincidences.
+
+Before this, a load called `seedRootFromDense()`, and `amr_mirror_root.wgsl`
+writes `f_root` ONLY -- the root's velocity survived a load untouched. A
+version-5 capture still loads, via that same fallback, and now says out loud
+what it does not carry rather than looking clean.
+
+*Gate:* U7-6b's own workaround, removed. That rung had to run level 0 LAST in
+`tools/lib/render-levels.js` because a level-0 perturbation survived the
+restore and poisoned every later row (one PASS, then three `ABSTAIN restore did
+not return to baseline`). The loop is back in natural order and all rows pass
+on both pages:
+
+```
+  index-amr.html            L0 PASS  L1 PASS  L2 PASS  L3 PASS
+  index-cylinder-amr.html   L0 PASS  L1 PASS  L2 PASS
+```
+
+Level 0 runs FIRST there now, so the later rows passing IS the restore working.
+Plus `make check`, `make test` (8 suites) and the full `validate-all.js` sweep.
+
+##### `validate-snapshot-roundtrip.js` IS RED, AND IT WAS RED BEFORE THIS RUNG
+
+All four gated rows fail. They also fail with this rung reverted, at the
+session's starting commit `2fe46e3`, and **at `6ffe437` -- U7-6a itself, the
+commit whose entry records "12 of 12, both legs genuinely different
+allocators, all four `stale` controls moving"**. Measured 2026-09-22 by
+checking each commit out and running it:
+
+```
+  6ffe437  U7-6a          FAIL x4   ref e3ffeb0f4dfaa5b2 / roundtrip 82a654e0a81062e0 (L2,rootpool=0)
+  2fe46e3  session start  FAIL x4   ref 01b703842ec46b05 / roundtrip fe009ff51bf1f856
+  HEAD     with U7-6c     FAIL x4   ref 3c72db437a061930 / roundtrip b4836bdd4d1174f0
+```
+
+The hashes differ per commit because the code does; the VERDICT does not.
+
+**IT IS NOT THIS RUNG'S, and the diff says so directly**: at every commit the
+differing keys are `.pools[].parentSlot`, `.blockSlot`, `.slotToBlock`,
+`.freeList` and one or two `.fB64`/`.velB64` -- and **never `.root.*`**, at
+HEAD, where `root` exists. The root round-trips exactly. U7-6c also did not
+change the failure: the `rootpool=1` rows read `32 .pools[].parentSlot + 1
+.pools[].velB64` both before and after it, to the entry.
+
+**IT IS NOT THE ENVIRONMENT EITHER.** Chrome has been 151.0.7922.173 since
+2026-08-24 and the machine has 5 weeks of uptime, so nothing moved under the
+code between U7-6a's green record and this red one. Both of the suite's
+controls (`stale` moves the outcome, `refuse` throws) PASS at every commit
+above, so the instrument is live and this is a real red, not a vacuous one.
+
+That leaves U7-6a's record not reproducing. The most likely explanation is the
+trap CLAUDE.md records having cost two full sweeps already -- `ensureServer`
+reusing a server whose cwd is another checkout -- but that cannot be proved
+retroactively and is not being asserted here. What IS established: **the
+snapshot round trip is not reproducible today, has not been for at least as
+long as the tool has existed, and the level-1/2 allocator state is where it
+diverges.** Not fixed here, and deliberately not folded into this rung.
+
+##### The D1-0 gate hashes moved, and that is the format, not the physics
+
+`8ddd3ff2f84a697f` / `3d80fa737af6bf9e` were formatVersion 5. `fingerprint`
+walks the whole snapshot object, so adding `root` moved both without moving any
+physics: **`e0b1b22bbe47cbfb` / `4705ea2b06226c8b` at version 6**, IDENTICAL
+over four runs each. Recorded in the tool beside the table, because a moved
+hash there is exactly the shape of a regression and this one is not.
+
 #### D1-b — SKIPPED, deliberately, 2026-09-18. The decision the rung asked to be made explicitly.
 
 The rung says: "If D1-b is judged not worth doing on a path scheduled for
@@ -3704,7 +3802,8 @@ the last deletes anything:
 ```
   U7-6b  the RENDERER's level 0 becomes a pool level, like 1..4 already are
          -- DONE 2026-09-18
-  U7-6c  debugSnapshotSave/Load carry the root pool and drop the dense arrays
+  U7-6c  debugSnapshotSave/Load carry the root pool  -- DONE 2026-09-22
+         (the dense arrays go at U7-6f, with the buffers themselves)
   U7-6d  the remaining host consumers -- readConservedTotals,
          readPoolUniformDeviation, the dense criterion read, the dense force
   U7-6e  tools/lib/field-reconstruct.js and tools/lib/dense-to-amr.js, which

@@ -358,6 +358,95 @@ export function allocLevelPool(device, U, m, NBX_m, NBY_m, maxFineBlocks, NCELLS
   return pool;
 }
 
+// --- THE ROOT POOL IN A SNAPSHOT (plans/uniform-levels.md U7-6c) -----------
+//
+// SHARED, unlike the rest of debugSnapshotSave/Load. CLAUDE.md's rule is that
+// those stay per-page because "they serialise whatever state that page owns",
+// and the root pool is the one part of them that is NOT page state: its shape
+// comes from `rootPoolSpec` and is the same on every page that has one. Three
+// pages carry snapshots, and three copies of a format is three chances to
+// carry a different one.
+//
+// WHAT IS AND IS NOT SAVED. The field (`f`) and the VELOCITY, and nothing
+// else. The root's blockSlot/slotToBlock are the IDENTITY, written once by
+// allocLevelPool and never touched again -- there is no grant or release at a
+// level with no parent -- so they are shape, not state, and `checkRootPoolIdentity`
+// already scores them against that rule. The free list is allocated and left
+// untouched for the same reason.
+//
+// THE VELOCITY IS STATE, AND THAT IS THE WHOLE POINT OF THIS RUNG. It looks
+// derived -- the step kernel rewrites it from `f` every macro-step -- but
+// `dispatchMacroStep` runs the REFINEMENT ROUND FIRST, reading "each level's
+// own velocity field as populated by the PREVIOUS macro-step". So the first
+// refine round after a load reads velocity the load must have put there. This
+// is the same defect D1-a found in `resetSim` on the cylinder page, at a
+// second site: a buffer that is rewritten every step is still state if
+// something reads it before the first step.
+//
+// Before this, a load called `seedRootFromDense()`, and `amr_mirror_root.wgsl`
+// writes `f_root` ONLY -- so the root's velocity survived a load untouched.
+// `tools/lib/render-levels.js` reported it as "restore did not return to
+// baseline" the moment it was given a level-0 row (U7-6b).
+export function encodeRootCapture(device, U, enc, pools) {
+  const root = pools[0];
+  if (!root) return null;
+  const velBytes = root.MAX_FINE_BLOCKS * root.cellsPerSlot * 2 * 4;
+  const st = {
+    f: device.createBuffer({ size: root.fSizePool, usage: U.MAP_READ | U.COPY_DST }),
+    vel: device.createBuffer({ size: velBytes, usage: U.MAP_READ | U.COPY_DST }),
+  };
+  // Sized from the pool's own fields, never recomputed from a page's NCELLS1 --
+  // the root tile is RINGLESS, so its cellsPerSlot is (2*RB)^2 where every
+  // other level's is (2*RB + 2*GHOST)^2. U7-6a records what an over-long copy
+  // costs: the encoder is invalidated and EVERY other copy in the same submit
+  // is silently dropped, producing an all-zero snapshot that passes any gate
+  // made of equalities.
+  enc.copyBufferToBuffer(root.finePoolF_a, 0, st.f, 0, root.fSizePool);
+  enc.copyBufferToBuffer(root.finePoolVel, 0, st.vel, 0, velBytes);
+  return st;
+}
+
+// Call after the staging buffers are mapped. Unmaps and destroys its own.
+export function readRootCapture(st, pools, { readF, bytesToB64 }) {
+  if (!st) return null;
+  const root = pools[0];
+  const cells = root.MAX_FINE_BLOCKS * root.cellsPerSlot;
+  const f = readF(st.f.getMappedRange(), cells);
+  const vel = new Float32Array(st.vel.getMappedRange()).slice();
+  for (const b of [st.f, st.vel]) { b.unmap(); b.destroy(); }
+  const bytes = (a) => bytesToB64(new Uint8Array(a.buffer, a.byteOffset, a.byteLength));
+  return {
+    level: 0,
+    MAX_FINE_BLOCKS: root.MAX_FINE_BLOCKS, NBLOCKS: root.NBLOCKS,
+    NBX: root.NBX, NBY: root.NBY, cellsPerSlot: root.cellsPerSlot,
+    fB64: bytes(f), velB64: bytes(vel),
+  };
+}
+
+// Returns true if the root was restored FROM THE SNAPSHOT. False means the
+// caller should fall back to seedRootFromDense() -- which is correct only for
+// a capture written before this rung, and only for `f`.
+export function restoreRootCapture(device, pools, snapRoot, { writeF, b64ToFloat32 }) {
+  const root = pools[0];
+  if (!snapRoot) return false;
+  if (!root) {
+    throw new Error('snapshot carries a root pool but this page has none (?rootpool=0) -- '
+      + 'refusing rather than dropping level 0 on the floor');
+  }
+  if (snapRoot.MAX_FINE_BLOCKS !== root.MAX_FINE_BLOCKS
+      || snapRoot.NBLOCKS !== root.NBLOCKS
+      || snapRoot.cellsPerSlot !== root.cellsPerSlot) {
+    throw new Error(`snapshot root (slots=${snapRoot.MAX_FINE_BLOCKS}, blocks=${snapRoot.NBLOCKS}, `
+      + `cellsPerSlot=${snapRoot.cellsPerSlot}) does not match this page's `
+      + `(slots=${root.MAX_FINE_BLOCKS}, blocks=${root.NBLOCKS}, cellsPerSlot=${root.cellsPerSlot})`);
+  }
+  const cells = root.MAX_FINE_BLOCKS * root.cellsPerSlot;
+  writeF(root.finePoolF_a, b64ToFloat32(snapRoot.fB64, cells * 9), cells);
+  const vel = b64ToFloat32(snapRoot.velB64, cells * 2);
+  device.queue.writeBuffer(root.finePoolVel, 0, vel.buffer, vel.byteOffset, vel.byteLength);
+  return true;
+}
+
 // The root's indirection is the identity, and blockSlot/slotToBlock are
 // inverses. Scored on the LIVE buffers, not on the host's intent -- the same
 // reason debugCheckSlotQuadrants scores quadrantBuf against quadrantOfSlot
