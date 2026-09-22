@@ -1023,6 +1023,38 @@ async function init() {
   // and a recomputed condition in four places is how those drift.
   const ROOT_MANAGED = rootFlags.managed;
 
+// ?densel0=0 -- STOP COMPUTING THE DENSE L0 AT ALL (plans/uniform-levels.md
+// U7-6d). Default 1, which is byte-identical to not having the flag.
+//
+// U5-3 kept the dense L0 grid stepping in parallel with the root pool so the
+// two representations stayed byte-identical and every remaining dense consumer
+// was untouched. U7-6b and U7-6c ported the last two consumers that mattered
+// -- the renderer and the snapshot -- so under `?rootpool=1` the dense grid is
+// now a field NOTHING READS FOR PHYSICS:
+//
+//   the renderer        reads the root pool (U7-6b's ROOT_IS_POOL)
+//   the snapshot        carries the root pool (U7-6c)
+//   level 1's ghosts    interpolate from the root (U5-3's coupleL1)
+//   level 1's criterion is criterionPoolPLs[0], on the root
+//   `denseCriterion`    still runs, and is REDIRECTED into rootGpu.denseCritBuf
+//                       -- a scratch buffer that exists only so the shared
+//                       refine round has somewhere harmless to land. Nothing
+//                       reads it.
+//   `frcPL`             only dispatches when N_LEVELS === 1, which every AMR
+//                       page refuses at init.
+//
+// What still reads it: `debugSnapshotSave` (which also carries the root now),
+// and the dev page's root COMPARATORS, whose whole job is to score the two
+// representations against each other. Those need the dense grid stepping, so
+// this flag turns them into a comparison against a frozen grid -- which is
+// U3's `?rootstep=0` control inverted, and is why they are excluded below
+// rather than left to fail confusingly.
+//
+// It goes away at U7-6f, when the dense path is deleted and there is no
+// `?densel0=1` to return to.
+const DENSE_L0 = urlParams.has('densel0') ? (parseInt(urlParams.get('densel0')) ? 1 : 0) : 1;
+
+
 // ?rootIsPool=0|1 -- draw level 0 from the DENSE grid or the ROOT POOL
 // (plans/uniform-levels.md U7-6b). Default: the root pool when one exists.
 // Both representations hold the same field while `?rootpool=1` keeps the dense
@@ -1421,6 +1453,10 @@ const RENDER_ROOT_IS_POOL = urlParams.has('rootIsPool')
     { ...modules, step1SM, mirrorRootSM }, pools,
     { W, H, RB, F16, DC_PRE, step1Constants, couplingConstants,
       cardStateBuf, denseFBuf: f_a, flags: rootFlags, beginPass }) : null;
+  // U7-6d: is the DENSE L0 still being computed? Only when there is no root
+  // pool to replace it, or when `?densel0=1` (the default) keeps both running
+  // so the root comparators have something to compare against.
+  const denseL0Live = () => !rootGpu || DENSE_L0 === 1;
 
   // U4-1: the CRITERION, serving the ROOT.
   //
@@ -2902,19 +2938,25 @@ const RENDER_ROOT_IS_POOL = urlParams.has('rootIsPool')
       p.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); p.end();
     },
     l0Step: (enc, useB) => {
-      const s = beginPass(enc, 'L0 step');
-      s.setPipeline(stepPL); s.setBindGroup(0, useB ? stepBG_ba : stepBG_ab);
-      s.dispatchWorkgroups(WGX, WGY); s.end();
+      // U7-6d: the dense half is skipped once the root pool is the authority.
+      if (denseL0Live()) {
+        const s = beginPass(enc, 'L0 step');
+        s.setPipeline(stepPL); s.setBindGroup(0, useB ? stepBG_ba : stepBG_ab);
+        s.dispatchWorkgroups(WGX, WGY); s.end();
+      }
       // U3: the same step, on the root pool, in parallel -- see
       // makeRootPool's encodeRootStep.
       if (rootGpu) rootGpu.encodeRootStep(enc, useB);
     },
     l1AverageIntoL0: (enc, useB) => {
       if (skipGroup('avg')) return;
-      const a = beginPass(enc, 'L1->L0 average');
-      a.setPipeline(skipGroup('avg-noop') ? noopPLs.avg : avgPL);
-      a.setBindGroup(0, useB ? avgBG_targetA : avgBG_targetB);
-      a.dispatchWorkgroups(1, 1, MAX_FINE_BLOCKS); a.end();
+      // U7-6d: the dense restriction is skipped once the root is the authority.
+      if (denseL0Live()) {
+        const a = beginPass(enc, 'L1->L0 average');
+        a.setPipeline(skipGroup('avg-noop') ? noopPLs.avg : avgPL);
+        a.setBindGroup(0, useB ? avgBG_targetA : avgBG_targetB);
+        a.dispatchWorkgroups(1, 1, MAX_FINE_BLOCKS); a.end();
+      }
       // U5-3: the SAME restriction into the root pool, in parallel -- see
       // makeRootPool's encodeRootAverage. Inside `avg`'s skip group, so
       // ?benchSkip=avg still isolates the step as the sole writer of either L0
@@ -3074,7 +3116,11 @@ const RENDER_ROOT_IS_POOL = urlParams.has('rootIsPool')
     // and the root's own criterion once it manages level 1.
     const refinePasses = {
       denseCriterion: (enc) => {
-        const p = beginPass(enc, 'criterion L0'); p.setPipeline(criterionPL); p.setBindGroup(0, criterionBG); p.dispatchWorkgroups(WGX, WGY); p.end();
+        // U7-6d: under a root pool this writes rootGpu.denseCritBuf, which
+        // nothing reads -- criterionPoolPLs[0] is level 1's live criterion.
+        if (denseL0Live()) {
+          const p = beginPass(enc, 'criterion L0'); p.setPipeline(criterionPL); p.setBindGroup(0, criterionBG); p.dispatchWorkgroups(WGX, WGY); p.end();
+        }
         // U4-1: the same decision from the root pool, into its own buffer.
         // Encoded immediately after the dense one so both read the SAME
         // velocity state -- a criterion compared across a step boundary would
@@ -4297,6 +4343,9 @@ const RENDER_ROOT_IS_POOL = urlParams.has('rootIsPool')
       perLevel: Array.from({ length: N_LEVELS - 1 }, (_, i) => ({ childLevel: i + 1, ...paramsForChildLevel(i + 1) })),
     }),
     getNumLevels: () => N_LEVELS,
+    // U7-6d. Asserted by the ?densel0= equivalence probe: a flag that did not
+    // take would otherwise read as a clean "the dense L0 is inert" pass.
+    getDenseL0: () => (denseL0Live() ? 1 : 0),
     getF16: () => F16,
     getDetSlots: () => DET_SLOTS,
     // Set the pass-skip set AFTER warm-up, which is the only way a skip A/B

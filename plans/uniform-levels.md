@@ -3903,6 +3903,94 @@ and the full `validate-all.js` sweep unchanged from baseline -- `dense-reference
 exactly 1.951/0.1260 and `amr-N2-diffuse` 1.652/0.1485, the two known
 diffuse-band cells and nothing else.
 
+#### U7-6d — DONE (2026-09-22). The dense L0 is provably inert, and `?densel0=0` proves it.
+
+**THE RUNG'S OWN ITEMISATION WAS STALE, and the audit is most of the result.**
+It named four consumers to port. Measured:
+
+```
+  readConservedTotals        ALREADY ROOT-CAPABLE. It is parameterised by
+                             `cellIndex` and `decode`, and main-amr.js has
+                             called it on pools[0].finePoolF_a since U4-3.
+  readPoolUniformDeviation   DOES NOT EXIST. No such symbol anywhere in the
+                             repo. Carried in the plan from an earlier sketch.
+  the dense criterion read   Not a port. Under a root pool `denseCriterion` is
+                             REDIRECTED into `rootGpu.denseCritBuf`, a scratch
+                             buffer that exists so the shared refine round has
+                             somewhere harmless to land. Nothing reads it.
+  the dense force            `frcPL` dispatches only when N_LEVELS === 1, which
+                             every AMR page REFUSES at init (`refuse-levels-1`).
+                             Dead in every reachable configuration.
+```
+
+So the work was not porting consumers. **U7-6b and U7-6c had already ported the
+last two that mattered** -- the renderer and the snapshot -- and what remained
+was that the dense L0 is still fully STEPPED and RESTRICTED every macro-step
+(U5-3 kept both running deliberately, so the two representations stayed
+byte-identical), feeding nothing.
+
+##### `?densel0=0`
+
+Default 1, byte-identical to not having the flag. 0 stops encoding the dense
+step, the dense restriction and the dense criterion once a root pool exists.
+Three call sites per page, five pages, plus `getDenseL0()` on each debug
+surface. It goes away at U7-6f along with the path it switches.
+
+*Gate -- the claim is bit-equality of everything that is not the dense grid:*
+
+```
+  card levels=2        densel0=1 07dbf161762d2265  densel0=0 07dbf161762d2265
+  card levels=3        densel0=1 b47c77656d4a854c  densel0=0 b47c77656d4a854c
+  cylinder levels=2    densel0=1 f7102f1332c6eafd  densel0=0 f7102f1332c6eafd
+  cylinder levels=3    densel0=1 4668084f39fbdb31  densel0=0 4668084f39fbdb31
+```
+
+2048 steps, `.fB64`/`.velB64` (the dense arrays, expected to freeze) excluded
+by name; `.root.*` and `.pools[]` are NOT excluded, because they are the claim.
+**Two controls, both active:** the probe asserts `getDenseL0()` matches the URL
+(a flag that did not take reads as a clean pass -- this project's most common
+false green), and requires 64 further steps to MOVE the compared state, since
+every row is an equality and a filter that excluded everything meaningful would
+pass them all.
+
+*And the end-to-end version, which is stronger than the bit comparison:* the
+cylinder physics suite under `--extra=densel0=0`, **69888 steps a case**, is
+identical to the recorded baseline -- `amr-N2-diffuse` Cd 1.652 / St 0.1485,
+`amr-N3-diffuse` Cd 1.473 / St 0.1570. Not "within tolerance": the same
+numbers.
+
+##### The cost it removes, measured badly on purpose to say so
+
+```
+  levels=2   1634 -> 1420 ms      (4096 steps, min of 2)
+  levels=3   3029 -> 1308 ms
+```
+
+**DO NOT QUOTE THESE AS A SPEEDUP.** They were taken on a contended GPU --
+earlier the same day the same configurations read 380 ms and 610 ms, so the
+machine was roughly 4x loaded and the ratio is not stable under that. The
+DIRECTION is certain (a whole dense L0 step and restriction per macro-step stop
+being encoded) and the magnitude is not measured. `plans/perf-characterization.md`
+is the protocol for doing it properly, and this was not that.
+
+Note also that `measure-determinism`'s hashes differ under `?densel0=0`
+(`c2f03ff0787bdd59` against `e0b1b22bbe47cbfb`) and that is CORRECT: its
+fingerprint walks the whole snapshot including the now-frozen dense arrays.
+The probe above is the comparison that excludes them.
+
+##### What this leaves for U7-6f
+
+The dense grid is now demonstrably a spectator on every page. What still
+touches it: `debugSnapshotSave` (which also carries the root since U7-6c), the
+dev page's root COMPARATORS -- whose entire job is scoring the two
+representations against each other, so they need it stepping and are why
+`?densel0=1` stays the default for now -- and `tools/lib/field-reconstruct.js`
+/ `dense-to-amr.js`, which are U7-6e.
+
+*Gate, all green:* `make check`; `make test` (9 suites);
+`validate-reset-fixed-point` 5/5; `validate-snapshot-roundtrip` 12 of 12; the
+full default sweep unchanged from baseline.
+
 #### D1-b — SKIPPED, deliberately, 2026-09-18. The decision the rung asked to be made explicitly.
 
 The rung says: "If D1-b is judged not worth doing on a path scheduled for
@@ -3989,8 +4077,9 @@ the last deletes anything:
          -- DONE 2026-09-18
   U7-6c  debugSnapshotSave/Load carry the root pool  -- DONE 2026-09-22
          (the dense arrays go at U7-6f, with the buffers themselves)
-  U7-6d  the remaining host consumers -- readConservedTotals,
-         readPoolUniformDeviation, the dense criterion read, the dense force
+  U7-6d  the remaining host consumers  -- DONE 2026-09-22, and the
+         itemisation was stale: two of the four were already done or never
+         existed. The real content was that the dense L0 still STEPS.
   U7-6e  tools/lib/field-reconstruct.js and tools/lib/dense-to-amr.js, which
          are inverses by construction and have a round-trip test already
   U7-6f  THE DELETION: the shaders, the f_a/f_b/velBuf buffers and their bind
