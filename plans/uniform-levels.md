@@ -3675,6 +3675,12 @@ Plus `make check`, `make test` (8 suites) and the full `validate-all.js` sweep.
 
 ##### `validate-snapshot-roundtrip.js` IS RED, AND IT WAS RED BEFORE THIS RUNG
 
+> **CHASED AND CLOSED THE SAME DAY -- see "U7-6c-fix" below. The suite is 12 of
+> 12.** Everything measured in this section is accurate; the CONCLUSION at the
+> end of it ("U7-6a's record does not reproduce") was wrong. The cause was
+> `resetSim` on `index-amr.html` not being a fixed point, which made the gate
+> depend on what had run before it.
+
 All four gated rows fail. They also fail with this rung reverted, at the
 session's starting commit `2fe46e3`, and **at `6ffe437` -- U7-6a itself, the
 commit whose entry records "12 of 12, both legs genuinely different
@@ -3717,6 +3723,89 @@ walks the whole snapshot object, so adding `root` moved both without moving any
 physics: **`e0b1b22bbe47cbfb` / `4705ea2b06226c8b` at version 6**, IDENTICAL
 over four runs each. Recorded in the tool beside the table, because a moved
 hash there is exactly the shape of a regression and this one is not.
+
+#### U7-6c-fix — the round-trip suite is GREEN (2026-09-22). `reset()` on the card page was not a fixed point either.
+
+`tools/validate-snapshot-roundtrip.js` was red on all four gated rows, at HEAD,
+at the session's start, and at `6ffe437` -- U7-6a itself, whose entry records
+12 of 12. Chased and closed. **12 of 12.**
+
+##### It was not the snapshot format. It was `resetSim`, for the third time.
+
+The chase, in the order it actually went, because two of the three steps were
+wrong and the wrong ones are the instructive part:
+
+**1. `newlyActivated` -- WRONG.** It is read by the init-fill (`GHOST_ONLY==0`)
+and nothing in the shaders clears it, which looked exactly like the
+"derived buffer that is actually state" class D1-a and U7-6c had just found
+twice. It is cleared, on the GPU, at the top of every refine round
+(`makeRefineRound`'s `enc.clearBuffer`) -- deliberately GPU-recorded so it
+interleaves with commands already in the encoder. Hypothesis dead in one grep.
+
+**2. The live rAF loop -- ALSO WRONG, and it cost a fix that changed nothing.**
+`open()` never paused the page, and `debugStepSync` only pauses on entry, so
+the FIRST leg after a navigate -- the reference leg -- was exposed to stray
+frames the round-trip leg was not. That is the identical confound
+`measure-determinism.js` carried until D1-a, so it looked like the answer.
+`setLive(false)` was added and the hashes did not move by one bit. The step
+assertion added alongside it never tripped either: `getStep()` was already
+exactly 2N, which says no frame ever stepped. **Both were kept** -- the
+assertion is a real guard and the pause is correct -- but neither is the fix,
+and saying so is the point.
+
+**3. `resetSim`, and the probe that found it.** A probe comparing the two legs'
+indirection came back IDENTICAL for `levels=2 rootpool=1` where the tool
+reported 32 `parentSlot` entries moved. The difference between probe and tool
+was the one thing left: **the probe navigated fresh for each leg; the tool runs
+both legs in ONE page**, reference first, then `reset()` and the round-trip
+leg. So the question became whether `reset()` puts the page back where a fresh
+load starts. Measured directly:
+
+```
+  A   fresh load          -> reset -> snapshot    87aecb4b36ab9036
+  B   after 2048 steps    -> reset -> snapshot    bb5106599df78f12
+  differing:  .pools[].parentSlot x44, .pools[].velB64, .root.velB64, .velB64
+```
+
+**That is the gate's failure signature, key for key.** `reset()` on
+`index-amr.html` never wrote the velocity buffers or cleared `parentSlotBuf` --
+the same defect D1-a fixed on `main-cylinder-amr.js` and U7-6c fixed for the
+root pool, at its third site. The refinement round runs BEFORE the step and
+`macroStepCounter = 0`, so the first refine after every reset read velocity
+nobody had written.
+
+**ZERO IS THE RIGHT VALUE ON THIS PAGE, and that is not luck.** `index-amr.html`
+starts at uniform rest -- `initF` is `feq(1, 0, 0, i)` everywhere -- so the
+velocity the restored `f` represents IS `(0,0)`. `main-cylinder-amr.js` has a
+perturbed freestream and had to derive its velocity from the same rng draw.
+Same defect, two initial conditions, two correct answers.
+
+*After:* `reset IS a fixed point`, and the suite is 12 of 12.
+
+##### Why the fix moves nothing that a fresh page does
+
+The reference leg's four hashes are BYTE-IDENTICAL before and after
+(`3c72db437a061930`, `fef986e81e68eed9`, `28f5419eb0f1c14c`,
+`676a9e59b9b483aa`). Only the round-trip leg moved, into agreement with it.
+That is the shape a correct fix has here: WebGPU zero-initialises buffers, so a
+FRESH load already had zero velocity and was always right -- only a reset after
+history was wrong. `measure-determinism` navigates fresh per run and reads
+`e0b1b22bbe47cbfb` at `levels=2 detslots=1` before and after, unchanged.
+
+##### What this says about U7-6a's green record
+
+It reproduces after all, and the explanation is ordinary. U7-6a's own run would
+have been green whenever its reference leg happened to start from a page whose
+history did not perturb the stale buffers -- and the buffers in question are
+velocity and free-slot `parentSlot`, whose contents depend on how far the
+previous config had run. The suite runs four configs in sequence through one
+Chrome, so config 1 sees a different history from config 4. **A gate that
+depends on what ran before it is not flaky, it is under-specified**, and the
+under-specification was `reset()`.
+
+So the earlier entry's "U7-6a's record does not reproduce" was the right
+observation and the wrong conclusion: the record was real, the gate was simply
+never measuring only what it claimed to.
 
 #### D1-b — SKIPPED, deliberately, 2026-09-18. The decision the rung asked to be made explicitly.
 

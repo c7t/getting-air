@@ -3191,6 +3191,39 @@ const RENDER_ROOT_IS_POOL = urlParams.has('rootIsPool')
 
   function resetSim() {
     writeF(f_a, initF(), NCELLS);
+    // THE VELOCITY FIELDS ARE STATE reset() OWNS, and nothing wrote them here
+    // until this fix. `dispatchMacroStep` runs the refinement round BEFORE
+    // S_Advance, reading "each level's own velocity field as populated by the
+    // PREVIOUS macro-step" -- and `macroStepCounter = 0` below means the first
+    // macro-step after a reset IS a refinement round. So the first refinement
+    // after every reset ran against whatever the page did before it.
+    //
+    // ZERO IS THE RIGHT VALUE HERE, not an approximation: this page's IC is
+    // uniform rest (initF is feq(1, 0, 0, i) at every cell), so the velocity
+    // the restored `f` represents is exactly (0, 0). main-cylinder-amr.js has
+    // a perturbed freestream and therefore has to derive its velocity from the
+    // same draw -- see its own note. Same defect, different initial condition.
+    //
+    // MEASURED, 2026-09-22: without this, reset() is NOT A FIXED POINT.
+    // `reset -> snapshot` from a fresh load and `4096 steps -> reset ->
+    // snapshot` differ in `.velB64`, `.root.velB64`, `.pools[].velB64` and 44
+    // `.pools[].parentSlot` entries -- which is exactly the signature
+    // `tools/validate-snapshot-roundtrip.js` had been failing on, because its
+    // reference leg runs from a fresh load and its round-trip leg runs after a
+    // reset in the same page.
+    device.queue.writeBuffer(velBuf, 0, new Float32Array(NCELLS * 2));
+    for (const pool of pools) {
+      if (!pool) continue;
+      device.queue.writeBuffer(pool.finePoolVel, 0,
+        new Float32Array(pool.MAX_FINE_BLOCKS * pool.cellsPerSlot * 2));
+      // Back to the zero fill allocLevelPool left. Written only at grant time,
+      // so a free slot's entry is stale rather than wrong -- but "stale" is
+      // page history, which is what reset exists to remove. quadrantBuf is NOT
+      // cleared: it holds `slot % 4`, a constant, not allocator state.
+      if (pool.parentSlotBuf) {
+        device.queue.writeBuffer(pool.parentSlotBuf, 0, new Int32Array(pool.MAX_FINE_BLOCKS));
+      }
+    }
     device.queue.writeBuffer(cardStateBuf, 0, initCardState());
     device.queue.writeBuffer(forceBuf, 0, new Int32Array([0, 0, 0, 0]));
     // Level 1's PER-BLOCK reset. Under quad allocation it is reset by the loop

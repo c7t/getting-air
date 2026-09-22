@@ -161,6 +161,23 @@ async function open(Runtime, Page, o, cfg) {
   if (det !== 1) throw new Error(`${cfg.name}: page reports detslots=${det}, expected 1`);
   const root = await ev(Runtime, 'window.__AMR.getRootPool() ? 1 : 0');
   if (!!root !== cfg.quad) throw new Error(`${cfg.name}: page reports rootPool=${root}, expected ${cfg.quad ? 1 : 0}`);
+  // PAUSE BEFORE ANYTHING ELSE, and this is not tidiness -- it is what makes
+  // the two legs comparable at all.
+  //
+  // The page boots `liveMode = true` and its rAF loop steps STEPS_PER_FRAME at
+  // a time. `debugStepSync` pauses on entry, so only the FIRST leg after a
+  // navigate is exposed -- and that is the reference leg. It absorbs an
+  // uncontrolled number of live frames between the navigate, its reset() and
+  // its first debugStepSync(); the round-trip leg then runs in the same,
+  // already-paused page and absorbs none. The two legs were starting from
+  // different amounts of uncounted evolution, and the gated rows have been
+  // comparing that difference rather than the round trip.
+  //
+  // Measured 2026-09-22: with both legs paused, `levels=2 rootpool=1`
+  // round-trips blockSlot, slotToBlock, parentSlot, quadrant and freeList
+  // EXACTLY -- where the unpaused tool reported 32 parentSlot entries moved.
+  // Same defect `tools/measure-determinism.js` carried until D1-a, same fix.
+  await ev(Runtime, 'window.__AMR.setLive(false)');
   return url;
 }
 
@@ -186,6 +203,11 @@ async function reference(Runtime, o) {
   await ev(Runtime, `window.__AMR.debugStepSync(${o.steps})`, 900000);
   const fp = fingerprint(await ev(Runtime, 'window.__AMR.debugSnapshotSave()', 300000));
   fp.step = await ev(Runtime, 'window.__AMR.getStep()');
+  // See open()'s setLive note: an over-count means the page stepped behind
+  // this tool and neither leg is what it claims to be.
+  if (fp.step !== 2 * o.steps) {
+    throw new Error(`reference leg ran ${fp.step} steps, expected ${2 * o.steps} -- the page stepped behind the harness`);
+  }
   fp.alive = half.hash !== fp.hash;
   return fp;
 }
