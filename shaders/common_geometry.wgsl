@@ -158,8 +158,15 @@ fn get_phi(p: vec2<f32>, state: CardState) -> f32 {
 }
 
 // Shared tanh-blend core of every get_chi -- callers compute their own
-// epsilon (it varies: fixed 1.5 at L0/L1, K_EPS*levelParams.dxL at
-// level>=2's shared pipelines) and pass it in here.
+// epsilon and pass it in here. Since B7 every caller computes the SAME rule,
+// `K_EPS * dx_level`: the step and force kernels read it per level from
+// `levelParams.kEps * levelParams.dxL`, and the render (which has no per-level
+// uniform) derives the finest level's dx from `N_POOL_LEVELS`. It did not
+// until 2026-09-22 -- see amr_render.wgsl's get_chi for what that drew.
+//
+// The 10%-90% width of the resulting blend is `2*atanh(0.8)*epsilon`, about
+// 2.2 epsilon, which is the conversion to use when comparing this band
+// against anything measured off a picture.
 fn chiFromPhiEps(phi: f32, epsilon: f32) -> f32 {
     // Clamp tanh arg: large |arg| overflows to NaN on some GPUs (e.g. Intel Gen12LP); saturated regime is unchanged. See PR.
     return 0.5f * (1.0f - tanh(clamp(phi / epsilon, -20.0f, 20.0f)));

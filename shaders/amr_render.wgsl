@@ -135,9 +135,48 @@ fn vs_main(@builtin(vertex_index) vi : u32) -> VSOut {
 // ABOVE. The instrument that settles that is a BAND ladder at fixed
 // resolution, not a resolution ladder (which moves the band and everything
 // else at once), and a band ladder needs this to be a parameter.
+// AND IT IS `K_EPS * dx_FINEST` HERE, WHICH IT WAS NOT UNTIL 2026-09-22.
+//
+// The paragraph above describes `epsilon = K_EPS * dx_level`, and every other
+// site does exactly that -- `amr_step1.wgsl` and `amr_force1.wgsl` both read
+// `levelParams.kEps * levelParams.dxL`. This one multiplied by nothing. The
+// render has no per-level uniform (it draws one pixel grid over the window and
+// walks the pools per pixel), so the bare constant silently meant dx = 1, i.e.
+// ROOT cells -- which was correct only while level 0 was the finest thing the
+// body ever sat on, the same expired premise `SPONGE_CELL_SNAP` carried.
+//
+// MEASURED, on the grid-scale ladder (`res + levels` held constant, so the
+// body's physical size, the finest dx and the solver's band are all fixed and
+// only the grid decomposition changes) -- 10%-90% width of the drawn edge,
+// from a screenshot pixel profile:
+//
+//     res lvl    drawn band      solver band    drawn/solver
+//       9   2    0.161 D         0.0352 D          4.6x
+//       8   3    0.309 D         0.0352 D          8.8x
+//       7   4    0.616 D         0.0352 D         17.5x
+//
+// The solver's band is invariant, as a grid-scale-invariant solver's should
+// be. The drawn one DOUBLED per rung -- the "halo grows when I add levels"
+// report this was found from. It was never the chi used for force blending.
+//
+// `N_POOL_LEVELS` is the count of pool levels (1..N), so the finest level's
+// dx is `2^-N_POOL_LEVELS` in L0 units. The body's neighbourhood is forced to
+// the finest level by the geometry-coverage rule, so that is the level whose
+// band the picture should show, and it is the one amr_force1.wgsl integrates
+// over since B4-3 made only the finest level compute force.
+//
+// THIS CHANGES THE SHIPPED PICTURE at every level count, including the
+// default: the drawn boundary gets 2^(N-1) times crisper. That is the bug
+// being fixed, not a side effect of it.
+//
+// DERIVED FROM THE OVERRIDE THIS FILE ALREADY HAS, not threaded in as a sixth
+// constant from five pages. `N_POOL_LEVELS` is already passed by all five and
+// already means exactly what is needed; a new `N_POOL_LEVELS_F` next to it
+// would be a five-copy list to keep in step, which is the shape of defect
+// U7-0..U7-3 spent four rungs removing.
 override K_EPS : f32 = 1.5f;
 fn get_chi(phi: f32) -> f32 {
-    return chiFromPhiEps(phi, K_EPS);
+    return chiFromPhiEps(phi, K_EPS * exp2(-f32(N_POOL_LEVELS)));
 }
 
 fn get_uy(x: i32, y: i32) -> f32 {
