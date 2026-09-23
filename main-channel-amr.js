@@ -50,10 +50,10 @@
 // to avoid.
 
 import { reportFatal, refuseConfig, reportNoWebGPU, reportNoAdapter } from './error-overlay.mjs';
-import { tauChainSingularity, tauSingularityMessage, rootCellIndex, rootPoolSpec } from './amr2d.mjs';
+import { tauChainSingularity, tauSingularityMessage, rootCellIndex } from './amr2d.mjs';
 import { loadShader } from './shader-loader.mjs';
-import { packF, unpackF, fWords } from './f-pack.mjs';
-import { check21BalanceOnGPU, allocLevelPool, writePoolInitialState, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState , checkRefinementClosureOnGPU , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU, makeRenderBindGroup, renderPoolLevels, MAX_RENDER_POOL_LEVELS, makeAMRLayouts, makeCouplingPipelines, makeLevelBindGroups, makeManageBindGroups, makeScheduler, makeRefineRound, allocRootPool, makeRootPool, seedRootFromDenseF } from './amr2d-gpu.mjs';
+import { packF, fWords } from './f-pack.mjs';
+import { check21BalanceOnGPU, allocLevelPool, writePoolInitialState, listActiveBlocks, readCardState , checkRefinementClosureOnGPU , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU, makeRenderBindGroup, renderPoolLevels, MAX_RENDER_POOL_LEVELS, makeAMRLayouts, makeCouplingPipelines, makeLevelBindGroups, makeManageBindGroups, makeScheduler, makeRefineRound, allocRootPool, makeRootPool, seedRootFromDense, readDiag } from './amr2d-gpu.mjs';
 // tauAtLevel: extracted to card-params.mjs by B3a-1, which landed the CALL
 // in all five AMR pages and this IMPORT in only main-amr.js. The other four
 // threw `ReferenceError: tauAtLevelOf is not defined` at init -- but only at
@@ -184,7 +184,7 @@ const NCELLS1 = FB * FB;
 // L0 units on this page); B2-2d deleted it.
 
 const MAX_FINE_BLOCKS = urlParams.has('maxFineBlocks') ? parseInt(urlParams.get('maxFineBlocks')) : 128;
-const NBX = W / BLOCK, NBY = H / BLOCK, NBLOCKS = NBX * NBY;
+const NBX = W / BLOCK, NBY = H / BLOCK;
 
 const N_LEVELS = urlParams.has('levels') ? parseInt(urlParams.get('levels')) : 2;
 // refuseConfig, not throw: this runs at module scope, where
@@ -360,10 +360,6 @@ async function init() {
   // main-amr.js's identical dummy buffers.
   // ?diag=1 counters -- 8 u32 slots, read+zeroed via debugReadDiag().
   const diagBuf = device.createBuffer({ size: 8 * 4, usage: U.STORAGE | U.COPY_SRC | U.COPY_DST });
-  // DEAD (born dead): f12528b added this buffer to all five pages and the
-  // debugReadDiag READER to two. Nothing here can read it, which is why
-  // amr-invariants.js's pool-starvation gate does not run on this page. See
-  // plans/uniform-levels.md "U7-6f -- WHAT IT LEFT BEHIND".
   const diagReadBuf = device.createBuffer({ size: 8 * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
   const dummyBlockSlotBuf = device.createBuffer({ size: 4, usage: U.STORAGE | U.COPY_DST });
   device.queue.writeBuffer(dummyBlockSlotBuf, 0, new Int32Array([-1]));
@@ -399,13 +395,22 @@ async function init() {
   // THE ROOT'S INITIAL FIELD, FROM THIS PAGE'S OWN IC (U7-6f). `initF()` is
   // built in dense block8 order -- the layout the IC has always been written
   // in, and the one the reference pages' own grids still use -- and the seeder
-  // permutes it into root tiles on the host. See seedRootFromDenseF, which is
+  // permutes it into root tiles on the host. See seedRootFromDense, which is
   // the one statement of it, shared with the other four AMR pages. Called at
   // init, at reset and at a pre-version-7 snapshot load, never per frame.
-  const seedRootFrom = (fDense) => seedRootFromDenseF(device, pools, fDense, { W, H, RB, writeF });
+  //
+  // AND ITS VELOCITY, WHICH ON THIS PAGE IS EXACTLY ZERO -- a statement, not
+  // a default. `initF()` is `feq(1, 0, 0, i)` at every cell, so the velocity
+  // that equilibrium distribution represents IS (0, 0); the cylinder and TGV
+  // pages had an APPROXIMATION in this slot, which is why seedRootFromDense
+  // REQUIRES the velocity instead of assuming one. See
+  // plans/uniform-levels.md "U7-6f -- WHAT IT LEFT BEHIND".
+  const ROOT_VEL_REST = new Float32Array(NCELLS * 2);
+  const seedRootFrom = (fDense, velDense) =>
+    seedRootFromDense(device, pools, fDense, velDense, { W, H, RB, writeF });
   // resetSim() is NOT called at page load, so this is a separate seed call
   // site and not a duplicate of the one in resetSim().
-  seedRootFrom(initF());
+  seedRootFrom(initF(), ROOT_VEL_REST);
 
   // The ROOT gets one too. `parentTau` is deliberately left at 0: the root's
   // pipeline sets OWN_TAU, so that field is never read, and writing a
@@ -471,7 +476,7 @@ async function init() {
   // consumed ones here keeps "what this page needs" readable.
   const layouts = makeAMRLayouts(device);
   const {
-    renBGL, interpPoolParentBGL, avgPoolBGL,
+    renBGL,
     criterionPoolBGL, managePoolBGL, step1BGL,
   } = layouts;
 
@@ -567,11 +572,6 @@ async function init() {
   for (let m = 0; m < N_LEVELS - 1; m++) {
     const parentPool = pools[m];
     const childParams = paramsForChildLevel(m + 1);
-    // DEAD since B2-2d deleted the grandchild cascade: this is
-    // `grandchildPool`'s per-page twin, and survived because it lives in the
-    // per-page pipeline loop rather than the shared bind-group one U7-2
-    // cleaned. See plans/uniform-levels.md "U7-6f -- WHAT IT LEFT BEHIND".
-    const hasGrandchild = (m + 2) < N_LEVELS;
     const poolConstants = {
       W, H, RB,
       NBX_PARENT: parentPool.NBX, NBY_PARENT: parentPool.NBY,
@@ -797,12 +797,10 @@ async function init() {
     useB = false;
     // U5-3: the root pool is L0 too, and reset() has to reach it. `useB =
     // false` above is the phase the seed writes (finePoolF_a).
-    seedRootFrom(f0);
+    seedRootFrom(f0, ROOT_VEL_REST);
     step = 0;
   }
 
-  // Pool indirection readback -- amr2d-gpu.mjs, five copies before B3a.
-  const readPoolIndirection = (level = 1) => readPoolIndirectionOn(device, pools, level);
   async function setAutoRefine(v) { autoRefine = !!v; }
 
   // Active blocks of one level -- amr2d-gpu.mjs, five copies before B3a.
@@ -942,6 +940,9 @@ async function init() {
     }));
   }
 
+  // ?diag=1 counters -- the shared reader (amr2d-gpu.mjs readDiag).
+  const debugReadDiag = () => readDiag(device, diagBuf, diagReadBuf, { enabled: DIAG !== 0 });
+
   window.__CYL = {
     setLive: (v) => { liveMode = !!v; },
     isLive: () => liveMode,
@@ -959,6 +960,7 @@ async function init() {
     debugCheckSlotQuadrants,
     debugCascadeRoundTrip,
     debugListActiveBlocks,
+    debugReadDiag,
     setAutoRefine,
     isAutoRefine: () => autoRefine,
     getBlockGridDims: () => ({ NBX, NBY, RB, GHOST, FB, NCELLS1, MAX_FINE_BLOCKS }),

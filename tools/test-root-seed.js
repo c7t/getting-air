@@ -40,7 +40,7 @@ const b64 = (f32) => Buffer.from(f32.buffer, f32.byteOffset, f32.byteLength).toS
 
 (async () => {
   const A = await import(path.join(__dirname, '..', 'amr2d.mjs'));
-  const { denseL0ToRootF, denseCellIndex, rootCellIndex,
+  const { denseL0ToRootF, denseL0ToRootVel, denseCellIndex, rootCellIndex,
           rootCellToDense, rootPoolSpec } = A;
   const { reconstructAMRToResolution } = require('./lib/field-reconstruct');
 
@@ -72,9 +72,13 @@ const b64 = (f32) => Buffer.from(f32.buffer, f32.byteOffset, f32.byteLength).toS
   const dense = buildDense();
   const spec = rootPoolSpec({ dims, rb: RB });
 
-  // FIXTURE, not subject: the root's velocity is laid out here by hand so the
-  // decode comparison below has something to decode. `f` is the thing under
-  // test; velocity only has to be consistent with the dense side.
+  // A HAND LAYOUT OF THE ROOT'S VELOCITY. It was the only one until
+  // `denseL0ToRootVel` existed -- a fixture, because `f` was the subject and
+  // velocity only had to be consistent with the dense side -- and it is now
+  // the INDEPENDENT ROUTE the real function is scored against. It is written
+  // straight off `rootCellIndex` with no reference to `rootFromDenseMap`,
+  // which is the composition `denseL0ToRootVel` uses, so the two agreeing is
+  // not two spellings of one formula.
   function rootVelFixture() {
     const out = new Float32Array(spec.cells * 2);
     for (let y = 0; y < H; y++) {
@@ -104,6 +108,52 @@ const b64 = (f32) => Buffer.from(f32.buffer, f32.byteOffset, f32.byteLength).toS
         }
       }
     }
+  });
+
+  // --- VELOCITY, the companion denseL0ToRootF did not have at U7-6f --------
+  //
+  // It was added because two of the five AMR pages gave the root a velocity
+  // that was an APPROXIMATION of what its own `f` represented, and the first
+  // criterion evaluation after a reset reads it. See plans/uniform-levels.md
+  // "U7-6f -- WHAT IT LEFT BEHIND".
+
+  ok('every root cell carries the dense VELOCITY at its own spatial coordinates', () => {
+    const rv = denseL0ToRootVel(dense.vel, { dims, rb: RB });
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        const c = rootCellIndex({ dims, rb: RB }, x, y);
+        assert.strictEqual(rv[c * 2], uxAt(x, y), `ux at (${x},${y})`);
+        assert.strictEqual(rv[c * 2 + 1], uyAt(x, y), `uy at (${x},${y})`);
+      }
+    }
+  });
+
+  ok('denseL0ToRootVel reproduces the hand layout exactly -- and is INTERLEAVED, not plane-major', () => {
+    // The layout trap this row exists for: `f` is plane-major (9 planes of
+    // NCELLS) and velocity is interleaved [ux, uy] per cell, because that is
+    // what finePoolVel and writePoolInitialState's velFill speak. A copy of
+    // denseL0ToRootF's inner loop with 9 changed to 2 would pass every
+    // spatial-permutation check above and still write ux into the first half
+    // of the buffer and uy into the second.
+    assert.deepStrictEqual(
+      Array.from(denseL0ToRootVel(dense.vel, { dims, rb: RB })),
+      Array.from(rootVelFixture()));
+  });
+
+  ok('a PLANE-MAJOR velocity layout fails that comparison -- the row is not vacuous', () => {
+    const planeMajor = new Float32Array(spec.cells * 2);
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        const c = rootCellIndex({ dims, rb: RB }, x, y);
+        planeMajor[c] = uxAt(x, y);
+        planeMajor[spec.cells + c] = uyAt(x, y);
+      }
+    }
+    assert.notDeepStrictEqual(Array.from(planeMajor), Array.from(rootVelFixture()));
+  });
+
+  ok('a wrong-length velocity REFUSES rather than reading past the end', () => {
+    assert.throws(() => denseL0ToRootVel(new Float32Array(NCELLS * 9), { dims, rb: RB }), /expected/);
   });
 
   ok('rootCellToDense round-trips the same permutation, from the other end', () => {
@@ -159,8 +209,13 @@ const b64 = (f32) => Buffer.from(f32.buffer, f32.byteOffset, f32.byteLength).toS
   };
 
   ok('the seeded root decodes to the field the dense grid decodes to', () => {
+    // BOTH halves of the seed are the subject here, not just `f`: `ux`/`uy`
+    // in this comparison now come from denseL0ToRootVel rather than the hand
+    // fixture, so the velocity permutation is gated by the same third route
+    // the `f` one is -- decoders validated by real GPU snapshots.
     const rf = denseL0ToRootF(dense.f, { dims, rb: RB });
-    const [viaRoot, viaDense] = bothWays(rf, rootVelFixture());
+    const rv = denseL0ToRootVel(dense.vel, { dims, rb: RB });
+    const [viaRoot, viaDense] = bothWays(rf, rv);
     for (const field of ['ux', 'uy', 'rho']) {
       assert.deepStrictEqual(Array.from(viaRoot[field]), Array.from(viaDense[field]),
         `${field} differs between the root and dense decodes`);

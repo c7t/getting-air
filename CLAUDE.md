@@ -141,6 +141,16 @@ invariants the AMR machinery depends on:
   band moves toward bounce-back's sharpness, which 3D's D4 measured as worse
   for a MOVING body (frame consistency and force noise). Adopting a narrower
   default needs the moving-card gates, not this ladder.
+  **AND THE RENDER'S OWN chi WAS NOT THIS BAND UNTIL 2026-09-22.** B7 threaded
+  `?kEps=` into the render precisely so a ladder's picture would not be
+  misleading, but `amr_render.wgsl`'s `get_chi` passed `K_EPS` with no `dx`
+  factor while the step and force kernels pass `kEps * levelParams.dxL` -- so
+  the DRAWN body edge was a fixed 1.5 ROOT cells and the solver's was 1.5
+  FINEST-level cells, a factor of `2^(levels-1)`. Fixed (the shader derives
+  dx_finest from its existing `N_POOL_LEVELS` override), which makes the
+  shipped picture's body edge `2^(levels-1)` times crisper. Any screenshot
+  taken before that date shows a halo the solver never used -- see
+  plans/uniform-levels.md U7-6g item 5 for the measured widths.
   **AMR Cd is only reproducible to ~+/-0.001; dense Cd is exact.** Measured
   2026-09-09: two runs of the SAME build gave `amr-N2-diffuse` Cd 1.619 and
   1.620, while `dense-reference` was bit-identical (1.950 / St 0.1258) across
@@ -185,6 +195,37 @@ invariants the AMR machinery depends on:
 
   N=2 has no reproducible baseline at all and `amr-diff` cannot gate there;
   use the Cd/St numbers, which ARE stable there to the digit across builds.
+  **THAT MAY NO LONGER BE TRUE — re-measure before relying on it either way.**
+  2026-09-22, same protocol (fresh load, `reset()`, 4096 steps), 4 runs at
+  `?levels=2`: THREE distinct snapshot hashes, but ux and vorticity relL2
+  EXACTLY 0 in every pairing, plus two more runs in a separate probe, also
+  identical. The race still permutes which SLOT holds a tile -- that is what
+  moves the hash -- but no longer which blocks are refined, so level 0's field
+  reproduces. Six runs, ONE session, ONE build, which is not the
+  several-builds standard this file asks for, so the figures above stand as
+  recorded; if it holds up, `amr-diff` gains a gate at N=2 it has never had.
+  Candidates for what closed it: D1-a's reset fixes (2026-09-18), U7-6f's
+  deletion, or U7-6g's root-velocity seed.
+
+  **AND THERE IS A THIRD FORM, WHICH IS STRONGER THAN EITHER AND COSTS
+  NOTHING: TAKE THE FREE LIST OUT OF THE LEG.** `setAutoRefine(false)`
+  immediately after `reset()` leaves every level >= 1 empty, so the ROOT ALONE
+  steps, no slot is ever handed out, and the run is bit-deterministic —
+  attractors cannot arise because the race that chooses them never happens.
+  A build A/B is then simply conclusive, with no repeat and no mode-matching.
+  It cannot see anything that needs a coarse/fine interface, so it is not a
+  replacement for the modes above; it IS the right instrument for anything
+  level 0 owns alone (the sponge, the root step, geometry in the far field).
+  Assert the zero tile count in the leg, or it is a different experiment from
+  the one you think you ran. Worked example: plans/uniform-levels.md U7-6g,
+  which retired `SPONGE_CELL_SNAP` on an IDENTICAL with a half-cell control
+  three orders away.
+
+  **`tools/amr-diff.js` WAS DEAD FROM 7dc30e8 UNTIL 2026-09-22** — it read the
+  dense arrays U7-6f deleted and threw a raw TypeError on every snapshot this
+  project can produce. Fixed (it takes level 0 from the snapshot's `root`), but
+  worth knowing when reading a number above: everything in this section was
+  measured before that commit.
 
   Note this inverts the Cd picture, where N=3 is the WIDER spread: do not
   assume one config's reproducibility from another's, in either direction.
@@ -224,7 +265,10 @@ invariants the AMR machinery depends on:
   only since the closure made it satisfiable), geometry-forced refinement
   (`debugCheckGeometryCoverage` — every leaf near the body already at the
   finest level), field-finite (NaN/blowup), pool starvation (refines refused
-  for want of a slot; needs `?diag=1` or it reads vacuously true), the 2:1
+  for want of a slot; needs `?diag=1` or it reads vacuously true — and needs
+  the page to expose `debugReadDiag`, which the channel, TGV and reentry pages
+  did NOT until 2026-09-22, so this gate was absent rather than green on
+  three of five AMR pages), the 2:1
   CLOSURE (`debugCheckRefinementClosure` — what the rule requires but the
   allocator did not deliver), and the slot-quadrant rule
   (`debugCheckSlotQuadrants`).
@@ -375,6 +419,16 @@ by 27x. For anything touching interp/average/ghosts, the instrument is
 `tools/analyze-amr-interface.js`'s conservation channel (plans/2D-backport.md
 B1, finding #1). A `*-amr-*` name in this suite does not by itself mean a run
 had an interface in it.
+**THE TGV HALF OF THAT ATTRIBUTION IS NOW MEASURED, NOT INFERRED, AND IT
+STANDS** (2026-09-22, plans/uniform-levels.md U7-6g). Until then the root's
+first criterion round read a ZERO velocity field on that page, so zero tiles
+at step 0 was guaranteed for a reason unrelated to the thresholds. The root is
+now seeded with the true Taylor-Green velocity (`denseL0ToRootVel`) and it is
+STILL zero at every level, at 0/64/512/2048 steps and at both `?levels=`.
+Controls: `readField()` reads `pools[0].finePoolVel` directly and reports
+max|ux| = max|uy| = U0 exactly with 4032/4096 cells nonzero, so the seed
+landed; and `?refineThresh=-8&coarsenThresh=-9` gives L1 = 64 active, so the
+count can go nonzero.
 
 `?f16=1|2` — real packed-half storage for `f` (`shaders/common_fpack.wgsl`,
 `f-pack.mjs`). Default 0 and byte-identical to the previous `array<f32>`

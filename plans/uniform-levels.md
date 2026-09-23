@@ -4416,6 +4416,15 @@ discarded sweeps for. Found by needing to run it here.
 
 #### U7-6f — WHAT IT LEFT BEHIND. Three artifacts, written down rather than carried.
 
+> **ALL THREE ARE CLEARED — see U7-6g below, and read it before acting on
+> anything in this section.** Item 1's premise turned out to be FALSE (the
+> window offset is never fractional, so `SPONGE_CELL_SNAP` had been a no-op
+> since B5), item 3's "eleven" undercounted because the sweep behind it only
+> saw `const NAME =` declarations, and a FOURTH leftover — `tools/amr-diff.js`
+> dead on every snapshot this project can produce — was found while measuring
+> the first three. What follows is left as written: it is the reasoning that
+> was acted on, and two of its three predictions were right.
+
 The deletion is clean in the sense that nothing dense remains in the solver.
 It is not clean in the sense that nothing is left to do. Three things survived
 it, each for a different reason, and each is recorded here so that "we know
@@ -4563,6 +4572,245 @@ starvation gate does not run there at all. It was vacuous before and it is
 absent now — better, because an absent check reports itself and a vacuous one
 does not, but not "the flag works". Finishing it means a `debugReadDiag` on
 those two pages, which is four lines each and its own small change.
+
+#### U7-6g — THE LEFTOVERS, CLEARED. All three, and one of the three was fiction.
+
+2026-09-22. U7-6f listed three things it left behind and said each needed its
+own measurement. All three are done. Two came out roughly as predicted; the
+first came out **the opposite way from its own write-up**, and the reason is
+worth more than the change.
+
+##### 1. `SPONGE_CELL_SNAP` was A NO-OP, and had been since B5
+
+The write-up above says level 0's sponge band "sits up to half a cell away
+from where every finer level's does", "whenever the window offset is
+fractional -- which on the falling-card page is essentially always."
+
+**THE WINDOW OFFSET IS NEVER FRACTIONAL.** `shaders/amr_physics.wgsl` sets
+`state.off_x = f32((floor(x_total) % W + W) % W)` and the same for y — an
+INTEGER, and that file's own B5 comment says so in as many words ("off
+therefore keeps deriving from x_total, and only its INTEGER part is ever
+consulted"). The root's buffer positions are integers too, and not by
+accident: at level 0 `GHOST` is 0, `dxL` is 1, `cellCentreOffset()` is 0
+(`NO_PARENT`), and `tileOriginL0` is `block * 2*RB`. So `bufferToWindowCell`'s
+u32 modular arithmetic and `bufferToWindowPos`'s `wrapf` were being handed
+integer minus integer and agreeing bit for bit, every cell, every step.
+
+The override was real when U3 wrote it — it mirrored a dense L0 that existed
+— and B5 made it inert without anyone noticing, because nothing ever scored
+the two conversions against each other on a page with a moving window. U7-6f
+then inherited the comment along with the code and restated its premise as
+current fact.
+
+**MEASURED, on a leg with no free list in it.** `index-reentry-amr.html`,
+`?levels=2`, `setAutoRefine(false)` immediately after `reset()` so every level
+>= 1 stays empty and the ROOT ALONE steps — which makes the run bit-
+deterministic and a build-vs-build comparison conclusive, instead of reading
+the attractor CLAUDE.md warns an AMR field diff normally reads. 4096 steps,
+body motion prescribed, window travelled 75 cells (`off_y` 75, `off_x` 0 —
+integers, as above):
+
+      build A   the shipped one, SPONGE_CELL_SNAP deleted
+      build B   the retired path restored by hand at `NO_PARENT != 0`
+
+      A vs B          ux relL2 0.0  uy 0.0  rho 0.0  vorticity 0.0   IDENTICAL
+
+**AND THE CONTROL SAYS THAT IS NOT VACUOUS.** A third build displaces the
+root's band by exactly the half cell the write-up claimed was at stake
+(`wpos + 0.5`), nothing else changed:
+
+      A vs control    ux relL2 6.19e-3  uy 7.41e-3  rho 8.03e-6
+                      vorticity 2.76e-2                          DIFFERS
+
+Three to four orders of magnitude between the thing under test and the
+perturbation it was supposed to be. So the deletion moves no number on any
+page, the override is gone, and `amr_step1.wgsl` has ONE window convention.
+
+**THE SIBLING THIS FOUND AND DID NOT TOUCH.** `common_refine.wgsl`'s
+`inSpongeBandAt` — the `?spongeExclude=` band that keeps fine tiles out of the
+sponge — also uses `bufferToWindowCell`. By the same argument it is also
+exact, so there is nothing to fix; it is named here only so the next reader of
+that call does not re-derive it. Note also that with the shipped
+`spongeExclude=8` against `SPONGE_W=4`, no level >= 1 has a cell in the band
+at all on the card or reentry pages, so the cross-level disagreement the old
+write-up described had no cells to disagree on even if `off` had been
+fractional. Two independent reasons it was fiction.
+
+##### 2. The root's initial VELOCITY — done, and TGV's prediction came back NO
+
+`amr2d.mjs` gains `denseL0ToRootVel`, the companion `denseL0ToRootF`
+deliberately did not have; `seedRootFromDenseF` becomes `seedRootFromDense`
+and takes both. **The velocity is a REQUIRED argument, which is the point:**
+the three pages whose IC is uniform rest pass an explicit zero array and
+thereby SAY that zero is exact for them (`initF()` is `feq(1,0,0,i)`
+everywhere, so the velocity that distribution represents IS (0,0)), instead of
+inheriting it from a default that was silently wrong for the other two. All
+thirteen call sites across the five pages pass one, `debugInjectSyntheticField`
+included — it builds a real velocity field and used to hand the root a
+stale one.
+
+`f` and velocity are now ONE statement and the seeder writes both, rather than
+`f` here and velocity in `writePoolInitialState`. On the cylinder that is a
+correctness requirement, not tidiness: `rng` is one stream shared by `initF`
+and every `initFPool`, so the root's velocity must come from the SAME draw as
+its `f`, which `initF(velOut)` produces in one pass. It also makes the seeder
+the LAST writer of the root's velocity at both call sites, so there is no
+ordering hazard between it and the `writePoolInitialState` loop.
+
+**THE TGV PREDICTION RESOLVES IN FAVOUR OF CLAUDE.md.** The write-up above
+argued that "zero active tiles on the TGV page" was not yet evidence about the
+thresholds, because the first criterion round read a ZERO velocity field and
+so zero tiles at step 0 was guaranteed for an unrelated reason. Seeded with
+the true Taylor-Green field, measured 2026-09-22 on `index-tgv-amr.html`:
+
+      levels=2   steps 0 / 64 / 512 / 2048    L1 = 0, 0, 0, 0
+      levels=3   steps 0 / 64 / 512 / 2048    L1 = 0, 0, 0, 0   L2 = 0, 0, 0, 0
+
+**Still zero — so the attribution was RIGHT and is now measured rather than
+assumed.** Two controls, because "0 everywhere" is also what a broken probe
+prints:
+
+      A  did the seed land?  `readField()` reads `pools[0].finePoolVel`
+         DIRECTLY, so at step 0 after a reset it IS the root's seeded
+         velocity. max|ux| = max|uy| = 0.04000 = U0 exactly, and 4032 of 4096
+         cells nonzero -- the 64 zeros being the analytic field's own nodes,
+         which is the count a W=64 row of `sin(ky*y)=0` predicts.
+      B  can the tile count go nonzero?  `?refineThresh=-8&coarsenThresh=-9`,
+         the page header's own documented "94% of the domain refines" regime:
+         L1 = 64 active at 256 steps, against 0 at the default.
+
+So the thresholds really are why TGV holds no tiles, and `tgv-amr-N2` /
+`tgv-amr-N3` printing the identical number remains the tell it was — for a
+reason that has now been tested instead of inferred.
+
+**THE CYLINDER MOVED NOTHING MEASURABLE.** The fix changes which tiles exist
+at step 0, so it was read as BAND membership as the write-up asked. Full
+default sweep, 2026-09-22, against CLAUDE.md's recorded baselines:
+
+      config              this run            CLAUDE.md baseline
+      dense-reference     1.951 / 0.1260      1.951 / 0.1260   (untouched page)
+      amr-N2-diffuse      1.652 / 0.1485      1.652 / 0.1484
+      amr-N2-bounceback   1.356 / 0.1642      1.356 / 0.1642
+      amr-N3-diffuse      1.473 / 0.1570      1.473 / 0.1570
+      amr-N3-bounceback   1.365 / 0.1645      1.365 / 0.1645
+
+Every cell on its recorded value, which is at the floor of what the instrument
+resolves (±0.001 at N=2, ±0.002 at N=3). The two reds are the documented
+diffuse-band ones, unchanged. The four analytic AMR configs are unmoved and
+`tgv-amr-N2`/`N3` still print the identical 1.3208e-3.
+
+##### 3. The dead declarations — and THE SWEEP THAT FOUND THEM WAS INCOMPLETE
+
+The ten are gone: seven deleted (`FSCALE` on reentry, `hasGrandchild` on four
+pages, `queryReadBuffer` on two), and **three were not dead but STARVED** —
+`diagReadBuf` on the channel, TGV and reentry pages is now read, because those
+three pages gained the `debugReadDiag` the write-up above says was the missing
+half of U7-6f's DIAG fix. `tools/lib/amr-invariants.js` feature-detects that
+function, so the pool-starvation gate goes from ABSENT to available on all
+five AMR pages rather than two. Deleting the buffer would have been the wrong
+half of that choice; the buffer was right and the reader was missing.
+
+**AND THE SWEEP THAT PRODUCED "ELEVEN" ONLY LOOKED AT `const NAME =`.** A
+binding-aware pass (the editor's own unused-binding diagnostics, across the
+five pages plus the two shared modules) finds a class it could not see:
+destructured bindings and unused imports. **Six of them died at 7dc30e8 —
+U7-6f ITSELF — which makes them the same case as `FSCALE`, not a pre-existing
+backlog**, and they are deleted here for the reason that rung's own cited rule
+gives:
+
+      binding                         page(s)              killed by
+      rootCellToDense   (import)      card                 7dc30e8  U7-6f
+      readBuf           (local)       card                 7dc30e8  U7-6f
+      rootPoolSpec      (import)      channel              7dc30e8  U7-6f
+      unpackF           (import)      channel              7dc30e8  U7-6f
+      NBLOCKS           (const)       channel, TGV         7dc30e8  U7-6f
+
+So U7-6f's own debris was SEVEN identifiers, not the one it admitted to. That
+is not a second failure of the rule so much as a first measurement of it: the
+dead-identifier sweep it was caught by could only see one declaration form,
+and a rule you can only check on a third of the surface is not yet a gate.
+
+The remaining pre-U7-6f ones are deleted too, since the argument for marking
+rather than removing them was "unreviewed churn in a rung already this large"
+and this rung is not that: `interpPoolParentBGL`/`avgPoolBGL` destructured and
+unused on four pages (U7-2 — and the comment two lines above those
+destructures already claimed "naming only the consumed ones here keeps what
+this page needs readable", which they made false), and `readPoolIndirection`
+plus its `readPoolIndirectionOn` import on the channel and TGV pages (B3a-3).
+
+##### 4. A FOURTH THING, found while measuring the first three: `tools/amr-diff.js` was DEAD
+
+`loadDenseFields` reads `snapshot.fB64` — the dense array U7-6f deleted — so
+it threw a raw `Buffer.from(undefined)` TypeError on **every snapshot this
+project can currently produce**. Not a degraded result: a stack trace.
+
+**THAT MATTERS OUT OF ALL PROPORTION TO ITS SIZE.** CLAUDE.md prescribes
+`debugSnapshotSave` + `tools/amr-diff.js` as THE instrument for the "which
+attractor is this run in" discipline, and records that an IDENTICAL from it is
+the only conclusive build-vs-build evidence this project has — the AMR field
+being otherwise unreproducible run to run. That instrument had been dead since
+7dc30e8 and nothing said so, because no gate calls it. It is fixed here:
+`loadDenseFields` takes level 0 from `snapshot.root` via the existing
+`rootToFlatL0` when the dense arrays are absent, sizing the tiles from
+`pools[1].RB` (the same source `reconstructAMRToResolution` uses) and refusing
+loudly rather than guessing if that is missing.
+
+It is also how item 1 above was measured, which is the only reason it was
+found — and the general lesson is the one B3-5 already recorded from the other
+direction: **a checker must retire WITH its subject, and a checker that merely
+READS its subject must be re-pointed when the subject moves.** Three vacuous
+gates came from ignoring the first half; this is the second half.
+
+##### 5. Found in passing: the RENDERED chi band was never the solver's
+
+`amr_render.wgsl`'s
+`get_chi` passed `K_EPS` with no `dx` factor while `amr_step1.wgsl` and
+`amr_force1.wgsl` both pass `kEps * levelParams.dxL`, so the drawn band was a
+fixed 1.5 ROOT cells and the solver's was 1.5 finest-level cells. On the
+grid-scale ladder (`res + levels` held at 11 -- section 8.6 on branch
+`amr2d/sponge-ladder`, parked until B6 lands) the drawn band DOUBLED per rung
+while the solver's stayed put —
+measured from a screenshot pixel profile, 10%-90% width:
+
+      res lvl   drawn band   solver band   ratio        after the fix
+        9   2    0.161 D       0.0352 D     4.6x        0.0893 D
+        8   3    0.309 D       0.0352 D     8.8x        0.0889 D
+        7   4    0.616 D       0.0352 D    17.5x        0.0900 D
+
+That is the "halo grows when I add levels" report, and it was a rendering
+artifact throughout: the force blend never moved. Fixed by deriving the finest
+level's dx from the `N_POOL_LEVELS` override the shader already has (not by
+threading a sixth constant from five pages). After the fix the drawn band is
+invariant to 1%, and the residual 2.5x against the `epsilon` column is just the
+tanh's shape — the 10%-90% width of `0.5*(1-tanh(phi/eps))` is `2*atanh(0.8)`
+= 2.2 epsilon. **The shipped picture changes**: the body's edge is now
+`2^(levels-1)` times crisper, which is the bug being fixed rather than a side
+effect.
+
+##### 6. Found in passing: `?levels=2`'s level-0 field now reproduces
+
+CLAUDE.md's note (2026-09-14) records "every one of 4 runs DIFFERS, at ux
+relL2 2-4e-5" and concludes "N=2 has no reproducible baseline at all and
+amr-diff cannot gate there". Measured today, 4 fresh loads, reset, 4096 steps:
+**3 distinct snapshot hashes but ux and vorticity relL2 EXACTLY 0 in every
+pairing.** The free-list race is still there — it is what makes the snapshots
+differ — but it now only permutes which SLOT holds a tile, not which blocks are
+refined, so level 0's field is identical. Six runs in one session on one
+build is not the several-builds standard this project asks for before a
+CLAUDE.md figure is rewritten, so it is recorded as measured and flagged
+there, not swapped in.
+
+##### What was run
+
+`make check` (90 checks, 28 shaders, 11 test suites, `root-seed` now 12 rows
+including four new velocity ones — the layout trap they exist for is that `f`
+is plane-major and velocity interleaved, so a copy of `denseL0ToRootF`'s loop
+with 9 changed to 2 would pass every spatial-permutation row and still be
+wrong). Full `validate-all.js` default sweep: every config PASS except the two
+documented diffuse-band reds. Boot smoke on all seven pages, re-run on the
+final build. `amr-dev-invariants` seven gates OK through 8192 steps.
+`render-levels-card` / `-cylinder` PASS. `validate-reset-fixed-point` 5/5.
+`validate-snapshot-roundtrip` 8/8 including all three controls.
 
 #### D1-b — SKIPPED, deliberately, 2026-09-18. The decision the rung asked to be made explicitly.
 
@@ -5217,4 +5465,3 @@ no coarse/fine seam intersects the ramp. It belongs in the invariant sweep
 alongside the other eight, and — per this project's own standard — it has to be
 shown to go red on a deliberately bad configuration (`?spongeExclude=0` with a
 criterion that fires at the edge) before it is believed when it is green.
-

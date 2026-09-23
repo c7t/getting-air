@@ -1451,3 +1451,35 @@ export function denseL0ToRootF(fDense, { dims, rb = RB_DEFAULT }) {
   }
   return out;
 }
+
+// VELOCITY, the companion `denseL0ToRootF` deliberately did not have at U7-6f.
+//
+// Interleaved [ux, uy] per cell -- the layout `finePoolVel` and
+// `writePoolInitialState`'s `velFill` speak, NOT the plane-major one `f`
+// uses. Same permutation, same `rootFromDenseMap`, so the two cannot drift
+// apart about which dense cell a root cell came from.
+//
+// WHY IT WAS NOT WRITTEN THEN AND IS NOW. U7-6f-a added the `f` re-layout and
+// stopped there on the rule that an exported, tested function no caller uses
+// is worse than one added when it is needed. What needed it was the second of
+// U7-6f's three leftovers: on the cylinder and TGV pages the root's initial
+// velocity was an APPROXIMATION of what its own `f` represents ([U0, 0]
+// against a perturbed freestream; [0, 0] against a Taylor-Green vortex), and
+// `dispatchMacroStep` runs the refinement round BEFORE `S_Advance`, so the
+// first criterion evaluation after a reset reads it. See
+// plans/uniform-levels.md "U7-6f -- WHAT IT LEFT BEHIND".
+export function denseL0ToRootVel(velDense, { dims, rb = RB_DEFAULT }) {
+  const map = rootFromDenseMap({ dims, rb });
+  const cells = map.length;
+  const ncells = dims.W * dims.H;
+  if (velDense.length !== ncells * 2) {
+    throw new Error(`denseL0ToRootVel: got ${velDense.length} floats, expected ${ncells * 2} (${ncells} cells x 2)`);
+  }
+  const out = new Float32Array(cells * 2);
+  for (let c = 0; c < cells; c++) {
+    const d = map[c];
+    out[c * 2] = velDense[d * 2];
+    out[c * 2 + 1] = velDense[d * 2 + 1];
+  }
+  return out;
+}

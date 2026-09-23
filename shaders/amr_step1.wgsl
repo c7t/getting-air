@@ -163,34 +163,23 @@ override GHOST : u32 = 2u;
 //    grid it is supposed to reproduce.
 override NO_PARENT : u32 = 0u;
 
-// SPONGE_CELL_SNAP: take the window position the way the DELETED dense L0
-// step did -- `bufferToWindowCell`, u32 modular arithmetic, which TRUNCATES
-// `off_x`/`off_y` to whole cells. Every other level uses `bufferToWindowPos`,
-// which keeps the sub-cell part.
+// SPONGE_CELL_SNAP IS GONE, AND THE WINDOW POSITION IS ONE CONVENTION.
 //
-// A REAL, PRE-EXISTING INCONSISTENCY, found by U3 and deliberately NOT fixed
-// since. Whenever the window offset is fractional -- which on the
-// falling-card page is essentially always -- level 0's sponge band sits up to
-// half a cell away from where every finer level's does.
+// It existed so the root could take the DELETED dense L0 step's convention:
+// `bufferToWindowCell`, u32 modular arithmetic, which TRUNCATES `off_x`/
+// `off_y` to whole cells, while every other level used `bufferToWindowPos`
+// and kept the sub-cell part. U3 found the disagreement and deliberately did
+// not fix it -- U3 was a REPRESENTATION stage, its job was to show the root
+// pool reproduces the dense grid exactly, not to improve it -- and U7-6f
+// deleted the grid but kept the convention, because unifying them moves
+// published numbers and that rung's gate was bit-identity.
 //
-// IT IS NOW THE ONLY THING THE DENSE STEP LEFT BEHIND, and that makes it worth
-// restating rather than pointing at a file that no longer exists. U3 was a
-// REPRESENTATION stage: its job was to show the root pool reproduces the dense
-// grid exactly, not to improve it, so the root took L0's convention. U7-6f
-// deleted the grid that convention came from and kept the convention, because
-// unifying the two would move published numbers. Fixing it is still its own
-// change with its own gate -- and it no longer has a second implementation to
-// be consistent WITH, which is an argument for doing it rather than against.
-//
-// Folded at pipeline creation, so no non-root pipeline evaluates the u32
-// conversion below -- which matters, because a ring cell's buffer position can
-// be negative and this branch would be meaningless there.
-//
-// One of THREE things U7-6f left behind, all written up together under
-// plans/uniform-levels.md "U7-6f -- WHAT IT LEFT BEHIND". The other two are
-// the root's initial VELOCITY on the cylinder and TGV pages, and ten marked
-// dead declarations across the five AMR pages.
-override SPONGE_CELL_SNAP : u32 = 0u;
+// `wx`/`wy` feed the SPONGE BAND and nothing else in this file (the body's
+// frame has been the buffer position itself since B5), so this was level 0's
+// band snapping to whole cells while a fractional window offset slid
+// underneath it -- a staircase where every finer level had a ramp. See
+// plans/uniform-levels.md "U7-6f -- WHAT IT LEFT BEHIND" for the measurement
+// that retired it, including what the disagreement was actually worth.
 
 // Sponge relaxation target velocity -- the same formula lbm_step.wgsl uses on
 // the dense reference pages (see this file's sponge comment below for why a
@@ -384,12 +373,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   // (see file header).
   let bufX = fineToCoarseUnit(fx, originX_L0);
   let bufY = fineToCoarseUnit(fy, originY_L0);
-  // WINDOW position, for the sponge band below. The BODY's frame is just the
-  // buffer position itself since B5 (common_geometry.wgsl).
-  var wpos = bufferToWindowPos(vec2<f32>(bufX, bufY), state);
-  if (SPONGE_CELL_SNAP != 0u) { // see the override -- L0's own convention
-    wpos = vec2<f32>(bufferToWindowCell(vec2<u32>(u32(bufX), u32(bufY)), state));
-  }
+  // WINDOW position, for the sponge band below -- ONE convention at every
+  // level, including the root, since SPONGE_CELL_SNAP went (see its old home
+  // above). The BODY's frame is just the buffer position itself since B5
+  // (common_geometry.wgsl).
+  let wpos = bufferToWindowPos(vec2<f32>(bufX, bufY), state);
   let wx = wpos.x; let wy = wpos.y;
   let p = vec2<f32>(bufX, bufY);
   // Periodic minimum-image lever arm, matching amr_force1.wgsl and
@@ -495,8 +483,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   // own diverges from its damped coarse neighbours, and the average pass then
   // writes that undamped state back onto them -- exactly the boundary artifact
   // this was fixed in response to. One formula for every level since U7-6f
-  // (level 0 runs this kernel too), reusing the wx/wy already computed above
-  // for the card SDF.
+  // (level 0 runs this kernel too), from the wx/wy computed above. That
+  // window position is now THE ONLY thing in this file that needs one: the
+  // card SDF it used to share has read the buffer position directly since B5.
   let dist_x = min(wx, f32(W) - 1.0f - wx);
   let dist_y = min(wy, f32(H) - 1.0f - wy);
   let sponge_weight = spongeWeight(dist_x, dist_y, SPONGE_W);

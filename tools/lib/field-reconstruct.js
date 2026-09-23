@@ -141,14 +141,40 @@ function loadDenseFields(snapshot) {
   // formatVersion 1 snapshots (pre-Milestone-1, and main-cylinder.js's own
   // dense debugSnapshotSave) predate/omit the 'layout' field and are always
   // flat row-major.
-  const layout = snapshot.layout || 'flat';
+  //
+  // LEVEL 0 COMES FROM `root` ON A FORMAT-7 SNAPSHOT, and that is not a
+  // nicety -- without it this function reads `snapshot.fB64`, the dense array
+  // U7-6f deleted, and throws a raw `Buffer.from(undefined)` TypeError on
+  // EVERY snapshot the project can currently produce. So tools/amr-diff.js
+  // was dead from that commit, which matters more than its size: CLAUDE.md
+  // prescribes `debugSnapshotSave` + `amr-diff` as THE instrument for the
+  // "which attractor is this run in" discipline, and an IDENTICAL from it is
+  // the only conclusive build-vs-build evidence this project has. A fourth
+  // thing U7-6f left behind, found while measuring the first three -- see
+  // plans/uniform-levels.md "U7-6f -- WHAT IT LEFT BEHIND".
+  //
+  // `rootToFlatL0` already decodes root tiles, and it yields FLAT row-major,
+  // so the unshift below is told 'flat' regardless of what the snapshot's own
+  // `layout` field says about the deleted dense arrays.
+  //
+  // RB FROM `pools[1]`, not from the root's own record, which does not carry
+  // one -- the same source reconstructAMRToResolution reads it from, so there
+  // is one rule rather than a second derivation from `cellsPerSlot` that
+  // would make rootToFlatL0's own cellsPerSlot assert vacuous.
+  const fromRoot = !snapshot.fB64 && snapshot.root;
+  if (fromRoot && !(snapshot.pools && snapshot.pools[1] && snapshot.pools[1].RB)) {
+    throw new Error('loadDenseFields: snapshot carries a root pool but no pools[1].RB to size its '
+      + 'tiles with -- refusing rather than guessing the tile side');
+  }
+  const l0 = fromRoot ? rootToFlatL0(snapshot.root, W, H, snapshot.pools[1].RB) : null;
+  const layout = fromRoot ? 'flat' : (snapshot.layout || 'flat');
 
-  const velRaw = b64ToFloat32(snapshot.velB64, NCELLS * 2);
+  const velRaw = fromRoot ? l0.vel : b64ToFloat32(snapshot.velB64, NCELLS * 2);
   const vel = unshiftField(velRaw, W, H, 2, offX, offY, layout);
   const ux = new Float32Array(NCELLS), uy = new Float32Array(NCELLS);
   for (let c = 0; c < NCELLS; c++) { ux[c] = vel[c * 2]; uy[c] = vel[c * 2 + 1]; }
 
-  const fRaw = b64ToFloat32(snapshot.fB64, NCELLS * 9);
+  const fRaw = fromRoot ? l0.f : b64ToFloat32(snapshot.fB64, NCELLS * 9);
   // f is laid out i*(W*H) + cell; unshift each of the 9 direction planes
   // independently, then treat the whole thing as a single 9-component field
   // so rhoFromF's i*(W*H)+cell indexing still holds.

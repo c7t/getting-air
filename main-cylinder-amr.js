@@ -25,7 +25,7 @@
 import { reportFatal, refuseConfig, setStatus, reportNoWebGPU, reportNoAdapter } from './error-overlay.mjs';
 import { loadShader } from './shader-loader.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
-import { check21BalanceOnGPU, allocLevelPool, writePoolInitialState, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState, checkGeometryCoverageOnGPU, makeRefusalWatch , checkRefinementClosureOnGPU , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU, makeRenderBindGroup, renderPoolLevels, MAX_RENDER_POOL_LEVELS, makeAMRLayouts, makeCouplingPipelines, makeLevelBindGroups, makeManageBindGroups, makeScheduler, makeRefineRound, allocRootPool, makeRootPool, encodeRootCapture, readRootCapture, restoreRootCapture, seedRootFromDenseF } from './amr2d-gpu.mjs';
+import { check21BalanceOnGPU, allocLevelPool, writePoolInitialState, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState, checkGeometryCoverageOnGPU, makeRefusalWatch , checkRefinementClosureOnGPU , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU, makeRenderBindGroup, renderPoolLevels, MAX_RENDER_POOL_LEVELS, makeAMRLayouts, makeCouplingPipelines, makeLevelBindGroups, makeManageBindGroups, makeScheduler, makeRefineRound, allocRootPool, makeRootPool, encodeRootCapture, readRootCapture, restoreRootCapture, seedRootFromDense, readDiag } from './amr2d-gpu.mjs';
 // tauAtLevel: extracted to card-params.mjs by B3a-1, which landed the CALL
 // in all five AMR pages and this IMPORT in only main-amr.js. The other four
 // threw `ReferenceError: tauAtLevelOf is not defined` at init -- but only at
@@ -944,12 +944,6 @@ async function init() {
     size: 16,
     usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC
   }) : null;
-  // DEAD (born dead): no timestamp readback path on this page. See
-  // plans/uniform-levels.md "U7-6f -- WHAT IT LEFT BEHIND".
-  const queryReadBuffer = hasTimestamp ? device.createBuffer({
-    size: 16,
-    usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
-  }) : null;
 
   device.pushErrorScope('validation');
 
@@ -1027,13 +1021,22 @@ async function init() {
   // THE ROOT'S INITIAL FIELD, FROM THIS PAGE'S OWN IC (U7-6f). `initF()` is
   // built in dense block8 order -- the layout the IC has always been written
   // in, and the one the reference pages' own grids still use -- and the seeder
-  // permutes it into root tiles on the host. See seedRootFromDenseF, which is
+  // permutes it into root tiles on the host. See seedRootFromDense, which is
   // the one statement of it, shared with the other four AMR pages. Called at
   // init, at reset and at a pre-version-7 snapshot load, never per frame.
-  const seedRootFrom = (fDense) => seedRootFromDenseF(device, pools, fDense, { W, H, RB, writeF });
+  //
+  // AND THE VELOCITY THAT `f` REPRESENTS, alongside it. `initF(velOut)` fills
+  // both from one rng draw; until the leftovers of U7-6f were cleared this
+  // page handed the root the UNPERTURBED freestream [U0, 0] instead, which
+  // the first refinement round read.
+  const seedRootFrom = (fDense, velDense) =>
+    seedRootFromDense(device, pools, fDense, velDense, { W, H, RB, writeF });
   // resetSim() is NOT called at page load, so this is a separate seed call
   // site and not a duplicate of the one in resetSim().
-  seedRootFrom(initF());
+  {
+    const rootVel = new Float32Array(NCELLS * 2);
+    seedRootFrom(initF(rootVel), rootVel);
+  }
   // pools[1].finePoolF_a's equilibrium pre-fill, and blockSlotBuf/
   // slotToBlockBuf's -1 fill, already happened above in allocLevelPool
   // (uniformly for every level, not just level 1 -- see its own comment).
@@ -1169,7 +1172,7 @@ async function init() {
   // six that went with the dense path at U7-6f.
   const layouts = makeAMRLayouts(device);
   const {
-    phyBGL, renBGL, interpPoolParentBGL, avgPoolBGL,
+    phyBGL, renBGL,
     criterionPoolBGL, managePoolBGL, step1BGL, force1BGL,
   } = layouts;
 
@@ -1271,15 +1274,6 @@ async function init() {
     // child level >=2, so it always picks up that child's own override (or
     // falls back to the base values if unset).
     const childParams = paramsForChildLevel(m + 1);
-    // HAS_GRANDCHILD (level m+2) for the 2:1-balance cascade -- see
-    // amr_manage_pool.wgsl's header. Existence-based (hasGrandchild), not
-    // criterion-based, so no separate grandchild-level threshold overrides
-    // are needed here -- just whether that level exists at all.
-    // DEAD since B2-2d deleted the grandchild cascade: this is
-    // `grandchildPool`'s per-page twin, and survived because it lives in the
-    // per-page pipeline loop rather than the shared bind-group one U7-2
-    // cleaned. See plans/uniform-levels.md "U7-6f -- WHAT IT LEFT BEHIND".
-    const hasGrandchild = (m + 2) < N_LEVELS;
     const poolConstants = {
       W, H, RB,
       NBX_PARENT: parentPool.NBX, NBY_PARENT: parentPool.NBY,
@@ -1888,8 +1882,11 @@ async function init() {
     // `initF()` DREW A VELOCITY FIELD TOO until U7-6f, for the dense grid's
     // own velocity buffer; the dense grid is gone and the pool velocities are
     // written by writePoolInitialState below, each from the same rng draw as
-    // the `f` it describes. The ROOT is the exception and is discussed there.
-    const f0 = initF();
+    // the `f` it describes. THE ROOT'S COMES FROM THE SAME `initF()` CALL AS
+    // ITS `f` -- one draw, one pass, handed to seedRootFrom together at the
+    // bottom of this function.
+    const rootVel = new Float32Array(NCELLS * 2);
+    const f0 = initF(rootVel);
     device.queue.writeBuffer(cardStateBuf, 0, initCardState());
     device.queue.writeBuffer(forceBuf, 0, new Int32Array([0, 0, 0, 0]));
     // THE DRAW ORDER IS LOAD-BEARING, which is why the velocity arrays are
@@ -1915,28 +1912,26 @@ async function init() {
     // itself uses -- see writePoolInitialState's header for the defects the
     // hand-written copies of this list produced.
     //
-    // THE ROOT GETS THE UNPERTURBED FREESTREAM, and that is a deliberate
-    // approximation rather than an oversight. Its `f` is `initF()`'s own draw
-    // permuted into root tiles by seedRootFrom below, and so carries the
-    // perturbation; its velocity would need the SAME field re-laid-out to
-    // match exactly. The two disagree for exactly ONE criterion evaluation --
-    // the first refine round -- after which the step recomputes velocity from
-    // `f`.
-    //
-    // **THE RE-LAYOUT EXISTS NOW** (`denseL0ToRootF`, U7-6f) and this is still
-    // [U0, 0] on purpose. Using it MOVES the first criterion evaluation,
-    // therefore refinement, therefore Cd -- so it does not belong in a rung
-    // whose whole gate is bit-identity. It is its own measured rung; see
-    // plans/uniform-levels.md U7-6f-a.
+    // THE ROOT'S ENTRY HERE IS A PLACEHOLDER, not its value. Until the
+    // leftovers of U7-6f were cleared this loop handed level 0 the
+    // UNPERTURBED freestream [U0, 0] while its `f` carried `initF()`'s
+    // perturbed draw -- an approximation the first refinement round read,
+    // because dispatchMacroStep runs that round before S_Advance. The real
+    // field now arrives with its own `f` at seedRootFrom below, which runs
+    // last and overwrites whatever this wrote; zero is the honest stand-in
+    // for "not yet seeded" (see plans/uniform-levels.md "U7-6f -- WHAT IT
+    // LEFT BEHIND").
     for (const pool of pools) {
-      if (pool) writePoolInitialState(device, pool, { velFill: poolVel[pool.level] || [U0, 0] });
+      if (pool) writePoolInitialState(device, pool, { velFill: poolVel[pool.level] || [0, 0] });
     }
     autoRefine = true; // matches the on-by-default initial state -- reset shouldn't silently disable it
     macroStepCounter = 0;
     useB = false;
     // U5-3: the root pool is L0 too, and reset() has to reach it. `useB =
-    // false` above is the phase the seed writes (finePoolF_a).
-    seedRootFrom(f0);
+    // false` above is the phase the seed writes (finePoolF_a). `rootVel` is
+    // the SAME draw as `f0` -- see initF's own comment on why a second pass
+    // would hand back a velocity belonging to a different field.
+    seedRootFrom(f0, rootVel);
     step = 0;
     trajectory.length = 0;
   }
@@ -2220,6 +2215,7 @@ async function init() {
   // window conversion -- off_x/off_y are 0 right after reset() anyway).
   function debugInjectSyntheticField(A, L) {
     const f = new Float32Array(NCELLS * 9);
+    const vel = new Float32Array(NCELLS * 2);
     for (let by = 0; by < NBY; by++) {
       for (let bx = 0; bx < NBX; bx++) {
         for (let ly = 0; ly < BLOCK; ly++) {
@@ -2229,12 +2225,13 @@ async function init() {
             const cell = blockID * (BLOCK * BLOCK) + ly * BLOCK + lx;
             const ux = -A * Math.sin(2 * Math.PI * y / L);
             const uy = A * Math.sin(2 * Math.PI * x / L);
+            vel[cell * 2] = ux; vel[cell * 2 + 1] = uy;
             for (let i = 0; i < 9; i++) f[i * NCELLS + cell] = feq(1, ux, uy, i);
           }
         }
       }
     }
-    seedRootFrom(f);
+    seedRootFrom(f, vel);
   }
 
   // Active blocks of one level -- amr2d-gpu.mjs, five copies before B3a.
@@ -2538,34 +2535,8 @@ async function init() {
     }));
   }
 
-  // ── ?diag=1 refinement convergence ───────────────────────────────────────
-  // Mirrors main-amr.js's. Reads AND ZEROES, so successive calls give
-  // per-interval counts. The refine counters describe the FINAL fixed-point
-  // iteration only (cleared just before it, see dispatchMacroStep), so
-  // converged=false means the loop was still creating tiles when its fixed
-  // iteration count ran out. If ?refineIters= (more rounds) does not fix it,
-  // it is an oscillation, not slow propagation.
-  async function debugReadDiag() {
-    const enc = device.createCommandEncoder();
-    enc.copyBufferToBuffer(diagBuf, 0, diagReadBuf, 0, 32);
-    device.queue.submit([enc.finish()]);
-    await diagReadBuf.mapAsync(GPUMapMode.READ);
-    const v = Array.from(new Uint32Array(diagReadBuf.getMappedRange().slice(0)));
-    diagReadBuf.unmap();
-    device.queue.writeBuffer(diagBuf, 0, new Uint32Array(8));
-    return {
-      diagEnabled: DIAG !== 0,
-      refineGranted: v[3],
-      refineStarved: v[5],
-      // The one thing here that is still a fault. NOT `granted === 0`: a
-      // criterion-driven grant is normal operation (a block whose own
-      // vorticity newly crossed threshold), and gating on it would turn a
-      // healthy config red -- measured on main, amr-N2-bounceback reported
-      // granted=1 at step 2048 with 2:1 balance passing at that same
-      // checkpoint.
-      poolOk: v[5] === 0,
-    };
-  }
+  // ?diag=1 counters -- the shared reader (amr2d-gpu.mjs readDiag).
+  const debugReadDiag = () => readDiag(device, diagBuf, diagReadBuf, { enabled: DIAG !== 0 });
 
   // ── The scene render, as ONE encoder path (plans/uniform-levels.md U6) ────
   // frame() and debugRenderOnce() both go through this. A second copy of the

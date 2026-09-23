@@ -22,8 +22,8 @@ import {
   tauAtLevel as tauAtLevelOf,
 } from './card-params.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
-import { check21BalanceOnGPU, allocLevelPool, writePoolInitialState, checkRootPoolIdentity, readConservedTotals, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState, checkGeometryCoverageOnGPU, makeRefusalWatch , checkRefinementClosureOnGPU , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU, makeRenderBindGroup, renderPoolLevels, MAX_RENDER_POOL_LEVELS, makeAMRLayouts, makeCouplingPipelines, makeLevelBindGroups, makeManageBindGroups, makeScheduler, makeRefineRound, allocRootPool, makeRootPool, encodeRootCapture, readRootCapture, restoreRootCapture, seedRootFromDenseF } from './amr2d-gpu.mjs';
-import { poolSlotsFor, tauChainSingularity, tauSingularityMessage, rootPoolSpec, rootCellToDense, rootCellIndex } from './amr2d.mjs';
+import { check21BalanceOnGPU, allocLevelPool, writePoolInitialState, checkRootPoolIdentity, readConservedTotals, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState, checkGeometryCoverageOnGPU, makeRefusalWatch , checkRefinementClosureOnGPU , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU, makeRenderBindGroup, renderPoolLevels, MAX_RENDER_POOL_LEVELS, makeAMRLayouts, makeCouplingPipelines, makeLevelBindGroups, makeManageBindGroups, makeScheduler, makeRefineRound, allocRootPool, makeRootPool, encodeRootCapture, readRootCapture, restoreRootCapture, seedRootFromDense, readDiag } from './amr2d-gpu.mjs';
+import { poolSlotsFor, tauChainSingularity, tauSingularityMessage, rootPoolSpec, rootCellIndex } from './amr2d.mjs';
 import { EX, EY, WT } from './lattice-2d.mjs';
 import { makeCanvasFit } from './canvas-fit.mjs';
 
@@ -1021,16 +1021,27 @@ async function init() {
   // THE ROOT'S INITIAL FIELD, FROM THE PAGE'S OWN IC (U7-6f). `initF()` is
   // built in dense block8 order -- the layout the IC has always been written
   // in, and the one the reference pages' own grids still use -- and the seeder
-  // permutes it into root tiles on the host. See seedRootFromDenseF, which is
+  // permutes it into root tiles on the host. See seedRootFromDense, which is
   // the one statement of it. Called at init, at reset and at a pre-version-7
   // snapshot load, never per frame.
-  const seedRootFrom = (fDense) => seedRootFromDenseF(device, pools, fDense, { W, H, RB, writeF });
+  //
+  // AND ITS VELOCITY, WHICH ON THIS PAGE IS EXACTLY ZERO -- a statement, not
+  // a default. `initF()` is `feq(1, 0, 0, i)` at every cell, so the velocity
+  // that equilibrium distribution represents IS (0, 0); the cylinder and TGV
+  // pages had an APPROXIMATION in this slot, which is why seedRootFromDense
+  // REQUIRES the velocity instead of assuming one. See
+  // plans/uniform-levels.md "U7-6f -- WHAT IT LEFT BEHIND".
+  // debugInjectSyntheticField below is the one caller here with a real field,
+  // and it builds the matching velocity as it builds the `f`.
+  const ROOT_VEL_REST = new Float32Array(NCELLS * 2);
+  const seedRootFrom = (fDense, velDense) =>
+    seedRootFromDense(device, pools, fDense, velDense, { W, H, RB, writeF });
 
   device.queue.writeBuffer(cardStateBuf, 0, initCardState());
   // resetSim() is NOT called at page load -- the initial field is written once
   // here -- so this is a separate seed call site and not a duplicate of the
   // one in resetSim().
-  seedRootFrom(initF());
+  seedRootFrom(initF(), ROOT_VEL_REST);
   // pools[1].finePoolF_a's equilibrium pre-fill, and blockSlotBuf/
   // slotToBlockBuf's -1 fill, already happened above in allocLevelPool
   // (uniformly for every level, not just level 1 -- see its own comment).
@@ -1399,15 +1410,6 @@ async function init() {
     // so it always picks up that child's own override (or falls back to
     // the base L0->L1 values if unset). See paramsForChildLevel's header.
     const childParams = paramsForChildLevel(m + 1);
-    // HAS_GRANDCHILD (level m+2) for the 2:1-balance cascade -- see
-    // amr_manage_pool.wgsl's header. Existence-based (hasGrandchild), not
-    // criterion-based, so no separate grandchild-level threshold overrides
-    // are needed here -- just whether that level exists at all.
-    // DEAD since B2-2d deleted the grandchild cascade: this is
-    // `grandchildPool`'s per-page twin, and survived because it lives in the
-    // per-page pipeline loop rather than the shared bind-group one U7-2
-    // cleaned. See plans/uniform-levels.md "U7-6f -- WHAT IT LEFT BEHIND".
-    const hasGrandchild = (m + 2) < N_LEVELS;
     const poolConstants = {
       W, H, RB, SDF_FAR,
       NBX_PARENT: parentPool.NBX, NBY_PARENT: parentPool.NBY,
@@ -1695,21 +1697,6 @@ async function init() {
   // moving run to run -- refinement itself was being driven by an unwritten
   // buffer, and nothing said so because every gate to date seeded by hand
   // before looking.
-
-  // Raw words out of any COPY_SRC buffer, on demand. One dedicated staging
-  // buffer per call rather than a cached one: these run on a paused page from
-  // a debug hook, never per frame, and a shared stage would have to be sized
-  // for the largest caller and guarded against overlapping awaits.
-  const readBuf = async (buf, bytes) => {
-    const stage = device.createBuffer({ size: bytes, usage: U.MAP_READ | U.COPY_DST });
-    const enc = device.createCommandEncoder();
-    enc.copyBufferToBuffer(buf, 0, stage, 0, bytes);
-    device.queue.submit([enc.finish()]);
-    await stage.mapAsync(GPUMapMode.READ);
-    const out = new Uint32Array(stage.getMappedRange()).slice();
-    stage.unmap(); stage.destroy();
-    return out;
-  };
 
   // compareRootToDense and the debugCheckRoot{Mirror,Vel,Criterion,Force,
   // Digest} family stood here until U7-6f. Every one of them scored a root
@@ -2321,7 +2308,7 @@ async function init() {
     useB = false;
     // U5-3: the root pool is L0 too, and reset() has to reach it. `useB =
     // false` above is the phase the seed writes (finePoolF_a).
-    seedRootFrom(f0);
+    seedRootFrom(f0, ROOT_VEL_REST);
     step = 0;
     trajectory.length = 0;
     trail.clear();
@@ -2633,6 +2620,7 @@ async function init() {
   // window conversion -- off_x/off_y are 0 right after reset() anyway).
   function debugInjectSyntheticField(A, L) {
     const f = new Float32Array(NCELLS * 9);
+    const vel = new Float32Array(NCELLS * 2);
     for (let by = 0; by < NBY; by++) {
       for (let bx = 0; bx < NBX; bx++) {
         for (let ly = 0; ly < BLOCK; ly++) {
@@ -2642,13 +2630,14 @@ async function init() {
             const cell = blockID * (BLOCK * BLOCK) + ly * BLOCK + lx;
             const ux = -A * Math.sin(2 * Math.PI * y / L);
             const uy = A * Math.sin(2 * Math.PI * x / L);
+            vel[cell * 2] = ux; vel[cell * 2 + 1] = uy;
             for (let i = 0; i < 9; i++) f[i * NCELLS + cell] = feq(1, ux, uy, i);
           }
         }
       }
     }
     // Level 0 IS the root pool, so this is the whole write.
-    seedRootFrom(f);
+    seedRootFrom(f, vel);
   }
 
   // Active blocks of one level -- amr2d-gpu.mjs, five copies before B3a.
@@ -3172,52 +3161,8 @@ async function init() {
   let benchRunning = false;
   let benchDone = false;
 
-  // ── ?diag=1 refinement convergence ───────────────────────────────────────
-  // Reads AND ZEROES, so successive calls give per-interval counts rather than
-  // a running total -- which is what makes "transient while refinement catches
-  // up" vs "steady state" answerable.
-  //
-  // WHAT THESE MEANT AND WHAT THEY MEAN NOW. They described the FINAL
-  // iteration of a fixed-point loop, and `converged` asked whether the 2:1
-  // cascade had stopped propagating when that loop ran out of iterations.
-  // B2 deleted the loop: the closure reaches its fixed point in one sweep by
-  // construction, so there is no iteration budget to run out of and no
-  // cascade-still-spreading state to detect.
-  //
-  // SO `converged` AND `refineByCascadeLastIter` ARE GONE rather than left
-  // reading OK. diag[4] stopped being written at all in B2-2d, which made
-  // `converged`'s first clause permanently true -- an always-true gate, the
-  // fourth this project has found (B3a-4 had two, B4-3 one). What was left of
-  // it was the pool-starvation half, so that is what it is now called.
-  //
-  // refineGranted is the tiles created in THIS round -- churn, not a fault.
-  // refineStarved is refines refused for want of a slot, which IS a fault:
-  // geometry-forced refinement being denied means a seam through the body,
-  // and since B4-3 only the finest level computes force, so the refused
-  // region contributes nothing at all. The live loop latches on it
-  // (makeRefusalWatch); this is how the HARNESS path sees it, since
-  // debugStepSync does not go through frame().
-  async function debugReadDiag() {
-    const enc = device.createCommandEncoder();
-    enc.copyBufferToBuffer(diagBuf, 0, diagReadBuf, 0, 32);
-    device.queue.submit([enc.finish()]);
-    await diagReadBuf.mapAsync(GPUMapMode.READ);
-    const v = Array.from(new Uint32Array(diagReadBuf.getMappedRange().slice(0)));
-    diagReadBuf.unmap();
-    device.queue.writeBuffer(diagBuf, 0, new Uint32Array(8));
-    return {
-      diagEnabled: DIAG !== 0,
-      refineGranted: v[3],
-      refineStarved: v[5],
-      // The one thing here that is still a fault. NOT `granted === 0`: a
-      // criterion-driven grant is normal operation (a block whose own
-      // vorticity newly crossed threshold), and gating on it would turn a
-      // healthy config red -- measured on main, amr-N2-bounceback reported
-      // granted=1 at step 2048 with 2:1 balance passing at that same
-      // checkpoint.
-      poolOk: v[5] === 0,
-    };
-  }
+  // ?diag=1 counters -- the shared reader (amr2d-gpu.mjs readDiag).
+  const debugReadDiag = () => readDiag(device, diagBuf, diagReadBuf, { enabled: DIAG !== 0 });
 
   // ── The scene render, as ONE encoder path ────────────────────────────────
   // frame() and debugRenderOnce() both go through this. A second copy of the

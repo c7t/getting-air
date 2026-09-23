@@ -39,6 +39,7 @@ import {
   nearBodyWant, nearBodyWantCentre, bodyPhiL0, bodyFrameL0, bodyFrameL0Legacy,
   cascade21, quadrantOfSlot, tileOriginL0, poolInverseViolations, rootPoolSpec,
   denseL0ToRootF,
+  denseL0ToRootVel,
 } from './amr2d.mjs';
 
 // Every level's blockSlot, copied in one command encoder and one submit, so
@@ -554,19 +555,45 @@ export function readRootCapture(st, pools, { readF, bytesToB64 }) {
 // order. `writeF` is injected because packing is the PAGE's property (?f16=),
 // the same dependency shape `restoreRootCapture` already takes.
 //
-// f ONLY. Velocity is `writePoolInitialState`'s, because its value is the
-// scenario's (zero for a card at rest, the freestream for the cylinder) and
-// that function is already where a pool's initial state is stated.
-export function seedRootFromDenseF(device, pools, fDense, { W, H, RB, writeF }) {
+// AND VELOCITY WITH IT, WHICH IT DID NOT CARRY AT U7-6f. That rung wrote "f
+// ONLY. Velocity is writePoolInitialState's, because its value is the
+// scenario's", and the boundary was wrong in a way its own leftovers list
+// records: the root's velocity is not a scenario CONSTANT, it is the velocity
+// THIS `f` represents, and on two of five pages the constant was an
+// approximation of it ([U0, 0] against a perturbed freestream; [0, 0] against
+// a Taylor-Green vortex). `dispatchMacroStep` runs the refinement round
+// BEFORE `S_Advance` and `macroStepCounter` is 0 after a reset, so the first
+// criterion evaluation reads the approximation and the tiles that exist at
+// step 0 come from it.
+//
+// SO THE TWO ARE ONE STATEMENT AND ARE WRITTEN TOGETHER. They have to come
+// from the SAME rng draw on the cylinder -- `initF(velOut)` fills both in one
+// pass for exactly that reason -- and a seeder that took one and left the
+// other to a second function is a seeder that lets them disagree. It is also
+// the LAST writer of the root's velocity at both call sites (init, where
+// `allocLevelPool`'s `writePoolInitialState` has already zeroed it, and
+// reset, where the page's own `writePoolInitialState` loop runs first), so
+// there is no ordering hazard to remember.
+//
+// `velDense` is REQUIRED, and that is the point rather than an inconvenience:
+// the three pages whose IC is uniform rest pass a zero array and thereby SAY
+// that zero is exact for them, instead of inheriting it from a default that
+// was silently wrong for the other two. Interleaved [ux, uy], dense block8
+// order, same length rule as any pool's `velFill`.
+export function seedRootFromDense(device, pools, fDense, velDense, { W, H, RB, writeF }) {
   const root = pools[0];
   if (!root) return;
   const cells = root.MAX_FINE_BLOCKS * root.cellsPerSlot;
   writeF(root.finePoolF_a, denseL0ToRootF(fDense, { dims: { W, H }, rb: RB }), cells);
+  const vel = denseL0ToRootVel(velDense, { dims: { W, H }, rb: RB });
+  device.queue.writeBuffer(root.finePoolVel, 0, vel.buffer, vel.byteOffset, vel.byteLength);
 }
 
-// Returns true if the root was restored FROM THE SNAPSHOT. False means the
-// caller should fall back to `seedRootFromDenseF` -- which is correct only for
-// a capture written before this rung, and only for `f`.
+// Returns true if the root was restored FROM THE SNAPSHOT. False meant "fall
+// back to the seeder" when a pre-root capture was still loadable; since U7-6f
+// the formatVersion check refuses those outright, so all three callers THROW
+// on false rather than seeding -- level 0 would otherwise keep whatever the
+// page already had, silently.
 export function restoreRootCapture(device, pools, snapRoot, { writeF, b64ToFloat32 }) {
   const root = pools[0];
   if (!snapRoot) return false;
@@ -1261,7 +1288,7 @@ export function makeCouplingPipelines(device, layouts, modules, { RB, F16, DC_PR
 // The root, as a level. `rootPoolSpec` is the shape; `allocLevelPool` is the
 // same allocator every other level uses, which is U1's whole claim in one
 // line. No initial field: a buffer nothing reads should not be given a state
-// that could be mistaken for one -- `seedRootFromDenseF` writes it, from the
+// that could be mistaken for one -- `seedRootFromDense` writes it, from the
 // page's own `initF()`.
 export function allocRootPool(device, U, { W, H, RB }) {
   const spec = rootPoolSpec({ dims: { W, H }, rb: RB });
@@ -1331,7 +1358,7 @@ export function makeRootPool(device, U, layouts, modules, pools, {
   const buildRootStepPL = (c) => device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [layouts.step1BGL] }),
     compute: { module: modules.step1SM, entryPoint: 'main',
-               constants: { ...c, DIRECT_GHOST: 1, GHOST: 0, NO_PARENT: 1, SPONGE_CELL_SNAP: 1 } },
+               constants: { ...c, DIRECT_GHOST: 1, GHOST: 0, NO_PARENT: 1 } },
   });
   let rootStepPL = buildRootStepPL(step1Constants);
   const rootBG = (fin, fout) => device.createBindGroup({ layout: layouts.step1BGL, entries: [
@@ -1742,6 +1769,55 @@ export function renderPoolLevels(nLevels) {
       + `Refused rather than drawn without the finest level -- see plans/uniform-levels.md U6.`);
   }
   return want;
+}
+
+// ── ?diag=1 counters, READ AND ZEROED ─────────────────────────────────────
+// One reader for all five AMR pages. Five byte-identical copies stood here
+// until 2026-09-23 -- two from f12528b, three added when U7-6g found the
+// channel, TGV and reentry pages had `diagBuf` and no reader (so
+// tools/lib/amr-invariants.js, which feature-detects `debugReadDiag`, skipped
+// the pool-starvation gate there: ABSENT rather than green).
+//
+// Reads AND ZEROES, so successive calls give per-interval counts rather than
+// a running total -- which is what makes "transient while refinement catches
+// up" vs "steady state" answerable.
+//
+// WHAT THESE MEANT AND WHAT THEY MEAN NOW. They described the FINAL
+// iteration of a fixed-point loop, and `converged` asked whether the 2:1
+// cascade had stopped propagating when that loop ran out of iterations.
+// B2 deleted the loop: the closure reaches its fixed point in one sweep by
+// construction, so there is no iteration budget to run out of and no
+// cascade-still-spreading state to detect. So `converged` and
+// `refineByCascadeLastIter` are GONE rather than left reading OK -- diag[4]
+// stopped being written in B2-2d, which made `converged` an always-true gate.
+//
+// refineGranted is the tiles created in THIS round -- churn, not a fault.
+// refineStarved is refines refused for want of a slot, which IS a fault:
+// geometry-forced refinement being denied means a seam through the body,
+// and since B4-3 only the finest level computes force, so the refused
+// region contributes nothing at all. The live loop latches on it
+// (makeRefusalWatch); this is how the HARNESS path sees it, since
+// debugStepSync does not go through frame().
+export async function readDiag(device, diagBuf, diagReadBuf, { enabled }) {
+  const enc = device.createCommandEncoder();
+  enc.copyBufferToBuffer(diagBuf, 0, diagReadBuf, 0, 32);
+  device.queue.submit([enc.finish()]);
+  await diagReadBuf.mapAsync(GPUMapMode.READ);
+  const v = Array.from(new Uint32Array(diagReadBuf.getMappedRange().slice(0)));
+  diagReadBuf.unmap();
+  device.queue.writeBuffer(diagBuf, 0, new Uint32Array(8));
+  return {
+    diagEnabled: enabled,
+    refineGranted: v[3],
+    refineStarved: v[5],
+    // The one thing here that is still a fault. NOT `granted === 0`: a
+    // criterion-driven grant is normal operation (a block whose own
+    // vorticity newly crossed threshold), and gating on it would turn a
+    // healthy config red -- measured on main, amr-N2-bounceback reported
+    // granted=1 at step 2048 with 2:1 balance passing at that same
+    // checkpoint.
+    poolOk: v[5] === 0,
+  };
 }
 
 export function makeRefusalWatch({ device, pools, nLevels, checkCoverage, minIntervalMs = 500 }) {
