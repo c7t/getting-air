@@ -2717,6 +2717,47 @@ levels 3, leaving explode about +6..19% / +12..16% over interp -- a range, not a
 number, until it is re-measured on a quiet machine. `average` is what is left
 of B6-5's cost finding; it touches what the criterion reads and is not started.
 
+### B6-8 — DONE (2026-09-23). The seam LINES were B6-4's own fallback deleting a curl term.
+
+Reported by eye on the falling card under explode: fine cell-edge lines along
+the boundaries between levels -- every straight coarse/fine seam, not just the
+corners B6-4 fixed. It was the render again, and specifically B6-4's rule for a
+tap with NO same-level neighbour: clamp the tap's VELOCITY to the tile's own
+edge cell. For a curl that deletes a term rather than approximating one. In the
+ring cell the bilinear blend reaches (weight up to 1/2), both x-taps land on
+the same edge cell, so du_y/dx is exactly zero; in the edge cell one tap is
+clamped onto the centre, so it is halved. omega = du_y/dx - du_x/dy, and where
+the flow is strain-dominated those two are large and nearly cancel -- drop one
+and a one-fine-cell line of the other appears. That is why the lines are
+COLOURED on a near-black background rather than darker: they are strain read
+as vorticity.
+
+Fix: `RING_FREE_RENDER` mode 2, the explode default (`?ringfreerender=1`
+restores B6-4's clamp to A/B, 0 reads the ring). A cell with no data of its own
+is pulled back onto the nearest cell that has some (one axis first, so a face
+neighbour still counts) -- clamping OMEGA, a half-cell plateau at worst -- and
+each derivative uses whichever of its two taps exist over the spacing it
+actually spans: central in the interior, one-sided at the seam. Interp (mode 0)
+and mode 1 are untouched code.
+
+Measured on ONE state (card, levels 3, 8000 steps, snapshot handed between two
+tabs over a BroadcastChannel, rendered at 3072^2): 0.73% of pixels change,
+and the difference image is exactly the seam network and nothing else
+(`plans/img/b6-8-seam-lines.png`: mode 1 | mode 2 | |diff| x20). What is left
+at a seam in mode 2 is the coarse-vs-fine omega step the walk's hard level
+switch has always had, visible only under a strong level stretch.
+`validate-render-levels.js --extra=interface=explode` passes at levels 4, and
+all five AMR pages boot on explode.
+
+**THE FIRST A/B WAS BYTE-IDENTICAL, AND THAT WAS THE BROWSER CACHE.** `https.py`
+sent Last-Modified and no Cache-Control, so Chrome heuristically reused the
+pre-edit `main-amr.js` and both tabs ran mode 1. No tool here disables the
+cache, so any GPU check after an edit could have been measuring the previous
+build. `https.py` now sends `Cache-Control: no-store` on every response. A
+server started before that change still serves the old headers, and a profile
+that cached under them still holds those entries -- restart the server and
+clear the cache (`Network.clearBrowserCache`) once.
+
 ### B7 — DONE (2026-09-14)
 
 `?kEps=` threads one `K_EPS` override through all nine chi sites (the render

@@ -107,8 +107,9 @@ const DC_PRE = urlParams.has('dcpre') ? (parseInt(urlParams.get('dcpre')) || 0) 
 const INTERFACE = readInterfaceMode(urlParams);
 const COLLIDE_RING = INTERFACE === 'explode' ? 0 : 1;
 // The render's ring rule follows the interface unless ?ringfreerender= says
-// otherwise -- see amr_render.wgsl's RING_FREE_RENDER (B6-4).
-const RING_FREE_RENDER = urlParams.has('ringfreerender') ? (parseInt(urlParams.get('ringfreerender')) ? 1 : 0) : 1 - COLLIDE_RING;
+// otherwise -- see amr_render.wgsl's RING_FREE_RENDER (B6-4, B6-8): 0 reads the
+// ring, 1 is B6-4's seam clamp (kept to A/B), 2 the one-sided seam curl.
+const RING_FREE_RENDER = urlParams.has('ringfreerender') ? Math.min(2, Math.max(0, parseInt(urlParams.get('ringfreerender')) || 0)) : 2 * (1 - COLLIDE_RING);
 
 
 

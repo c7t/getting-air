@@ -239,22 +239,39 @@ fn poolSlotOf(m: u32, blockID: i32) -> i32 {
 // units and the central difference spans +/-1 fine cell, so the factor is
 // 1/(2 * 2^-m) = 2^(m-1): 1 at level 1, 2 at level 2, and so on. The two
 // hand-written copies this replaces carried exactly those two constants.
-// RING_FREE_RENDER (plans/2D-backport.md B6-4). The taps below reach up to
-// two cells past a tile's interior -- the bilinear blend one, the curl's +-1
+// RING_FREE_RENDER (plans/2D-backport.md B6-4, B6-8). The taps below reach up
+// to two cells past a tile's interior -- the bilinear blend one, the curl's +-1
 // another -- i.e. into the RING. On the interp path a ring cell holds a
-// collided, parent-interpolated state and that was close enough. On the
-// explode path the ring is an inbox/outbox, and at a CONVEX CORNER of the
+// collided, parent-interpolated state and that was close enough (mode 0). On
+// the explode path the ring is an inbox/outbox, and at a CONVEX CORNER of the
 // refined region its gathered directions are largely zeros or clamps, so its
 // "velocity" is garbage and the curl turns it into a single bright cell --
 // reported on the cylinder page, and measured to be the render's alone: the
-// tile INTERIORS showed no corner outlier on either path (plans/2D-backport.md
-// B6-4). So on that path a tap outside the interior resolves into the
-// SAME-level neighbour tile, and where there is none (a coarse seam) it takes
-// the tile's own edge cell -- the rule amr_criterion_pool.wgsl's RING_FREE_TAPS
-// uses. Default 0 keeps the interp picture byte-identical.
+// tile INTERIORS showed no corner outlier on either path (B6-4). So on that
+// path a tap outside the interior resolves into the SAME-level neighbour tile.
+//
+// WHERE THERE IS NONE (a coarse seam) THE RULE IS WHAT MATTERS, and B6-4's was
+// wrong (mode 1, kept to A/B). It clamped the missing tap's VELOCITY to the
+// tile's own edge cell. For the curl that is not a small error, it deletes a
+// term: in the ring cell both x-taps land on the same edge cell, so du_y/dx is
+// exactly ZERO there, and in the edge cell one tap is clamped onto the centre,
+// so it is HALVED. omega = du_y/dx - du_x/dy, and in a strain-dominated region
+// those two terms are large and nearly cancel -- drop one and a one-cell-wide
+// line of the other appears along every straight coarse/fine seam. Reported by
+// eye on the falling card as "fine cell-edge lines between levels" (B6-8).
+//
+// Mode 2 (the explode default) never differences a clamped value. A cell with
+// no data of its own is pulled back onto the nearest cell that has some -- one
+// axis first, so a face neighbour still counts -- which clamps OMEGA, a
+// piecewise-constant half-cell at worst rather than a missing term; and each
+// derivative uses whichever of its two taps exist, divided by the spacing it
+// actually spans: central where both do, one-sided at the seam.
 override RING_FREE_RENDER : u32 = 0u;
 
-fn poolVelRingFree(m: u32, slot: u32, bx: u32, by: u32, nbxL: u32, nbyL: u32, cx: i32, cy: i32) -> vec2<f32> {
+// A fine cell (cx, cy) of level-m tile (bx, by), resolved to (slot, ix, iy) in
+// POOL coordinates of the tile that owns it as INTERIOR -- this tile or its
+// same-level neighbour. slot < 0: nobody at this level owns it.
+fn resolveInterior(m: u32, slot: u32, bx: u32, by: u32, nbxL: u32, nbyL: u32, cx: i32, cy: i32) -> vec3<i32> {
   let RB2 = i32(RB * 2u);
   var ix = cx - i32(GHOST); var iy = cy - i32(GHOST);
   var tbx = bx; var tby = by;
@@ -264,11 +281,14 @@ fn poolVelRingFree(m: u32, slot: u32, bx: u32, by: u32, nbxL: u32, nbyL: u32, cx
   else if (iy >= RB2) { iy -= RB2; tby = (by + 1u) % nbyL; }
   var s = i32(slot);
   if (tbx != bx || tby != by) { s = poolSlotOf(m, i32(tby * nbxL + tbx)); }
-  if (s < 0) {
-    s = i32(slot);
-    ix = clamp(cx - i32(GHOST), 0, RB2 - 1); iy = clamp(cy - i32(GHOST), 0, RB2 - 1);
-  }
-  return poolVel(m, u32(s), ix + i32(GHOST), iy + i32(GHOST));
+  return vec3<i32>(s, ix + i32(GHOST), iy + i32(GHOST));
+}
+
+fn poolVelRingFree(m: u32, slot: u32, bx: u32, by: u32, nbxL: u32, nbyL: u32, cx: i32, cy: i32) -> vec2<f32> {
+  let r = resolveInterior(m, slot, bx, by, nbxL, nbyL, cx, cy);
+  if (r.x >= 0) { return poolVel(m, u32(r.x), r.y, r.z); }
+  let lo = i32(GHOST); let hi = i32(GHOST + RB * 2u) - 1;
+  return poolVel(m, slot, clamp(cx, lo, hi), clamp(cy, lo, hi));
 }
 
 fn tapVelAt(m: u32, slot: u32, bx: u32, by: u32, nbxL: u32, nbyL: u32, cx: i32, cy: i32) -> vec2<f32> {
@@ -276,7 +296,38 @@ fn tapVelAt(m: u32, slot: u32, bx: u32, by: u32, nbxL: u32, nbyL: u32, cx: i32, 
   return poolVel(m, slot, cx, cy);
 }
 
+// Mode 2's curl. Same normalisation as fineOmegaAt below: a derivative per
+// COARSE unit is (difference / cells spanned) / 2^-m.
+fn seamOmegaAt(m: u32, slot: u32, bx: u32, by: u32, nbxL: u32, nbyL: u32, cx: i32, cy: i32) -> f32 {
+  let lo = i32(GHOST); let hi = i32(GHOST + RB * 2u) - 1;
+  var c = vec2<i32>(cx, cy);
+  if (resolveInterior(m, slot, bx, by, nbxL, nbyL, c.x, c.y).x < 0) {
+    let cX = vec2<i32>(clamp(cx, lo, hi), cy);
+    let cY = vec2<i32>(cx, clamp(cy, lo, hi));
+    if (resolveInterior(m, slot, bx, by, nbxL, nbyL, cX.x, cX.y).x >= 0) { c = cX; }
+    else if (resolveInterior(m, slot, bx, by, nbxL, nbyL, cY.x, cY.y).x >= 0) { c = cY; }
+    else { c = vec2<i32>(clamp(cx, lo, hi), clamp(cy, lo, hi)); }
+  }
+  let r0 = resolveInterior(m, slot, bx, by, nbxL, nbyL, c.x, c.y);
+  let u0 = poolVel(m, u32(r0.x), r0.y, r0.z);
+
+  let rxp = resolveInterior(m, slot, bx, by, nbxL, nbyL, c.x + 1, c.y);
+  let rxm = resolveInterior(m, slot, bx, by, nbxL, nbyL, c.x - 1, c.y);
+  let ryp = resolveInterior(m, slot, bx, by, nbxL, nbyL, c.x, c.y + 1);
+  let rym = resolveInterior(m, slot, bx, by, nbxL, nbyL, c.x, c.y - 1);
+  var uyp = u0.y; var uym = u0.y; var uxp = u0.x; var uxm = u0.x;
+  var sx = 0.0f; var sy = 0.0f;
+  if (rxp.x >= 0) { uyp = poolVel(m, u32(rxp.x), rxp.y, rxp.z).y; sx += 1.0f; }
+  if (rxm.x >= 0) { uym = poolVel(m, u32(rxm.x), rxm.y, rxm.z).y; sx += 1.0f; }
+  if (ryp.x >= 0) { uxp = poolVel(m, u32(ryp.x), ryp.y, ryp.z).x; sy += 1.0f; }
+  if (rym.x >= 0) { uxm = poolVel(m, u32(rym.x), rym.y, rym.z).x; sy += 1.0f; }
+  let duy = select(0.0f, (uyp - uym) / sx, sx > 0.0f);
+  let dux = select(0.0f, (uxp - uxm) / sy, sy > 0.0f);
+  return (duy - dux) * exp2(f32(m));
+}
+
 fn fineOmegaAt(m: u32, slot: u32, bx: u32, by: u32, nbxL: u32, nbyL: u32, cx: i32, cy: i32) -> f32 {
+  if (RING_FREE_RENDER == 2u) { return seamOmegaAt(m, slot, bx, by, nbxL, nbyL, cx, cy); }
   let uyp = tapVelAt(m, slot, bx, by, nbxL, nbyL, cx + 1, cy).y;
   let uym = tapVelAt(m, slot, bx, by, nbxL, nbyL, cx - 1, cy).y;
   let uxp = tapVelAt(m, slot, bx, by, nbxL, nbyL, cx, cy + 1).x;
