@@ -4338,8 +4338,13 @@ the intended one. They are `icCellIndex` and `cellIndexJS` now, named apart.
   flag and its only consumer was the DENSE manager's constants bundle; the
   pool manager's `poolConstants` left `DIAG` implicit, with a comment saying
   "this page has no ?diag= flag" -- it did. The counter is wired through now
-  rather than the const deleted, so the pool-starvation gate is not vacuous
-  there.
+  rather than the const deleted.
+  **THIS IS HALF A FIX AND THIS ENTRY ORIGINALLY CLAIMED IT WAS A WHOLE ONE.**
+  It said "so the pool-starvation gate is not vacuous there", and that does not
+  follow: the SHADER increments `diag[5]` now, but neither page has a
+  `debugReadDiag`, and `tools/lib/amr-invariants.js` feature-detects it -- so
+  `starvationChecked` is FALSE there and the gate does not run at all. See
+  "what it left behind" below.
 - **`debugForceBreakdown`'s `l0` leg** ran a dense force pass. It reports a
   structural zero now, with the measurement that licensed that (in
   amr_force1.wgsl's header, moved there from the deleted file) named at the
@@ -4408,6 +4413,156 @@ including the new formatVersion refusal; boot smoke on all seven pages;
 tools -- which on a machine with more than one worktree live means it runs
 against another checkout's server, the exact trap CLAUDE.md records two
 discarded sweeps for. Found by needing to run it here.
+
+#### U7-6f — WHAT IT LEFT BEHIND. Three artifacts, written down rather than carried.
+
+The deletion is clean in the sense that nothing dense remains in the solver.
+It is not clean in the sense that nothing is left to do. Three things survived
+it, each for a different reason, and each is recorded here so that "we know
+about it" is a fact in the repository rather than a memory.
+
+They are listed together because each was left behind for a stated reason and
+not by oversight -- but the reasons are NOT the same one, which is worth being
+precise about. The first two MOVE NUMBERS and so could not ride a rung whose
+gate was bit-identity, which U7-6f's was; each needs its own measurement. The
+third moves nothing and could have ridden it. It did not, because deleting ten
+unrelated declarations inside a 4,000-line deletion is how an unreviewable
+diff is made, and one of the eleven turns out to be this rung's own debris --
+which is the part that had to be found before any of them could be judged.
+
+##### 1. `SPONGE_CELL_SNAP` — the dense step's last convention
+
+Recorded in full at its own `override` in `shaders/amr_step1.wgsl`; summarised
+here so the three are in one place.
+
+Level 0 converts to window coordinates with `bufferToWindowCell` — u32 modular
+arithmetic, which TRUNCATES `off_x`/`off_y` to whole cells. Every other level
+uses `bufferToWindowPos` and keeps the sub-cell part. Whenever the window
+offset is fractional — which on the falling-card page is essentially always —
+**level 0's sponge band sits up to half a cell from where every finer level's
+does.**
+
+U3 found it and deliberately did not fix it: U3 was a REPRESENTATION stage, its
+job was to show the root pool reproduces the dense grid exactly, not to improve
+it, so the root took L0's convention. U7-6f deleted the grid that convention
+came from and kept the convention, because unifying the two moves published
+numbers.
+
+**It no longer has a second implementation to be consistent WITH, which is an
+argument for fixing it rather than against.** The override exists precisely so
+the fix is one constant and its gate is the falling-card page's own numbers.
+
+##### 2. The root's initial VELOCITY, on two pages
+
+`writePoolInitialState` writes every pool's velocity at reset, because
+`dispatchMacroStep` runs the refinement round BEFORE `S_Advance` and
+`macroStepCounter = 0` after a reset — so the first macro-step's criterion
+reads velocity nothing has computed yet. It is state, not a derived quantity,
+and D1-a is the measurement that established that.
+
+For the ROOT, on two of five pages, the value written is an approximation:
+
+```
+  page                 root velFill   what the root's `f` actually represents
+  index-amr            [0, 0]         uniform rest            EXACT
+  index-reentry-amr    [0, 0]         uniform rest            EXACT
+  index-channel-amr    [0, 0]         uniform rest            EXACT
+  index-cylinder-amr   [U0, 0]        PERTURBED freestream    approximate
+  index-tgv-amr        [0, 0]         a Taylor-Green vortex   approximate
+```
+
+The three exact ones are exact for a real reason and not by luck: their
+`initF()` is `feq(1, 0, 0, i)` at every cell, so the velocity that equilibrium
+distribution represents IS (0, 0).
+
+**IT LASTS EXACTLY ONE CRITERION EVALUATION.** The first macro-step after a
+reset is a refinement round reading this value; the step then recomputes
+velocity from `f`, and every later round reads the real field. So the blast
+radius is "which tiles exist at step 0", not "the flow is wrong".
+
+**WHY IT EXISTED IS GONE.** `main-cylinder-amr.js`'s own comment named the
+blocker: the root's velocity "would need that same field re-laid-out from
+block8 into root tiles to match exactly". U7-6f-a built that re-layout
+(`denseL0ToRootF`). The velocity companion, `denseL0ToRootVel`, was
+deliberately NOT added in that rung — an exported, tested function no caller
+uses is worse than one added when it is needed — so the fix is that function
+plus one line per page.
+
+**THE CYLINDER'S DRAW ORDER IS LOAD-BEARING and is what makes this more than a
+one-liner.** `rng` is one stream shared by `initF` and every `initFPool`, so a
+pool's velocity must come from the SAME draw as the `f` it describes, in order.
+`initF(velOut)` already produces that paired velocity field; U7-6f dropped the
+`vel0` array because its only consumer was the deleted `velBuf`. The fix is to
+bring it back and permute it exactly as `f` is permuted — not to re-derive a
+velocity from anywhere else.
+
+**ON TGV IT IS A TESTABLE PREDICTION, AND THAT IS THE INTERESTING HALF.**
+CLAUDE.md records `tgv-amr-N2`/`tgv-amr-N3` as holding ZERO active tiles, and
+attributes it to "thresholds that never fire at TGV's vorticity scale". Right
+now the first criterion round on that page reads a ZERO velocity field, so zero
+tiles at step 0 is guaranteed for a reason that has nothing to do with the
+thresholds. **Seeding the true velocity tests that attribution for the first
+time.** If tiles appear, the attribution was wrong, and the analytic AMR
+configs are even less of a coarse/fine-seam test than CLAUDE.md already warns
+they are.
+
+*Gate for the fix, when it is done:* it moves Cd/St on the cylinder, so read
+those as BAND membership against the literature, which is what they are for.
+On TGV the instrument is `debugListActiveBlocks` after a reset, not Cd.
+
+##### 3. Dead declarations, and one of them is U7-6f's own debris
+
+ELEVEN `const`s across the five AMR pages are declared and never read. They are
+harmless at runtime and they are not noise: each one is a mechanism that was
+deleted without deleting what fed it, which is a class this project has already
+named. `amr2d-gpu.mjs`'s `makeManageBindGroups` header records it about
+`grandchildPool` — "Deleting a mechanism has to include deleting what fed it;
+`amr_manage_pool.wgsl`'s own header records the identical lesson about
+`refineWants`."
+
+```
+  identifier        pages                        dead since
+  FSCALE            main-amr                     7dc30e8 -- U7-6f ITSELF
+  FSCALE            reentry                      born dead (41843c6)
+  hasGrandchild     card, cylinder, channel,     B2-2d, which deleted the
+                    reentry                      grandchild cascade
+  diagReadBuf       channel, tgv, reentry        born dead (f12528b)
+  queryReadBuffer   cylinder, reentry            born dead
+```
+
+**`FSCALE` ON `main-amr.js` IS NOT A PRE-EXISTING ARTIFACT — U7-6f KILLED IT**,
+by deleting `debugCheckRootForce`, its last reader. That is this rung failing
+its own cited rule, caught by a dead-identifier sweep after the fact rather
+than by the deletion itself. **Deleted, in the same change as this write-up.**
+The other TEN predate U7-6f and are left in place, each marked at its own
+declaration with a pointer here -- `grep "WHAT IT LEFT BEHIND"` finds all of
+them. Removing them is unrelated to the dense path and would put unreviewed
+churn in a rung already this large; marking them costs nothing and means the
+next dead-identifier sweep does not have to re-derive which are known.
+
+**`hasGrandchild` IS `grandchildPool`'s PER-PAGE TWIN and survived for a
+structural reason worth noting.** U7-2 removed `grandchildPool` when it moved
+the bind-group loop into `makeManageBindGroups`; `hasGrandchild` lives in the
+per-page PIPELINE-construction loop, which was never shared, so there was no
+moment at which someone read all four copies side by side. A thing that exists
+in five places does not get audited; that is the whole argument for U7-0..U7-3.
+
+**THE `diagReadBuf` THREE ARE A DIFFERENT SUB-CLASS, AND THEY MATTER MORE THAN
+THEIR SIZE.** `f12528b` added the `?diag=1` buffer to all five pages and the
+`debugReadDiag` READER to two. So on the channel and TGV pages the allocation
+is there and nothing can read it — and the allocation being there is what made
+the missing pipeline override look deliberate rather than forgotten, which is
+exactly the defect U7-6f found in those pages' constants bundle.
+
+**AND THAT FIX IS ONLY HALF A FIX. The U7-6f entry above claims more than is
+true and is corrected here.** Passing `DIAG` into `poolConstants` makes the
+SHADER increment `diag[5]` on those pages. Nothing on the host can read it:
+`tools/lib/amr-invariants.js` feature-detects `debugReadDiag`, so
+`starvationChecked` is FALSE on the channel and TGV pages and the pool-
+starvation gate does not run there at all. It was vacuous before and it is
+absent now — better, because an absent check reports itself and a vacuous one
+does not, but not "the flag works". Finishing it means a `debugReadDiag` on
+those two pages, which is four lines each and its own small change.
 
 #### D1-b — SKIPPED, deliberately, 2026-09-18. The decision the rung asked to be made explicitly.
 

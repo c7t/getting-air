@@ -383,6 +383,9 @@ recalculate();
   // card-params.mjs owns this rule and tools/test-card-params.js tests it.
   // Five pages inlined the same loop -- see plans/2D-backport.md B3a.
   const tauAtLevel = (m) => tauAtLevelOf(TAU, m);
+// DEAD (born dead): this page has no debugForceBreakdown, which is FSCALE's
+// only reader -- it lives on main-cylinder-amr.js alone. See
+// plans/uniform-levels.md "U7-6f -- WHAT IT LEFT BEHIND".
 const FSCALE  = 1e7;
 
 // The D2Q9 basis, from the ONE place it is derived -- lattice-2d.mjs, which
@@ -543,6 +546,8 @@ async function init() {
     size: 16,
     usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC
   }) : null;
+  // DEAD (born dead): no timestamp readback path on this page. See
+  // plans/uniform-levels.md "U7-6f -- WHAT IT LEFT BEHIND".
   const queryReadBuffer = hasTimestamp ? device.createBuffer({
     size: 16,
     usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
@@ -570,6 +575,10 @@ async function init() {
   // hasChild is true, which is never the case for whoever binds this.
   // ?diag=1 counters -- 8 u32 slots, read+zeroed via debugReadDiag().
   const diagBuf = device.createBuffer({ size: 8 * 4, usage: U.STORAGE | U.COPY_SRC | U.COPY_DST });
+  // DEAD (born dead): f12528b added this buffer to all five pages and the
+  // debugReadDiag READER to two. Nothing here can read it, which is why
+  // amr-invariants.js's pool-starvation gate does not run on this page. See
+  // plans/uniform-levels.md "U7-6f -- WHAT IT LEFT BEHIND".
   const diagReadBuf = device.createBuffer({ size: 8 * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
   const dummyBlockSlotBuf = device.createBuffer({ size: 4, usage: U.STORAGE | U.COPY_DST });
   device.queue.writeBuffer(dummyBlockSlotBuf, 0, new Int32Array([-1]));
@@ -903,6 +912,10 @@ async function init() {
     // amr_manage_pool.wgsl's header. Existence-based (hasGrandchild), not
     // criterion-based, so no separate grandchild-level threshold overrides
     // are needed here -- just whether that level exists at all.
+    // DEAD since B2-2d deleted the grandchild cascade: this is
+    // `grandchildPool`'s per-page twin, and survived because it lives in the
+    // per-page pipeline loop rather than the shared bind-group one U7-2
+    // cleaned. See plans/uniform-levels.md "U7-6f -- WHAT IT LEFT BEHIND".
     const hasGrandchild = (m + 2) < N_LEVELS;
     const poolConstants = {
       W, H, RB,

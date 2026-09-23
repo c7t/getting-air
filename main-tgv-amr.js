@@ -404,6 +404,10 @@ async function init() {
   const U = GPUBufferUsage;
   // ?diag=1 counters -- 8 u32 slots, read+zeroed via debugReadDiag().
   const diagBuf = device.createBuffer({ size: 8 * 4, usage: U.STORAGE | U.COPY_SRC | U.COPY_DST });
+  // DEAD (born dead): f12528b added this buffer to all five pages and the
+  // debugReadDiag READER to two. Nothing here can read it, which is why
+  // amr-invariants.js's pool-starvation gate does not run on this page. See
+  // plans/uniform-levels.md "U7-6f -- WHAT IT LEFT BEHIND".
   const diagReadBuf = device.createBuffer({ size: 8 * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
   const dummyBlockSlotBuf = device.createBuffer({ size: 4, usage: U.STORAGE | U.COPY_DST });
   device.queue.writeBuffer(dummyBlockSlotBuf, 0, new Int32Array([-1]));
@@ -777,6 +781,20 @@ async function init() {
     // that drift produced. The root pool is included: pools[0] is a level like
     // any other and its velocity is read by the first refinement round after
     // this reset.
+    //
+    // THE ROOT GETS (0, 0) WHILE ITS `f` CARRIES A TAYLOR-GREEN VORTEX, and
+    // that is an approximation, not a value. Every other page whose IC is
+    // uniform rest gets (0,0) EXACTLY right -- `feq(1,0,0,i)` represents zero
+    // velocity -- and this page's does not. It lasts exactly one criterion
+    // evaluation (the step recomputes velocity from `f` immediately after),
+    // so the blast radius is which tiles exist at step 0.
+    //
+    // IT IS ALSO WHY "ZERO ACTIVE TILES" ON THIS PAGE IS NOT YET EVIDENCE
+    // ABOUT THE THRESHOLDS. CLAUDE.md attributes that to thresholds which
+    // never fire at TGV's vorticity scale; the first criterion round here
+    // reads a ZERO field, so zero tiles at step 0 is guaranteed for an
+    // unrelated reason. Seeding the true velocity would test the attribution.
+    // See plans/uniform-levels.md, "U7-6f -- WHAT IT LEFT BEHIND".
     for (const pool of pools) {
       if (pool) writePoolInitialState(device, pool, { velFill: [0, 0] });
     }

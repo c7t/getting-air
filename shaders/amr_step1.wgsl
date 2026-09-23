@@ -185,6 +185,11 @@ override NO_PARENT : u32 = 0u;
 // Folded at pipeline creation, so no non-root pipeline evaluates the u32
 // conversion below -- which matters, because a ring cell's buffer position can
 // be negative and this branch would be meaningless there.
+//
+// One of THREE things U7-6f left behind, all written up together under
+// plans/uniform-levels.md "U7-6f -- WHAT IT LEFT BEHIND". The other two are
+// the root's initial VELOCITY on the cylinder and TGV pages, and ten marked
+// dead declarations across the five AMR pages.
 override SPONGE_CELL_SNAP : u32 = 0u;
 
 // Sponge relaxation target velocity -- the same formula lbm_step.wgsl uses on

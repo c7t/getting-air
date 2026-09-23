@@ -742,7 +742,6 @@ recalculate();
   // card-params.mjs owns this rule and tools/test-card-params.js tests it.
   // Five pages inlined the same loop -- see plans/2D-backport.md B3a.
   const tauAtLevel = (m) => tauAtLevelOf(TAU, m);
-const FSCALE  = 1e7;
 
 // The D2Q9 basis, from the ONE place it is derived -- lattice-2d.mjs, which
 // also generates shaders/common_lattice.wgsl. Typed out here (and in nine
@@ -1404,6 +1403,10 @@ async function init() {
     // amr_manage_pool.wgsl's header. Existence-based (hasGrandchild), not
     // criterion-based, so no separate grandchild-level threshold overrides
     // are needed here -- just whether that level exists at all.
+    // DEAD since B2-2d deleted the grandchild cascade: this is
+    // `grandchildPool`'s per-page twin, and survived because it lives in the
+    // per-page pipeline loop rather than the shared bind-group one U7-2
+    // cleaned. See plans/uniform-levels.md "U7-6f -- WHAT IT LEFT BEHIND".
     const hasGrandchild = (m + 2) < N_LEVELS;
     const poolConstants = {
       W, H, RB, SDF_FAR,

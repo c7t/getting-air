@@ -360,6 +360,10 @@ async function init() {
   // main-amr.js's identical dummy buffers.
   // ?diag=1 counters -- 8 u32 slots, read+zeroed via debugReadDiag().
   const diagBuf = device.createBuffer({ size: 8 * 4, usage: U.STORAGE | U.COPY_SRC | U.COPY_DST });
+  // DEAD (born dead): f12528b added this buffer to all five pages and the
+  // debugReadDiag READER to two. Nothing here can read it, which is why
+  // amr-invariants.js's pool-starvation gate does not run on this page. See
+  // plans/uniform-levels.md "U7-6f -- WHAT IT LEFT BEHIND".
   const diagReadBuf = device.createBuffer({ size: 8 * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
   const dummyBlockSlotBuf = device.createBuffer({ size: 4, usage: U.STORAGE | U.COPY_DST });
   device.queue.writeBuffer(dummyBlockSlotBuf, 0, new Int32Array([-1]));
@@ -563,6 +567,10 @@ async function init() {
   for (let m = 0; m < N_LEVELS - 1; m++) {
     const parentPool = pools[m];
     const childParams = paramsForChildLevel(m + 1);
+    // DEAD since B2-2d deleted the grandchild cascade: this is
+    // `grandchildPool`'s per-page twin, and survived because it lives in the
+    // per-page pipeline loop rather than the shared bind-group one U7-2
+    // cleaned. See plans/uniform-levels.md "U7-6f -- WHAT IT LEFT BEHIND".
     const hasGrandchild = (m + 2) < N_LEVELS;
     const poolConstants = {
       W, H, RB,

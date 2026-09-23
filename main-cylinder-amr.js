@@ -944,6 +944,8 @@ async function init() {
     size: 16,
     usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC
   }) : null;
+  // DEAD (born dead): no timestamp readback path on this page. See
+  // plans/uniform-levels.md "U7-6f -- WHAT IT LEFT BEHIND".
   const queryReadBuffer = hasTimestamp ? device.createBuffer({
     size: 16,
     usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
@@ -1273,6 +1275,10 @@ async function init() {
     // amr_manage_pool.wgsl's header. Existence-based (hasGrandchild), not
     // criterion-based, so no separate grandchild-level threshold overrides
     // are needed here -- just whether that level exists at all.
+    // DEAD since B2-2d deleted the grandchild cascade: this is
+    // `grandchildPool`'s per-page twin, and survived because it lives in the
+    // per-page pipeline loop rather than the shared bind-group one U7-2
+    // cleaned. See plans/uniform-levels.md "U7-6f -- WHAT IT LEFT BEHIND".
     const hasGrandchild = (m + 2) < N_LEVELS;
     const poolConstants = {
       W, H, RB,
