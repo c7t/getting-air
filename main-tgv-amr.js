@@ -560,7 +560,7 @@ async function init() {
     constants: couplingConstants,
     interpPoolParentPL, interpPoolParentInitPL, interpPoolParentFFPL,
     avgPoolPL,
-  } = makeCouplingPipelines(device, layouts, modules, { RB, F16, DC_PRE });
+  } = makeCouplingPipelines(device, layouts, modules, { RB, F16, DC_PRE, RING_FREE_SAMPLE: 1 - COLLIDE_RING });
 
   const step1PL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [step1BGL] }),

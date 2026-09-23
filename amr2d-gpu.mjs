@@ -1229,6 +1229,7 @@ export function makeLevelBindGroups(device, U, layouts, pools, nLevels, { cardSt
       { binding: 5, resource: { buffer: childPool.blockSlotBuf } },
       { binding: 6, resource: { buffer: childPool.parentSlotBuf } },
       { binding: 7, resource: { buffer: childPool.quadrantBuf } },
+      { binding: 8, resource: { buffer: parentPool.blockSlotBuf } },
     ];
     childPool.interpPoolParentBG_readA = device.createBindGroup({ layout: layouts.interpPoolParentBGL, entries: interpEntries(parentPool.finePoolF_a) });
     childPool.interpPoolParentBG_readB = device.createBindGroup({ layout: layouts.interpPoolParentBGL, entries: interpEntries(parentPool.finePoolF_b) });
@@ -1322,16 +1323,16 @@ export function makeLevelBindGroups(device, U, layouts, pools, nLevels, { cardSt
 // root-parent twins of U5 -- must build it from these rather than from its own
 // second copy of the same literal, which is how a measurement twin drifts from
 // the thing it is measuring.
-export function makeCouplingPipelines(device, layouts, modules, { RB, F16, DC_PRE }) {
+export function makeCouplingPipelines(device, layouts, modules, { RB, F16, DC_PRE, RING_FREE_SAMPLE = 0 }) {
   const c = {
     // No W/H: a level's own grid extent is a runtime uniform (levelParams),
     // not baked into the pipeline, precisely so ONE compiled pipeline serves
     // every L(m)->L(m+1) pair -- including L0->L1, since U7-6f made the root
     // one of them. The dense-parent variants carried W/H and were the reason
     // this bundle had two of everything.
-    interpPool:     { RB, GHOST_ONLY: 1, F16, DC_PRE },
-    interpPoolInit: { RB, GHOST_ONLY: 0, F16, DC_PRE },
-    interpPoolFF:   { RB, GHOST_ONLY: 1, FINE_FINE_ONLY: 1, F16, DC_PRE },
+    interpPool:     { RB, GHOST_ONLY: 1, F16, DC_PRE, RING_FREE_SAMPLE },
+    interpPoolInit: { RB, GHOST_ONLY: 0, F16, DC_PRE, RING_FREE_SAMPLE },
+    interpPoolFF:   { RB, GHOST_ONLY: 1, FINE_FINE_ONLY: 1, F16, DC_PRE, RING_FREE_SAMPLE },
     avgPool:        { RB, F16, DC_PRE },
   };
   const compute = (layout, module, entryPoint, constants) => device.createComputePipeline({
@@ -1494,6 +1495,7 @@ export function makeRootPool(device, U, layouts, modules, pools, {
     { binding: 5, resource: { buffer: l1.blockSlotBuf } },
     { binding: 6, resource: { buffer: unread } },
     { binding: 7, resource: { buffer: unread } },
+    { binding: 8, resource: { buffer: root.blockSlotBuf } },   // unread: the root is ringless
   ]});
   const rootInterpLiveBG_readA = liveInterpBG(root.finePoolF_a, l1.finePoolF_a);
   const rootInterpLiveBG_readB = liveInterpBG(root.finePoolF_b, l1.finePoolF_a);
@@ -1728,7 +1730,9 @@ export function makeAMRLayouts(device) {
     { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }
+    { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    // B6-6: the PARENT level's blockSlot, for RING_FREE_SAMPLE's owner lookup.
+    { binding: 8, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }
   ]});
   // Milestone 9: per-quadrant criterion for any level-(m+1) decision,
   // parent=level m -- see amr_criterion_pool.wgsl's header (one pipeline

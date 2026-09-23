@@ -137,12 +137,44 @@ fn parentCellIndex(pSlot: u32, ix: i32, iy: i32) -> u32 {
 // CoarseSample lives in common_interp.wgsl, alongside the blend that consumes
 // it -- this supplies only the FETCH.
 //
+// RING_FREE_SAMPLE (plans/2D-backport.md B6-6). At a POOL parent a stencil
+// tap one cell past the parent tile's interior lands in the parent's RING, and
+// under explode/coalesce a ring is an inbox/outbox, not a distribution. Worse,
+// the refinement round that births a child is often the same round the 2:1
+// cascade births the NEIGHBOURING parent tile, so a ring cell that was a coarse
+// seam one step ago -- explode's partial distribution, zeros in the outward
+// directions -- is what the child's init reads, and nothing refreshes it first
+// (the steady interp pass runs inside S_Advance, after the round). Measured on
+// the falling card at levels=3: a single-cell density jump of 8.9% on a newborn
+// level-2 tile, decaying over ~4 rounds -- the "popcorn". So on the explode
+// path the tap resolves through the parent tile that OWNS the cell; the refine
+// round fills parents coarsest-first, so a same-round neighbour is already real
+// data by then. The ring is the fallback only if no parent tile holds the cell,
+// which the 2:1 closure is meant to exclude. Default 0: interp byte-identical.
+override RING_FREE_SAMPLE : u32 = 0u;
+
 // (bx, by) are this child's own logical block coordinates, which a ringed
 // parent does not need and a root parent does: see the ring-free resolution
 // below, and the kernel's header for why the accessor takes them at all.
 fn sampleParent(slot: u32, bx: u32, by: u32, ix: i32, iy: i32) -> CoarseSample {
   var pSlot = parentSlotOf(slot, bx, by);
   var jx = ix; var jy = iy;
+  if (PARENT_GHOST != 0u && RING_FREE_SAMPLE != 0u) {
+    let RB2 = i32(RB * 2u);
+    if (jx < 0 || jx >= RB2 || jy < 0 || jy >= RB2) {
+      // Same one-hop resolution as the root path below, then an OWNER lookup
+      // instead of the identity, since a pool level is sparse.
+      let pnbx = parentNbx(); let pnby = parentNby();
+      var pbx = bx >> 1u; var pby = by >> 1u;
+      if (jx < 0)         { jx += RB2; pbx = (pbx + pnbx - 1u) % pnbx; }
+      else if (jx >= RB2) { jx -= RB2; pbx = (pbx + 1u) % pnbx; }
+      if (jy < 0)         { jy += RB2; pby = (pby + pnby - 1u) % pnby; }
+      else if (jy >= RB2) { jy -= RB2; pby = (pby + 1u) % pnby; }
+      let owner = parentBlockSlot[pby * pnbx + pbx];
+      if (owner >= 0) { pSlot = u32(owner); }
+      else { jx = ix; jy = iy; }   // no owner: the ring, as before
+    }
+  }
   if (PARENT_GHOST == 0u) {
     // THE RING-FREE PATH. amr2d.mjs's resolveSource, specialised to a level
     // that is always full: an index below 0 belongs to the tile on the low

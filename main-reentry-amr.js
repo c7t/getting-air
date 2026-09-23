@@ -831,7 +831,7 @@ async function init() {
     constants: couplingConstants,
     interpPoolParentPL, interpPoolParentInitPL, interpPoolParentFFPL,
     avgPoolPL,
-  } = makeCouplingPipelines(device, layouts, modules, { RB, F16, DC_PRE });
+  } = makeCouplingPipelines(device, layouts, modules, { RB, F16, DC_PRE, RING_FREE_SAMPLE: 1 - COLLIDE_RING });
 
   // KINEMATIC=1 (this scenario's whole point, see file header): VY/OMEGA are
   // baked in as override constants, same "rebuild the pipeline on slider

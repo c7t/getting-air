@@ -2636,6 +2636,63 @@ invariants through 8192 steps on explode, and nothing more is claimed.
 **Still open, found at B6-4:** single-COARSE-cell density outliers on a
 straight downstream seam of the cylinder under explode (1.0e-4, 5.4x p99).
 
+### B6-6 — DONE (2026-09-23). THE CELL LIFECYCLE, and the invariant birth broke ("popcorn").
+
+Reported by eye on the falling card under explode: occasional bright cells that
+appear and fade, suspected at corners of newly populated refinement. The
+lifecycle of a level-m cell under explode, with who writes it, who reads it and
+what must be true -- checked against the code row by row:
+
+```
+state / event            writer                               reader                         invariant
+uncovered (m solves it)  level-m step                         neighbours' pulls; explode     a real post-collision
+                                                              (as v); criterion/render       distribution
+covered (child tile)     coalesce (outbox slots, time-t buf)  uncovered neighbours pull      between macro-steps: a
+                         -> parent step (garbage) -> AVERAGE  ONLY coalesced slots; readers  real distribution (the
+                         (full restriction, new buffer)       see the restriction            restriction)
+birth (refine)           interp INIT: bilinear parent sample  the new tile's first substep   every sampled parent cell
+                         + DC rescale, interior and ring                                     is a real distribution
+death (coarsen)          nothing -- it already holds the      the parent's next step         average ran after the
+                         restriction                                                         last step (it does)
+ring facing same-level   steady interp (FF copy) -> the       NOBODY in the dynamics         must be real IF a child's
+tile                     tile's own substeps, uncollided      (DIRECT_GHOST) -- but a CHILD  init can reach it  <-- BROKEN
+                                                              born at this tile's edge
+```
+
+**THE LAST ROW WAS THE BUG, AND IT FAILS TWO WAYS.** A level-2 tile born at its
+level-1 parent tile's edge has a bilinear stencil reaching one cell into the
+parent's RING. (1) With COLLIDE_RING = 0 a ring cell is PRE-collision: same rho
+and u, but f_neq instead of (1-omega) f_neq, and at the card's tau_1 ~ 0.509
+omega ~ 1.965 FLIPS ITS SIGN. (2) Worse, the round that births the child is
+often the round the 2:1 cascade births the NEIGHBOURING parent tile, so that
+ring cell was a coarse seam one step ago -- explode's partial distribution,
+zeros outward -- and nothing refreshes it before the init reads it (the steady
+interp pass runs inside S_Advance, after the round). (2) is what moves rho.
+Interp's ring was always stale in the same way, only collided and mild.
+
+MEASURED IN THE FLUID, not the picture: `debugStepOne` across refinement
+rounds, snapshot before and after, newborn cells from the level-map diff,
+single-cell density outliers ranked:
+
+```
+                          worst birth-round spike   on a newborn tile   aftermath
+interp, levels 3          3.4x p99                  0/3                 -
+explode, levels 3         429x, 132x (drho 8.9%)    3/4                 p99 30x, decays ~4 rounds
+explode, levels 2         2.4x                      0/3                 -        <- predicted: root parent, ringless
+explode, levels 3, FIXED  3.3-4.6x (drho 1.4e-4)    1/4 at baseline     none
+```
+
+**Fix: `RING_FREE_SAMPLE`** in `common_interp_parent_pool.wgsl` (explode path;
+interp byte-identical, fingerprints unmoved). An off-tile stencil tap resolves
+through the parent tile that OWNS the cell (the parent level's blockSlot is
+interp's new binding 8); the refine round fills coarsest-first, so a same-round
+neighbour is already real data. **That is the fifth ring consumer on this
+path**, and the rule is now one sentence: on the explode path NOTHING reads a
+ring cell except the step's own streaming and coalesce.
+
+**Which makes the steady interp pass consumer-free on the explode path** -- the
+half of B6-5's cost that was waiting on exactly this.
+
 ### B7 — DONE (2026-09-14)
 
 `?kEps=` threads one `K_EPS` override through all nine chi sites (the render

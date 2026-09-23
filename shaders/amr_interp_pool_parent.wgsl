@@ -42,6 +42,11 @@ struct LevelParams {
 // data (plans/2D-backport.md B6-9c).
 @group(0) @binding(6) var<storage, read>       parentSlot     : array<i32>;
 @group(0) @binding(7) var<storage, read>       quadrant       : array<u32>;
+// B6-6: the PARENT level's own blockSlot, so a stencil tap that leaves the
+// parent tile resolves through the tile that OWNS it instead of the parent's
+// ring -- see common_interp_parent_pool.wgsl's RING_FREE_SAMPLE. Unread on the
+// root-parent pipeline (ringless, always full) and wherever that override is 0.
+@group(0) @binding(8) var<storage, read>       parentBlockSlot : array<i32>;
 
 // @include "common_interp_parent_pool.wgsl"
 // @include "common_interp_kernel.wgsl"
