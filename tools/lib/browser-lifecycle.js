@@ -44,7 +44,6 @@ async function ensureServer(baseUrl, repoRoot) {
   console.log('[setup] starting https.py dev server');
   const proc = spawn('python3', ['https.py'], { cwd: repoRoot, detached: true, stdio: 'ignore' });
   proc.unref();
-  fs.closeSync(logFd);
   const ok = await waitFor(() => httpsGetOk(`${baseUrl}/index.html`), 10000, 300);
   if (!ok) throw new Error(`https.py did not come up at ${baseUrl} within 10s`);
   return { started: true, proc };
