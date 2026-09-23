@@ -90,6 +90,38 @@ fn tapVel(bx: u32, by: u32, sx: i32, sy: i32, FB: u32, comp: u32) -> f32 {
 }
 
 // Read by common_criterion.wgsl's wgReduceMax1 -- see its own comment.
+// RING_FREE_TAPS (plans/2D-backport.md B6-1): 1 on the explode/coalesce path.
+// The +-1 stencil at a tile's edge reaches one cell past the interior. On the
+// interp path that cell is the RING, which holds a collided, parent-
+// interpolated state -- close enough to a velocity. On the explode path the
+// ring is an inbox/outbox (plans/uniform-levels.md 2.5): its moments are not a
+// velocity, and reading them measured as spurious edge vorticity that drove
+// level-2 refinement until the pool starved (amr-dev-invariants: 2669
+// refines refused at step 5120). So the tap is resolved the way the root's
+// already is -- into the SAME-level neighbour tile's interior -- and where no
+// neighbour exists (a coarse seam), it takes the tile's own edge cell, i.e. a
+// one-sided difference. Default 0 keeps the interp path byte-identical.
+override RING_FREE_TAPS : u32 = 0u;
+
+// Interior-local (ix, iy) of tile (bx, by), one cell past either edge allowed.
+fn tapInterior(slot: u32, bx: u32, by: u32, ix: i32, iy: i32, FB: u32, comp: u32) -> f32 {
+  let RB2 = i32(RB * 2u);
+  var nx = ix; var ny = iy;
+  var tbx = bx; var tby = by;
+  if (nx < 0)         { nx += RB2; tbx = (bx + NBX_PARENT - 1u) % NBX_PARENT; }
+  else if (nx >= RB2) { nx -= RB2; tbx = (bx + 1u) % NBX_PARENT; }
+  if (ny < 0)         { ny += RB2; tby = (by + NBY_PARENT - 1u) % NBY_PARENT; }
+  else if (ny >= RB2) { ny -= RB2; tby = (by + 1u) % NBY_PARENT; }
+  var s = i32(slot);
+  if (tbx != bx || tby != by) { s = blockSlot[tby * NBX_PARENT + tbx]; }
+  if (s < 0) {
+    // No same-level neighbour: the tile's own edge cell.
+    s = i32(slot);
+    nx = clamp(ix, 0, RB2 - 1); ny = clamp(iy, 0, RB2 - 1);
+  }
+  return velAt(u32(s), u32(nx) + GHOST, u32(ny) + GHOST, FB, comp);
+}
+
 var<workgroup> wg_omega : array<f32, 64>;
 
 @compute @workgroup_size(8, 8)
@@ -116,6 +148,13 @@ fn main(
       let ix = i32(fx); let iy = i32(fy);
       omega = discreteCurl(tapVel(bx, by, ix + 1, iy, FB, 1u), tapVel(bx, by, ix - 1, iy, FB, 1u),
                            tapVel(bx, by, ix, iy + 1, FB, 0u), tapVel(bx, by, ix, iy - 1, FB, 0u));
+    } else if (RING_FREE_TAPS != 0u) {
+      // Explode path: never read the ring -- see RING_FREE_TAPS.
+      let bx = u32(blockID) % NBX_PARENT;
+      let by = u32(blockID) / NBX_PARENT;
+      let ix = i32(lx); let iy = i32(ly);
+      omega = discreteCurl(tapInterior(slot, bx, by, ix + 1, iy, FB, 1u), tapInterior(slot, bx, by, ix - 1, iy, FB, 1u),
+                           tapInterior(slot, bx, by, ix, iy + 1, FB, 0u), tapInterior(slot, bx, by, ix, iy - 1, FB, 0u));
     } else {
       // The ghost border guarantees fx+-1 is in range (see header), which is
       // the whole difference from the dense kernel's periodic wrap.

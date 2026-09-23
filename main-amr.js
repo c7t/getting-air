@@ -22,7 +22,7 @@ import {
   tauAtLevel as tauAtLevelOf,
 } from './card-params.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
-import { check21BalanceOnGPU, allocLevelPool, writePoolInitialState, checkRootPoolIdentity, readConservedTotals, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState, checkGeometryCoverageOnGPU, makeRefusalWatch , checkRefinementClosureOnGPU , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU, makeRenderBindGroup, renderPoolLevels, MAX_RENDER_POOL_LEVELS, makeAMRLayouts, makeCouplingPipelines, makeLevelBindGroups, makeManageBindGroups, makeScheduler, makeRefineRound, allocRootPool, makeRootPool, encodeRootCapture, readRootCapture, restoreRootCapture, seedRootFromDense, readDiag } from './amr2d-gpu.mjs';
+import { check21BalanceOnGPU, allocLevelPool, writePoolInitialState, checkRootPoolIdentity, readConservedTotals, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState, checkGeometryCoverageOnGPU, makeRefusalWatch , checkRefinementClosureOnGPU , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU, makeRenderBindGroup, renderPoolLevels, MAX_RENDER_POOL_LEVELS, makeAMRLayouts, makeCouplingPipelines, makeLevelBindGroups, makeManageBindGroups, makeScheduler, makeRefineRound, allocRootPool, makeRootPool, encodeRootCapture, readRootCapture, restoreRootCapture, seedRootFromDense, readDiag, readInterfaceMode, makeExplodeCoalesce } from './amr2d-gpu.mjs';
 import { poolSlotsFor, tauChainSingularity, tauSingularityMessage, rootPoolSpec, rootCellIndex } from './amr2d.mjs';
 import { EX, EY, WT } from './lattice-2d.mjs';
 import { makeCanvasFit } from './canvas-fit.mjs';
@@ -520,6 +520,11 @@ const F16 = urlParams.has('f16') ? (parseInt(urlParams.get('f16')) || 0) : 0;
 // still here. It also has no tau = 1 singularity, so it is the escape hatch
 // the refusal names.
 const DC_PRE = urlParams.has('dcpre') ? (parseInt(urlParams.get('dcpre')) || 0) : 0;
+// ?interface=explode|interp -- the coarse/fine coupling (plans/2D-backport.md
+// B6-1). interp is the default until explode's gates are green; see
+// amr2d-gpu.mjs's readInterfaceMode and makeExplodeCoalesce.
+const INTERFACE = readInterfaceMode(urlParams);
+const COLLIDE_RING = INTERFACE === 'explode' ? 0 : 1;
 
 // ── ?ghostcopy=1 -- legacy materialized same-level ghost cells ───────────────
 // Default 0: the fine step resolves a source cell that falls outside its tile
@@ -1236,7 +1241,7 @@ async function init() {
   // configuration deeper than the shader binds, rather than drawing it without
   // its finest level -- which is what this override replaced HAS_LEVEL2 for.
   const renderConstants = { W, H, RB, N_POOL_LEVELS: renderPoolLevels(N_LEVELS), K_EPS };
-  const step1Constants = { W, H, RB, SDF_FAR, F16, DIRECT_GHOST: GHOST_COPY ? 0 : 1 };
+  const step1Constants = { COLLIDE_RING, W, H, RB, SDF_FAR, F16, DIRECT_GHOST: GHOST_COPY ? 0 : 1 };
 
   // U7-1: the twelve coupling pipelines, from ONE place. Every page built
   // these identically; see makeCouplingPipelines for what stays per page and
@@ -1432,7 +1437,7 @@ async function init() {
       compute: { module: criterionPoolSM, entryPoint: 'main',
                  constants: m === 0
                    ? { RB, NBX_PARENT: parentPool.NBX, NBY_PARENT: parentPool.NBY, GHOST: 0 }
-                   : { RB, NBX_PARENT: parentPool.NBX } }
+                   : { RB, NBX_PARENT: parentPool.NBX, NBY_PARENT: parentPool.NBY, RING_FREE_TAPS: 1 - COLLIDE_RING } }
     });
     managePoolDecidePLs[m] = device.createComputePipeline({
       layout: device.createPipelineLayout({ bindGroupLayouts: [managePoolBGL] }),
@@ -1570,6 +1575,15 @@ async function init() {
   // the force block; see makeLevelBindGroups.
   makeLevelBindGroups(device, U, layouts, pools, N_LEVELS,
     { cardStateBuf, forceBuf });
+  // B6-1: explode/coalesce, when ?interface=explode. Null otherwise, so the
+  // pass table below carries no explode passes and makeScheduler's interp
+  // order is untouched.
+  const seam = INTERFACE === 'explode'
+    ? makeExplodeCoalesce(device, layouts, {
+        explodeSM: await loadShader(device, 'shaders/amr_explode.wgsl'),
+        coalesceSM: await loadShader(device, 'shaders/amr_coalesce.wgsl'),
+      }, pools, N_LEVELS, { RB, F16 })
+    : null;
 
   // Milestone 8: level 1's own force pass. Always reads pools[1].finePoolF_a
   // -- level 1's own buffer is always "current" (_a) at a macro-step
@@ -2003,6 +2017,7 @@ async function init() {
   // per-pass profiling labels, and the root pool's parallel passes, none of
   // which belong on a shipped page.
   const passes = {
+    ...(seam || {}),
     l0InterpIntoL1: (enc, useB) => {
       if (skipGroup('interp')) return;
       const p = beginPass(enc, 'L0->L1 interp');
@@ -2057,7 +2072,7 @@ async function init() {
     },
   };
   const { S_Advance: S_AdvanceShared } = makeScheduler({
-    nLevels: N_LEVELS,
+    nLevels: N_LEVELS, explode: INTERFACE === 'explode',
     // The in-session bench configuration can turn the legacy path on as well
     // as the page-load flag, which is why this is a callback and not a value.
     ghostCopy: () => GHOST_COPY !== 0 || skipGroup('ghostcopy'),

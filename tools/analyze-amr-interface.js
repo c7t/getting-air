@@ -85,6 +85,7 @@ const CDP = require('/usr/lib/node_modules/chrome-remote-interface');
 const {
   ensureServer, ensureChrome, openTab, firstTab, navigateTo, waitForGlobal, teardown,
 } = require('./lib/browser-lifecycle');
+const { analyticVelocity } = require('./lib/tgv-metrics');
 
 // A page that threw during init still answers debugStepSync with a stale
 // global, so a run has to be told the page was healthy rather than assume it.
@@ -219,6 +220,71 @@ function urlFor(o, c) {
   return `${o.baseUrl}/index-tgv-amr.html?${q.join('&')}`;
 }
 
+// THE FIELD CHANNEL (plans/2D-backport.md B6-1). Conservation is necessary
+// and NOT sufficient -- 3D's M4.1b was exactly conservative while carrying an
+// 8x field defect at the seam -- so every checkpoint also scores the root's
+// velocity against the EXACT Taylor-Green solution, whole-domain and bucketed
+// by distance to the seam. The seam is taken from the FROZEN level-1 tile set:
+// a root cell is covered when its level-1 block holds a tile, and the seam is
+// every cell with a 4-neighbour of the other kind. Distance is Chebyshev
+// (8-neighbour BFS), periodic. A rung with no seam puts every cell in `far`.
+const FIELD_BUCKETS = [[0, 1, 'd0-1'], [2, 4, 'd2-4'], [5, 8, 'd5-8'], [9, Infinity, 'far']];
+
+function seamDistance(N, RB, blocks) {
+  const cov = new Uint8Array(N * N);
+  const on = new Set(blocks.map(b => `${b.bx},${b.by}`));
+  for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
+    if (on.has(`${Math.floor(x / RB)},${Math.floor(y / RB)}`)) cov[y * N + x] = 1;
+  }
+  const d = new Float64Array(N * N).fill(Infinity);
+  const q = [];
+  const w = (a) => ((a % N) + N) % N;
+  for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
+    const c = cov[y * N + x];
+    if (c !== cov[y * N + w(x + 1)] || c !== cov[y * N + w(x - 1)]
+     || c !== cov[w(y + 1) * N + x] || c !== cov[w(y - 1) * N + x]) { d[y * N + x] = 0; q.push(y * N + x); }
+  }
+  for (let h = 0; h < q.length; h++) {
+    const i = q[h], x = i % N, y = (i - x) / N;
+    for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+      const j = w(y + dy) * N + w(x + dx);
+      if (d[j] > d[i] + 1) { d[j] = d[i] + 1; q.push(j); }
+    }
+  }
+  return d;
+}
+
+function fieldError(field, analytic, dist) {
+  const out = {};
+  const acc = FIELD_BUCKETS.map(() => ({ e: 0, a: 0, n: 0 }));
+  let E = 0, A = 0;
+  for (let i = 0; i < field.ux.length; i++) {
+    const dux = field.ux[i] - analytic.ux[i], duy = field.uy[i] - analytic.uy[i];
+    const e = dux * dux + duy * duy, a = analytic.ux[i] ** 2 + analytic.uy[i] ** 2;
+    E += e; A += a;
+    const k = FIELD_BUCKETS.findIndex(([lo, hi]) => dist[i] >= lo && dist[i] <= hi);
+    acc[k].e += e; acc[k].a += a; acc[k].n++;
+  }
+  out.whole = Math.sqrt(E / A);
+  FIELD_BUCKETS.forEach(([, , name], k) => { out[name] = acc[k].n ? Math.sqrt(acc[k].e / Math.max(acc[k].a, 1e-30)) : null; });
+  // AMPLITUDE vs SHAPE. Taylor-Green is one mode, so project the simulated
+  // field onto it: `amp` = <sim, exact>/<exact, exact> - 1 is a decay-rate
+  // (or amplitude) error, uniform in space by construction; `shape` is the
+  // L2rel of what is left once that is removed -- a seam artifact, a phase
+  // error, anything that is not the mode itself. A seam defect lives in
+  // `shape` and in the near buckets; a wrong effective viscosity lives in `amp`.
+  let sa = 0;
+  for (let i = 0; i < field.ux.length; i++) sa += field.ux[i] * analytic.ux[i] + field.uy[i] * analytic.uy[i];
+  const g = sa / A;
+  let R = 0;
+  for (let i = 0; i < field.ux.length; i++) {
+    R += (field.ux[i] - g * analytic.ux[i]) ** 2 + (field.uy[i] - g * analytic.uy[i]) ** 2;
+  }
+  out.amp = g - 1;
+  out.shape = Math.sqrt(R / A);
+  return out;
+}
+
 async function runConfig(Runtime, o, c) {
   const G = 'window.__CYL';
   const T = o.timeout * 1000;
@@ -232,7 +298,13 @@ async function runConfig(Runtime, o, c) {
 
   const grid = await evalOrThrow(Runtime, `${G}.getBlockGridDims()`, 20000, 'getBlockGridDims');
   const params = await evalOrThrow(Runtime, `${G}.getParams()`, 20000, 'getParams');
-  const activeBefore = (await evalOrThrow(Runtime, `${G}.debugListActiveBlocks(1)`, 60000, 'listActive')).length;
+  const blocksBefore = await evalOrThrow(Runtime, `${G}.debugListActiveBlocks(1)`, 60000, 'listActive');
+  const activeBefore = blocksBefore.length;
+  const dist = seamDistance(params.N, grid.RB, blocksBefore);
+  const fieldAt = async (step) => {
+    const field = await evalOrThrow(Runtime, `${G}.readField()`, 60000, 'readField');
+    return fieldError(field, analyticVelocity(params.N, params.U0, params.nu, step), dist);
+  };
   const nBlocks = grid.NBX * grid.NBY;
 
   // The PAGE's step counter at the freeze, which every sample is measured
@@ -240,13 +312,15 @@ async function runConfig(Runtime, o, c) {
   const step0 = (await evalOrThrow(Runtime, `${G}.debugStepSync(0)`, T, 'step0')).step;
 
   const samples = [];
-  samples.push({ t: 0, ...await evalOrThrow(Runtime, `${G}.debugConservedTotals()`, 180000, 'totals') });
+  samples.push({ t: 0, ...await evalOrThrow(Runtime, `${G}.debugConservedTotals()`, 180000, 'totals'),
+                 field: await fieldAt(step0) });
   let prev = 0;
   for (const want of o.checkpoints) {
     if (want <= prev) continue;
     const r = await evalOrThrow(Runtime, `${G}.debugStepSync(${want - prev})`, T, 'debugStepSync');
     prev = want;
-    samples.push({ t: r.step - step0, ...await evalOrThrow(Runtime, `${G}.debugConservedTotals()`, 180000, 'totals') });
+    samples.push({ t: r.step - step0, ...await evalOrThrow(Runtime, `${G}.debugConservedTotals()`, 180000, 'totals'),
+                   field: await fieldAt(r.step) });
   }
 
   // The freeze has to have held, or every number above is about something
@@ -355,6 +429,21 @@ function report(o, results, eps) {
   console.log('\n  fneq has no zeroth or first moment, so the Dupuis-Chopard rescale (B1)');
   console.log('  cannot move mass and CAN move momentum. Momentum drifting while mass sits');
   console.log('  at its lattice floor is that defect; the reverse is the weights.');
+
+  console.log('\n' + '='.repeat(78));
+  console.log('FIELD ERROR vs the exact Taylor-Green solution (root velocity, L2rel)');
+  console.log('  bucketed by Chebyshev distance to the seam, in root cells. Conservation');
+  console.log('  does not imply consistency: read the seam buckets against `far` and');
+  console.log('  against the no-interface rungs.');
+  console.log('='.repeat(78));
+  const names = ['whole', ...FIELD_BUCKETS.map(b => b[2]), 'amp', 'shape'];
+  console.log(`  ${padL('rung', 6)}${padL('step', 7)}${names.map(n => padL(n, 11)).join('')}`);
+  for (const r of results) {
+    for (const smp of r.samples) {
+      if (!smp.field) continue;
+      console.log(`  ${padL(r.name, 6)}${padL(smp.t, 7)}${names.map(n => padL(e3(smp.field[n]), 11)).join('')}`);
+    }
+  }
 
   console.log('\n' + '='.repeat(78));
   console.log('FIELD HEALTH (a drift number from a diverging run means nothing)');

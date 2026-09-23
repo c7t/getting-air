@@ -62,7 +62,7 @@ import { reportFatal, refuseConfig, reportNoWebGPU, reportNoAdapter } from './er
 import { tauChainSingularity, tauSingularityMessage, rootCellIndex, rootPoolSpec, denseCellIndex } from './amr2d.mjs';
 import { loadShader } from './shader-loader.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
-import { check21BalanceOnGPU, readConservedTotals, allocLevelPool, writePoolInitialState, listActiveBlocks, readCardState , checkRefinementClosureOnGPU , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU, makeRenderBindGroup, renderPoolLevels, MAX_RENDER_POOL_LEVELS, makeAMRLayouts, makeCouplingPipelines, makeLevelBindGroups, makeManageBindGroups, makeScheduler, makeRefineRound, allocRootPool, makeRootPool, seedRootFromDense, readDiag } from './amr2d-gpu.mjs';
+import { check21BalanceOnGPU, readConservedTotals, allocLevelPool, writePoolInitialState, listActiveBlocks, readCardState , checkRefinementClosureOnGPU , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU, makeRenderBindGroup, renderPoolLevels, MAX_RENDER_POOL_LEVELS, makeAMRLayouts, makeCouplingPipelines, makeLevelBindGroups, makeManageBindGroups, makeScheduler, makeRefineRound, allocRootPool, makeRootPool, seedRootFromDense, readDiag, readInterfaceMode, makeExplodeCoalesce } from './amr2d-gpu.mjs';
 // tauAtLevel: extracted to card-params.mjs by B3a-1, which landed the CALL
 // in all five AMR pages and this IMPORT in only main-amr.js. The other four
 // threw `ReferenceError: tauAtLevelOf is not defined` at init -- but only at
@@ -101,6 +101,11 @@ const F16 = urlParams.has('f16') ? (parseInt(urlParams.get('f16')) || 0) : 0;
 // still here. It also has no tau = 1 singularity, so it is the escape hatch
 // the refusal names.
 const DC_PRE = urlParams.has('dcpre') ? (parseInt(urlParams.get('dcpre')) || 0) : 0;
+// ?interface=explode|interp -- the coarse/fine coupling (plans/2D-backport.md
+// B6-1). interp is the default until explode's gates are green; see
+// amr2d-gpu.mjs's readInterfaceMode and makeExplodeCoalesce.
+const INTERFACE = readInterfaceMode(urlParams);
+const COLLIDE_RING = INTERFACE === 'explode' ? 0 : 1;
 
 
 
@@ -541,7 +546,7 @@ async function init() {
   const stepConstants = { W, H, HAS_BODY: 0, SPONGE_W: 0, F16 };
   const fineConstants = { W, H, RB };
 
-  const step1Constants = { ...stepConstants, RB, DIRECT_GHOST: GHOST_COPY ? 0 : 1 };
+  const step1Constants = { COLLIDE_RING, ...stepConstants, RB, DIRECT_GHOST: GHOST_COPY ? 0 : 1 };
 
   // U7-1: the twelve coupling pipelines, from ONE place. Every page built
   // these identically; see makeCouplingPipelines for what stays per page and
@@ -620,7 +625,7 @@ async function init() {
       compute: { module: criterionPoolSM, entryPoint: 'main',
                  constants: m === 0
                    ? { RB, NBX_PARENT: parentPool.NBX, NBY_PARENT: parentPool.NBY, GHOST: 0 }
-                   : { RB, NBX_PARENT: parentPool.NBX } }
+                   : { RB, NBX_PARENT: parentPool.NBX, NBY_PARENT: parentPool.NBY, RING_FREE_TAPS: 1 - COLLIDE_RING } }
     });
     managePoolDecidePLs[m] = device.createComputePipeline({
       layout: device.createPipelineLayout({ bindGroupLayouts: [managePoolBGL] }),
@@ -687,6 +692,15 @@ async function init() {
   // the force block; see makeLevelBindGroups.
   makeLevelBindGroups(device, U, layouts, pools, N_LEVELS,
     { cardStateBuf });
+  // B6-1: explode/coalesce, when ?interface=explode. Null otherwise, so the
+  // pass table below carries no explode passes and makeScheduler's interp
+  // order is untouched.
+  const seam = INTERFACE === 'explode'
+    ? makeExplodeCoalesce(device, layouts, {
+        explodeSM: await loadShader(device, 'shaders/amr_explode.wgsl'),
+        coalesceSM: await loadShader(device, 'shaders/amr_coalesce.wgsl'),
+      }, pools, N_LEVELS, { RB, F16 })
+    : null;
 
   const error = await device.popErrorScope();
   if (error) { handleErr(error); return; }
@@ -708,6 +722,7 @@ async function init() {
   // was byte-identical across four pages and differed on the fifth only by the
   // root pool -- see its header for why the seam is order vs. content.
   const passes = {
+    ...(seam || {}),
     l0InterpIntoL1: (enc, useB) => {
       const p = enc.beginComputePass();
       p.setPipeline(l1InterpPL);
@@ -750,7 +765,7 @@ async function init() {
     },
   };
   const { S_Advance: S_AdvanceShared } = makeScheduler({
-    nLevels: N_LEVELS, ghostCopy: () => !!GHOST_COPY, passes,
+    nLevels: N_LEVELS, explode: INTERFACE === 'explode', ghostCopy: () => !!GHOST_COPY, passes,
   });
   const S_Advance = (level, enc) => S_AdvanceShared(level, enc, useB);
 

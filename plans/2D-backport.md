@@ -2317,6 +2317,49 @@ two of its legs came out wrong (a spurious 8.49e-3, and a false "does not
 boot"). Every row above is from a health-checked RTX run
 (`tools/check-browser.js`, now in every tool's teardown).
 
+### B6-1 — the design, before the code (2026-09-23)
+
+3D's M4.1b + M4.1c-i ported to D2Q9, behind `?interface=explode` with
+`interp` still the default (3D's own staging). Everything below is inherited
+from `common_d3_amr_explode.wgsl` / `common_d3_amr_coalesce.wgsl` except where
+marked 2D.
+
+- **Explode** (`shaders/amr_explode.wgsl`): for each child ring cell whose
+  parent cell `v` is UNCOVERED, direction `i` gets `f_i(v)` -- a plain copy,
+  no interpolation, no rescale -- if `v + e_i` is covered; otherwise the
+  IN-orphan rule (`f_i(v)` iff the child's one-fine-step destination is
+  covered AND in this tile, else 0). **2D: parent cells are resolved through
+  their OWNING tile** (parent `blockSlot`), never through the parent tile's
+  ring, which is not a distribution under this scheme.
+- **Coalesce** (`shaders/amr_coalesce.wgsl`): dispatched over parent-tile
+  interiors. A covered `c` gets, for each `i` whose target `c + e_i` is
+  uncovered, the MEAN of the four ring cells covering the target (1/4 = the
+  2D volume ratio) written into its own slot of the parent's TIME-t buffer,
+  so the unmodified parent step pulls it. An uncovered `c` next to a covered
+  cell runs the OUT-orphan pass (half-step exits, found by the owner of
+  `p - e_i`) net of the IN-orphans explode injected, `f_i(c) += net/4`.
+  Both orphans land together: 3D measured the pair as one defect.
+- **The ring advects and does not collide** (`COLLIDE_RING = 0` on the
+  explode path; the interior still collides). No Dupuis-Chopard factor on
+  this path -- `tau_f = 2 tau_c - 1/2` is Chen's `omega_f` at n = 2.
+- **Order** (`makeScheduler`, `explode`): per parent substep
+  `interp -> explode -> child cycle -> coalesce -> parent step -> average`.
+  **2D DIFFERENCE, deliberate: `average` is KEPT, after the parent step.**
+  Nothing in the dynamics reads it (an uncovered cell pulls only coalesced
+  slots from a covered one; explode reads only uncovered cells), but it keeps
+  every covered cell a true restriction between macro-steps, so: no drain
+  pass is needed (sec 2's argument still holds), and the conservation
+  instrument, snapshots, render and criterion keep their meaning. `interp`
+  is kept too, BEFORE explode, as the source of the same-level ring values a
+  new tile's bilinear init reads; explode then overwrites the coarse-seam
+  ring cells. Both are cost, not physics, and are B6-perf's to remove.
+
+**Gate:** `analyze-amr-interface.js --extra=interface=explode` -- cap 96 and
+cap 64 fall from 89x/184x to the no-interface floor in momentum and to ratio
+1.000 in mass; `none` and `all` bit-identical to `interp` (no coarse seam to
+transfer across). Then field error against the no-interface control, then
+`validate-all.js` with the default untouched.
+
 
 **Do not start here.** Start at B0b. 2D's interface today is interp (ring
 ghosts) + average (restriction), with no flux correction: coarse cells at the
@@ -2385,6 +2428,69 @@ a 2D geometry ladder; then the field error tracking a no-interface control;
 then `validate-amr-vs-dense.js` and `validate-divergence.js` (whose `edge`
 column exists for exactly this class) showing the interface error falling
 toward the `fullrefine` noise floor.
+
+### B6-1 — BUILT (2026-09-23). Conservative; 3.5x better in the field; not yet consistent.
+
+Opt-in, `?interface=explode`, on all five AMR pages. Every number below is from
+a health-checked RTX run (`tools/check-browser.js`); TGV N=128, tau=0.8.
+
+**CONSERVATION -- MET.** Momentum, max|d mom| against the no-seam controls in
+the same run:
+
+```
+seam rung       interp (same build)     explode             control
+cap 64  @512    6.61e-3 = 184x          3.80e-5 = 1.06x     none 3.60e-5
+cap 96  @512    3.20e-3 =  89x          5.73e-5 = 0.55x     all  1.05e-4
+cap 96  @256    1.77e-3                 1.60e-5             none 6.3e-5
+cap 96  @4096   6.78e-3                 1.46e-3             all  2.54e-3
+```
+
+Mass ratio against the lattice floor 0.997 / 1.000 / 0.996 (interp 0.80-0.98).
+`none` and `all` are BIT-IDENTICAL to interp, as they must be: no coarse seam,
+nothing to transfer. The late-time explode drift sits under `all`, which has no
+seam at all -- it is the f32 rounding that scales with fine stepping.
+
+**THE DEFAULT PATH IS BYTE-IDENTICAL**, measured: `measure-determinism.js`
+detslots=1 fingerprints before and after, same hashes on the dev page
+(`dec9eb05032bcced`, `cc0dd492cd6ced2c`) and the cylinder page
+(`57f916c1cf590e12`, `72718a827cbccd57`) at levels 2 and 3.
+
+**A RING CELL IS NOT A STATE, AND THE CRITERION WAS READING ONE.** The first
+explode run of `amr-dev-invariants` starved the pool (2669 refines refused at
+step 5120) and then broke geometry coverage. The criterion's +-1 vorticity
+stencil at a tile's edge reads the RING's velocity; on interp that is a
+collided, interpolated state, on explode it is an inbox/outbox, and its curl is
+noise that drove level-2 refinement. `RING_FREE_TAPS` resolves those taps into
+the same-level neighbour tile (one-sided at a coarse seam) on the explode path;
+with it, all seven invariants are green through 8192 steps. This was
+uniform-levels 2.5's warning, met in practice. `amr_render.wgsl`'s stencil is
+the other listed consumer and is visual-only; not yet audited.
+
+**CONSISTENCY -- NOT MET, AND THE INSTRUMENT SAYS WHY.** The field channel
+(`analyze-amr-interface.js`, new: L2rel against the exact Taylor-Green
+solution, bucketed by distance to the seam, and split into the mode's
+AMPLITUDE and the residual SHAPE):
+
+```
+@2048 (~1 t_d)       whole     d0-1      far       amp        shape
+none (no seam)       3.07e-4   -         3.07e-4   +1.9e-4    2.41e-4
+all  (no seam)       2.69e-4   -         2.69e-4   -1.1e-4    2.45e-4
+half interp          8.34e-3   9.11e-3   8.03e-3   -7.70e-3   3.21e-3
+half explode         2.42e-3   2.55e-3   2.35e-3   -2.14e-3   1.11e-3
+```
+
+The seam error is almost entirely AMPLITUDE -- extra dissipation, growing
+linearly (explode ~-1e-6 of the mode per step, ~0.2% of the analytic decay
+rate; interp ~4x that) -- and it is NOT localized (d0-1 = far), because the
+mode is global and a seam that dissipates lowers it everywhere. That is the
+signature of a first-order reconstruction at the seam, which the UNIFORM
+explosion is. **B6-2 is the linear explosion** (3D's M4.1c-ii, worth 2x there),
+gated on `amp` falling toward the controls.
+
+**Found on the way, and fixed separately:** `browser-lifecycle.js`'s
+`ensureServer` had been broken by the health-check commit (f9e170d), and the
+explode scheduler read the dev page's `ghostCopy` callback before the state it
+closes over existed (caught by the new health check on its first run).
 
 ### B7 — DONE (2026-09-14)
 

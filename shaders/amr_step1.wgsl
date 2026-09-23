@@ -138,6 +138,19 @@ override DIRECT_GHOST : u32 = 1u;
 // 2*RB x 2*RB cells and the local coordinates ARE the cells.
 override GHOST : u32 = 2u;
 
+// COLLIDE_RING (plans/2D-backport.md B6-1). 0 on the explode/coalesce path:
+// a RING cell advects and stores what it gathered, uncollided, and the
+// interior collides as ever. Chen et al.'s coalesce averages advected-but-
+// UNCOLLIDED states -- "an arithmetic average of N_i's rather than of
+// Ntilde_i's would invalidate the correctness of non-equilibrium distributions
+// on the coarse grid" -- and the explode's ring self-advance is what lets one
+// explosion feed both substeps. Colliding the ring would relax the parent's
+// populations at the child's tau, which is the thing the Dupuis-Chopard factor
+// existed to undo; not colliding is why this path has no factor. Default 1 is
+// the interp path, byte-identical. The root (GHOST 0) has no ring, so it is
+// indifferent.
+override COLLIDE_RING : u32 = 1u;
+
 // NO_PARENT: this level is the ROOT. Two things follow, and both are
 // consequences of the same fact rather than two switches.
 //
@@ -448,6 +461,25 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 + u32(clamp(sy, 0, i32(FB) - 1)) * FB
                 + u32(clamp(sx, 0, i32(FB) - 1));
     f[i] = fUnpack(f_in[fIdx(i, poolPlaneStride, srcCell)], i);
+  }
+
+  // A ring cell advects and stores -- see COLLIDE_RING. Its velocity is still
+  // written, from the gathered moments, so nothing that samples a ring reads a
+  // value left over from before the path changed; it is NOT a fluid velocity
+  // (a ring cell is an inbox/outbox, plans/uniform-levels.md 2.5).
+  if (COLLIDE_RING == 0u && GHOST > 0u) {
+    let inInterior = fx >= GHOST && fx < GHOST + RB2 && fy >= GHOST && fy < GHOST + RB2;
+    if (!inInterior) {
+      var rr = 0f; var mx = 0f; var my = 0f;
+      for (var i = 0u; i < 9u; i++) { rr += f[i]; mx += f[i] * f32(ex[i]); my += f[i] * f32(ey[i]); }
+      let rd = max(rr, 1e-6f);
+      vel_pool[cell * 2u] = mx / rd; vel_pool[cell * 2u + 1u] = my / rd;
+      let nwr = fWords();
+      for (var wi = 0u; wi < nwr; wi++) {
+        f_out[wi * poolPlaneStride + cell] = fPack(f[fLo(wi)], f[fHi(wi)], wi);
+      }
+      return;
+    }
   }
 
   // 2. Local Macroscopic Variables

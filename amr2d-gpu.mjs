@@ -1043,7 +1043,61 @@ export function makeRefineRound({ nLevels, pools, cascade, encodeCascade, passes
 // profiling or ?benchSkip= decoration the page wants around it. The order was
 // identical five times over; the content legitimately differs, because
 // main-amr.js carries measurement twins the shipped pages do not.
-export function makeScheduler({ nLevels, ghostCopy, passes }) {
+export function makeScheduler({ nLevels, ghostCopy, passes, explode = false }) {
+  // B6-1: THE EXPLODE/COALESCE ORDER (plans/2D-backport.md), per substep of
+  // a parent level:
+  //
+  //   interp    as ever -- it is still what fills a ring cell that faces a
+  //             SAME-level neighbour, which a new tile's bilinear init reads.
+  //   explode   overwrites the coarse-seam ring cells from the parent at t.
+  //   child     the child's full cycle; its ring advects without colliding.
+  //   coalesce  the child's outflux into the COVERED cells' slots of the
+  //             parent's TIME-t buffer.
+  //   step      the parent LAST, so it pulls those slots as ordinary
+  //             neighbours -- the inverted order is the whole trick.
+  //   average   the restriction into the parent's NEW buffer, kept so every
+  //             covered cell is a real distribution between steps (no drain
+  //             pass needed; the instrument, snapshots, render and criterion
+  //             keep their meaning). Nothing in the dynamics reads it.
+  //
+  // `cur` names the PARENT's time-t buffer: at the root that is `useB`, at
+  // every other level a cycle starts in 'a' and returns to it.
+  function S_AdvanceExplode(level, enc, useB) {
+    const hasChild = (level + 1) < nLevels;
+    if (level === 0) {
+      const cur = useB ? 'b' : 'a';
+      if (hasChild) {
+        passes.l0InterpIntoL1(enc, useB);
+        passes.explodeIntoChild(enc, 0, cur);
+        S_AdvanceExplode(1, enc, useB);
+        passes.coalesceFromChild(enc, 0, cur);
+      }
+      passes.l0Step(enc, useB);
+      if (hasChild) passes.l1AverageIntoL0(enc, useB);
+      return;
+    }
+    for (const [cur, next] of [['a', 'b'], ['b', 'a']]) {
+      if (hasChild) {
+        passes.interpIntoChild(enc, level, cur);
+        passes.explodeIntoChild(enc, level, cur);
+        S_AdvanceExplode(level + 1, enc, useB);
+        passes.coalesceFromChild(enc, level, cur);
+      }
+      passes.substep(enc, level, cur);
+      if (hasChild) passes.averageFromChild(enc, level, next);
+    }
+  }
+  if (explode) {
+    // Checked PER CALL, not here: `ghostCopy` is a callback precisely because
+    // a page may resolve it from state declared after this call (main-amr.js's
+    // in-session bench toggles it), and reading it at construction threw
+    // "Cannot access 'benchSkip' before initialization" on that page.
+    return { S_Advance: (level, enc, useB) => {
+      if (ghostCopy()) throw new Error('?interface=explode with ?ghostcopy=1 is not supported: the legacy between-substep ring copy would overwrite the advecting outbox');
+      return S_AdvanceExplode(level, enc, useB);
+    } };
+  }
+
   function S_Advance(level, enc, useB) {
     const hasChild = (level + 1) < nLevels;
 
@@ -1545,6 +1599,75 @@ export function makeRootPool(device, U, layouts, modules, pools, {
 // (phyBGL, force1BGL -- the two bodyless pages have no force pass).
 // A GPUBindGroupLayout nobody binds costs nothing, and selecting a subset per
 // page would reintroduce exactly the per-page variation this removes.
+// --- B6-1: EXPLODE / COALESCE (plans/2D-backport.md) ------------------------
+//
+// `?interface=explode|interp`. interp -- today's interpolated ring plus
+// restriction, NOT conservative (B6-0 measured the seam at 89x the floor) --
+// stays the default until explode's gates are green, the same staging the 3D
+// fork used. Anything else is REFUSED rather than read as the default.
+export function readInterfaceMode(urlParams) {
+  const v = urlParams.get('interface') || 'interp';
+  if (v !== 'interp' && v !== 'explode') throw new Error(`?interface=${v}: expected interp or explode`);
+  return v;
+}
+
+// The pipelines, bind groups and the two passes makeScheduler's explode order
+// calls. One pair per CHILD level; the parent is the level above, and the root
+// is just a parent with no ring and an identity indirection (PARENT_GHOST 0 --
+// the same fold every other root-parent kernel makes).
+//
+// `cur` is the PARENT's time-t buffer ('a' | 'b'). The child side is always
+// its 'a': explode fills the buffer the child's substep A reads, and coalesce
+// harvests the one its substep B wrote, which is 'a' again.
+export function makeExplodeCoalesce(device, layouts, modules, pools, nLevels, { RB, F16 }) {
+  const pipe = (layout, module, constants) => device.createComputePipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [layout] }),
+    compute: { module, entryPoint: 'main', constants },
+  });
+  const explodePL = [pipe(layouts.explodeBGL, modules.explodeSM, { RB, F16, PARENT_GHOST: 0 }),
+                     pipe(layouts.explodeBGL, modules.explodeSM, { RB, F16, PARENT_GHOST: 2 })];
+  const coalescePL = [pipe(layouts.coalesceBGL, modules.coalesceSM, { RB, F16, PARENT_GHOST: 0 }),
+                      pipe(layouts.coalesceBGL, modules.coalesceSM, { RB, F16, PARENT_GHOST: 2 })];
+  const FB = 2 * RB + 4;
+  const bgs = [];
+  for (let c = 1; c < nLevels; c++) {
+    const parent = pools[c - 1], child = pools[c];
+    const pf = { a: parent.finePoolF_a, b: parent.finePoolF_b };
+    const ex = (cur) => device.createBindGroup({ layout: layouts.explodeBGL, entries: [
+      { binding: 0, resource: { buffer: child.levelParamsBuf } },
+      { binding: 1, resource: { buffer: pf[cur] } },
+      { binding: 2, resource: { buffer: child.finePoolF_a } },
+      { binding: 3, resource: { buffer: child.slotToBlockBuf } },
+      { binding: 4, resource: { buffer: child.blockSlotBuf } },
+      { binding: 5, resource: { buffer: parent.blockSlotBuf } },
+    ]});
+    const co = (cur) => device.createBindGroup({ layout: layouts.coalesceBGL, entries: [
+      { binding: 0, resource: { buffer: child.levelParamsBuf } },
+      { binding: 1, resource: { buffer: child.finePoolF_a } },
+      { binding: 2, resource: { buffer: pf[cur] } },
+      { binding: 3, resource: { buffer: child.blockSlotBuf } },
+      { binding: 4, resource: { buffer: parent.slotToBlockBuf } },
+    ]});
+    bgs[c] = { explode: { a: ex('a'), b: ex('b') }, coalesce: { a: co('a'), b: co('b') } };
+  }
+  const which = (level) => (level === 0 ? 0 : 1);
+  return {
+    // Keyed by the PARENT level, matching makeScheduler's passes.
+    explodeIntoChild: (enc, level, cur) => {
+      const child = pools[level + 1];
+      const p = enc.beginComputePass();
+      p.setPipeline(explodePL[which(level)]); p.setBindGroup(0, bgs[level + 1].explode[cur]);
+      p.dispatchWorkgroups(Math.ceil(FB / 8), Math.ceil(FB / 8), child.MAX_FINE_BLOCKS); p.end();
+    },
+    coalesceFromChild: (enc, level, cur) => {
+      const parent = pools[level];
+      const p = enc.beginComputePass();
+      p.setPipeline(coalescePL[which(level)]); p.setBindGroup(0, bgs[level + 1].coalesce[cur]);
+      p.dispatchWorkgroups(Math.ceil(2 * RB / 8), Math.ceil(2 * RB / 8), parent.MAX_FINE_BLOCKS); p.end();
+    },
+  };
+}
+
 export function makeAMRLayouts(device) {
   const phyBGL = device.createBindGroupLayout({ label: 'phyBGL', entries: [
     { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
@@ -1695,7 +1818,26 @@ export function makeAMRLayouts(device) {
     // a 16-per-stage ceiling -- see CLAUDE.md before adding more.
     { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }
   ]});
-  return { phyBGL, renBGL, interpPoolParentBGL, avgPoolBGL, criterionPoolBGL, managePoolBGL, step1BGL, force1BGL };
+  // B6-1: explode/coalesce (plans/2D-backport.md). Built unconditionally --
+  // a layout is free and a page on the interp path simply never uses them,
+  // which keeps "which layouts exist" from forking on a URL flag.
+  const ro = { type: 'read-only-storage' };
+  const explodeBGL = device.createBindGroupLayout({ label: 'explodeBGL', entries: [
+    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: ro },
+    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: ro },
+    { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: ro },
+    { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: ro },
+  ]});
+  const coalesceBGL = device.createBindGroupLayout({ label: 'coalesceBGL', entries: [
+    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: ro },
+    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: ro },
+    { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: ro },
+  ]});
+  return { phyBGL, renBGL, interpPoolParentBGL, avgPoolBGL, criterionPoolBGL, managePoolBGL, step1BGL, force1BGL, explodeBGL, coalesceBGL };
 }
 
 // --- the renderer's per-level wiring (plans/uniform-levels.md U6) -----------
