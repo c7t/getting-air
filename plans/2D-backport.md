@@ -2693,6 +2693,30 @@ ring cell except the step's own streaming and coalesce.
 **Which makes the steady interp pass consumer-free on the explode path** -- the
 half of B6-5's cost that was waiting on exactly this.
 
+### B6-7 — DONE (2026-09-23). The steady interp pass is gone from the explode path -- it was already dead.
+
+Removed from `makeScheduler`'s explode order. The claim was BIT-IDENTITY and it
+was tested the strict way: explode-path determinism fingerprints (detslots) of
+the new build against `f942b55`, served from a scratch worktree -- identical on
+the dev page (dynamic refinement, births and deaths: `de3b342bd6e9cf5b`,
+`721ffabc08161f0f`) and the cylinder page (`7651fae871da3212`,
+`d9a01454492a7b3f`) at levels 2 and 3.
+
+**The fingerprint covers every pool's WHOLE `f`, rings included, and that is
+why identical is the prediction and not a blind spot.** A ring cell facing a
+same-level tile gathers every source from a real interior (DIRECT_GHOST), never
+from its own content, and substep B rewrites the whole tile -- rings too -- into
+the buffer interp had written. Everything the pass wrote was overwritten before
+anything read it. B6-6 removed the last reader that COULD have seen it.
+
+**Cost, priced inside one build** (`?b6interp=1` re-encodes the dead pass,
+timing only): the machine was heavily contended during the run, so absolute
+minima are meaningless (they had explode cheaper than interp); the SAME-ROUND
+ratios are what stand. Removing it saves ~2-13% at levels 2 and 15-18% at
+levels 3, leaving explode about +6..19% / +12..16% over interp -- a range, not a
+number, until it is re-measured on a quiet machine. `average` is what is left
+of B6-5's cost finding; it touches what the criterion reads and is not started.
+
 ### B7 — DONE (2026-09-14)
 
 `?kEps=` threads one `K_EPS` override through all nine chi sites (the render

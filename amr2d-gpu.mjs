@@ -1047,8 +1047,13 @@ export function makeScheduler({ nLevels, ghostCopy, passes, explode = false }) {
   // B6-1: THE EXPLODE/COALESCE ORDER (plans/2D-backport.md), per substep of
   // a parent level:
   //
-  //   interp    as ever -- it is still what fills a ring cell that faces a
-  //             SAME-level neighbour, which a new tile's bilinear init reads.
+  //   (no interp) the steady ring refresh is NOT encoded on this path since
+  //             B6-7. Its last reader was a new tile's bilinear init, and
+  //             RING_FREE_SAMPLE (B6-6) resolves that through the owning
+  //             tile; explode rewrites every coarse-seam ring cell, and a ring
+  //             cell facing a same-level tile is read by nobody (the step goes
+  //             through DIRECT_GHOST; criterion, force and render are all
+  //             ring-free on this path). Measured bit-identical without it.
   //   explode   overwrites the coarse-seam ring cells from the parent at t.
   //   child     the child's full cycle; its ring advects without colliding.
   //   coalesce  the child's outflux into the COVERED cells' slots of the
@@ -1062,20 +1067,23 @@ export function makeScheduler({ nLevels, ghostCopy, passes, explode = false }) {
   //
   // `cur` names the PARENT's time-t buffer: at the root that is `useB`, at
   // every other level a cycle starts in 'a' and returns to it.
-  // TIMING ONLY: `?b6skip=interp,average` drops those passes from THIS order so
-  // each can be priced by removal (plans/perf-characterization.md: never by
-  // per-pass timestamps). With the topology FROZEN (setAutoRefine(false)) the
-  // dynamics do not read either -- interp's ring refresh only feeds a NEW
-  // tile's init, and average feeds only readers -- but a live run with either
-  // skipped is wrong. Read from the URL here rather than threaded through five
-  // pages, because it is an instrument and not a mode.
+  // TIMING ONLY: `?b6skip=average` drops that pass from THIS order so it can be
+  // priced by removal (plans/perf-characterization.md: never by per-pass
+  // timestamps). With the topology FROZEN (setAutoRefine(false)) the dynamics
+  // do not read it -- average feeds only readers, and a DEATH, which the
+  // freeze excludes -- but a live run with it skipped is wrong. Read from the
+  // URL here rather than threaded through five pages, because it is an
+  // instrument and not a mode. `?b6interp=1` is the inverse instrument for the
+  // pass B6-7 REMOVED: it re-encodes the dead steady interp so its cost can be
+  // priced in one build and one session. Bit-identical either way (measured).
+  const b6interp = typeof location !== 'undefined' && new URLSearchParams(location.search).get('b6interp') === '1';
   const b6skip = new Set(((typeof location !== 'undefined' && new URLSearchParams(location.search).get('b6skip')) || '').split(',').filter(Boolean));
   function S_AdvanceExplode(level, enc, useB) {
     const hasChild = (level + 1) < nLevels;
     if (level === 0) {
       const cur = useB ? 'b' : 'a';
       if (hasChild) {
-        if (!b6skip.has('interp')) passes.l0InterpIntoL1(enc, useB);
+        if (b6interp) passes.l0InterpIntoL1(enc, useB);
         passes.explodeIntoChild(enc, 0, cur);
         S_AdvanceExplode(1, enc, useB);
         passes.coalesceFromChild(enc, 0, cur);
@@ -1086,7 +1094,7 @@ export function makeScheduler({ nLevels, ghostCopy, passes, explode = false }) {
     }
     for (const [cur, next] of [['a', 'b'], ['b', 'a']]) {
       if (hasChild) {
-        if (!b6skip.has('interp')) passes.interpIntoChild(enc, level, cur);
+        if (b6interp) passes.interpIntoChild(enc, level, cur);
         passes.explodeIntoChild(enc, level, cur);
         S_AdvanceExplode(level + 1, enc, useB);
         passes.coalesceFromChild(enc, level, cur);
