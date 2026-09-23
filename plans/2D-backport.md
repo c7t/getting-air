@@ -2274,6 +2274,50 @@ the default velocity set and questionable for the `?q=27` variant.
 
 ### B6 — the coarse/fine interface
 
+### B6-0 — THE BEFORE-NUMBER, AND WHY IT READ AS FIXED (2026-09-23)
+
+Re-measured before starting, and the first reading said there was nothing to
+fix: the `half` rung's momentum drift at 512 steps was **7.8e-5, 0.75x the `all`
+control**, against B1's recorded 1.302e-2. It was bisected rather than
+believed, and **nothing was fixed -- the test geometry had become symmetric.**
+
+```
+build / mode                                   half rung @512   geometry
+a230ace  (B1)                                  1.302e-2         jagged band (holes, stub)
+ae90867  dense coupling                        1.302e-2         same, bit-identical
+ae90867  ?rootpool=1  + OLD manager            1.302e-2         same, bit-identical
+ae90867  ?rootpool=1  + quad manager (U5-4)    7.836e-5         FLAT band, rows 0-7
+HEAD                                           7.836e-5         same, bit-identical
+```
+
+The root-pool COUPLING reproduces the dense leak bit for bit; the drop is the
+MANAGER. U5-4 allocates level 1 in quads, so the pool-capped `half` rung became
+a flat full-width band of exactly half the domain -- two seams half a
+Taylor-Green period apart, where the flow is negated and the seams face
+opposite ways, so their leaks cancel in the GLOBAL sum the instrument reads.
+Breaking the symmetry with the cap, same build (HEAD), flat seams throughout:
+
+```
+cap   band        seams          max|d mom| @512      growth   mass ratio
+ 64   rows 0-3    y=0, y=32      6.608e-3 = 184x      t^0.91   0.803
+ 96   rows 0-5    y=0, y=48      3.198e-3 =  89x      t^0.88   0.867
+128   rows 0-7    y=0, y=64      7.836e-5 = 2.2x      t^1.72   0.927
+```
+
+**So the leak is real, linear in t (a per-step source), and present on FLAT
+seams** -- it is not a convex-corner effect, which matters for B6: the corner
+is not where it lives. `tools/analyze-amr-interface.js` now defaults to
+`--halfCap=96`; do not choose a cap whose refined fraction is one half.
+
+**Two things to carry.** A global conservation total is blind to any geometry
+with a symmetry that negates the per-seam flux; a declared asymmetric seam (or
+a per-seam budget) is the instrument, not a lucky cap. And this bisect was
+first run on a debug Chrome whose GPU process had crashed, on SwiftShader --
+two of its legs came out wrong (a spurious 8.49e-3, and a false "does not
+boot"). Every row above is from a health-checked RTX run
+(`tools/check-browser.js`, now in every tool's teardown).
+
+
 **Do not start here.** Start at B0b. 2D's interface today is interp (ring
 ghosts) + average (restriction), with no flux correction: coarse cells at the
 seam stream from their own coarse neighbours while the fine tile streams from

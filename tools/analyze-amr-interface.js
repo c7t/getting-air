@@ -140,13 +140,27 @@ const DEFAULTS = {
   // mid-measurement takes its solution with it).
   settle: 64,
   configs: null, extra: '', timeout: 900, keepOpen: false,
+  // The `half` rung's pool cap -- 96, NOT 128, and the difference is the whole
+  // instrument (plans/2D-backport.md B6-0, 2026-09-23).
+  //
+  // Under the quad manager (U5-4 on) a capped pool refines a FLAT full-width
+  // band from row 0. At 128 of 256 that band is exactly HALF the domain, so its
+  // two seams sit half a Taylor-Green period apart -- where the flow is
+  // negated and the seams face opposite ways -- and their leaks CANCEL in the
+  // global sum, which is all this tool reads. It measured 7.8e-5 there (2.2x
+  // floor) and read as "the seam leak is fixed"; at 96 the same build reads
+  // 3.2e-3 (89x) and at 64 6.6e-3 (184x), both linear in t. Nothing was fixed:
+  // U5-4 turned the old jagged band into a symmetric flat one. A global
+  // conservation sum is blind to any geometry with that symmetry, so do not
+  // pick a cap that makes the refined fraction one half.
+  halfCap: 96,
 };
 
 // thresh -6 is the page's own default and refines nothing on TGV; -11 is past
 // the point where every block wants a child, so the cap is what decides.
 const CONFIGS = [
   { name: 'none', thresh: -6, maxFineBlocks: 512 },
-  { name: 'half', thresh: -11, maxFineBlocks: 128 },
+  { name: 'half', thresh: -11, maxFineBlocks: 96 },  // overridden by --halfCap; see halfCap
   { name: 'all', thresh: -11, maxFineBlocks: 512 },
 ];
 
@@ -163,6 +177,7 @@ function parseArgs(argv) {
     else if (a.startsWith('--configs=')) o.configs = a.slice(10).split(',');
     else if (a.startsWith('--extra=')) o.extra = a.slice(8);
     else if (a.startsWith('--timeout=')) o.timeout = parseInt(a.slice(10));
+    else if (a.startsWith('--halfCap=')) o.halfCap = parseInt(a.slice(10));
     else if (a === '--keepOpen') o.keepOpen = true;
     else { console.error(`unknown argument ${a}`); process.exit(2); }
   }
@@ -355,7 +370,8 @@ function report(o, results, eps) {
 
 async function main() {
   const o = parseArgs(process.argv.slice(2));
-  const configs = CONFIGS.filter(c => !o.configs || o.configs.includes(c.name));
+  const configs = CONFIGS.filter(c => !o.configs || o.configs.includes(c.name))
+    .map(c => (c.name === 'half' ? { ...c, maxFineBlocks: o.halfCap } : c));
   if (!configs.length) { console.error('no configs selected'); process.exit(2); }
   const eps = latticeWeightExcess();
 
