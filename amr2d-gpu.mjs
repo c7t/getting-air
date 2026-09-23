@@ -1062,29 +1062,37 @@ export function makeScheduler({ nLevels, ghostCopy, passes, explode = false }) {
   //
   // `cur` names the PARENT's time-t buffer: at the root that is `useB`, at
   // every other level a cycle starts in 'a' and returns to it.
+  // TIMING ONLY: `?b6skip=interp,average` drops those passes from THIS order so
+  // each can be priced by removal (plans/perf-characterization.md: never by
+  // per-pass timestamps). With the topology FROZEN (setAutoRefine(false)) the
+  // dynamics do not read either -- interp's ring refresh only feeds a NEW
+  // tile's init, and average feeds only readers -- but a live run with either
+  // skipped is wrong. Read from the URL here rather than threaded through five
+  // pages, because it is an instrument and not a mode.
+  const b6skip = new Set(((typeof location !== 'undefined' && new URLSearchParams(location.search).get('b6skip')) || '').split(',').filter(Boolean));
   function S_AdvanceExplode(level, enc, useB) {
     const hasChild = (level + 1) < nLevels;
     if (level === 0) {
       const cur = useB ? 'b' : 'a';
       if (hasChild) {
-        passes.l0InterpIntoL1(enc, useB);
+        if (!b6skip.has('interp')) passes.l0InterpIntoL1(enc, useB);
         passes.explodeIntoChild(enc, 0, cur);
         S_AdvanceExplode(1, enc, useB);
         passes.coalesceFromChild(enc, 0, cur);
       }
       passes.l0Step(enc, useB);
-      if (hasChild) passes.l1AverageIntoL0(enc, useB);
+      if (hasChild && !b6skip.has('average')) passes.l1AverageIntoL0(enc, useB);
       return;
     }
     for (const [cur, next] of [['a', 'b'], ['b', 'a']]) {
       if (hasChild) {
-        passes.interpIntoChild(enc, level, cur);
+        if (!b6skip.has('interp')) passes.interpIntoChild(enc, level, cur);
         passes.explodeIntoChild(enc, level, cur);
         S_AdvanceExplode(level + 1, enc, useB);
         passes.coalesceFromChild(enc, level, cur);
       }
       passes.substep(enc, level, cur);
-      if (hasChild) passes.averageFromChild(enc, level, next);
+      if (hasChild && !b6skip.has('average')) passes.averageFromChild(enc, level, next);
     }
   }
   if (explode) {

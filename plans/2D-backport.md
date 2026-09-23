@@ -2580,6 +2580,62 @@ outliers the interp one does not -- 1.0e-4 (5.4x its p99, against interp's
 axis at x ~ 575, y ~ 480/543, ~32 fine cells from any corner: on a straight
 downstream seam. Too small for the vorticity picture; a real seam signature.
 
+### B6-5 — THE PRE-DEFAULT LIST, WORKED (2026-09-23)
+
+The four items B6-3 left before explode could be the default. All numbers from
+health-checked RTX runs.
+
+**1. Render stencil** -- B6-4. Fixed; it was the reported corner cells.
+
+**2. The dense-comparison tools** (`--extra=` added to `validate-divergence.js`
+and `analyze-reentry-seam.js`, AMR leg only):
+
+```
+validate-divergence  levels 2, Re 20, bounce-back, shared seed
+                     adaptive final   fullrefine floor   interface excess   edge
+  interp             3.01e-3          2.71e-3            1.11x              0.96-0.97
+  explode            2.99e-3          2.70e-3            1.11x              0.96
+
+analyze-reentry-seam  moving body, prescribed trajectory, tau 0.509, mean|err omega|
+                     nearHigh   farHigh    nearLow    overall relL2
+  interp             1.78e-3    1.19e-3    6.9e-4     1.66
+  explode            1.69e-3    1.18e-3    7.8e-4     1.71
+```
+
+NO REGRESSION, AND NO DISCRIMINATION EITHER. Both cases sit where the seam is
+not the dominant error: the steady Re 20 shell is at the divergence tool's own
+floor on both paths, and reentry's tau = 0.509 is where CLAUDE.md records the
+moving-body coupling as the limiting defect. The TGV rungs (B6-0..B6-2) remain
+the instrument that CAN see the seam.
+
+**3. Cost** (cylinder, frozen topology, ms per macro-step, min over three
+INTERLEAVED rounds; the first, non-interleaved measurement read levels 3 at
++126% and was contention -- retracted):
+
+```
+              interp   explode   -interp pass   -average   -both    explode uniform
+  levels 2    0.078    0.094     0.087          0.101      0.075    0.105
+  levels 3    0.131    0.180     0.169          0.180      0.157    0.201
+```
+
+Explode costs +20% / +37%, and MOST OF IT IS THE TWO PASSES KEPT FOR READERS,
+not explode/coalesce: without both, levels 2 is back at interp and levels 3 at
++20%. Single-pass rows are inside this machine's +-10% noise; read the pair.
+The linear explosion is free (uniform measured slower, i.e. noise), as 3D
+found. `?b6skip=interp,average` is the timing-only instrument (frozen
+topology only -- a live run with either skipped is wrong). **B6-perf** is then
+two changes, neither started: (a) a new tile's init resolves its parent through
+owner tiles, so interp's steady ring refresh can go; (b) average once per
+macro-step rather than per substep -- which touches what the criterion reads,
+so it needs its own gate.
+
+**4. The moving-body pages** -- reentry scored above (a wash). The falling card
+(`index-amr.html`) has no external reference; it boots and holds all seven
+invariants through 8192 steps on explode, and nothing more is claimed.
+
+**Still open, found at B6-4:** single-COARSE-cell density outliers on a
+straight downstream seam of the cylinder under explode (1.0e-4, 5.4x p99).
+
 ### B7 — DONE (2026-09-14)
 
 `?kEps=` threads one `K_EPS` override through all nine chi sites (the render

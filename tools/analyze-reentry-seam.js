@@ -70,6 +70,9 @@ function parseArgs(argv) {
     else if (arg.startsWith('--a=')) opts.a = parseFloat(arg.slice(4));
     else if (arg.startsWith('--b=')) opts.b = parseFloat(arg.slice(4));
     else if (arg.startsWith('--tau=')) opts.tau = parseFloat(arg.slice(6));
+    // Appended to the AMR leg only (the dense reference has no interface):
+    // `--extra=interface=explode` is the B6 A/B, plans/2D-backport.md.
+    else if (arg.startsWith('--extra=')) opts.extra = arg.slice(8);
     else if (arg.startsWith('--maxDist=')) opts.maxDist = parseInt(arg.slice(10));
     else if (arg.startsWith('--vortThresh=')) opts.vortThresh = parseFloat(arg.slice(13));
     else if (arg.startsWith('--mode=')) opts.mode = arg.slice(7);
@@ -192,7 +195,7 @@ async function main() {
     // coverage).
     const NBX = (1 << opts.baseRes) / 8;
     const maxFineBlocksQS = opts.mode === 'fullrefine' ? `&maxFineBlocks=${NBX * NBX}` : '';
-    const amrUrl = `${opts.baseUrl}/index-reentry-amr.html?res=${opts.baseRes}&levels=${opts.levels}&${sharedQS}${maxFineBlocksQS}`;
+    const amrUrl = `${opts.baseUrl}/index-reentry-amr.html?res=${opts.baseRes}&levels=${opts.levels}&${sharedQS}${maxFineBlocksQS}${opts.extra ? '&' + opts.extra : ''}`;
     const amrSnap = await runLeg(Runtime, Page, amrUrl, '__AMR', steps, timeoutMs, opts.mode, opts.levels);
     const amr = reconstructAMRToResolution(amrSnap, targetRes);
     const levelMap = buildLevelMap(amrSnap, targetRes);

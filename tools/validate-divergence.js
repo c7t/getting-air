@@ -81,6 +81,9 @@ function parseArgs(argv) {
     bounceback: true,
     timeout: 600,
     saveSnapshots: null,
+    // Appended to the AMR leg's URL only -- the dense reference has no
+    // interface. `--extra=interface=explode` is the B6 A/B (plans/2D-backport.md).
+    extra: '',
     keepOpen: false,
     allowUnvalidatedLevels: false,
     allowMarginalTau: false,
@@ -98,6 +101,7 @@ function parseArgs(argv) {
     else if (a.startsWith('--transient=')) o.transient = Number(a.slice(12));
     else if (a.startsWith('--timeout=')) o.timeout = Number(a.slice(10));
     else if (a.startsWith('--saveSnapshots=')) o.saveSnapshots = a.slice(16);
+    else if (a.startsWith('--extra=')) o.extra = a.slice(8);
     else if (a === '--diffuse') o.bounceback = false;
     else if (a === '--bounceback') o.bounceback = true;
     else if (a === '--keepOpen') o.keepOpen = true;
@@ -301,7 +305,7 @@ async function main() {
           baseResLog2: amrParams.baseResLog2, nLevels, sharedParams: shared,
           maxFineBlocksByLevel: mode === 'fullrefine' ? fr.byLevel : {},
           forceBounceback: opts.bounceback && opts.allowUnvalidatedLevels,
-        });
+        }) + (opts.extra ? '&' + opts.extra : '');
 
         // Checkpoint schedule, in AMR L0 macro-steps. Dense advances
         // refineRatio times as many of its own steps per checkpoint: under
