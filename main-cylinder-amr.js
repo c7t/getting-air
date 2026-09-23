@@ -25,7 +25,7 @@
 import { reportFatal, refuseConfig, setStatus, reportNoWebGPU, reportNoAdapter } from './error-overlay.mjs';
 import { loadShader } from './shader-loader.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
-import { check21BalanceOnGPU, allocLevelPool, writePoolInitialState, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState, checkGeometryCoverageOnGPU, makeRefusalWatch , checkRefinementClosureOnGPU , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU, makeRenderBindGroup, renderRootIsPool, renderPoolLevels, MAX_RENDER_POOL_LEVELS, makeAMRLayouts, makeCouplingPipelines, makeLevelBindGroups, makeManageBindGroups, makeScheduler, makeRefineRound, readRootFlags, allocRootPool, makeRootPool, encodeRootCapture, readRootCapture, restoreRootCapture } from './amr2d-gpu.mjs';
+import { check21BalanceOnGPU, allocLevelPool, writePoolInitialState, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState, checkGeometryCoverageOnGPU, makeRefusalWatch , checkRefinementClosureOnGPU , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU, makeRenderBindGroup, renderRootIsPool, renderPoolLevels, MAX_RENDER_POOL_LEVELS, makeAMRLayouts, makeCouplingPipelines, makeLevelBindGroups, makeManageBindGroups, makeScheduler, makeRefineRound, readRootFlags, allocRootPool, makeRootPool, encodeRootCapture, readRootCapture, restoreRootCapture, seedRootFromDenseF } from './amr2d-gpu.mjs';
 // tauAtLevel: extracted to card-params.mjs by B3a-1, which landed the CALL
 // in all five AMR pages and this IMPORT in only main-amr.js. The other four
 // threw `ReferenceError: tauAtLevelOf is not defined` at init -- but only at
@@ -1088,7 +1088,19 @@ async function init() {
   }
 
   device.queue.writeBuffer(cardStateBuf, 0, initCardState());
-  writeF(f_a, initF(), NCELLS);
+  // THE ROOT'S INITIAL FIELD, FROM THIS PAGE'S OWN IC (U7-6f). `initF()` is
+  // built in dense block8 order; the seeder permutes it into root tiles on the
+  // host -- see seedRootFromDenseF, which is the one statement of it, shared
+  // with the other four AMR pages. Called at init, at reset and at a rootless
+  // snapshot load, never per frame.
+  const seedRootFrom = (fDense) => seedRootFromDenseF(device, pools, fDense, { W, H, RB, writeF });
+  {
+    const f0 = initF();
+    writeF(f_a, f0, NCELLS);
+    // resetSim() is NOT called at page load, so this is a separate seed call
+    // site and not a duplicate of the one in resetSim().
+    seedRootFrom(f0);
+  }
   // pools[1].finePoolF_a's equilibrium pre-fill, and blockSlotBuf/
   // slotToBlockBuf's -1 fill, already happened above in allocLevelPool
   // (uniformly for every level, not just level 1 -- see its own comment).
@@ -1328,8 +1340,9 @@ async function init() {
   const cascade = makeCascadePipelines(device, cascadeSM, pools, N_LEVELS,
     { quadCompleteFrom: ROOT_MANAGED ? 1 : 2 });
 
-  // U7-4b: THE ROOT POOL'S SOLVER HALF, from amr2d-gpu.mjs -- the mirror (and
-  // seeder), the root step, the criterion redirect and U5-3's live coupling.
+  // U7-4b: THE ROOT POOL'S SOLVER HALF, from amr2d-gpu.mjs -- the root step,
+  // the criterion redirect, U5-3's live coupling and U2's mirror (a
+  // comparator setup since U7-6f moved the seed to the host).
   // See makeRootPool for the solver/instrument split; the instrument and the
   // debugCheckRoot* comparators stay on index-amr.html.
   const rootGpu = ROOT_POOL ? makeRootPool(device, U, layouts, rootModules, pools,
@@ -1339,11 +1352,10 @@ async function init() {
   // pool to replace it, or when `?densel0=1` (the default) keeps both running
   // so the root comparators have something to compare against.
   const denseL0Live = () => !rootGpu || DENSE_L0 === 1;
-  // The root is L0 in the other layout, so it starts where the dense grid
-  // starts. Mirroring the just-written initF() is exact by U2's proof; an
-  // unseeded root drives refinement off an unwritten buffer, which is the
-  // state bug 1.2's fingerprint gate caught.
-  if (rootGpu) rootGpu.seedRootFromDense();
+  // The root pool's initial field was seeded above, next to this page's own
+  // initF() -- U7-6f moved it off the GPU mirror, which needed the dense
+  // buffer to hold the IC. An unseeded root drives refinement off an unwritten
+  // buffer, which is the state bug 1.2's fingerprint gate caught.
 
 
   // Milestone 9: one criterion/manage pipeline PAIR per PARENT level
@@ -1738,7 +1750,8 @@ async function init() {
 
     const snapshot = {
       // U7-6c: 6 adds `root`. A version-5 capture still loads -- the load
-      // falls back to seedRootFromDense() and says what that does not carry.
+      // re-seeds the root from the restored dense grid and says what that
+      // does not carry.
       formatVersion: 6,
       // The ROOT POOL, or null when this page has none (?rootpool=0).
       root: rootOut,
@@ -1834,14 +1847,14 @@ async function init() {
     // U7-6c: the root pool comes from the snapshot when the capture has one.
     // restoreRootCapture REFUSES a mismatch rather than loading a wrong shape.
     if (!restoreRootCapture(device, pools, snapshot.root, { writeF, b64ToFloat32 })) {
-      // Pre-U7-6c capture (formatVersion <= 5). Mirroring the just-restored
-      // dense grid is exact for `f` by U2's proof -- but amr_mirror_root.wgsl
-      // writes f_root ONLY, so the root's VELOCITY is whatever the page had
-      // before the load. The refinement round runs BEFORE the step, so the
-      // first one after this reads that stale velocity and the load is not
-      // reproducible. Say so rather than letting it look clean.
+      // Pre-U7-6c capture (formatVersion <= 5). Re-laying-out the
+      // just-restored dense grid is exact for `f` by U2's proof -- but
+      // `seedRootFrom` writes the root's `f` ONLY, so its VELOCITY is whatever
+      // the page had before the load. The refinement round runs BEFORE the
+      // step, so the first one after this reads that stale velocity and the
+      // load is not reproducible. Say so rather than letting it look clean.
       if (rootGpu) {
-        rootGpu.seedRootFromDense();
+        seedRootFrom(f);
         console.warn('debugSnapshotLoad: formatVersion ' + (snapshot.formatVersion ?? '?')
           + ' carries no root pool; seeded f from the dense grid and left the root VELOCITY stale. '
           + 'The next refinement round reads that velocity -- re-save at version 6 for a reproducible load.');
@@ -2134,7 +2147,8 @@ async function init() {
     // initial condition it is supposed to read. Zeroing would also be
     // reproducible and would quietly hide the IC from that round.
     const vel0 = new Float32Array(NCELLS * 2);
-    writeF(f_a, initF(vel0), NCELLS);
+    const f0 = initF(vel0);
+    writeF(f_a, f0, NCELLS);
     device.queue.writeBuffer(velBuf, 0, vel0);
     device.queue.writeBuffer(cardStateBuf, 0, initCardState());
     device.queue.writeBuffer(forceBuf, 0, new Int32Array([0, 0, 0, 0]));
@@ -2188,8 +2202,8 @@ async function init() {
     macroStepCounter = 0;
     useB = false;
     // U5-3: the root pool is L0 too, and reset() has to reach it. `useB =
-    // false` above is the phase the mirror writes (finePoolF_a).
-    if (rootGpu) rootGpu.seedRootFromDense();
+    // false` above is the phase the seed writes (finePoolF_a).
+    seedRootFrom(f0);
     step = 0;
     trajectory.length = 0;
   }

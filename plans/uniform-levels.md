@@ -4161,6 +4161,87 @@ else.
 `blockSlotCPU`/`slotToBlockCPU`/`freeSlots` host mirrors that exist only to
 serve it.
 
+#### U7-6f-a — the root's initial field comes from the HOST, not the mirror (2026-09-22)
+
+U7-6f is the deletion, and this is the one thing standing in front of it that
+is not itself a deletion: **the root pool's initial state still came from the
+dense `f` buffer.** `seedRootFromDense()` dispatched
+`shaders/amr_mirror_root.wgsl`, which reads the dense grid -- so however inert
+the dense L0 had become (U7-6d proved it is a spectator during a run), the
+dense buffers still had to exist, be allocated at full size and be written at
+every reset, for the sole purpose of being permuted into the root once.
+
+`amr2d.mjs`'s `denseL0ToRootF` is that permutation on the host, and
+`amr2d-gpu.mjs`'s `seedRootFromDenseF` is the one statement of the seed that
+all five pages call. Three call sites per page (init, `resetSim`, the
+pre-version-6 snapshot-load fallback), plus `debugInjectSyntheticField` on the
+two card pages -- which wrote the dense grid ONLY and has therefore been inert
+for physics since U5-3 made the root the authority. That is a live bug fixed in
+passing, not a refactor: the helper's whole purpose is to inject a level-0
+field.
+
+**THE MIRROR STAYS, AND THAT IS DELIBERATE.** It is no longer the seeder, but
+it is still the setup that `tools/validate-root-mirror.js` and
+`tools/validate-root-kernels.js` drive, and those score the root against the
+dense grid. A checker retires WITH its subject (B3-5), so all three go together
+in the deletion itself, not here.
+
+##### The proof the mirror carried had to survive the move
+
+U2's lesson is the trap this rung walks straight into: the mirror shader and
+`amr2d.mjs`'s `rootCellToDense` were written together, both said `gy*W + gx`,
+they agreed exactly, and 98.4% of the root pool was reading the wrong dense
+cell. Writing a third formula that also agrees would buy nothing.
+
+`tools/test-root-seed.js` (new, 8 cases) therefore scores the permutation
+against a route neither it nor U2 wrote, and one that is validated by DATA:
+`tools/lib/field-reconstruct.js`'s `rootToFlatL0` and `unshiftField`, the
+decoders that read real GPU snapshots.
+
+    dense block8  --denseL0ToRootF-->  root tiles  --rootToFlatL0-->  flat
+    dense block8  --unshiftField---------------------------------->  flat
+
+and it COMPOSES rather than compares -- "does this root cell hold the field at
+the place it stands for" -- which is the check U2 records as the one that would
+have caught it, where a bijection check and an agreement check were both green
+over the bug. Mutation rows: a transposed local index and U2's own row-major
+slip must both turn it red; both do. The fixture is 64x32, deliberately not
+square and more than one tile per axis, so a transposition cannot pass.
+
+##### Gate: BIT-IDENTICAL, which is the whole claim
+
+The permutation is applied to the same f32 values the mirror copied as words,
+and `packF` is elementwise per (plane-pair, cell), so a correct move is exactly
+byte-for-byte. Measured against the pre-change tree on the same Chrome and the
+same dev server, `measure-determinism.js`, index-amr.html, 4096 steps, 2 runs
+each:
+
+      config                 before             after
+      levels=2 detslots=1    e0b1b22bbe47cbfb   e0b1b22bbe47cbfb   (2/2 both)
+      levels=3 detslots=1    4705ea2b06226c8b   4705ea2b06226c8b   (2/2 both)
+      levels=2 detslots=0    e0b1b22bbe47cbfb   e0b1b22bbe47cbfb   (2/2 both)
+      levels=3 detslots=0    DIFFERS            DIFFERS            (attractors)
+
+Three rows match the baseline EXACTLY, which CLAUDE.md's own reading rule says
+is conclusive -- no race can forge a bit-exact match. The fourth differs
+run-to-run on both trees and is the known `levels=3` attractor spread, which is
+why it is reported and not read as a signal.
+
+*Also green:* `make check`; `make test` (11 suites); `validate-reset-fixed-point`;
+`validate-snapshot-roundtrip`; boot smoke on all seven pages
+(`--configs=index-boot,amr-dev-boot,reentry-boot,reentry-amr-boot,cylinder-amr-boot-N3,channel-amr-boot-N3,tgv-amr-boot-N3`).
+
+##### One thing this deliberately did NOT fix
+
+`main-cylinder-amr.js`'s `resetSim` gives the ROOT the unperturbed freestream
+`[U0, 0]` while its `f` carries the per-cell perturbation, and its own comment
+says why: "its velocity would need that same field re-laid-out from block8 into
+root tiles to match exactly." That re-layout now exists. Using it is a ONE-LINE
+change and it MOVES THE FIRST CRITERION EVALUATION, hence refinement, hence Cd
+-- so it is not folded into a rung whose entire gate is bit-identity. Same for
+`main-tgv-amr.js`, which hands every pool `[0, 0]` while its IC is a Taylor-
+Green velocity field. Both are their own measured rung.
+
 #### D1-b — SKIPPED, deliberately, 2026-09-18. The decision the rung asked to be made explicitly.
 
 The rung says: "If D1-b is judged not worth doing on a path scheduled for

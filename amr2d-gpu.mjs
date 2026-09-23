@@ -38,6 +38,7 @@ import {
   check21Balance, nbAtLevel, makePool, cellSizeL0AtLevel,
   nearBodyWant, nearBodyWantCentre, bodyPhiL0, bodyFrameL0, bodyFrameL0Legacy,
   cascade21, quadrantOfSlot, tileOriginL0, poolInverseViolations, rootPoolSpec,
+  denseL0ToRootF,
 } from './amr2d.mjs';
 
 // Every level's blockSlot, copied in one command encoder and one submit, so
@@ -216,7 +217,7 @@ export async function listActiveBlocks(device, pools, level = 1) {
 //   D1-a    main-cylinder-amr.js  velBuf / finePoolVel / parentSlotBuf never
 //                                 written by resetSim -> the first refinement
 //                                 round after every reset ran on page history
-//   U7-6c   the root pool         seedRootFromDense writes f_root ONLY, so a
+//   U7-6c   the root pool         the root's seed writes f ONLY, so a
 //                                 snapshot load left root velocity stale
 //   U7-6c-fix  main-amr.js        the same three buffers, same consequence --
 //                                 and it is what made the snapshot round-trip
@@ -496,8 +497,8 @@ export function allocLevelPool(device, U, m, NBX_m, NBY_m, maxFineBlocks, NCELLS
 // second site: a buffer that is rewritten every step is still state if
 // something reads it before the first step.
 //
-// Before this, a load called `seedRootFromDense()`, and `amr_mirror_root.wgsl`
-// writes `f_root` ONLY -- so the root's velocity survived a load untouched.
+// Before this, a load re-seeded the root from the dense grid, and that seed
+// writes `f` ONLY -- so the root's velocity survived a load untouched.
 // `tools/lib/render-levels.js` reported it as "restore did not return to
 // baseline" the moment it was given a level-0 row (U7-6b).
 export function encodeRootCapture(device, U, enc, pools) {
@@ -536,8 +537,36 @@ export function readRootCapture(st, pools, { readF, bytesToB64 }) {
   };
 }
 
+// THE ROOT'S INITIAL FIELD, FROM THE PAGE'S OWN INITIAL CONDITION (U7-6f).
+//
+// ONE statement of the seed, for the same reason `writePoolInitialState` is
+// one statement of a pool's initial allocator state: five pages had a copy of
+// the old `rootGpu.seedRootFromDense()` call and five copies of a seed is five
+// chances for one to be missed.
+//
+// U5-3 SEEDED IT FROM THE GPU, through `shaders/amr_mirror_root.wgsl`, because
+// the mirror was the map U2 had already validated against a third route. That
+// made the root's initial field depend on the dense `f` buffer holding the IC
+// -- the last thing the dense L0 was needed for. `denseL0ToRootF` is the same
+// permutation on the host, scored by tools/test-root-seed.js against the
+// snapshot decoder, which is a route neither it nor U2 wrote.
+//
+// `fDense` is the page's own `initF()` output: plane-major f32 in dense block8
+// order. `writeF` is injected because packing is the PAGE's property (?f16=),
+// the same dependency shape `restoreRootCapture` already takes.
+//
+// f ONLY. Velocity is `writePoolInitialState`'s, because its value is the
+// scenario's (zero for a card at rest, the freestream for the cylinder) and
+// that function is already where a pool's initial state is stated.
+export function seedRootFromDenseF(device, pools, fDense, { W, H, RB, writeF }) {
+  const root = pools[0];
+  if (!root) return;
+  const cells = root.MAX_FINE_BLOCKS * root.cellsPerSlot;
+  writeF(root.finePoolF_a, denseL0ToRootF(fDense, { dims: { W, H }, rb: RB }), cells);
+}
+
 // Returns true if the root was restored FROM THE SNAPSHOT. False means the
-// caller should fall back to seedRootFromDense() -- which is correct only for
+// caller should fall back to `seedRootFromDenseF` -- which is correct only for
 // a capture written before this rung, and only for `f`.
 export function restoreRootCapture(device, pools, snapRoot, { writeF, b64ToFloat32 }) {
   const root = pools[0];
@@ -1355,7 +1384,8 @@ export function readRootFlags(urlParams, { staging = true } = {}) {
 // The root, as a level. `rootPoolSpec` is the shape; `allocLevelPool` is the
 // same allocator every other level uses, which is U1's whole claim in one
 // line. No initial field: a buffer nothing reads should not be given a state
-// that could be mistaken for one -- `seedRootFromDense` writes it.
+// that could be mistaken for one -- `seedRootFromDenseF` writes it, from the
+// page's own `initF()`.
 export function allocRootPool(device, U, { W, H, RB }) {
   const spec = rootPoolSpec({ dims: { W, H }, rb: RB });
   return allocLevelPool(device, U, 0, spec.nbx, spec.nby, spec.slots, spec.cellsPerSlot);
@@ -1410,11 +1440,14 @@ export function makeRootPool(device, U, layouts, modules, pools, {
   const root = pools[0], l1 = pools[1];
 
   // U2's mirror: dense L0 -> the root pool, so the pool's addressing can be
-  // scored against the live dense buffer before any kernel depends on it --
-  // and, since 1.2's fingerprint gate caught an unseeded root driving
-  // refinement, the SEEDER as well. One dispatch at init, at reset and after a
-  // snapshot load, never per frame. At U7-6 the root is the only L0 and takes
-  // `initF()` directly, and this goes with the dense path.
+  // scored against the live dense buffer before any kernel depends on it.
+  //
+  // IT WAS ALSO THE SEEDER until U7-6f, and is not any more: the root now
+  // takes `initF()` through `seedRootFromDenseF` on the host, so nothing in
+  // the live path needs the dense buffer to hold the IC. What is left here is
+  // the mirror's original job -- the comparator setup
+  // tools/validate-root-mirror.js and tools/validate-root-kernels.js drive --
+  // and it retires with the dense grid those score against.
   const mirrorBGL = device.createBindGroupLayout({ entries: [
     { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },

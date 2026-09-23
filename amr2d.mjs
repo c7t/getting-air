@@ -1390,3 +1390,64 @@ export function rootCellToDense({ dims, rb = RB_DEFAULT }, slot, lx, ly) {
   }
   return denseCellIndex({ dims }, gx, gy);
 }
+
+// ── THE ROOT'S INITIAL STATE, FROM THE PAGE'S OWN INITIAL CONDITION ─────────
+//
+// (plans/uniform-levels.md U7-6f.)
+//
+// Every page builds its initial condition as a DENSE, block8-indexed array --
+// `initF()` walks cells in `denseCellIndex` order, and on the cylinder page
+// that order is load-bearing because one shared `rng` stream draws the
+// perturbation per cell. The root pool wants the same field in TILE order.
+// This is that permutation, and it is the LAST thing the dense L0 was still
+// needed for: until U7-6f the root was filled by mirroring the live dense `f`
+// buffer through `shaders/amr_mirror_root.wgsl`, which meant the dense grid
+// had to exist, be allocated at full size, and be written at every reset for
+// no other reason.
+//
+// SO THIS REPLACES A GPU PASS WITH A HOST LOOP, AND THAT IS THE POINT: it runs
+// at init, at reset and at a snapshot load with no root -- never per frame --
+// and in exchange the dense buffers stop being state anything writes.
+//
+// THE ADDRESSING IS U2's, AND U2's LESSON APPLIES HERE UNCHANGED. The mirror
+// shader and `rootCellToDense` were written together, both said `gy*W + gx`,
+// they agreed exactly, and 98.4% of the root pool was reading the wrong dense
+// cell. So this composes the two sides -- `rootCellIndex` for where a spatial
+// cell lives in the pool, `denseCellIndex` for where it lives in the grid --
+// rather than restating either, and `tools/test-root-seed.js` scores the
+// result against a THIRD route that neither wrote: `tools/lib/
+// field-reconstruct.js`'s `rootToFlatL0`, which is the decoder that reads real
+// GPU snapshots and is therefore validated by data.
+//
+// Returns a fresh array; the caller owns it. No padding case exists --
+// `blockGridAtLevel` refuses a domain that does not divide into whole root
+// tiles, so the root's cell count IS W*H.
+function rootFromDenseMap({ dims, rb = RB_DEFAULT }) {
+  const side = tileCellsAtLevel(0, rb);
+  const [nbx, nby] = blockGridAtLevel(dims, 0, rb);
+  const map = new Int32Array(nbx * nby * side * side);
+  for (let gy = 0; gy < dims.H; gy++) {
+    for (let gx = 0; gx < dims.W; gx++) {
+      map[rootCellIndex({ dims, rb }, gx, gy)] = denseCellIndex({ dims }, gx, gy);
+    }
+  }
+  return map;
+}
+
+// `f`, plane-major: 9 planes of NCELLS, the layout f-pack.mjs and every
+// snapshot speak. The plane stride changes with the layout (dense NCELLS ->
+// root cells) even though the two are equal today, so both are named.
+export function denseL0ToRootF(fDense, { dims, rb = RB_DEFAULT }) {
+  const map = rootFromDenseMap({ dims, rb });
+  const cells = map.length;
+  const ncells = dims.W * dims.H;
+  if (fDense.length !== ncells * 9) {
+    throw new Error(`denseL0ToRootF: got ${fDense.length} floats, expected ${ncells * 9} (9 planes of ${ncells})`);
+  }
+  const out = new Float32Array(cells * 9);
+  for (let c = 0; c < cells; c++) {
+    const d = map[c];
+    for (let i = 0; i < 9; i++) out[i * cells + c] = fDense[i * ncells + d];
+  }
+  return out;
+}
