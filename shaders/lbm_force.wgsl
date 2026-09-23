@@ -53,7 +53,7 @@ fn get_chi(phi: f32) -> f32 {
 }
 
 // Sanitize NaN to 0 and clamp to the fixed-point range so the float->i32 force
-// cast is well-defined on every backend (parity with amr_force.wgsl).
+// cast is well-defined on every backend (parity with amr_force1.wgsl).
 fn safeFixed(x: f32) -> i32 {
     let s = select(x, 0.0f, x != x);
     return i32(clamp(s, -2.0e9f, 2.0e9f));

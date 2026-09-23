@@ -1,8 +1,11 @@
 // Milestone 9 (plans/AMR-multilevel.md): refine/coarsen decision + quad
-// allocation for any L(m)->L(m+1) hop with m>=1 -- sibling of
-// amr_manage.wgsl (which stays the L0->L1 decision, dense-parent-specific,
-// but gains a matching cascade/coarsen-block check against THIS file's own
-// child level -- see that file's header).
+// allocation for any L(m)->L(m+1) hop.
+//
+// EVERY HOP, INCLUDING L0->L1, SINCE U7-6f. It served m>=1 only while a
+// separate dense-parent manager (amr_manage.wgsl) owned the L0->L1 decision
+// and allocated level 1 per BLOCK rather than per quad; U5-4 made the root the
+// parent of level 1 and U7-6f deleted the other manager, so this is the only
+// allocator in the project and the pool is uniform from the root down.
 //
 // One pipeline instance PER PARENT LEVEL (NBX_PARENT/NBY_PARENT/
 // PARENT_CELL_SIZE_L0/PARENT_HAS_CACHED_ORIGIN baked as overrides) --
@@ -38,9 +41,8 @@
 //   child, because a same-level neighbor happened not to be active yet
 //   -- the cascade meant to catch this up within the same round didn't
 //   always converge in time. The OUTWARD cascade that restores 2:1
-//   balance after a hard-required deep refine is amr_manage.wgsl's own
-//   cascade (or, recursively, a shallower amr_manage_pool.wgsl
-//   instance) -- see that file's header, now also existence- (not
+//   balance after a hard-required deep refine is a shallower instance of
+//   THIS file's own cascade -- existence- (not
 //   criterion-) based for the same reason this file's own grandchild
 //   cascade is, below. A criterion (vorticity)-only refine -- no
 //   geometric or cascade reason -- still needs the gate, so vorticity-
@@ -70,7 +72,7 @@
 //     both missed cascades AND a refine/coarsen oscillation.) EXISTENCE
 //     (hasGrandchild), not desire -- an earlier version of this fix used a
 //     criterion-based "does the neighbor's child WANT a grandchild" test
-//     (mirroring amr_manage.wgsl's own level2WantsRefine one level down)
+//     (mirroring the deleted dense manager's own level2WantsRefine one level down)
 //     and it was live-verified wrong: debugCheck21Balance still caught
 //     real depth-1-vs-depth-3 violations with it, because criterion is
 //     re-evaluated fresh every round and can read as "doesn't want it
@@ -129,8 +131,9 @@
 @group(0) @binding(8)  var<storage, read_write> childWant         : array<u32>;
 // ── Refinement refusal counter (?diag=1) ─────────────────────────────────────
 //
-// Binding 9, matching amr_manage.wgsl's numbering for the SAME buffer and the
-// same slot within it: diag[5] counts refines refused for want of a pool slot.
+// Binding 9: diag[5] counts refines refused for want of a pool slot. The
+// number was chosen to match the dense manager's binding for the SAME buffer
+// and the same slot within it; that manager is gone, the numbering stays.
 //
 // ADDED AT plans/uniform-levels.md U5-4, because that stage took level 1 off
 // the dense manager and the refusal counter went with it. Measured before and
@@ -173,11 +176,11 @@ override RB : u32;
 override NBX_PARENT : u32;
 override NBY_PARENT : u32;
 override PARENT_CELL_SIZE_L0 : f32;
-// When 0, isNearBodyAt is unconditionally false -- see amr_manage.wgsl's
-// identical override.
+// When 0, isNearBodyAt is unconditionally false -- the two bodyless pages
+// (TGV, channel) pass it.
 override HAS_BODY : u32 = 1u;
 // When 0, isNearBodyAt reverts to the pre-B4 single sample at the tile CENTRE
-// (?boxrefine=0) -- see amr_manage.wgsl's identical override.
+// (?boxrefine=0).
 override BOX_REFINE : u32 = 1u;
 
 // THE 2:1 DECISION IS NOT IN THIS FILE (plans/2D-backport.md B2). decide()
@@ -233,9 +236,9 @@ fn parentCentreL0(bxP: u32, byP: u32) -> vec2<f32> {
 }
 override FORCE_REFINE_MARGIN : f32;
 override FORCE_REFINE_LOOKAHEAD : f32;
-// L0 window-space edge band excluded from vorticity-driven refinement (same
-// fixed L0-window strip as amr_manage.wgsl -- unscaled per level, since the
-// sponge is a fixed L0 strip). Gated off when <= 0.
+// L0 window-space edge band excluded from vorticity-driven refinement -- a
+// fixed L0-window strip, UNSCALED per level, since the sponge it shadows is
+// itself a fixed L0 strip. Gated off when <= 0.
 override SPONGE_EXCLUDE_W : f32 = 0.0f;
 
 // THE WANT SET FOR THE CHILD LEVEL. Dispatched over PARENT slots, like

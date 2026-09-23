@@ -54,7 +54,7 @@
 
 const { b64ToFloat32, unshiftField, rhoFromF } = require('./field-reconstruct');
 
-const BLOCK = 8; // matches shaders/amr_step.wgsl's block8 cellIndex
+const BLOCK = 8; // block8, the DENSE reference pages' layout -- amr2d.mjs's denseCellIndex
 
 const EX = [0, 1, 0, -1, 0, 1, -1, -1, 1];
 const EY = [0, 0, 1, 0, -1, 1, 1, -1, -1];
@@ -84,7 +84,7 @@ function tauAtLevel(tau0, m) {
 // Composed Dupuis-Chopard fneq rescale from level `src` down to level `dst`
 // (dst <= src, i.e. fine -> coarse).
 //
-// One hop, from shaders/amr_average_f2c.wgsl: 2 * tau_coarse / tau_fine.
+// One hop, from shaders/common_average.wgsl: 2 * tau_coarse / tau_fine.
 // Composing k hops telescopes, since each hop's numerator tau cancels the
 // next hop's denominator:
 //   (2*t_L/t_{L+1}) * (2*t_{L+1}/t_{L+2}) * ... = 2^k * t_dst / t_src
@@ -223,7 +223,7 @@ function injectDenseIntoAMRSnapshot({ denseSnapshot, amrSnapshot, tau0 = null, f
 
   // Average one axis-aligned square of the dense target grid. rho is an
   // arithmetic mean (mass-conservative) and velocity is mass-weighted
-  // (momentum-conservative), exactly matching amr_average_f2c.wgsl's own
+  // (momentum-conservative), exactly matching common_average.wgsl's own
   // choice; fneq is an arithmetic mean, which is what makes the composed
   // rescale in fneqRescale an identity rather than an approximation.
   const acc = new Float32Array(9);
@@ -273,6 +273,14 @@ function injectDenseIntoAMRSnapshot({ denseSnapshot, amrSnapshot, tau0 = null, f
   // is the exact inverse. Absent on a pre-U7-6c template, in which case there
   // is nothing to write.
   const rootTpl = amrSnapshot.root || null;
+  // U7-6f: a version-7 capture has NO dense L0 arrays -- level 0 is the root.
+  // A template with neither is one this cannot fill, and filling only the
+  // dense pair would hand `debugSnapshotLoad` a snapshot it refuses.
+  const hasDenseL0 = typeof amrSnapshot.fB64 === 'string';
+  if (!rootTpl && !hasDenseL0) {
+    throw new Error('injectDenseIntoAMRSnapshot: the AMR template carries neither `root` nor a dense '
+      + '`fB64` -- there is nowhere to write level 0');
+  }
   const rootSide = 2 * pools[1].RB;   // RB itself is declared with the pool section below
   let fRoot = null, velRoot = null, rootCells = 0;
   if (rootTpl) {
@@ -290,7 +298,7 @@ function injectDenseIntoAMRSnapshot({ denseSnapshot, amrSnapshot, tau0 = null, f
     for (let cx = 0; cx < W0; cx++) {
       const s = sampleSquare(cx, cy, 1);
       // block8: L0 storage is block-major, NOT row-major (see
-      // shaders/amr_step.wgsl's cellIndex) -- writing row-major here would
+      // amr2d.mjs's denseCellIndex) -- writing row-major here would
       // scramble the field in a way that still decodes without error.
       const nbx = W0 / BLOCK;
       const bID = Math.floor(cy / BLOCK) * nbx + Math.floor(cx / BLOCK);
@@ -386,9 +394,14 @@ function injectDenseIntoAMRSnapshot({ denseSnapshot, amrSnapshot, tau0 = null, f
 
   return {
     ...amrSnapshot,
-    fB64: float32ToB64(fL0),
-    velB64: float32ToB64(velL0),
-    // U7-6e: and the root, which is what a post-U7-6c load actually reads.
+    // BOTH LAYOUTS, EACH ONLY WHEN THE TEMPLATE HAS IT. U7-6e's finding was
+    // that writing the dense pair alone left the TEMPLATE's root untouched,
+    // so an injected snapshot loaded cleanly and seeded the run with the state
+    // the injection was supposed to replace. Since U7-6f the root is the only
+    // level 0 a live page has, and the dense pair survives here for archived
+    // pre-version-7 templates -- and for the unit test, which fills both from
+    // one sample and requires them to decode to the same field.
+    ...(hasDenseL0 ? { fB64: float32ToB64(fL0), velB64: float32ToB64(velL0) } : {}),
     ...(rootTpl ? { root: { ...rootTpl, fB64: float32ToB64(fRoot), velB64: float32ToB64(velRoot) } } : {}),
     pools: outPools,
     // Provenance, so a snapshot that has been injected into is identifiable

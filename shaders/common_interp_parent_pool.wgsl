@@ -156,7 +156,8 @@ fn sampleParent(slot: u32, bx: u32, by: u32, ix: i32, iy: i32) -> CoarseSample {
     // matching what the dense accessor's wrapCoord(ix, W) does over the whole
     // domain -- which is what makes this hop bit-identical to that one rather
     // than merely equivalent. It inherits that accessor's known WALL_Y gap
-    // unchanged (see common_interp_parent_dense.wgsl's header).
+    // unchanged (the dense-parent fragment this mirrors said the same before
+    // U7-6f deleted it).
     let RB2 = i32(RB * 2u);
     let pnbx = parentNbx(); let pnby = parentNby();
     var pbx = bx >> 1u; var pby = by >> 1u;

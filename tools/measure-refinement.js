@@ -11,7 +11,7 @@
 // THREE MEASUREMENTS, because the obvious one alone is misleading:
 //
 //  1. COVERAGE. Per-L0-block max|omega| reconstructed from a snapshot's own
-//     coarse velocity field -- the same quantity amr_criterion.wgsl reduces,
+//     coarse velocity field -- the same quantity amr_criterion_pool.wgsl reduces,
 //     with the same central-difference formula -- tabulated against candidate
 //     REFINE_THRESH values. This is the table main-amr.js's REFINE_THRESH
 //     comment is built from, so a retune can be compared like for like.
@@ -75,21 +75,29 @@ function parseArgs(argv) {
 }
 
 // Per-L0-block max|omega| from the snapshot's own coarse velocity field.
-// Deliberately re-derives amr_criterion.wgsl's formula rather than sharing
+// Deliberately re-derives amr_criterion_pool.wgsl's formula rather than sharing
 // one, so a change to the shader shows up here as a disagreement instead of
 // being silently tracked -- the same convention debugCheckGeometryCoverage
-// uses against amr_manage.wgsl.
+// uses against amr_manage_pool.wgsl.
+// U7-6f: LEVEL 0's VELOCITY IS `snap.root`, not `snap.velB64` -- the dense L0
+// grid and its block8 index are gone. The root's tiles are 2*RB on a side,
+// RINGLESS, row-major within a tile, and its indirection is the identity, so
+// the cell index is a pure function of (cx, cy). `BLOCK` below stays 8 because
+// the CRITERION's reduction unit is an 8-cell block, which is level 1's block
+// grid and has nothing to do with how level 0 is stored.
 const BLOCK_OMEGA = (G) => `(async () => {
   const snap = await ${G}.debugSnapshotSave();
   const { W, H } = ${G}.getDims();
   const BLOCK = 8, nbx = W / BLOCK, nby = H / BLOCK;
-  const bin = atob(snap.velB64);
+  if (!snap.root) throw new Error('snapshot carries no root pool -- level 0 has no velocity to read');
+  const SIDE = 2 * snap.pools[1].RB, rnbx = W / SIDE;
+  const bin = atob(snap.root.velB64);
   const bytes = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
   const vel = new Float32Array(bytes.buffer);
   const cellIndex = (cx, cy) => {
-    const bx = (cx / BLOCK) | 0, by = (cy / BLOCK) | 0;
-    return (by * nbx + bx) * (BLOCK * BLOCK) + (cy % BLOCK) * BLOCK + (cx % BLOCK);
+    const slot = ((cy / SIDE) | 0) * rnbx + ((cx / SIDE) | 0);
+    return slot * (SIDE * SIDE) + (cy % SIDE) * SIDE + (cx % SIDE);
   };
   const wrap = (v, n) => ((v % n) + n) % n;
   const gx = (cx, cy) => vel[cellIndex(wrap(cx, W), wrap(cy, H)) * 2];

@@ -2,13 +2,16 @@
 // that does NOT depend on where the four parent samples came from.
 // Included via `// @include "common_interp.wgsl"`.
 //
-// WHY THIS EXISTS. amr_interp_dense_parent.wgsl and
-// amr_interp_pool_parent.wgsl differ in exactly one thing: how they FETCH a
-// parent cell. The dense one reads the L0 grid at wrapped buffer coordinates
-// (sampleCoarse); the pool one reads a parent tile at parent-local interior
-// coordinates (sampleParentPool). Everything after those four fetches --
-// the bilinear blend, the Dupuis-Chopard rescale, the reconstruction of f --
-// was character-for-character identical in both, and is now here once.
+// WHY THIS EXISTS. There were two interp entry files until U7-6f --
+// amr_interp_dense_parent.wgsl and amr_interp_pool_parent.wgsl -- differing in
+// exactly one thing: how they FETCH a parent cell. The dense one read the L0
+// grid at wrapped buffer coordinates (sampleCoarse); the pool one reads a
+// parent tile at parent-local interior coordinates (sampleParentPool).
+// Everything after those four fetches -- the bilinear blend, the
+// Dupuis-Chopard rescale, the reconstruction of f -- was
+// character-for-character identical in both, and is here once. The dense one
+// is gone and this stays shared: the STEP kernels run the same reconstruction
+// inline for the ghost-free work (plans/ghost-free.md).
 //
 // It is a fragment, so per shader-loader.mjs it must not itself @include.
 // It depends on `feqD2Q9` from common_lattice.wgsl; every file that includes
@@ -47,7 +50,7 @@ override DC_PRE : u32 = 0u;
 //
 // because fneq scales as tau * (velocity gradient per lattice cell) and the
 // same physical shear spans 2x as many fine cells, halving the per-cell
-// gradient. But amr_step.wgsl is a FUSED pull-stream + collide, so every
+// gradient. But the step kernel is a FUSED pull-stream + collide, so every
 // buffer on both sides of this transfer holds f AFTER collision. BGK gives
 // fneq* = ((tau - 1)/tau) * fneq_pre at whichever level it is evaluated, and
 // composing decollide -> the relation above -> recollide cancels both tau's

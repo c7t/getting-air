@@ -1,9 +1,10 @@
-// Coarse -> fine ghost-cell interpolation for every L(m) -> L(m+1) hop with
-// m>=1: the parent is itself a POOL tile, not the dense grid. Milestone 6
-// (plans/AMR-multilevel.md / -M5.md).
+// Coarse -> fine ghost-cell interpolation for EVERY L(m) -> L(m+1) hop: the
+// parent is a POOL tile. Milestone 6 (plans/AMR-multilevel.md / -M5.md); m>=1
+// only until U7-6f, when the dense L0 grid and its own interp entry file went
+// and the root became the parent of level 1 like any other.
 //
-// The kernel itself is shaders/common_interp_kernel.wgsl, shared with
-// amr_interp_dense_parent.wgsl since plans/2D-backport.md B3-3; the pool
+// The kernel itself is shaders/common_interp_kernel.wgsl, one copy since
+// plans/2D-backport.md B3-3 and now with one includer; the pool
 // parent's tau, block grid, origin and fetch are
 // shaders/common_interp_parent_pool.wgsl (read that one for why this side
 // needs no periodic wrap and no second slot lookup). What is left here is the

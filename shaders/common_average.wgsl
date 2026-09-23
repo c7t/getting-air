@@ -1,15 +1,16 @@
-// THE fine -> parent averaging (restriction) kernel, whole. Both entry files
-// -- amr_average_f2c.wgsl (parent = the dense L0 grid) and
-// amr_average_pool_parent.wgsl (parent = a level>=1 pool tile) -- are now
-// their bindings, their overrides, and two @include lines. There is one
-// implementation of the restriction, here. plans/2D-backport.md B3-2.
+// THE fine -> parent averaging (restriction) kernel, whole. Its entry file --
+// amr_average_pool_parent.wgsl -- is its bindings, its overrides, and two
+// @include lines. There is one implementation of the restriction, here.
+// plans/2D-backport.md B3-2.
 //
-// WHAT THE TWO ENTRY FILES ACTUALLY DIFFERED IN, having been near-identical
-// 142/147-line copies: the parent's TAU (L0's own `state.tau` vs. this
-// level's `levelParams.parentTau`) and WHERE the averaged cell is written
-// (a dense `cellIndex()` address at plane stride W*H vs. an (lx,ly) inside
-// the parent's own FB*FB tile at the pool's plane stride). Nothing else --
-// the restriction math below was character-for-character the same.
+// THERE WERE TWO ENTRY FILES until U7-6f, the other being amr_average_f2c.wgsl
+// with the dense L0 grid as the parent, and B3-2 records what the two
+// near-identical 142/147-line copies actually differed in: the parent's TAU
+// (L0's own `state.tau` vs. this level's `levelParams.parentTau`) and WHERE
+// the averaged cell is written (a dense `cellIndex()` address at plane stride
+// W*H vs. an (lx,ly) inside the parent's own FB*FB tile). Nothing else -- the
+// restriction math below was character-for-character the same, which is what
+// made merging them safe and what made deleting one of them cheap.
 //
 // So the split is an ACCESSOR, exactly as plans/2D-backport.md B3 describes
 // for 3D's `common_d3_parent_{dense,pool}.wgsl`: each parent kind supplies
@@ -55,7 +56,7 @@ override DC_PRE : u32 = 0u;
 // (tau_coarse/tau_fine) * n with n=2 -- the per-cell velocity gradient
 // doubles going to the coarser grid, so fneq is scaled up by n. The
 // POST-collision form is what this solver actually needs, because both sides
-// of this transfer hold f after collision (amr_step.wgsl is a fused
+// of this transfer hold f after collision (the step kernel is a fused
 // pull-stream + collide). amr2d.mjs's dcRescaleFineToCoarse is the host
 // statement; tools/test-amr2d.js asserts the two directions multiply to 1 to
 // within one ulp, which is the property that makes a round trip through the

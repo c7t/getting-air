@@ -285,7 +285,7 @@ function defaultConfigs(baseUrl) {
     // runChannelPhysics. `url` here is a display label only, not
     // navigated to directly. AMR configs default to a single mid-sweep
     // resolution (chanResFilter) -- AMR channel flow's own marginal value
-    // is "does amr_step.wgsl match lbm_step.wgsl," already the same at
+    // is "does the AMR step match lbm_step.wgsl," already the same at
     // every resolution, not a resolution study of its own (see
     // main-channel-amr.js's header on autoRefine defaulting off here).
     {

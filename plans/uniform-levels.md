@@ -28,7 +28,7 @@ it runs on.
 | U4 | criterion, force, digest, conserved totals | **DONE** — all four consumers on the root. Exact on the criterion, digest max and conserved totals; the force to the truncation floor | `tools/validate-root-kernels.js`, 8 rungs + 2 controls |
 | U5 | L1 becomes a quad child of the root | **U5-0…U5-4 DONE under `?rootpool=1`** — both hops of the coupling and the manager. Level 1 is quad-allocated and quad-managed; tiles +28-32%; new fingerprints, default unmoved. `amr_manage.wgsl` cannot retire until the other four AMR pages get a root pool, and Cd/St is unmeasurable until then | `validate-root-kernels.js` (11 rungs, 4 controls); `validate-all.js` invariants ± starved pool; `measure-determinism.js` |
 | U6 | The renderer walks levels | **DONE** — and it found that three of the five pages never drew level 2 either. Level 1 bit-identical to before; gate green on two pages and in the default sweep | `tools/validate-render-levels.js`, `tools/lib/render-levels.js` |
-| U7 | One implementation across the five pages, then delete the dense path | **U7-0…U7-4 DONE** (layouts, coupling pipelines, per-level bind groups, both orderings, and now the root pool itself shared — net −1559 lines through U7-3, every gate unmoved; U7-4 puts a root pool on all five pages behind `?rootpool=1` and MEASURES U5-4's Cd/St, which U5 could not); **U7-5, U7-5a and U7-6a DONE** — `?rootpool=1` is the DEFAULT, pool demand re-measured at quad granularity, and the snapshot format now carries level 1's quad indirection AND the free list. The flip moved published Cd within the noise -- and that noise turned out to be the cylinder page's RACING allocator, whose attractor spread (~±0.009) is 10x the same-build repeat the gates quote. **D1 (port DET_SLOTS to the cylinder page) is now sequenced ahead of U7-6**, which deletes its control. U7-6 (delete the dense path) remains. **Split into U7-0…U7-6** — U1–U5 all landed on `main-amr.js` alone, so the remaining work is propagation before deletion. Measured: all 14 bind group layouts are byte-identical across five pages, and `S_Advance` is byte-identical across the other four | each rung byte-identical on the default path (`measure-determinism.js`), except U7-5 which is the one that moves numbers |
+| U7 | One implementation across the five pages, then delete the dense path | **DONE, U7-0…U7-6f.** U7-0…U7-3 shared the layouts, coupling pipelines, per-level bind groups and both orderings (net −1559 lines, every gate unmoved); U7-4 put a root pool on all five pages; U7-5 flipped `?rootpool=1` to the default; U7-6a…U7-6e ported every consumer -- the renderer, the snapshot format, the host tail, `field-reconstruct.js` and `dense-to-amr.js` -- one at a time, each against a dense buffer already proven equal; **U7-6f DELETED THE DENSE PATH**: nine shaders, six of the fourteen bind group layouts, `f_a`/`f_b`/`velBuf` on all five pages, the per-block level-1 allocator, six URL flags and three dense-only tools, net −4,076 lines. Level 0 is the root pool, and there is one implementation of every level | each rung byte-identical on the default path (`measure-determinism.js`) except U7-5, which is the one that moves numbers; U7-6f's own gate is the full sweep AT THE BASELINE TO THE DIGIT plus a `validate-divergence` seeding error of EXACTLY ZERO |
 
 **Where the risk actually sits.** U0–U2 went in clean and each found something
 (a half-cell convention, an f16 stride, a window-convention split between L0 and
@@ -90,7 +90,7 @@ at the end.
     U7-5      flip the default, DONE
     D1        DET_SLOTS on the cylinder page -- the Cd gate cannot resolve
               anything below ~0.02 without it, and U7-6 deletes its control
-    U7-6      delete the dense path
+    U7-6      delete the dense path -- DONE (U7-6a..f)
     --   the sponge seam INVARIANT (gate only)
     B6   explode/coalesce
     --   sponge refinement policy, then section 8's ladders
@@ -4241,6 +4241,173 @@ change and it MOVES THE FIRST CRITERION EVALUATION, hence refinement, hence Cd
 -- so it is not folded into a rung whose entire gate is bit-identity. Same for
 `main-tgv-amr.js`, which hands every pool `[0, 0]` while its IC is a Taylor-
 Green velocity field. Both are their own measured rung.
+
+#### U7-6f — DONE (2026-09-22). THE DELETION. The dense path is gone.
+
+Nine shaders, six of the fourteen bind group layouts, the `f_a`/`f_b`/`velBuf`
+buffers on all five AMR pages, the per-block level-1 allocator and its host
+mirrors, four URL flags, ~500 lines of root comparators, three opt-in tools,
+and the snapshot format's dense arrays. **Net −4,076 lines.**
+
+```
+  shaders/           amr_step.wgsl  amr_criterion.wgsl  amr_manage.wgsl
+                     amr_force.wgsl  amr_interp_dense_parent.wgsl
+                     amr_average_f2c.wgsl  common_interp_parent_dense.wgsl
+                     common_avg_parent_dense.wgsl  amr_mirror_root.wgsl
+  layouts            stepBGL  frcBGL  interpBGL  avgBGL  criterionBGL
+                     manageBGL            (14 -> 8)
+  flags              ?rootpool=  ?rootstep=  ?rootcouple=  ?rootmanage=
+                     ?densel0=  ?rootIsPool=
+  tools              validate-root-mirror.js  validate-root-kernels.js
+                     probe-dense-l0-inert.js
+```
+
+It is small relative to what it removes because U7-0..U7-3 made each thing
+named ONCE -- fourteen bind group layouts in one function, twelve coupling
+pipelines in one function, the scheduler and the refine round in one function
+each. A deletion spread over five copies is five chances to leave one behind,
+and that is what those rungs bought.
+
+##### What the pages look like now
+
+`makeRefineRound`'s three special cases are gone: it was
+`passes.denseCriterion(enc)` in front of a `m = firstParentLevel` loop and a
+`m === 1 && useDenseManage` branch inside coarsen and refine. Every stage is
+now one loop from `m = 0`. `makeScheduler` is untouched -- `l0Step` and
+`l1AverageIntoL0` keep their names and lose their dense halves, which is
+exactly the order-vs-content seam U7-3 built.
+
+**EVERY LEVEL ALLOCATES IN QUADS, and `allocLevelPool`'s `quadAlloc` parameter
+is gone with the choice.** Level 1 allocated per BLOCK for as long as its
+parent was the dense grid -- L0 was not itself decomposed into quads, so there
+was no quad on that boundary. That parameter defaulted to `m !== 1`, and
+DROPPING THE CALL SITE'S EXPLICIT `{ quadAlloc: ROOT_MANAGED }` WITHOUT
+CHANGING THE DEFAULT SILENTLY PUT LEVEL 1 BACK ON THE PER-BLOCK ALLOCATOR.
+Caught by the boot smoke in one run -- `createBindGroup` failed on
+`childPool.parentSlotBuf`, which a per-block pool does not have -- on all five
+AMR pages at once, which is the shape CLAUDE.md records for the binding-mirror
+trap and the reason that config list exists.
+
+##### The snapshot format is version 7, and an older capture is REFUSED
+
+7 drops `fB64`, `velB64` and the `layout: 'block8'` tag that described them.
+Level 0 is `root`, which the format has carried since U7-6c.
+
+**A pre-7 capture does not load, and that is deliberate.** Those carry level 0
+as a dense block8 grid this build has no buffer for; loading one would restore
+every pool level and leave level 0 holding whatever the page had -- a state bug
+that presents as a physics one. The same convention that refused a
+pre-Milestone-1 flat-row-major capture rather than reading it as block8.
+
+`validate-snapshot-roundtrip.js` goes from four configurations to two (there is
+no second allocator to pair rows on) and its `refuse` control gains a second
+shape: a per-block level 1 AND a formatVersion 6 must each throw. One refusal
+control over one incompatibility would have gone vacuous the moment the
+per-block allocator stopped existing.
+
+##### Three consumers were NOT inert, and the `?densel0=` probe could not see them
+
+U7-6d concluded "the dense L0 is provably inert" from a `?densel0=0` vs `=1`
+equivalence probe over the SNAPSHOT. That was true of the snapshot and false of
+three host readbacks the probe never touched:
+
+```
+  main-tgv-amr.js      readField, debugConservedTotals   read velBuf / f_a
+  main-channel-amr.js  readProfile                       read velBuf
+```
+
+These are what the `tgv-*` and `channel-*` analytic configs measure -- the
+gates CLAUDE.md names as THE precision gate, over Cd/St. They were reading the
+dense grid the whole time, which was correct only because U5-3 kept the two
+representations byte-identical. All three now read the root pool through
+`rootCellIndex`, and `readConservedTotals` needed no change beyond its
+`cellIndex` callback -- which is what amr2d.mjs's own header said that callback
+was for (U4-4).
+
+**AND THE TGV PAGE NEEDED TWO CELL INDICES, NOT ONE.** `initF()`'s output is
+the IC as the SEEDER wants it -- dense block8, permuted into root tiles by
+`seedRootFromDenseF` -- while `cellIndexJS` is where a level-0 cell lives on
+the GPU afterwards. They were the same function while level 0 was a dense grid.
+Repointing the single name at `rootCellIndex` would have double-permuted the
+Taylor-Green initial condition, silently, into a field with no resemblance to
+the intended one. They are `icCellIndex` and `cellIndexJS` now, named apart.
+
+##### What was fixed in passing, because the deletion exposed it
+
+- **`?diag=1` did nothing on the TGV and channel pages.** Both declared the
+  flag and its only consumer was the DENSE manager's constants bundle; the
+  pool manager's `poolConstants` left `DIAG` implicit, with a comment saying
+  "this page has no ?diag= flag" -- it did. The counter is wired through now
+  rather than the const deleted, so the pool-starvation gate is not vacuous
+  there.
+- **`debugForceBreakdown`'s `l0` leg** ran a dense force pass. It reports a
+  structural zero now, with the measurement that licensed that (in
+  amr_force1.wgsl's header, moved there from the deleted file) named at the
+  call site.
+
+##### Records moved rather than deleted
+
+A deleted file takes its header with it, and three of those headers were the
+only statement of something measured:
+
+- `amr_force.wgsl`'s per-level force accumulator readings (levels=2/3 x
+  diffuse/bounce-back, 8192 steps, every coarser level EXACTLY zero) -- the
+  measurement that licensed B4-3's "only the finest level's force pass is
+  dispatched". Now in `amr_force1.wgsl`.
+- `amr_step1.wgsl`'s `SPONGE_CELL_SNAP` pointed at the dense step for the
+  convention it reproduces. That convention is now the ONLY thing the dense
+  step left behind -- level 0's sponge band sits up to half a cell from every
+  finer level's whenever the window offset is fractional -- so it is restated
+  in full, with the note that it no longer has a second implementation to be
+  consistent WITH, which is an argument for fixing it rather than against.
+- D0's `linkCoarsen`/`linkRefine` "KEPT ON EVIDENCE, NOT ON ARGUMENT" finding.
+  Those passes were the dense manager's and had not been dispatched on the
+  default path since U7-5. `amr_manage_pool.wgsl` has never had them, and D1-a
+  separately measured that `?detslots=1` does not pin the quad allocator -- so
+  "?detslots=1 is deterministic" is a claim about a manager that no longer
+  exists, and the note now says so rather than letting it transfer.
+
+##### Gate
+
+**The full `validate-all.js` sweep is the BASELINE, to the digit.** 26 of 28
+PASS; the two red cells are the two CLAUDE.md records as red on `main`, at
+exactly the numbers it records:
+
+      config              this run            CLAUDE.md baseline
+      dense-reference     1.951 / 0.1260      1.951 / 0.1260   (untouched page)
+      amr-N2-diffuse      1.652 / 0.1485      1.652 / 0.1484
+      amr-N2-bounceback   1.356 / 0.1642      1.356 / 0.1642
+      amr-N3-diffuse      1.473 / 0.1570      1.473 / 0.1570
+      amr-N3-bounceback   1.365 / 0.1645      1.365 / 0.1645
+
+CLAUDE.md puts AMR Cd's same-build reproducibility at ~±0.001 (N=2) to ~±0.002
+(N=3), so four AMR cells landing on their recorded value is at the floor of
+what the instrument can resolve. `tgv-amr-N2` and `tgv-amr-N3` still print the
+IDENTICAL number (maxL2rel 1.3208e-3), which is the tell for "zero active
+tiles" -- unchanged, as it should be.
+
+**`validate-divergence.js --mode=fullrefine`: the seeding error at step 0 is
+EXACTLY ZERO**, which that tool's header requires of `fullrefine` and which is
+the end-to-end proof of the whole chain at once: dense state ->
+`dense-to-amr` -> the ROOT pool, now the only level 0 -> `debugSnapshotLoad`
+under format 7 -> a reconstruction that matches the dense grid bit for bit.
+Injector, format, load refusals, root addressing and reconstructor, verified
+against the actual GPU rather than against each other.
+
+      AMRstep   relL2(ux)  relL2(uy)  relL2(rho)   meanErr
+            0     0.00e+0    0.00e+0     0.00e+0     0.00e+0
+          256     3.59e-3    5.92e-2     3.92e-5     6.78e-5
+
+*Also green:* `make check` (28 shaders, was 37; 11 test suites);
+`validate-reset-fixed-point` 5/5; `validate-snapshot-roundtrip` 8 of 8
+including the new formatVersion refusal; boot smoke on all seven pages;
+`amr-dev-invariants` all seven structural gates OK through 8192 steps.
+
+**`validate-divergence.js` gained `--baseUrl=` / `--port=`.** It hardcoded
+`https://localhost:4444` and debug port 9333, alone among the `validate-*`
+tools -- which on a machine with more than one worktree live means it runs
+against another checkout's server, the exact trap CLAUDE.md records two
+discarded sweeps for. Found by needing to run it here.
 
 #### D1-b — SKIPPED, deliberately, 2026-09-18. The decision the rung asked to be made explicitly.
 

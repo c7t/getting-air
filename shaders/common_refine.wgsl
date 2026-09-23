@@ -40,10 +40,11 @@
 // DEPENDS ON THE INCLUDER declaring the overrides `REFINE_THRESH`,
 // `N_REFINE_INC`, `N_REFINE_MAX` and `MAX_LEVEL`, the `state` binding, and
 // `override W`/`override H` -- the same arrangement common_geometry.wgsl uses.
-// Its two includers, amr_manage.wgsl and amr_manage_pool.wgsl, are the only
-// files that declare all of those, which is why the geometry predicates below
-// live here and not in a more general fragment (see common_criterion.wgsl's
-// header for what happens when a fragment's dependencies straddle includers).
+// Its includer, amr_manage_pool.wgsl, is the only file that declares all of
+// those, which is why the geometry predicates below live here and not in a
+// more general fragment (see common_criterion.wgsl's header for what happens
+// when a fragment's dependencies straddle includers). It had two until U7-6f
+// deleted the dense-parent manager.
 
 // Desired level for a block whose physical log2|omega| is epsPhys.
 // Returns 0 (no refinement) up to MAX_LEVEL (finest configured).
@@ -78,10 +79,10 @@ fn desiredLevelCoarsen(epsPhys: f32) -> i32 {
 // ─────────────────────────────────────────────────────────────────────────────
 // THE DECISION PREDICATES, ONE COPY (plans/2D-backport.md B3-7)
 //
-// amr_manage.wgsl and amr_manage_pool.wgsl each carried their own
-// isNearBody/inSpongeBand. They were the same tests, differing only in how the
-// candidate's centre and half-extent were derived -- which is the one thing
-// each manager genuinely knows for itself:
+// The dense-parent manager (deleted at U7-6f) and amr_manage_pool.wgsl each
+// carried their own isNearBody/inSpongeBand. They were the same tests,
+// differing only in how the candidate's centre and half-extent were derived --
+// which was the one thing each manager genuinely knew for itself:
 //
 //   dense   an L0 block is BLOCK cells of size 1 -> half-extent BLOCK/2
 //   pool    a level-m tile's interior is 2*RB cells of size 2^-m
@@ -144,7 +145,7 @@ fn nearBodyAt(centre: vec2<f32>, halfExtent: f32) -> bool {
 }
 
 // True if `centre` lies within SPONGE_EXCLUDE_W (L0 cells) of any window edge,
-// i.e. inside/near the ALBC sponge band (amr_step.wgsl's SPONGE_W). A fixed L0
+// i.e. inside/near the ALBC sponge band (amr_step1.wgsl's SPONGE_W). A fixed L0
 // strip, deliberately NOT scaled per level -- the sponge is a property of the
 // window, not of the level being decided. Gated off when SPONGE_EXCLUDE_W <= 0
 // (the JS default is 8; ?spongeExclude=0 disables it).

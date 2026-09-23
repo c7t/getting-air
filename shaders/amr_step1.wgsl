@@ -35,9 +35,11 @@
 // (card-params.mjs), written per level by the host and re-written when the TAU
 // slider moves.
 //
-// L0 stays a dense, ghost-free, cellIndex()-addressed grid with its own kernel
-// (amr_step.wgsl) -- that asymmetry is deliberate and stays
-// (plans/AMR-multilevel.md decision 1).
+// L0 IS A POOL LEVEL TOO SINCE U7-6f, served by THIS kernel with GHOST 0 and
+// NO_PARENT 1 -- see amr2d-gpu.mjs's makeRootPool. It was a dense,
+// ghost-free, cellIndex()-addressed grid with its own separate kernel through
+// plans/AMR-multilevel.md decision 1 and every rung up to U7-6e; the root tile
+// being RINGLESS is all that survives of that asymmetry.
 
 // @include "common_geometry.wgsl"
 // @include "common_lattice.wgsl"
@@ -161,32 +163,33 @@ override GHOST : u32 = 2u;
 //    grid it is supposed to reproduce.
 override NO_PARENT : u32 = 0u;
 
-// SPONGE_CELL_SNAP: take the window position the way amr_step.wgsl does.
+// SPONGE_CELL_SNAP: take the window position the way the DELETED dense L0
+// step did -- `bufferToWindowCell`, u32 modular arithmetic, which TRUNCATES
+// `off_x`/`off_y` to whole cells. Every other level uses `bufferToWindowPos`,
+// which keeps the sub-cell part.
 //
 // A REAL, PRE-EXISTING INCONSISTENCY, found by U3 and deliberately NOT fixed
-// here. The dense L0 step converts to window coordinates with
-// `bufferToWindowCell`, which is u32 modular arithmetic and therefore
-// TRUNCATES `off_x`/`off_y` to whole cells. Every pool level uses
-// `bufferToWindowPos`, which keeps the sub-cell part. So whenever the window
-// offset is fractional -- which on the falling-card page is essentially always
-// -- L0's sponge band sits up to half a cell away from where every finer
-// level's does.
+// since. Whenever the window offset is fractional -- which on the
+// falling-card page is essentially always -- level 0's sponge band sits up to
+// half a cell away from where every finer level's does.
 //
-// That is a physics difference, small and confined to the sponge band, and
-// unifying the two conventions would move published numbers. U3 is a
-// REPRESENTATION stage: its job is to show the root pool reproduces the dense
-// grid exactly, not to improve it. So the root takes L0's convention, the
-// inconsistency is recorded rather than silently absorbed, and fixing it is
-// its own change with its own gate.
+// IT IS NOW THE ONLY THING THE DENSE STEP LEFT BEHIND, and that makes it worth
+// restating rather than pointing at a file that no longer exists. U3 was a
+// REPRESENTATION stage: its job was to show the root pool reproduces the dense
+// grid exactly, not to improve it, so the root took L0's convention. U7-6f
+// deleted the grid that convention came from and kept the convention, because
+// unifying the two would move published numbers. Fixing it is still its own
+// change with its own gate -- and it no longer has a second implementation to
+// be consistent WITH, which is an argument for doing it rather than against.
 //
 // Folded at pipeline creation, so no non-root pipeline evaluates the u32
 // conversion below -- which matters, because a ring cell's buffer position can
 // be negative and this branch would be meaningless there.
 override SPONGE_CELL_SNAP : u32 = 0u;
 
-// Sponge relaxation target velocity -- mirrors amr_step.wgsl's SPONGE_UX/UY
-// exactly (same formula, see this file's sponge comment below for why the
-// fine level needs its own copy of the sponge at all).
+// Sponge relaxation target velocity -- the same formula lbm_step.wgsl uses on
+// the dense reference pages (see this file's sponge comment below for why a
+// refined level needs its own copy of the sponge at all).
 override SPONGE_UX : f32 = 0.0f;
 override SPONGE_UY : f32 = 0.0f;
 // Sponge ring width in cells -- see lbm_step.wgsl's identical override.
@@ -196,7 +199,7 @@ override SPONGE_W : f32 = 4.0f;
 // physical constant -- a fixed epsilon means refinement only ever improves
 // *sampling* of an unchanging diffuse-boundary width, never the boundary's
 // own sharpness. kEps=1.5 matches today's L0/L1 value exactly (dx_L0=1,
-// dx_L1=0.5; L0's is still a hardcoded literal in amr_step.wgsl, which is why
+// dx_L1=0.5; L0's was a hardcoded literal in the deleted dense step, which is why
 // ITS epsilon does not change).
 //
 // BOTH factors are now per-level runtime uniforms, and the second one had to
@@ -384,9 +387,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   }
   let wx = wpos.x; let wy = wpos.y;
   let p = vec2<f32>(bufX, bufY);
-  // Periodic minimum-image lever arm, matching amr_step.wgsl / amr_force.wgsl
-  // (the coarse step and force pass wrap rx/ry; the fine step previously did
-  // not, so a cell reached across a seam got the wrong rotational velocity).
+  // Periodic minimum-image lever arm, matching amr_force1.wgsl and
+  // lbm_step.wgsl (the force pass and the dense reference step wrap rx/ry; the
+  // fine step previously did not, so a cell reached across a seam got the
+  // wrong rotational velocity).
   var rx = p.x - state.cx;
   var ry = p.y - state.cy;
   rx -= f32(W) * round(rx / f32(W));
@@ -460,7 +464,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     ux_star += f[i] * f32(ex[i]);
     uy_star += f[i] * f32(ey[i]);
   }
-  // NaN-containment floor (see amr_step.wgsl): finite velocity even if rho<=0.
+  // NaN-containment floor (see lbm_step.wgsl): finite velocity even if rho<=0.
   let rhoDen = max(rho, 1e-6f);
   ux_star /= rhoDen; uy_star /= rhoDen;
 
@@ -481,13 +485,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   // sponge entirely on the (then-true) assumption that the fine region
   // never reaches the window edge -- valid when M2 hand-placed a single
   // static box, but false once refinement is criterion-driven and can
-  // trigger anywhere, including near the sponge band where the coarse step
-  // (amr_step.wgsl) DOES damp toward equilibrium. A refined block there
-  // with no sponge of its own diverges from its damped coarse neighbors,
-  // and the average pass then writes that undamped state back onto them --
-  // exactly the boundary artifact this was fixed in response to. Same
-  // formula as amr_step.wgsl's sponge, reusing the wx/wy already computed
-  // above for the card SDF.
+  // trigger anywhere, including near the sponge band where the COARSER level
+  // DOES damp toward equilibrium. A refined block there with no sponge of its
+  // own diverges from its damped coarse neighbours, and the average pass then
+  // writes that undamped state back onto them -- exactly the boundary artifact
+  // this was fixed in response to. One formula for every level since U7-6f
+  // (level 0 runs this kernel too), reusing the wx/wy already computed above
+  // for the card SDF.
   let dist_x = min(wx, f32(W) - 1.0f - wx);
   let dist_y = min(wy, f32(H) - 1.0f - wy);
   let sponge_weight = spongeWeight(dist_x, dist_y, SPONGE_W);

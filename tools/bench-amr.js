@@ -18,7 +18,7 @@
 //
 // A CAVEAT THAT REMAINS, and it is not small. Refinement allocation is
 // nondeterministic: blocks race on `atomicSub(&freeCount, 1)` in
-// amr_manage.wgsl, so which blocks win slots differs run to run even with
+// amr_manage_pool.wgsl, so which blocks win slots differs run to run even with
 // identical code and inputs. Two page loads therefore freeze at different
 // active-block counts (measured 148 vs 162 for the same config), and that
 // is a real workload difference, not measurement error. So:

@@ -442,6 +442,28 @@ function main() {
     assert.strictEqual(out.root, undefined, 'invented a root the template did not have');
   });
 
+  test('a VERSION-7 template -- root only, no dense L0 -- injects the root and invents no dense pair', () => {
+    // U7-6f: a live capture has no fB64/velB64 at all. The injector must fill
+    // the root and NOT synthesise a dense pair the format no longer has --
+    // debugSnapshotLoad refuses a capture carrying one.
+    const amr = buildAMRSnapshot({ withRoot: true });
+    delete amr.fB64;
+    delete amr.velB64;
+    const out = injectDenseIntoAMRSnapshot({ denseSnapshot: buildDenseSnapshot(), amrSnapshot: amr });
+    assert.strictEqual(out.fB64, undefined, 'invented a dense L0 the template did not have');
+    assert.strictEqual(out.velB64, undefined, 'invented a dense L0 velocity the template did not have');
+    assert.ok(typeof out.root.fB64 === 'string' && out.root.fB64.length > 0, 'the root was not written');
+    assert.notStrictEqual(out.root.fB64, amr.root.fB64, 'the root was passed through, not injected');
+  });
+
+  test('a template with NEITHER level-0 representation is refused', () => {
+    const amr = buildAMRSnapshot({ withRoot: false });
+    delete amr.fB64;
+    delete amr.velB64;
+    assert.throws(() => injectDenseIntoAMRSnapshot({ denseSnapshot: buildDenseSnapshot(), amrSnapshot: amr }),
+      /nowhere to write level 0/);
+  });
+
   test('a root whose geometry disagrees with the domain is refused', () => {
     const amr = buildAMRSnapshot({ withRoot: true });
     amr.root.cellsPerSlot = 400; // a RINGED tile -- wrong for the root

@@ -67,7 +67,7 @@
 // magnitude is tiny (~0.02, vs ux's ~0.04) almost everywhere except right at
 // that shear layer, so relL2 (which normalizes by the reference field's own
 // norm) is a harsh metric here: a handful of cells where two INDEPENDENTLY-
-// implemented WGSL kernels (lbm_step.wgsl vs amr_step.wgsl/amr_step1.wgsl)
+// implemented WGSL kernels (lbm_step.wgsl vs amr_step1.wgsl)
 // disagree by a small absolute amount, right where gradients are sharpest,
 // can dominate the norm of an otherwise-tiny field. Cd/ux/rho are the
 // reliable corroborating signals for steady, near-symmetric cases (Re=20,

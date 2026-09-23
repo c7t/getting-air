@@ -3,7 +3,7 @@
 // Milestone 7 (plans/AMR-multilevel.md).
 //
 // The kernel itself is shaders/common_average.wgsl, shared with
-// amr_average_f2c.wgsl since plans/2D-backport.md B3-2; the pool parent's tau
+// the deleted dense-parent entry file since plans/2D-backport.md B3-2; the pool parent's tau
 // and destination addressing are shaders/common_avg_parent_pool.wgsl. What is
 // left here is the binding layout (which must match avgPoolBGL in the pages
 // one-to-one).

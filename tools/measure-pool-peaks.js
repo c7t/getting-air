@@ -26,24 +26,24 @@
 //
 // ── READ THE TWO PAGES DIFFERENTLY, AND THIS IS THE IMPORTANT PART ──────────
 //
-// index-amr.html is a FALLING CARD and it is chaotic. Two runs that differ in
-// refinement are at different points in the tumble long before 40k steps, so
-// its rootpool=0 and rootpool=1 columns are NOT a controlled comparison of
-// allocator granularity -- they are two different trajectories, each of which
-// legitimately demands what it demands. That is the same trap
-// measure-refinement.js warns about for visual A/B, one level down.
+// ONE ALLOCATOR SINCE U7-6f, so one leg. This ran a `rootpool=0` and a
+// `rootpool=1` column; `--rootpool=` is still accepted and now ignored.
 //
-//   index-amr.html         the numbers that SIZE THE SHIPPED POOLS. Read the
-//                          absolute peaks; do not read the ratio.
-//   index-cylinder-amr.html  statistically steady, pinned body. Read the RATIO
-//                          here -- this is the page that can say what quad
-//                          allocation costs, because the flow is the same one
-//                          either way.
+// THE WARNING THAT COLUMN CARRIED IS WORTH KEEPING. index-amr.html is a
+// FALLING CARD and it is chaotic: two runs that differ in refinement are at
+// different points in the tumble long before 40k steps, so its two columns
+// were NOT a controlled comparison of allocator granularity -- they were two
+// different trajectories, each legitimately demanding what it demanded. Same
+// trap measure-refinement.js warns about for visual A/B, one level down. Any
+// future two-configuration comparison here needs index-cylinder-amr.html,
+// which is statistically steady with a pinned body.
+//
+//   index-amr.html         the numbers that SIZE THE SHIPPED POOLS.
+//   index-cylinder-amr.html  statistically steady, pinned body.
 //
 //     node tools/measure-pool-peaks.js
 //     node tools/measure-pool-peaks.js --steps=40000 --levels=3,4,5
 //     node tools/measure-pool-peaks.js --page=index-cylinder-amr.html --levels=3,4
-//     node tools/measure-pool-peaks.js --rootpool=1 --levels=3
 //
 // VERIFY WHICH TREE THE DEV SERVER IS SERVING first -- `ensureServer` reuses
 // whatever already answers on the port, and this repo has twice discarded a
@@ -89,7 +89,7 @@ function parseArgs(argv) {
     o.global = AMR_PAGES.includes(o.page) ? 'window.__AMR' : 'window.__CYL';
   }
   // Quad allocation refuses a cap that is not a multiple of 4 (allocLevelPool),
-  // and under ?rootpool=1 that now includes LEVEL 1.
+  // and since U7-6f that is EVERY level including level 1.
   if (o.cap % 4 !== 0) { console.error('--cap must be a multiple of 4 (quad allocation)'); process.exit(2); }
   return o;
 }
@@ -111,7 +111,6 @@ function capParams(nLevels, cap) {
 
 async function measureOne(Runtime, Page, o, nLevels, rootpool) {
   const q = [`levels=${nLevels}`, capParams(nLevels, o.cap)];
-  if (rootpool !== null) q.push(`rootpool=${rootpool}`);
   if (o.extra) q.push(o.extra.replace(/^&/, ''));
   const url = `${o.baseUrl}/${o.page}?${q.join('&')}`;
   const G = o.global;
@@ -128,10 +127,9 @@ async function measureOne(Runtime, Page, o, nLevels, rootpool) {
   if (caps.some(c => c !== o.cap)) {
     throw new Error(`cap not applied: levels report MAX_FINE_BLOCKS ${caps.join(',')} against --cap=${o.cap}`);
   }
-  if (rootpool !== null) {
-    const rp = await ev(Runtime, `${G}.getRootPool() ? 1 : 0`);
-    if (String(rp) !== String(rootpool)) throw new Error(`asked for rootpool=${rootpool}, page reports ${rp}`);
-  }
+  void rootpool;
+  const rp = await ev(Runtime, `${G}.getRootPool() ? 1 : 0`);
+  if (!rp) throw new Error('page reports no root pool -- level 0 has no pool to size');
 
   await ev(Runtime, `${G}.reset()`, 120000);
   const peaks = new Array(nLevels).fill(0);
@@ -160,7 +158,11 @@ async function measureOne(Runtime, Page, o, nLevels, rootpool) {
 
 async function main() {
   const o = parseArgs(process.argv.slice(2));
-  const legs = o.rootpool !== null ? [o.rootpool] : ['0', '1'];
+  // ONE LEG SINCE U7-6f. `?rootpool=` is gone with the dense path, so there is
+  // no second allocator to compare against; `--rootpool=` is accepted and
+  // ignored rather than removed, so an old invocation reports rather than
+  // exiting 2 on an unknown argument.
+  const legs = [null];
 
   const server = await ensureServer(o.baseUrl, REPO_ROOT);
   const chrome = await ensureChrome(o.port);
@@ -175,7 +177,6 @@ async function main() {
   try {
     console.log(`  ${o.page}, ${o.steps} steps, cap ${o.cap} on every level, sampled every ${o.sample}\n`);
     for (const rp of legs) {
-      console.log(`[rootpool=${rp}]`);
       for (const n of o.levels) {
         const r = await measureOne(Runtime, Page, o, n, rp);
         rows.push({ rootpool: rp, nLevels: n, ...r });
@@ -194,7 +195,7 @@ async function main() {
   // that depth (finest vs parent), because it steps up when a level acquires a
   // child -- 2:1 closure forcing a parent tile for everything refined below.
   for (const rp of legs) {
-    const mine = rows.filter(r => r.rootpool === rp);
+    const mine = rows;
     if (!mine.length) continue;
     const finest = {}, parent = {};
     for (const r of mine) {
@@ -204,14 +205,14 @@ async function main() {
         bag[m] = Math.max(bag[m] || 0, r.peaks[m]);
       }
     }
-    console.log(`POOL_PEAKS for rootpool=${rp} (max over the level counts measured):`);
+    void rp;
+    console.log('POOL_PEAKS (max over the level counts measured):');
     console.log(`  finest: { ${Object.keys(finest).sort().map(k => `${k}: ${finest[k]}`).join(', ')} },`);
     console.log(`  parent: { ${Object.keys(parent).sort().map(k => `${k}: ${parent[k]}`).join(', ')} },`);
   }
 
-  console.log('\nRead the ABSOLUTE peaks on index-amr.html (they size the shipped pools) and');
-  console.log('the RATIO on index-cylinder-amr.html (steady flow, so the two legs are the');
-  console.log('same problem). The card is chaotic -- its two legs are different trajectories.');
+  console.log('\nRead the ABSOLUTE peaks on index-amr.html -- they size the shipped pools.');
+  console.log('The two-allocator RATIO this used to report went with ?rootpool= at U7-6f.');
   if (rows.some(r => r.refused)) {
     console.log('\nAt least one level HIT THE CAP: that row reports a clip, not a demand.');
     console.log('Re-run it with a larger --cap= before using any number from it.');

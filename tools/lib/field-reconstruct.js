@@ -13,7 +13,7 @@
 // byte-for-byte identical logic to what tools/amr-diff.js had inline before
 // this file existed (see git history) -- no behavior change there.
 
-const BLOCK = 8; // matches shaders/amr_step.wgsl's block8 cellIndex
+const BLOCK = 8; // block8 -- amr2d.mjs's denseCellIndex owns the rule
 
 function b64ToFloat32(b64, floatCount) {
   const binary = Buffer.from(b64, 'base64');

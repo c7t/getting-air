@@ -9,7 +9,7 @@
 // a window source and then mapped it straight back to a buffer source --
 // composing a shift with its own inverse, once per direction per cell.
 //
-// This is the shape shaders/amr_step.wgsl has always had, and the shape 3D
+// This is the shape the AMR step kernels have always had, and the shape 3D
 // settled on. The dense path was the last window-dispatch kernel in the tree.
 //
 // PROVABLY INERT, not merely believed so: the two readings visit the same

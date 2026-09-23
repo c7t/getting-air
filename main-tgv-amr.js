@@ -59,10 +59,10 @@
 // to avoid.
 
 import { reportFatal, refuseConfig, reportNoWebGPU, reportNoAdapter } from './error-overlay.mjs';
-import { tauChainSingularity, tauSingularityMessage } from './amr2d.mjs';
+import { tauChainSingularity, tauSingularityMessage, rootCellIndex, rootPoolSpec, denseCellIndex } from './amr2d.mjs';
 import { loadShader } from './shader-loader.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
-import { check21BalanceOnGPU, readConservedTotals, allocLevelPool, writePoolInitialState, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState , checkRefinementClosureOnGPU , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU, makeRenderBindGroup, renderRootIsPool, renderPoolLevels, MAX_RENDER_POOL_LEVELS, makeAMRLayouts, makeCouplingPipelines, makeLevelBindGroups, makeManageBindGroups, makeScheduler, makeRefineRound, readRootFlags, allocRootPool, makeRootPool, seedRootFromDenseF } from './amr2d-gpu.mjs';
+import { check21BalanceOnGPU, readConservedTotals, allocLevelPool, writePoolInitialState, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState , checkRefinementClosureOnGPU , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU, makeRenderBindGroup, renderPoolLevels, MAX_RENDER_POOL_LEVELS, makeAMRLayouts, makeCouplingPipelines, makeLevelBindGroups, makeManageBindGroups, makeScheduler, makeRefineRound, allocRootPool, makeRootPool, seedRootFromDenseF } from './amr2d-gpu.mjs';
 // tauAtLevel: extracted to card-params.mjs by B3a-1, which landed the CALL
 // in all five AMR pages and this IMPORT in only main-amr.js. The other four
 // threw `ReferenceError: tauAtLevelOf is not defined` at init -- but only at
@@ -102,59 +102,9 @@ const F16 = urlParams.has('f16') ? (parseInt(urlParams.get('f16')) || 0) : 0;
 // the refusal names.
 const DC_PRE = urlParams.has('dcpre') ? (parseInt(urlParams.get('dcpre')) || 0) : 0;
 
-// ?rootpool=1 -- L0 becomes a pool level like every other (U7-4b). The flag,
-// its default and the sixty-five lines of design record behind it live in
-// amr2d-gpu.mjs's readRootFlags.
-//
-// `staging: false`: `?rootstep=`, `?rootcouple=` and `?rootmanage=` are
-// main-amr.js's A/B knobs for U5-2/U5-3/U5-4 and U7-5 collapses all three.
-// Giving a shipped page a knob already scheduled for deletion is work in both
-// directions, so here the root pool is all-or-nothing.
-const rootFlags = readRootFlags(urlParams, { staging: false });
-const ROOT_POOL = rootFlags.pool;
-const ROOT_MANAGED = rootFlags.managed;
-
-// ?densel0=0 -- STOP COMPUTING THE DENSE L0 AT ALL (plans/uniform-levels.md
-// U7-6d). Default 1, which is byte-identical to not having the flag.
-//
-// U5-3 kept the dense L0 grid stepping in parallel with the root pool so the
-// two representations stayed byte-identical and every remaining dense consumer
-// was untouched. U7-6b and U7-6c ported the last two consumers that mattered
-// -- the renderer and the snapshot -- so under `?rootpool=1` the dense grid is
-// now a field NOTHING READS FOR PHYSICS:
-//
-//   the renderer        reads the root pool (U7-6b's ROOT_IS_POOL)
-//   the snapshot        carries the root pool (U7-6c)
-//   level 1's ghosts    interpolate from the root (U5-3's coupleL1)
-//   level 1's criterion is criterionPoolPLs[0], on the root
-//   `denseCriterion`    still runs, and is REDIRECTED into rootGpu.denseCritBuf
-//                       -- a scratch buffer that exists only so the shared
-//                       refine round has somewhere harmless to land. Nothing
-//                       reads it.
-//   `frcPL`             only dispatches when N_LEVELS === 1, which every AMR
-//                       page refuses at init.
-//
-// What still reads it: `debugSnapshotSave` (which also carries the root now),
-// and the dev page's root COMPARATORS, whose whole job is to score the two
-// representations against each other. Those need the dense grid stepping, so
-// this flag turns them into a comparison against a frozen grid -- which is
-// U3's `?rootstep=0` control inverted, and is why they are excluded below
-// rather than left to fail confusingly.
-//
-// It goes away at U7-6f, when the dense path is deleted and there is no
-// `?densel0=1` to return to.
-const DENSE_L0 = urlParams.has('densel0') ? (parseInt(urlParams.get('densel0')) ? 1 : 0) : 1;
 
 
-// ?rootIsPool=0|1 -- draw level 0 from the DENSE grid or the ROOT POOL
-// (plans/uniform-levels.md U7-6b). Default: the root pool when one exists.
-// Both representations hold the same field while `?rootpool=1` keeps the dense
-// grid stepped, so this is a ONE-BUILD A/B of the two addressings: the picture
-// must be IDENTICAL either way, and `tools/validate-all.js
-// --configs=render-levels-* --extra=rootIsPool=0` is what checks it.
-const RENDER_ROOT_IS_POOL = urlParams.has('rootIsPool')
-  ? (parseInt(urlParams.get('rootIsPool')) ? 1 : 0)
-  : null;
+
 
 
 // ── ?ghostcopy=1 -- legacy materialized same-level ghost cells ───────────────
@@ -324,19 +274,25 @@ function feq(rho, ux, uy, i) {
 }
 
 // Exact analytic field at t=0 -- see main-tgv.js's identical derivation.
-// Indexed block-major (cellIndexJS), NOT flat row-major -- amr_step.wgsl's
-// f_a/f_b buffers are laid out that way (see cellIndexJS's own comment),
-// unlike main-tgv.js's dense lbm_step.wgsl, which really is flat row-major.
+//
+// INDEXED WITH `icCellIndex`, NOT `cellIndexJS`, AND THE TWO ARE DIFFERENT
+// LAYOUTS SINCE U7-6f. `initF()`'s output is the IC as the SEEDER wants it --
+// dense block8 -- and `seedRootFromDenseF` permutes it into root tiles;
+// `cellIndexJS` is where a level-0 cell lives ON THE GPU afterwards, which is
+// the root pool's tile-major index. They were the same function while level 0
+// was a dense grid.
+//
 // Seeding at the wrong layout doesn't error (both are just NCELLS-length
-// arrays) -- it silently scrambles which physical (x,y) each cell's
-// analytic value lands on, corrupting the initial condition into
-// something with no resemblance to the intended field.
+// arrays) -- it silently scrambles which physical (x,y) each cell's analytic
+// value lands on, corrupting the initial condition into something with no
+// resemblance to the intended field. That is the whole reason they are named
+// apart rather than one being the default.
 function analyticFieldAtZero() {
   const CS2 = 1 / 3;
   const ux = new Float64Array(NCELLS), uy = new Float64Array(NCELLS), rho = new Float64Array(NCELLS);
   for (let y = 0; y < H; y++) {
     for (let x = 0; x < W; x++) {
-      const c = cellIndexJS(x, y);
+      const c = icCellIndex(x, y);
       const cx = Math.cos(KX * x), sx = Math.sin(KX * x);
       const cy = Math.cos(KY * y), sy = Math.sin(KY * y);
       ux[c] = -U0 * cx * sy;
@@ -391,15 +347,22 @@ function handleErr(e) {
 // card-params.mjs owns this rule and tools/test-card-params.js tests it.
 // Five pages inlined the same loop -- see plans/2D-backport.md B3a.
 const tauAtLevel = (m) => tauAtLevelOf(TAU, m);
-// Block-major linear index for a cell at BUFFER coordinates (cx, cy) --
-// matches shaders/amr_step.wgsl's cellIndex() exactly.
-function cellIndexJS(cx, cy) {
-  const nbx = W / BLOCK;
-  const bx = Math.floor(cx / BLOCK), by = Math.floor(cy / BLOCK);
-  const lx = cx % BLOCK, ly = cy % BLOCK;
-  const blockID = by * nbx + bx;
-  return blockID * (BLOCK * BLOCK) + ly * BLOCK + lx;
-}
+// THE INITIAL CONDITION'S OWN LAYOUT: dense block8, which is what
+// `seedRootFromDenseF` consumes and permutes into root tiles. amr2d.mjs owns
+// the rule (`denseCellIndex`) and tools/lib/field-reconstruct.js's `rawIndex`
+// is the decoder scored against it -- restating the four lines here is how U2
+// got two agreeing routes over a wrong mapping.
+const icCellIndex = (cx, cy) => denseCellIndex({ dims: { W, H } }, cx, cy);
+
+// WHERE A LEVEL-0 CELL LIVES, for the host readbacks below.
+//
+// It was `shaders/amr_step.wgsl`'s block8 `cellIndex()` until U7-6f, because
+// level 0 was a dense grid in that layout. Level 0 is the ROOT POOL now --
+// 2*RB-square tiles, row-major within a tile, ringless -- so the mapping is
+// amr2d.mjs's `rootCellIndex`, which is the same function the shader and the
+// snapshot decoder use. THE ROOT'S INDIRECTION IS THE IDENTITY, which is what
+// lets this be a pure function of (x, y) with no blockSlot lookup.
+const cellIndexJS = (cx, cy) => rootCellIndex({ dims: { W, H }, rb: RB }, cx, cy);
 
 async function init() {
   if (!navigator.gpu) { reportNoWebGPU(statusEl); return; }
@@ -439,17 +402,6 @@ async function init() {
   resize();
 
   const U = GPUBufferUsage;
-  const fSize   = NCELLS * 9 * 4;
-  const f_a     = device.createBuffer({ size: fSize, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
-  const f_b     = device.createBuffer({ size: fSize, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
-  // COPY_DST: debugSnapshotLoad restores this with queue.writeBuffer.
-  // Without the flag that write is a validation error and is silently
-  // dropped, so a loaded snapshot keeps whatever ux/uy were already there.
-  // The load path's own comment already describes this exact symptom
-  // ("rho round-tripped exactly, but ux/uy didn't -- the asymmetry was the
-  // tell") -- the writeBuffer call was added then, but the usage flag was
-  // not, so the fix never actually took effect.
-  const velBuf  = device.createBuffer({ size: NCELLS * 2 * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
   // ?diag=1 counters -- 8 u32 slots, read+zeroed via debugReadDiag().
   const diagBuf = device.createBuffer({ size: 8 * 4, usage: U.STORAGE | U.COPY_SRC | U.COPY_DST });
   const diagReadBuf = device.createBuffer({ size: 8 * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
@@ -469,16 +421,16 @@ async function init() {
   const cardStateBuf = device.createBuffer({ size: 104, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
 
   const pools = [undefined]; // pools[0] unused unless ?rootpool=1 makes L0 a level
-  if (ROOT_POOL) pools[0] = allocRootPool(device, U, { W, H, RB });
+  pools[0] = allocRootPool(device, U, { W, H, RB });
   {
     let curNBX = NBX, curNBY = NBY;
     for (let m = 1; m < N_LEVELS; m++) {
       const maxFineBlocks = m === 1
         ? MAX_FINE_BLOCKS
         : (urlParams.has(`maxFineBlocks${m}`) ? parseInt(urlParams.get(`maxFineBlocks${m}`)) : 128);
-      // Level 1 allocates in QUADS once the root is its parent (U5-4).
-      const pool = allocLevelPool(device, U, m, curNBX, curNBY, maxFineBlocks, NCELLS1,
-        m === 1 ? { quadAlloc: ROOT_MANAGED } : {});
+      // EVERY level allocates in QUADS, level 1 included since the root
+      // became its parent (U5-4) and unconditionally since U7-6f.
+      const pool = allocLevelPool(device, U, m, curNBX, curNBY, maxFineBlocks, NCELLS1);
       writeF(pool.finePoolF_a, initFPool(maxFineBlocks), maxFineBlocks * NCELLS1);
       pools.push(pool);
       curNBX *= 2; curNBY *= 2;
@@ -487,31 +439,20 @@ async function init() {
 
   device.queue.writeBuffer(cardStateBuf, 0, initCardState());
   // THE ROOT'S INITIAL FIELD, FROM THIS PAGE'S OWN IC (U7-6f). `initF()` is
-  // built in dense block8 order; the seeder permutes it into root tiles on the
-  // host -- see seedRootFromDenseF, which is the one statement of it, shared
-  // with the other four AMR pages. Called at init, at reset and at a rootless
-  // snapshot load, never per frame.
+  // built in dense block8 order -- the layout the IC has always been written
+  // in, and the one the reference pages' own grids still use -- and the seeder
+  // permutes it into root tiles on the host. See seedRootFromDenseF, which is
+  // the one statement of it, shared with the other four AMR pages. Called at
+  // init, at reset and at a pre-version-7 snapshot load, never per frame.
   const seedRootFrom = (fDense) => seedRootFromDenseF(device, pools, fDense, { W, H, RB, writeF });
-  {
-    const f0 = initF();
-    writeF(f_a, f0, NCELLS);
-    // resetSim() is NOT called at page load, so this is a separate seed call
-    // site and not a duplicate of the one in resetSim().
-    seedRootFrom(f0);
-  }
-  // Level 1's eager free-list seed, for the PER-BLOCK allocator only. Under
-  // quad allocation allocLevelPool has already written the quad-indexed pair
-  // (and would be overwritten by a block-indexed one here), which is why this
-  // is conditional rather than unconditional-and-harmless.
-  if (!ROOT_MANAGED) {
-    device.queue.writeBuffer(pools[1].freeListBuf, 0, new Int32Array(MAX_FINE_BLOCKS).map((_, i) => i));
-    device.queue.writeBuffer(pools[1].freeCountBuf, 0, new Int32Array([MAX_FINE_BLOCKS]));
-  }
+  // resetSim() is NOT called at page load, so this is a separate seed call
+  // site and not a duplicate of the one in resetSim().
+  seedRootFrom(initF());
 
   // The ROOT gets one too. `parentTau` is deliberately left at 0: the root's
   // pipeline sets OWN_TAU, so that field is never read, and writing a
   // plausible value there would create a second source of truth.
-  for (let c = (ROOT_POOL ? 0 : 1); c < N_LEVELS; c++) {
+  for (let c = 0; c < N_LEVELS; c++) {
     const pool = pools[c];
     if (!pool) continue;
     pool.levelParamsBuf = device.createBuffer({ size: 32, usage: U.UNIFORM | U.COPY_DST });
@@ -544,44 +485,36 @@ async function init() {
   const overlaySlider = document.getElementById('slider-overlay');
   const overlayValEl = document.getElementById('val-overlay');
 
-  const [stepSM, renSM, interpDenseSM, interpPoolSM, step1SM, avgSM, avgPoolSM, criterionSM, manageSM, criterionPoolSM, managePoolSM, mirrorRootSM] = await Promise.all([
-    loadShader(device, 'shaders/amr_step.wgsl'),
+  const [renSM, interpPoolSM, step1SM, avgPoolSM, criterionPoolSM, managePoolSM] = await Promise.all([
     loadShader(device, 'shaders/amr_render.wgsl'),
-    loadShader(device, 'shaders/amr_interp_dense_parent.wgsl'),
     loadShader(device, 'shaders/amr_interp_pool_parent.wgsl'),
     loadShader(device, 'shaders/amr_step1.wgsl'),
-    loadShader(device, 'shaders/amr_average_f2c.wgsl'),
     loadShader(device, 'shaders/amr_average_pool_parent.wgsl'),
-    loadShader(device, 'shaders/amr_criterion.wgsl'),
-    loadShader(device, 'shaders/amr_manage.wgsl'),
     loadShader(device, 'shaders/amr_criterion_pool.wgsl'),
     loadShader(device, 'shaders/amr_manage_pool.wgsl'),
-    // U7-4b: dense L0 -> root pool. Loaded unconditionally (a module nothing
-    // instantiates costs nothing) so the WGSL compiles on every page load
-    // rather than only under ?rootpool=1, where a syntax error would hide
-    // until someone set it.
-    loadShader(device, 'shaders/amr_mirror_root.wgsl'),
   ]);
 
-  // The six modules the shared coupling pipelines need, as one object; plus
-  // the two makeRootPool wants on top of them.
-  const modules = { interpDenseSM, interpPoolSM, avgSM, avgPoolSM, criterionSM, manageSM };
-  const rootModules = { ...modules, step1SM, mirrorRootSM };
+  // The two modules the shared coupling pipelines need, as one object; plus
+  // the fine step, which makeRootPool wants on top of them. It was six until
+  // U7-6f deleted the dense-parent interp/average and the dense
+  // criterion/manager.
+  const modules = { interpPoolSM, avgPoolSM };
+  const rootModules = { ...modules, step1SM };
 
-  // U7-0: the fourteen bind group layouts, from ONE place. They were spelled
-  // out inline here and in four other pages, byte-identical in all of them --
-  // see makeAMRLayouts for why that mattered more than the line count.
+  // U7-0: the EIGHT bind group layouts, from ONE place. They were spelled out
+  // inline here and in four other pages, byte-identical in all of them -- see
+  // makeAMRLayouts for why that mattered more than the line count, and for the
+  // six that went with the dense path at U7-6f.
   //
   // Only what this page uses: it has no body, so no force or physics pass and
-  // no frcBGL/phyBGL/force1BGL. makeAMRLayouts builds all fourteen regardless
-  // -- a layout nobody binds costs nothing, and selecting a subset there would
+  // no phyBGL/force1BGL. makeAMRLayouts builds all eight regardless -- a
+  // layout nobody binds costs nothing, and selecting a subset there would
   // reintroduce the per-page variation this removes -- but naming only the
   // consumed ones here keeps "what this page needs" readable.
   const layouts = makeAMRLayouts(device);
   const {
-    stepBGL, renBGL, interpBGL, interpPoolParentBGL,
-    avgBGL, avgPoolBGL, criterionBGL, criterionPoolBGL, manageBGL,
-    managePoolBGL, step1BGL,
+    renBGL, interpPoolParentBGL, avgPoolBGL,
+    criterionPoolBGL, managePoolBGL, step1BGL,
   } = layouts;
 
   const constants = { W, H };
@@ -591,7 +524,6 @@ async function init() {
   const fineConstants = { W, H, RB };
 
   const step1Constants = { ...stepConstants, RB, DIRECT_GHOST: GHOST_COPY ? 0 : 1 };
-  const manageConstants = { DIAG, W, H, REFINE_THRESH, COARSEN_THRESH, FORCE_REFINE_MARGIN, FORCE_REFINE_LOOKAHEAD, HAS_BODY: 0  };
 
   // U7-1: the twelve coupling pipelines, from ONE place. Every page built
   // these identically; see makeCouplingPipelines for what stays per page and
@@ -600,17 +532,10 @@ async function init() {
   // SAME literal the real pipeline used rather than a second copy of it.
   const {
     constants: couplingConstants,
-    interpPL, interpInitPL, interpFFPL,
     interpPoolParentPL, interpPoolParentInitPL, interpPoolParentFFPL,
-    avgPL, avgPoolPL, criterionPL,
-    manageDecidePL, manageCoarsenPL, manageRefinePL,
-  } = makeCouplingPipelines(device, layouts, modules,
-      { W, H, RB, F16, DC_PRE, manage: manageConstants });
+    avgPoolPL,
+  } = makeCouplingPipelines(device, layouts, modules, { RB, F16, DC_PRE });
 
-  const stepPL = device.createComputePipeline({
-    layout: device.createPipelineLayout({ bindGroupLayouts: [stepBGL] }),
-    compute: { module: stepSM, entryPoint: 'main', constants: stepConstants }
-  });
   const step1PL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [step1BGL] }),
     compute: { module: step1SM, entryPoint: 'main', constants: { ...step1Constants, F16 } }
@@ -625,27 +550,22 @@ async function init() {
       // -- and never drawn. Three of the five AMR pages were in that state.
       // U7-6b: ROOT_IS_POOL must match what makeRenderBindGroup put on binding
       // 0 -- see renderRootIsPool, which is the single statement of that rule.
-      constants: { ...fineConstants, N_POOL_LEVELS: renderPoolLevels(N_LEVELS), ROOT_IS_POOL: renderRootIsPool(pools, RENDER_ROOT_IS_POOL) } },
+      constants: { ...fineConstants, N_POOL_LEVELS: renderPoolLevels(N_LEVELS) } },
     primitive: { topology: 'triangle-list' },
   });
   // plans/2D-backport.md B2: the 2:1 closure's own pipelines. Built but
   // NOT yet in dispatchMacroStep -- see debugCascadeRoundTrip.
   const cascadeSM = await loadShader(device, 'shaders/amr_cascade.wgsl');
   const cascade = makeCascadePipelines(device, cascadeSM, pools, N_LEVELS,
-    { quadCompleteFrom: ROOT_MANAGED ? 1 : 2 });
+    { quadCompleteFrom: 1 });
 
   // U7-4b: THE ROOT POOL'S SOLVER HALF, from amr2d-gpu.mjs -- the root step,
   // the criterion redirect, U5-3's live coupling and U2's mirror (a
   // comparator setup since U7-6f moved the seed to the host).
   // See makeRootPool for the solver/instrument split; the instrument and the
   // debugCheckRoot* comparators stay on index-amr.html.
-  const rootGpu = ROOT_POOL ? makeRootPool(device, U, layouts, rootModules, pools,
-    { W, H, RB, F16, DC_PRE, step1Constants, couplingConstants,
-      cardStateBuf, denseFBuf: f_a, flags: rootFlags }) : null;
-  // U7-6d: is the DENSE L0 still being computed? Only when there is no root
-  // pool to replace it, or when `?densel0=1` (the default) keeps both running
-  // so the root comparators have something to compare against.
-  const denseL0Live = () => !rootGpu || DENSE_L0 === 1;
+  const rootGpu = makeRootPool(device, U, layouts, rootModules, pools,
+    { W, H, RB, F16, DC_PRE, step1Constants, couplingConstants, cardStateBuf });
   // The root pool's initial field was seeded above, next to this page's own
   // initF() -- U7-6f moved it off the GPU mirror, which needed the dense
   // buffer to hold the IC. An unseeded root drives refinement off an unwritten
@@ -658,7 +578,7 @@ async function init() {
   const managePoolRefinePLs = {};
   // U5-4: `m` is the PARENT level, and it starts at the ROOT once the root is
   // a pool level. One manager, every level.
-  for (let m = (ROOT_MANAGED ? 0 : 1); m < N_LEVELS - 1; m++) {
+  for (let m = 0; m < N_LEVELS - 1; m++) {
     const parentPool = pools[m];
     const childParams = paramsForChildLevel(m + 1);
     const poolConstants = {
@@ -667,10 +587,13 @@ async function init() {
       PARENT_CELL_SIZE_L0: cellSizeL0AtLevel(m),
       ...childParams,
       HAS_BODY: 0,
-      // U5-4: DIAG defaults to 0 in the shader, which is this page's value --
-      // it has no ?diag= flag. Left implicit rather than passed, so the
-      // binding is bound and the counter stays off, which is what a page with
-      // no refusal watch wants.
+      // U5-4 left DIAG implicit here on the grounds that "this page has no
+      // ?diag= flag" -- it does, declared above, and its only consumer was
+      // the DENSE manager's constants bundle. U7-6f deleted that bundle, so
+      // the flag is passed through rather than the const deleted: `?diag=1`
+      // now enables the refusal counter here the way it does on the card and
+      // cylinder pages, and at DIAG=0 (the default) every counter stays 0.
+      DIAG,
     };
     criterionPoolPLs[m] = device.createComputePipeline({
       layout: device.createPipelineLayout({ bindGroupLayouts: [criterionPoolBGL] }),
@@ -695,8 +618,6 @@ async function init() {
     });
   }
 
-  const stepBG_ab = device.createBindGroup({ layout: stepBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_a } }, { binding: 2, resource: { buffer: f_b } }, { binding: 3, resource: { buffer: velBuf } }]});
-  const stepBG_ba = device.createBindGroup({ layout: stepBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_b } }, { binding: 2, resource: { buffer: f_a } }, { binding: 3, resource: { buffer: velBuf } }]});
   // Level 1's own fine-step bind groups, in the SAME layout every other level
   // uses -- the c>=2 loop below builds the identical pair. Level 1 differs
   // only in what its levelParams says (dxL 0.5, parentTau = L0's own tau);
@@ -721,18 +642,9 @@ async function init() {
   // built this inline and three of which never passed the level-2 override at
   // all -- see makeRenderBindGroup.
   const renBG = makeRenderBindGroup(device, renBGL, pools,
-    { velBuf, cardStateBuf, overlayOpacityBuf, outlineOpacityBuf,
-      rootIsPool: renderRootIsPool(pools, RENDER_ROOT_IS_POOL) });
-  const interpBG_readA = device.createBindGroup({ layout: interpBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_a } }, { binding: 2, resource: { buffer: pools[1].finePoolF_a } }, { binding: 3, resource: { buffer: pools[1].slotToBlockBuf } }, { binding: 4, resource: { buffer: pools[1].newlyActivatedBuf } }, { binding: 5, resource: { buffer: pools[1].blockSlotBuf } }]});
-  const interpBG_readB = device.createBindGroup({ layout: interpBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_b } }, { binding: 2, resource: { buffer: pools[1].finePoolF_a } }, { binding: 3, resource: { buffer: pools[1].slotToBlockBuf } }, { binding: 4, resource: { buffer: pools[1].newlyActivatedBuf } }, { binding: 5, resource: { buffer: pools[1].blockSlotBuf } }]});
-  const interpFFBG_b = device.createBindGroup({ layout: interpBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_a } }, { binding: 2, resource: { buffer: pools[1].finePoolF_b } }, { binding: 3, resource: { buffer: pools[1].slotToBlockBuf } }, { binding: 4, resource: { buffer: pools[1].newlyActivatedBuf } }, { binding: 5, resource: { buffer: pools[1].blockSlotBuf } }]});
-  const avgBG_targetA = device.createBindGroup({ layout: avgBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: pools[1].finePoolF_a } }, { binding: 2, resource: { buffer: f_a } }, { binding: 3, resource: { buffer: pools[1].slotToBlockBuf } }]});
-  const avgBG_targetB = device.createBindGroup({ layout: avgBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: pools[1].finePoolF_a } }, { binding: 2, resource: { buffer: f_b } }, { binding: 3, resource: { buffer: pools[1].slotToBlockBuf } }]});
-  const interpInitBG_readA = device.createBindGroup({ layout: interpBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_a } }, { binding: 2, resource: { buffer: pools[1].finePoolF_a } }, { binding: 3, resource: { buffer: pools[1].slotToBlockBuf } }, { binding: 4, resource: { buffer: pools[1].newlyActivatedBuf } }, { binding: 5, resource: { buffer: pools[1].blockSlotBuf } }]});
-  const interpInitBG_readB = device.createBindGroup({ layout: interpBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_b } }, { binding: 2, resource: { buffer: pools[1].finePoolF_a } }, { binding: 3, resource: { buffer: pools[1].slotToBlockBuf } }, { binding: 4, resource: { buffer: pools[1].newlyActivatedBuf } }, { binding: 5, resource: { buffer: pools[1].blockSlotBuf } }]});
+    { cardStateBuf, overlayOpacityBuf, outlineOpacityBuf });
 
-    // U5-3: which parent level 1 is coupled to, chosen ONCE. The dense-parent
-  // bundle goes in, whichever one is live comes back -- see makeRootPool's
+  // U5-3: level 1's coupling to the ROOT, named ONCE -- see makeRootPool's
   // `coupleL1` for why selecting it per dispatch site is the trap.
   const {
     interpPL:     l1InterpPL,
@@ -741,25 +653,15 @@ async function init() {
     interpBG:     l1InterpBG,
     interpInitBG: l1InterpInitBG,
     interpFFBG:   l1InterpFFBG,
-  } = (() => {
-    const denseParent = {
-      interpPL, interpInitPL, interpFFPL,
-      interpBG:     (b) => b ? interpBG_readB : interpBG_readA,
-      interpInitBG: (b) => b ? interpInitBG_readB : interpInitBG_readA,
-      interpFFBG:   interpFFBG_b,
-    };
-    return rootGpu ? rootGpu.coupleL1(denseParent) : denseParent;
-  })();
+  } = rootGpu.coupleL1();
 
-  const criterionBG = device.createBindGroup({ layout: criterionBGL, entries: [{ binding: 0, resource: { buffer: velBuf } }, { binding: 1, resource: { buffer: ROOT_MANAGED ? rootGpu.denseCritBuf : pools[1].blockCriterionBuf } }]});
-  const manageBG = device.createBindGroup({ layout: manageBGL, entries: [{ binding: 0, resource: { buffer: pools[1].blockCriterionBuf } }, { binding: 1, resource: { buffer: pools[1].blockSlotBuf } }, { binding: 2, resource: { buffer: pools[1].slotToBlockBuf } }, { binding: 3, resource: { buffer: pools[1].freeListBuf } }, { binding: 4, resource: { buffer: pools[1].freeCountBuf } }, { binding: 5, resource: { buffer: pools[1].newlyActivatedBuf } }, { binding: 6, resource: { buffer: cardStateBuf } }, { binding: 7, resource: { buffer: pools[1].candRankBuf } }, { binding: 9, resource: { buffer: diagBuf } }, { binding: 10, resource: { buffer: pools[1].wantBuf } }]});
 
   // U7-2: one criterion/manage bind-group pair per parent level, from ONE
   // place -- byte-identical across four pages before this, and differing on
   // the fifth only by where the loop starts. See makeManageBindGroups.
   const { criterionPoolBGs, managePoolBGs } = makeManageBindGroups(
     device, layouts, pools, N_LEVELS,
-    { cardStateBuf, diagBuf, firstParentLevel: ROOT_MANAGED ? 0 : 1 });
+    { cardStateBuf, diagBuf });
 
 
   // U7-2: every level >= 2's interp / step / average / force bind groups, from
@@ -771,9 +673,7 @@ async function init() {
   const error = await device.popErrorScope();
   if (error) { handleErr(error); return; }
 
-  const WGX = Math.ceil(W / 8), WGY = Math.ceil(H / 8);
   const WGX1 = Math.ceil(FB / 8), WGY1 = Math.ceil(FB / 8);
-  const WG_MANAGE = Math.ceil(NBLOCKS / 64);
   const STEPS_PER_FRAME = 64;
   let step = 0, lastT = performance.now();
   let useB = false;
@@ -796,29 +696,11 @@ async function init() {
       p.setBindGroup(0, l1InterpBG(useB));
       p.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); p.end();
     },
-    l0Step: (enc, useB) => {
-      // U7-6d: the dense half is skipped once the root pool is the authority.
-      if (denseL0Live()) {
-        const s = enc.beginComputePass();
-        s.setPipeline(stepPL);
-        s.setBindGroup(0, useB ? stepBG_ba : stepBG_ab);
-        s.dispatchWorkgroups(WGX, WGY); s.end();
-      }
-      // U3: the same step, on the root pool, in parallel.
-      if (rootGpu) rootGpu.encodeRootStep(enc, useB);
-    },
-    l1AverageIntoL0: (enc, useB) => {
-      // U7-6d: the dense restriction is skipped once the root is the authority.
-      if (denseL0Live()) {
-        const a = enc.beginComputePass();
-        a.setPipeline(avgPL);
-        a.setBindGroup(0, useB ? avgBG_targetA : avgBG_targetB);
-        a.dispatchWorkgroups(1, 1, MAX_FINE_BLOCKS); a.end();
-      }
-      // U5-3: the SAME restriction into the root pool. BOTH run -- that is
-      // what keeps the two L0 representations byte-identical.
-      if (rootGpu) rootGpu.encodeRootAverage(enc, useB);
-    },
+    // LEVEL 0's STEP. It ran alongside a dense L0 step from U3 until U7-6f;
+    // the root pool is the only L0 now. See makeRootPool's encodeRootStep.
+    l0Step: (enc, useB) => rootGpu.encodeRootStep(enc, useB),
+    // Level 1's restriction into level 0. See makeRootPool's encodeRootAverage.
+    l1AverageIntoL0: (enc, useB) => rootGpu.encodeRootAverage(enc, useB),
     interpIntoChild: (enc, level, readCur) => {
       const childPool = pools[level + 1];
       const bg = readCur === 'a' ? childPool.interpPoolParentBG_readA : childPool.interpPoolParentBG_readB;
@@ -861,15 +743,9 @@ async function init() {
     // three separate places it is subtle -- is amr2d-gpu.mjs's
     // makeRefineRound, byte-identical across four pages before this.
     const refinePasses = {
-      // U7-6d: under a root pool this writes rootGpu.denseCritBuf, which
-      // nothing reads -- criterionPoolPLs[0] is level 1's live criterion.
-      denseCriterion: (enc) => { if (!denseL0Live()) return; const p = enc.beginComputePass(); p.setPipeline(criterionPL); p.setBindGroup(0, criterionBG); p.dispatchWorkgroups(WGX, WGY); p.end(); },
       poolCriterion: (enc, m) => { const p = enc.beginComputePass(); p.setPipeline(criterionPoolPLs[m]); p.setBindGroup(0, criterionPoolBGs[m]); p.dispatchWorkgroups(2, 2, pools[m].MAX_FINE_BLOCKS); p.end(); },
-      denseDecide: (enc) => { const p = enc.beginComputePass(); p.setPipeline(manageDecidePL); p.setBindGroup(0, manageBG); p.dispatchWorkgroups(WG_MANAGE); p.end(); },
       poolDecide: (enc, m) => { const p = enc.beginComputePass(); p.setPipeline(managePoolDecidePLs[m]); p.setBindGroup(0, managePoolBGs[m]); p.dispatchWorkgroups(Math.ceil(pools[m].MAX_FINE_BLOCKS / 64)); p.end(); },
-      denseCoarsen: (enc) => { const p = enc.beginComputePass(); p.setPipeline(manageCoarsenPL); p.setBindGroup(0, manageBG); p.dispatchWorkgroups(WG_MANAGE); p.end(); },
       poolCoarsen: (enc, m) => { const p = enc.beginComputePass(); p.setPipeline(managePoolCoarsenPLs[m - 1]); p.setBindGroup(0, managePoolBGs[m - 1]); p.dispatchWorkgroups(Math.ceil(pools[m].MAX_FINE_BLOCKS / 64)); p.end(); },
-      denseRefine: (enc) => { const p = enc.beginComputePass(); p.setPipeline(manageRefinePL); p.setBindGroup(0, manageBG); p.dispatchWorkgroups(WG_MANAGE); p.end(); },
       poolRefine: (enc, m) => { const p = enc.beginComputePass(); p.setPipeline(managePoolRefinePLs[m - 1]); p.setBindGroup(0, managePoolBGs[m - 1]); p.dispatchWorkgroups(Math.ceil(pools[m - 1].MAX_FINE_BLOCKS / 64)); p.end(); },
       l1InitFill: (enc) => { const p = enc.beginComputePass(); p.setPipeline(l1InterpInitPL); p.setBindGroup(0, interpInitBG); p.dispatchWorkgroups(WGX1, WGY1, MAX_FINE_BLOCKS); p.end(); },
       poolInitFill: (enc, m) => { const p = enc.beginComputePass(); p.setPipeline(interpPoolParentInitPL); p.setBindGroup(0, pools[m].interpPoolParentBG_readA); p.dispatchWorkgroups(WGX1, WGY1, pools[m].MAX_FINE_BLOCKS); p.end(); },
@@ -877,7 +753,7 @@ async function init() {
     if (autoRefine && macroStepCounter % REFINE_EVERY === 0) {
       makeRefineRound({
         nLevels: N_LEVELS, pools, cascade, encodeCascade,
-        firstParentLevel: ROOT_MANAGED ? 0 : 1, passes: refinePasses,
+        passes: refinePasses,
       })(enc);
     }
     macroStepCounter++;
@@ -889,16 +765,9 @@ async function init() {
 
   function resetSim() {
     const f0 = initF();
-    writeF(f_a, f0, NCELLS);
     writeF(pools[1].finePoolF_a, initFPool(), MAX_FINE_BLOCKS * NCELLS1);
     device.queue.writeBuffer(cardStateBuf, 0, initCardState());
-    // The DENSE L0 velocity, the page-level counterpart of the pool loop
-    // below. Same reasoning: the refinement round runs BEFORE the step and
-    // macroStepCounter is 0 here, so the first criterion after a reset reads
-    // this buffer, and nothing wrote it. It goes with the dense grid at
-    // U7-6f; until then it is state reset() owns.
-    device.queue.writeBuffer(velBuf, 0, new Float32Array(NCELLS * 2));
-    for (let c = (ROOT_MANAGED ? 1 : 2); c < N_LEVELS; c++) {
+    for (let c = 1; c < N_LEVELS; c++) {
       const pool = pools[c];
       writeF(pool.finePoolF_a, initFPool(pool.MAX_FINE_BLOCKS), pool.MAX_FINE_BLOCKS * NCELLS1);
     }
@@ -978,12 +847,19 @@ async function init() {
   // both exactly and any drift is the coarse/fine interface).
   //
   // THE CURRENT BUFFER IS READ FROM `useB`, NOT ASSUMED. debugSnapshotSave
-  // can hardcode f_a because STEPS_PER_FRAME is even and useB therefore
-  // returns to false at every frame boundary -- but that is an invariant of
-  // how it is called, and a diagnostic taking checkpoints at arbitrary step
-  // counts should not inherit it.
+  // can hardcode the _a buffer because STEPS_PER_FRAME is even and useB
+  // therefore returns to false at every frame boundary -- but that is an
+  // invariant of how it is called, and a diagnostic taking checkpoints at
+  // arbitrary step counts should not inherit it.
+  //
+  // `readConservedTotals` is parameterised by a `cellIndex` callback precisely
+  // so it can walk either representation of level 0 in spatial order
+  // (amr2d.mjs's rootCellIndex header, U4-4). Handing it the root's mapping
+  // and the root's `f` is the whole of the U7-6f change here.
+  const rootSpec = rootPoolSpec({ dims: { W, H }, rb: RB });
   const debugConservedTotals = () => readConservedTotals(device, {
-    f: useB ? f_b : f_a, W, H, NCELLS, ex: EX, ey: EY,
+    f: useB ? pools[0].finePoolF_b : pools[0].finePoolF_a,
+    W, H, NCELLS: rootSpec.cells, ex: EX, ey: EY,
     decode: readF, cellIndex: cellIndexJS,
   });
 
@@ -1005,16 +881,16 @@ async function init() {
 
   const stagingVel = device.createBuffer({ size: NCELLS * 2 * 4, usage: U.MAP_READ | U.COPY_DST });
 
-  // Full 2D velocity field. Reads velBuf directly -- L0's own step kernel
-  // writes every cell every step regardless of refinement, and the
-  // average pass (S_Advance) overwrites any refined block's L0 cells with
-  // the finer level's restricted value, so velBuf always holds the
-  // finest-available data even in a partially-refined domain (same
-  // reasoning as main-channel-amr.js's readProfile). Block-major indexing
-  // (cellIndexJS), not flat row-major -- see amr_step.wgsl.
+  // Full 2D velocity field. Reads LEVEL 0's velocity directly -- its own step
+  // kernel writes every cell every step regardless of refinement, and the
+  // average pass (S_Advance) overwrites any refined block's level-0 cells with
+  // the finer level's restricted value, so it always holds the
+  // finest-available data even in a partially-refined domain (same reasoning
+  // as main-channel-amr.js's readProfile). Tile-major indexing (cellIndexJS),
+  // not flat row-major -- see rootCellIndex.
   async function readField() {
     const enc = device.createCommandEncoder();
-    enc.copyBufferToBuffer(velBuf, 0, stagingVel, 0, NCELLS * 2 * 4);
+    enc.copyBufferToBuffer(pools[0].finePoolVel, 0, stagingVel, 0, NCELLS * 2 * 4);
     device.queue.submit([enc.finish()]);
     await stagingVel.mapAsync(GPUMapMode.READ);
     const vel = new Float32Array(stagingVel.getMappedRange()).slice();
@@ -1063,10 +939,7 @@ async function init() {
       perLevel: Array.from({ length: N_LEVELS - 1 }, (_, i) => ({ childLevel: i + 1, ...paramsForChildLevel(i + 1) })),
     }),
     getNumLevels: () => N_LEVELS,
-    // U7-6d. Asserted by the ?densel0= equivalence probe: a flag that did not
-    // take would otherwise read as a clean "the dense L0 is inert" pass.
-    getDenseL0: () => (denseL0Live() ? 1 : 0),
-    getRootPool: () => (rootGpu ? { ...rootGpu.spec, stepped: true } : null),
+    getRootPool: () => ({ ...rootGpu.spec, stepped: true }),
     getLevelPoolSizes,
     tauAtLevel,
   };

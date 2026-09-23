@@ -3,17 +3,12 @@
 // @include "common_geometry.wgsl"
 // @include "common_vortcolor.wgsl"
 
-// BINDING 0 IS LEVEL 0'S VELOCITY, AND WHAT THAT BUFFER *IS* DEPENDS ON
-// ROOT_IS_POOL (plans/uniform-levels.md U7-6b).
-//
-//   ROOT_IS_POOL = 0   the dense L0 grid, addressed by `cellIndex`'s block8
-//                      layout. The pre-U7-6 path, kept live under ?rootpool=0.
-//   ROOT_IS_POOL = 1   the ROOT POOL's velocity, addressed by `rootCellIndex`
-//                      through binding 12's indirection. The default, and what
-//                      lets U7-6f delete the dense grid.
-//
-// Both are a velocity per L0 cell; only the addressing differs, which is why
-// this is one binding and not two.
+// BINDING 0 IS LEVEL 0'S VELOCITY: the ROOT POOL's, addressed by
+// `rootCellIndex` through binding 12's indirection (plans/uniform-levels.md
+// U7-6b). It carried the dense L0 grid in block8 layout until U7-6f, selected
+// by a ROOT_IS_POOL override -- the two addressings are not interchangeable,
+// so that flag moved the BUFFER as well as the arithmetic. There is one
+// representation of level 0 now and no flag.
 @group(0) @binding(0) var<storage, read> vel         : array<f32>;
 @group(0) @binding(1) var<storage, read> state       : CardState;
 // ONE VELOCITY/INDIRECTION PAIR PER POOL LEVEL, AND THE WALK OVER THEM IS A
@@ -50,9 +45,7 @@
 @group(0) @binding(9) var<storage, read> blockSlot3  : array<i32>;
 @group(0) @binding(10) var<storage, read> vel_pool4  : array<f32>;
 @group(0) @binding(11) var<storage, read> blockSlot4 : array<i32>;
-// The ROOT pool's block->slot indirection. Read only when ROOT_IS_POOL != 0;
-// bound to level 1's under ?rootpool=0 for the same reason the unused deeper
-// levels are -- an out-of-range read is not safe on every stack.
+// The ROOT pool's block->slot indirection, for binding 0.
 @group(0) @binding(12) var<storage, read> blockSlot0 : array<i32>;
 // Quadtree outline opacity [0,1] -- optional, off (0) by default. Separate
 // uniform from overlayOpacity (the coverage FILL) so the two can be toggled
@@ -71,10 +64,6 @@ const BLOCK = 8u;
 override RB : u32;
 const GHOST = 2u;
 
-// Is level 0 a pool level? See binding 0's note. Default 0 so a build that
-// does not pass it is byte-identical to the pre-U7-6 renderer.
-override ROOT_IS_POOL : u32 = 0u;
-
 // How many POOL levels this configuration actually has, i.e. N_LEVELS - 1.
 // The walk below runs m = 1 .. N_POOL_LEVELS and never touches a deeper
 // binding, which is what makes the dummy bindings safe (see their note above).
@@ -85,18 +74,7 @@ override ROOT_IS_POOL : u32 = 0u;
 // rather than render a lie. main-amr.js checks it.
 override N_POOL_LEVELS : u32 = 1u;
 
-// Block-major linear index for a cell at BUFFER coordinates (cx, cy).
-// See amr_step.wgsl for the full derivation; vel is laid out this way
-// (Milestone 1, plans/AMR.md) instead of flat row-major.
-fn cellIndex(cx: u32, cy: u32) -> u32 {
-  let nbx = W / BLOCK;
-  let bx = cx / BLOCK; let by = cy / BLOCK;
-  let lx = cx % BLOCK; let ly = cy % BLOCK;
-  let blockID = by * nbx + bx;
-  return blockID * (BLOCK * BLOCK) + ly * BLOCK + lx;
-}
-
-// The same buffer cell, addressed through the ROOT POOL.
+// A buffer cell, addressed through the ROOT POOL.
 //
 // THE ROOT TILE HAS NO GHOST RING, and that is the one thing that stops level
 // 0 from simply joining `poolVel`'s ladder below. `amr2d.mjs`'s
@@ -118,10 +96,9 @@ fn rootCellIndex(cx: u32, cy: u32) -> u32 {
   return slot * (tile * tile) + (cy % tile) * tile + (cx % tile);
 }
 
-// Level 0's velocity at a BUFFER cell, from whichever representation is live.
+// Level 0's velocity at a BUFFER cell.
 fn rootVel(bx: u32, by: u32) -> vec2<f32> {
-  var i = cellIndex(bx, by);
-  if (ROOT_IS_POOL != 0u) { i = rootCellIndex(bx, by); }
+  let i = rootCellIndex(bx, by);
   return vec2<f32>(vel[i * 2u], vel[i * 2u + 1u]);
 }
 

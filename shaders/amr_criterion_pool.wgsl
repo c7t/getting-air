@@ -1,13 +1,13 @@
 // Milestone 9 (plans/AMR-multilevel.md): per-quadrant vorticity criterion
 // for deciding whether a level-(m+1) child should exist -- sibling of
-// amr_criterion.wgsl (which stays exactly as-is: it decides L0->L1,
+// the deleted dense-parent criterion (which decided L0->L1 until U7-6f,
 // reading L0's own dense velBuf; this decides L(m)->L(m+1) for any m>=1,
 // reading level m's own finePoolVel).
 //
 // Dispatch: (2, 2, MAX_FINE_BLOCKS[m]) with workgroup_size(8,8). A parent
 // slot's own interior is 2*RB x 2*RB cells -- exactly 4 RB*RB=64-cell
 // quadrants, each exactly one workgroup (same "one workgroup = one
-// reduction unit" convention as amr_criterion.wgsl/amr_force*.wgsl).
+// reduction unit" convention as amr_force1.wgsl).
 // workgroup_id.xy IS the quadrant (qx,qy) directly -- no separate
 // quadrant math needed the way amr_step1.wgsl's quadrant lookup
 // requires, since here we're producing a criterion for a NOT-YET-existing

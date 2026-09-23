@@ -12,17 +12,17 @@
 // are gone from it -- and with the fine step off them since B3-1a, THIS WAS
 // THEIR LAST READER. See plans/2D-backport.md B3-4 for what that retires.
 //
-// Generalizes amr_force.wgsl (L0's own, which stays: L0 is a dense,
-// ghost-free grid) the same way amr_step1.wgsl generalizes amr_step.wgsl --
-// same momentum-exchange math, dispatched over pool tiles (full FB*FB shape,
-// Z=slot, same as amr_step1.wgsl and NOT amr_average_f2c.wgsl's
+// THE ONLY FORCE PASS SINCE U7-6f. It generalized a dense L0 one
+// (amr_force.wgsl, deleted with the dense grid) the same way amr_step1.wgsl
+// generalized the dense step -- same momentum-exchange math, dispatched over
+// pool tiles (full FB*FB shape, Z=slot, and NOT the restriction's
 // RB-granularity one, since MORE sample points per unit area is the entire
 // point of Milestone 8: a fixed physical epsilon under-sampled the chi
 // transition band at coarse resolution, aliasing the force/torque that drives
 // the body's own trajectory).
 //
-// TWO THINGS A NAIVE PER-LEVEL COPY OF amr_force.wgsl WOULD GET WRONG, and
-// they are why this is not simply amr_force.wgsl with a different binding:
+// TWO THINGS A NAIVE PER-LEVEL COPY OF A DENSE FORCE PASS WOULD GET WRONG,
+// and they are why this was not simply that file with a different binding:
 //
 // 1. GHOST cells must NOT contribute. Unlike amr_step1.wgsl (which
 //    legitimately collides/streams every cell, ghost included, since ghost
@@ -58,8 +58,29 @@
 // FINEST-WINS MASKING IS GONE (plans/2D-backport.md B4-3), along with its
 // HAS_CHILD override, the childBlockSlot binding it read, and the levelParams
 // nbx/nby/hasChild reads that served it. Only the finest level's force pass is
-// dispatched now -- see amr_force.wgsl's header for the measurement that
-// showed every coarser pass already contributing exactly zero.
+// dispatched now. `average` keeps a parent's cells populated under an active
+// child, so summing every level unconditionally would double-count the same
+// physical drag; the premise that makes masking unnecessary rather than merely
+// absent is the geometry-forced-refinement hard constraint -- every leaf
+// within FORCE_REFINE_MARGIN of the body is already at the finest level --
+// which amr2d-gpu.mjs's checkGeometryCoverageOnGPU asserts on every AMR page
+// and tools/validate-amr-invariants.js gates periodically through a run.
+//
+// MEASURED BEFORE DELETING, not argued. This record lived in the dense force
+// pass's header and moves here with U7-6f rather than going with the file.
+// debugForceBreakdown ran each level's pass in isolation; with the masking
+// still in place the coarser levels' raw i32 accumulators (FSCALE = 1e7)
+// read, at 8192 steps:
+//
+//   levels=2            L0 0            L1 237344  (finest)
+//   levels=3            L0 0    L1 1    L2 214591  (finest)
+//   levels=2 bounceback L0 0            L1 201702  (finest)
+//   levels=3 bounceback L0 0    L1 0    L2 207126  (finest)
+//
+// EXACTLY zero, bar a single 1e-7 unit on one config -- one workgroup's
+// truncated partial (see the FSCALE header below), 5e-6 of the total and
+// ~100x below the ~1e-3 reproducibility floor AMR Cd already has. Dead code,
+// demonstrated.
 
 // @include "common_geometry.wgsl"
 // @include "common_lattice.wgsl"

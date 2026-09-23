@@ -41,11 +41,14 @@
 //             without it, a `debugSnapshotLoad` that silently did nothing at
 //             all would pass every gated row, since the leg would simply have
 //             stepped 2N times uninterrupted.
-//   refuse    hand a page a snapshot whose level 1 was allocated the OTHER
-//             way and require it to THROW. The formats are structurally
-//             compatible enough to load and corrupt silently, which is the
-//             failure U7-6a's marker exists to make loud -- so "it refused" is
-//             a result, not an error.
+//   refuse    hand a page a snapshot from a build it cannot restore and
+//             require it to THROW. Two shapes, because there are two ways a
+//             capture can be structurally compatible enough to load and
+//             corrupt silently: a level 1 allocated PER BLOCK (U7-6a's
+//             marker) and a pre-version-7 capture whose level 0 is a dense
+//             block8 grid (U7-6f). Either one loaded quietly would leave the
+//             allocator or level 0 holding something the run did not produce,
+//             so "it refused" is a result, not an error.
 //
 // `?detslots=1` throughout (plans/uniform-levels.md D0): with a racing free
 // list the reference leg is not reproducible against itself, and nothing below
@@ -69,19 +72,21 @@ const {
 
 const REPO_ROOT = path.resolve(__dirname, '..');
 
-// `quad` is what level 1's allocator is under each configuration, and it is
-// the thing the cross-granularity control pairs rows on.
-// BOTH LEGS NAME THE FLAG EXPLICITLY, and that is not redundancy. These rows
-// leaned on `?rootpool=` defaulting to 0 until U7-5 flipped it, at which point
-// the "rootpool=0" legs were silently running the quad allocator and testing
-// the same thing twice. `open()`'s assertion caught it rather than the suite
-// going green on four copies of one configuration -- which is the whole reason
-// that assertion is there.
+// TWO CONFIGURATIONS, NOT FOUR, SINCE U7-6f. There were `rootpool=0` and
+// `rootpool=1` legs of each level count, pairing rows on level 1's allocator
+// granularity; `?rootpool=0` and the per-block allocator it selected are gone
+// with the dense path, so the two surviving rows are the two level counts.
+//
+// THE ROWS NAMED THE FLAG EXPLICITLY AND THAT WAS NOT REDUNDANCY -- worth
+// keeping in view now that there is no flag to name. They leaned on
+// `?rootpool=` defaulting to 0 until U7-5 flipped it, at which point the
+// "rootpool=0" legs were silently running the quad allocator and testing the
+// same thing twice; `open()`'s assertion caught it rather than the suite going
+// green on four copies of one configuration. That assertion stays for the same
+// reason, now checking that the root pool is there at all.
 const CONFIGS = [
-  { name: 'levels=2 rootpool=0', q: 'levels=2&detslots=1&rootpool=0', quad: false },
-  { name: 'levels=3 rootpool=0', q: 'levels=3&detslots=1&rootpool=0', quad: false },
-  { name: 'levels=2 rootpool=1', q: 'levels=2&detslots=1&rootpool=1', quad: true  },
-  { name: 'levels=3 rootpool=1', q: 'levels=3&detslots=1&rootpool=1', quad: true  },
+  { name: 'levels=2', q: 'levels=2&detslots=1' },
+  { name: 'levels=3', q: 'levels=3&detslots=1' },
 ];
 
 function parseArgs(argv) {
@@ -160,7 +165,7 @@ async function open(Runtime, Page, o, cfg) {
   const det = await ev(Runtime, 'window.__AMR.getDetSlots()');
   if (det !== 1) throw new Error(`${cfg.name}: page reports detslots=${det}, expected 1`);
   const root = await ev(Runtime, 'window.__AMR.getRootPool() ? 1 : 0');
-  if (!!root !== cfg.quad) throw new Error(`${cfg.name}: page reports rootPool=${root}, expected ${cfg.quad ? 1 : 0}`);
+  if (!root) throw new Error(`${cfg.name}: page reports no root pool -- level 0 has nothing to capture`);
   // PAUSE BEFORE ANYTHING ELSE, and this is not tidiness -- it is what makes
   // the two legs comparable at all.
   //
@@ -173,7 +178,7 @@ async function open(Runtime, Page, o, cfg) {
   // different amounts of uncounted evolution, and the gated rows have been
   // comparing that difference rather than the round trip.
   //
-  // Measured 2026-09-22: with both legs paused, `levels=2 rootpool=1`
+  // Measured 2026-09-22: with both legs paused, `levels=2` under the root pool
   // round-trips blockSlot, slotToBlock, parentSlot, quadrant and freeList
   // EXACTLY -- where the unpaused tool reported 32 parentSlot entries moved.
   // Same defect `tools/measure-determinism.js` carried until D1-a, same fix.
@@ -276,26 +281,30 @@ async function main() {
       rows.push({ cfg, kind: 'stale', ok });
     }
 
-    // A STUB IS ENOUGH HERE, AND DELIBERATELY SO. The granularity marker is
-    // checked before debugSnapshotLoad writes a single buffer, so a stub
-    // carrying the page's own geometry and the OPPOSITE marker reaches it by
-    // exactly the path a full capture would -- at a few bytes instead of the
-    // several megabytes a real snapshot costs to ship twice over CDP. What is
-    // being scored is the marker, not the payload.
-    console.log('\n  CONTROL -- a level-1 granularity mismatch must REFUSE, not load');
+    // A MUTATED CAPTURE IS ENOUGH HERE, AND DELIBERATELY SO. Both markers are
+    // checked before debugSnapshotLoad writes a single buffer, so a real
+    // capture with one field changed reaches the refusal by exactly the path
+    // an incompatible capture would, without shipping a second several-megabyte
+    // payload over CDP. What is being scored is the marker, not the payload.
+    const REFUSALS = [
+      { what: 'level 1 per-block', mutate: 'delete snap.pools[1].quadAlloc;', expect: /QUAD|per-block/ },
+      { what: 'formatVersion 6',   mutate: 'snap.formatVersion = 6;',         expect: /formatVersion/ },
+    ];
+    console.log('\n  CONTROL -- a capture this build cannot restore must REFUSE, not load');
     for (const cfg of CONFIGS) {
-      await open(Runtime, Page, o, cfg);
-      const threw = await ev(Runtime, `(async () => {
-        const snap = await window.__AMR.debugSnapshotSave();
-        snap.pools[1].quadAlloc = ${!cfg.quad};
-        if (!${!cfg.quad}) delete snap.pools[1].quadAlloc;
-        try { await window.__AMR.debugSnapshotLoad(snap); return ''; }
-        catch (e) { return String(e.message || e); }
-      })()`, 300000);
-      const ok = /QUAD|per-block/.test(threw);
-      if (!ok) failed++;
-      console.log(`  ${ok ? 'ok  ' : 'FAIL'} ${cfg.name.padEnd(22)} ${threw ? threw.slice(0, 96) : 'LOADED SILENTLY'}`);
-      rows.push({ cfg, kind: 'refuse', ok });
+      for (const r of REFUSALS) {
+        await open(Runtime, Page, o, cfg);
+        const threw = await ev(Runtime, `(async () => {
+          const snap = await window.__AMR.debugSnapshotSave();
+          ${r.mutate}
+          try { await window.__AMR.debugSnapshotLoad(snap); return ''; }
+          catch (e) { return String(e.message || e); }
+        })()`, 300000);
+        const ok = r.expect.test(threw);
+        if (!ok) failed++;
+        console.log(`  ${ok ? 'ok  ' : 'FAIL'} ${(cfg.name + ' / ' + r.what).padEnd(30)} ${threw ? threw.slice(0, 84) : 'LOADED SILENTLY'}`);
+        rows.push({ cfg, kind: 'refuse', ok });
+      }
     }
   } finally {
     await client.close();
@@ -307,8 +316,8 @@ async function main() {
     console.log(`FAIL: ${failed} of ${rows.length} row(s) did not hold.`);
     process.exit(1);
   }
-  console.log('PASS: snapshots round-trip exactly at both level-1 granularities, the');
-  console.log('comparison can fail, and a granularity mismatch is refused rather than loaded.');
+  console.log('PASS: snapshots round-trip exactly at both level counts, the comparison');
+  console.log('can fail, and a capture this build cannot restore is refused, not loaded.');
 }
 
 main().catch(e => { console.error(e); process.exit(1); });

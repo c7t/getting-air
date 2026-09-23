@@ -39,6 +39,11 @@
 //   node tools/validate-divergence.js --res=9 --levels=2 --re=20
 //   node tools/validate-divergence.js --mode=adaptive --checkpoints=6 --horizon=400
 //   node tools/validate-divergence.js --diffuse --saveSnapshots=/tmp/div
+//   node tools/validate-divergence.js --baseUrl=https://localhost:4471 --port=9401
+//
+// PIN BOTH PORTS on a machine with more than one worktree live. `ensureServer`
+// reuses whatever already answers, so the default https://localhost:4444 is
+// routinely another checkout's server -- see CLAUDE.md's dev-server trap.
 //
 // Defaults to --bounceback, like tools/validate-amr-vs-dense.js: bounce-back
 // is sharp at exactly R, so it carries no effective-radius offset. --diffuse
@@ -57,11 +62,17 @@ const { deriveAMRParams, deriveSharedURLParams, buildDenseUrl, buildAMRUrl } = r
 const { loadDenseFields, reconstructAMRToResolution, buildLevelMap, diffStats } = require('./lib/field-reconstruct');
 const { injectDenseIntoAMRSnapshot } = require('./lib/dense-to-amr');
 
-const BASE_URL = 'https://localhost:4444';
-const PORT = 9333;
+// `--baseUrl=` / `--port=` OVERRIDE THESE, and on a machine with more than one
+// worktree live they are not optional. `ensureServer` reuses whatever already
+// answers on the port, so the default 4444 is routinely another checkout's
+// server -- CLAUDE.md records two full sweeps discarded for exactly that.
+// They were hardcoded here, alone among the validate-* tools, until U7-6f.
+const DEFAULT_BASE_URL = 'https://localhost:4444';
+const DEFAULT_PORT = 9333;
 
 function parseArgs(argv) {
   const o = {
+    baseUrl: DEFAULT_BASE_URL, port: DEFAULT_PORT,
     res: 9, levels: [2], re: [100], mode: 'both',
     horizon: 256,      // AMR L0 macro-steps to advance in total after seeding
     checkpoints: 4,    // number of comparison points across that horizon
@@ -75,7 +86,9 @@ function parseArgs(argv) {
     allowMarginalTau: false,
   };
   for (const a of argv) {
-    if (a.startsWith('--res=')) o.res = Number(a.slice(6));
+    if (a.startsWith('--baseUrl=')) o.baseUrl = a.slice(10);
+    else if (a.startsWith('--port=')) o.port = Number(a.slice(7));
+    else if (a.startsWith('--res=')) o.res = Number(a.slice(6));
     else if (a.startsWith('--levels=')) o.levels = a.slice(9).split(',').map(Number);
     else if (a.startsWith('--re=')) o.re = a.slice(5).split(',').map(Number);
     else if (a.startsWith('--mode=')) o.mode = a.slice(7);
@@ -140,7 +153,7 @@ async function fullyRefine(Runtime, nLevels, timeoutMs) {
 // full sweep completes. Deterministic, so size it here rather than making
 // the caller discover the number from a crash (which is what
 // validate-amr-vs-dense.js's manual --maxFineBlocks= currently requires).
-const BLOCK = 8; // matches shaders/amr_step.wgsl's cellIndex
+const BLOCK = 8; // block8 -- amr2d.mjs's denseCellIndex owns the rule
 function fullRefinePoolSizes(baseResLog2, nLevels) {
   const nbx0 = (1 << baseResLog2) / BLOCK;
   const nblocks0 = nbx0 * nbx0;
@@ -258,10 +271,10 @@ async function openPage(Page, Runtime, url) {
 
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
-  const server = await BL.ensureServer(BASE_URL, REPO_ROOT);
-  const chrome = await BL.ensureChrome(PORT);
-  const tabId = await BL.openTab(PORT, 'about:blank');
-  const client = await CDP({ port: PORT, target: tabId });
+  const server = await BL.ensureServer(opts.baseUrl, REPO_ROOT);
+  const chrome = await BL.ensureChrome(opts.port);
+  const tabId = await BL.openTab(opts.port, 'about:blank');
+  const client = await CDP({ port: opts.port, target: tabId });
   const { Page, Runtime } = client;
   await Page.enable(); await Runtime.enable();
 
@@ -280,11 +293,11 @@ async function main() {
 
       for (const re of opts.re) {
         const shared = deriveSharedURLParams({ re, bounceback: opts.bounceback });
-        const denseUrl = buildDenseUrl(BASE_URL, { targetResLog2: opts.res, sharedParams: shared });
+        const denseUrl = buildDenseUrl(opts.baseUrl, { targetResLog2: opts.res, sharedParams: shared });
         // fullrefine needs every slot resident at once; adaptive uses the
         // pages' own sparse defaults. Built per-mode below.
         const fr = fullRefinePoolSizes(amrParams.baseResLog2, nLevels);
-        const amrUrlFor = (mode) => buildAMRUrl(BASE_URL, {
+        const amrUrlFor = (mode) => buildAMRUrl(opts.baseUrl, {
           baseResLog2: amrParams.baseResLog2, nLevels, sharedParams: shared,
           maxFineBlocksByLevel: mode === 'fullrefine' ? fr.byLevel : {},
           forceBounceback: opts.bounceback && opts.allowUnvalidatedLevels,
@@ -452,7 +465,7 @@ async function main() {
     console.log("file's header) and compare adaptive against its own fullrefine baseline.");
   } finally {
     await client.close();
-    await BL.teardown({ port: PORT, tabId, chrome, server, keepOpen: opts.keepOpen });
+    await BL.teardown({ port: opts.port, tabId, chrome, server, keepOpen: opts.keepOpen });
   }
 }
 

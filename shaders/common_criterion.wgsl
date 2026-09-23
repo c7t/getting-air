@@ -1,5 +1,5 @@
 // The two pieces the refinement-criterion kernels share: the vorticity
-// stencil, and the 64-lane max reduction. Included by amr_criterion.wgsl
+// stencil, and the 64-lane max reduction. Included by amr_criterion_pool.wgsl
 // (parent = L0's dense grid) and amr_criterion_pool.wgsl (parent = a pool
 // tile). plans/2D-backport.md B3-6.
 //

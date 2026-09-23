@@ -11,6 +11,33 @@ step** — the source *is* the artifact; GitHub Pages serves it directly.
   harness (base + AMR variants).
 - `shaders/` — all WGSL. `Makefile` — validation + release helpers.
 
+**THERE IS NO DENSE LEVEL 0 ON AN AMR PAGE** (plans/uniform-levels.md U7-6f,
+2026-09-22). Level 0 is the ROOT POOL: 2\*RB-square tiles, RINGLESS
+(`ghostDepthAtLevel(0)` is 0 — a ring holds a parent interface and the root has
+no parent), indirection the identity, always full. It runs the same
+`amr_step1.wgsl` every other level runs, is allocated in quads by the same
+`amr_manage_pool.wgsl`, and is addressed by `amr2d.mjs`'s `rootCellIndex`.
+
+`amr_step.wgsl`, `amr_criterion.wgsl`, `amr_manage.wgsl`, `amr_force.wgsl`,
+`amr_interp_dense_parent.wgsl`, `amr_average_f2c.wgsl`,
+`common_interp_parent_dense.wgsl`, `common_avg_parent_dense.wgsl` and
+`amr_mirror_root.wgsl` are GONE, along with `?rootpool=`, `?rootstep=`,
+`?rootcouple=`, `?rootmanage=`, `?densel0=` and `?rootIsPool=`. The five
+NON-AMR reference pages (`index.html`, `index-cylinder.html`,
+`index-reentry.html`, `index-channel.html`, `index-tgv.html`) keep their own
+dense grids and `lbm_step.wgsl` — untouched, and still the control the AMR
+pages are scored against.
+
+**The block8 layout is still real, and it is theirs.** `amr2d.mjs`'s
+`denseCellIndex` owns the rule; it is what `initF()` builds an initial
+condition in (the seeder permutes it into root tiles) and what
+`tools/lib/dense-to-amr.js` reads a dense capture in. A page that needs both
+names them apart — see `main-tgv-amr.js`'s `icCellIndex` vs `cellIndexJS`,
+which were one function until they meant two things.
+
+**Snapshots are formatVersion 7** and carry level 0 as `root`. A pre-7 capture
+is REFUSED on load rather than read with a missing level 0.
+
 ## Validate before committing (no GPU needed)
 Run `make check` and make it pass before committing shader/JS changes:
 - `make js` — syntax-check every `*.js` and `*.mjs` (needs Node). The

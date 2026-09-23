@@ -1,8 +1,11 @@
-// THE coarse -> fine ghost-cell interpolation kernel, whole. Both entry files
-// -- amr_interp_dense_parent.wgsl (parent = the dense L0 grid) and
-// amr_interp_pool_parent.wgsl (parent = a level>=1 pool tile) -- are now their
-// bindings, their overrides, and their own parent fragment.
-// plans/2D-backport.md B3-3.
+// THE coarse -> fine ghost-cell interpolation kernel, whole. Its entry file --
+// amr_interp_pool_parent.wgsl -- is its bindings, its overrides, and its own
+// parent fragment. plans/2D-backport.md B3-3.
+//
+// THERE WERE TWO until U7-6f, the other being amr_interp_dense_parent.wgsl
+// with the dense L0 grid as the parent. The accessor split below is what
+// survives of that: the root is a pool tile like any other parent now, but it
+// is a RINGLESS one (PARENT_GHOST 0), so the fetch still varies.
 //
 // NOT TO BE CONFUSED WITH common_interp.wgsl, which is the BLEND
 // (`CoarseSample`, `dcRescaleCoarseToFine`, `interpCoarseToFine`) and is shared
