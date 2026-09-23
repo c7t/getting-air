@@ -1,9 +1,57 @@
 ---
 name: webgpu-verify
-description: Launch this WebGPU app (index.html + main.js/vpm.js) in a real GPU-capable Chrome, drive it via CDP, and capture screenshots AND error state (status line, fatal overlay, uncaught exceptions, NaN fields) to verify changes actually render. Use when asked to run, verify, screenshot or debug this project, to confirm a WebGPU/shader change works, or to find out why a page refused to boot.
+description: Launch this WebGPU app (index.html + main.js/vpm.js) in a real GPU-capable Chrome, drive it via CDP, and capture screenshots AND error state (status line, fatal overlay, uncaught exceptions, NaN fields) to verify changes actually render -- and, on EVERY invocation, a whole-browser health check (tools/check-browser.js: real GPU adapter not a SwiftShader fallback, no error/fatal state in any tab, no competing live tabs) without which no result counts. Use when asked to run, verify, screenshot or debug this project, to confirm a WebGPU/shader change works, or to find out why a page refused to boot.
 ---
 
 # Running and screenshotting this app
+
+## 0. CHECK THE WHOLE BROWSER ON EVERY INVOCATION — any error silently invalidates any result
+
+Run this **at launch (or on adopting an existing debug Chrome), before trusting
+ANY number or screenshot, and again at the end** of whatever you did:
+
+```bash
+node tools/check-browser.js --port=<debug port> --chromeLog=<chrome launch log>
+```
+
+Exit 1 means **nothing produced by this browser since the last OK can be
+believed**. Do not rationalise a FAIL away and do not "note it and continue":
+fix the browser, then re-run the measurement. It checks EVERY page tab, not just
+the one you drove, because a failure anywhere in the browser can poison the
+result you care about:
+
+| check | verdict | why it exists |
+|---|---|---|
+| adapter is a fallback (`isFallbackAdapter`, `swiftshader`) or null | FAIL | the GPU process crashed and WebGPU fell back to the CPU rasterizer SILENTLY |
+| `#status` starts with `error:` in any tab | FAIL | every init/frame/validation failure is written there, and nothing else reports it |
+| `#fatal-overlay` showing | FAIL | same failure, the human-visible half |
+| more than one app tab LIVE-stepping | FAIL | GPU contention; see the orphan warning in Gotchas |
+| `#status` still "initializing..." with no debug global | WARN | init never finished |
+| more than one app tab open | WARN | close what you are not measuring |
+| the Chrome log shows a GPU-process crash / `vkCreateInstance failed` | FAIL | the CAUSE of a fallback, which can predate every open tab |
+
+**The incident this exists for (2026-09-23).** The debug Chrome's GPU process
+crashed mid-session; every later `vkCreateInstance` failed and WebGPU fell back
+to SwiftShader (`google/swiftshader`, 10 storage buffers per stage). Pages that
+fit in 10 bindings kept booting and kept producing plausible numbers. An
+afternoon of conservation and bisect runs went through it before the user
+noticed an old build refusing to boot — "needs 16 storage buffers per shader
+stage, this GPU's max is 10" — in a tab no tool was reading. By then the session
+had also left TEN tabs open, two of them live-stepping. The GPU looked idle
+because it was.
+
+Every Node tool gets the same check automatically:
+`tools/lib/browser-lifecycle.js`'s `teardown` runs it at the end of every run
+(including `--keepOpen` ones), prints a RESULTS-NOT-TRUSTWORTHY banner and
+exits nonzero on a FAIL. Set `GA_CHROME_LOG=<chrome launch log>` when a tool
+ADOPTS a Chrome you launched, so it can scan that log too; a Chrome the tool
+launches itself logs to `<profile>/chrome.log` and is scanned automatically.
+**A tool's exit code is therefore part of its result** -- read it, and read the
+`[teardown] browser health:` line, before reading its numbers.
+
+The check was made to FAIL on each shape before it was trusted: a Chrome forced
+onto SwiftShader (`--use-webgpu-adapter=swiftshader`), a `?levels=1` refusal
+tab, two live tabs, and a log containing the real crash line.
 
 This is a static WebGPU page (`index.html`, `main.js`, `vpm.js`, `shaders/*.wgsl`) —
 no build step, no dev server framework. WebGPU needs a real GPU-capable browser, so
@@ -47,7 +95,14 @@ DISPLAY=:0 nohup /opt/google/chrome/chrome \
 echo $! > /tmp/vpm-chrome.pid
 sleep 3
 curl -s http://localhost:9333/json/version   # confirms the debug port is up
+export GA_CHROME_LOG=/tmp/vpm-chrome.log     # so every tool's teardown scans it
+node tools/check-browser.js --port=9333 --chromeLog=/tmp/vpm-chrome.log   # section 0 -- MUST be OK
 ```
+
+**The debug port being up says nothing about the GPU.** Only section 0's check
+does: a Chrome whose GPU process died answers CDP perfectly and runs WebGPU on
+SwiftShader. Expect `nvidia/lovelace sb=16` (or whatever the real device is) in
+its adapter column; `google/swiftshader FALLBACK sb=10` means relaunch.
 
 `DISPLAY=:0` is required — this launches headed (not `--headless`), since headless
 Chrome's WebGPU/GPU support is unreliable here and the real GPU process gives a much
@@ -271,7 +326,20 @@ and the cache is the far more common explanation.
   real bug. (Match on the profile dir, never on the process name -- `pkill -f
   chrome` would take the user's own browser with it.)
 
+- **`--keepOpen` leaves the tool's tab behind, every run.** Tools that adopt a
+  Chrome open their OWN tab (`openTab`) and only close it in `teardown` when
+  `--keepOpen` is absent, so N kept-open runs leave N tabs -- measured 10 in one
+  session, two still live-stepping. Section 0's check WARNs at two app tabs and
+  FAILs at two live ones. Close stray tabs (`curl http://localhost:<port>/json/close/<id>`)
+  rather than letting them accumulate.
+- **`--keepOpen` also means the tool never EXITS** -- it holds its CDP socket.
+  A foreground caller waiting on process exit waits forever after the report
+  has printed; wait on the report's own last line in the log instead.
+
 ## Cleanup
+
+Run section 0's check one last time first -- a FAIL at the end invalidates
+everything since the last OK, not just the last step.
 
 If you launched Chrome by hand (section 2), the simplest cleanup is:
 

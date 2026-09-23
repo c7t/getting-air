@@ -67,6 +67,14 @@ screenshots. A black/blank canvas is a failure, not success.
 Chrome via CDP and either compare against known physics or assert structural
 invariants the AMR machinery depends on:
 
+**A GPU result is only valid if the BROWSER was healthy** — run
+`node tools/check-browser.js --port=<p> --chromeLog=<log>` at launch and read
+every tool's `[teardown] browser health:` line and exit code
+(`browser-lifecycle.js`'s teardown runs the same check). On 2026-09-23 the debug
+Chrome's GPU process crashed mid-session and WebGPU fell back SILENTLY to
+SwiftShader (CPU, 10 storage buffers); pages kept booting and producing
+plausible numbers. See the webgpu-verify skill's section 0.
+
 - **`tools/validate-all.js`** — single top-level harness, run this by
   default. Owns the whole Chrome/HTTPS-server lifecycle (launches its own
   dedicated debug-port Chrome if none is running; one tab reused across every

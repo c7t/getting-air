@@ -44,6 +44,7 @@ async function ensureServer(baseUrl, repoRoot) {
   console.log('[setup] starting https.py dev server');
   const proc = spawn('python3', ['https.py'], { cwd: repoRoot, detached: true, stdio: 'ignore' });
   proc.unref();
+  fs.closeSync(logFd);
   const ok = await waitFor(() => httpsGetOk(`${baseUrl}/index.html`), 10000, 300);
   if (!ok) throw new Error(`https.py did not come up at ${baseUrl} within 10s`);
   return { started: true, proc };
@@ -123,7 +124,7 @@ function reapAllChromes() {
 async function ensureChrome(port) {
   if (await chromeDebugOk(port)) {
     console.log(`[setup] Chrome already listening on debug port ${port}`);
-    return { started: false, profileDir: null, pid: null };
+    return { started: false, profileDir: null, pid: null, chromeLog: process.env.GA_CHROME_LOG || null };
   }
   console.log('[setup] launching dedicated WebGPU-capable Chrome');
   const profileRoot = PROFILE_ROOT;
@@ -134,6 +135,12 @@ async function ensureChrome(port) {
   // about:blank, not a config's own URL -- callers drive ONE tab for the
   // whole run (Page.navigate between configs, see navigateTo), never more
   // than one WebGPU context alive at once.
+  // Chrome's own stderr goes to a file, NOT to 'ignore': it is where a GPU-
+  // process crash and the Vulkan failures behind a silent SwiftShader fallback
+  // show up, and teardown's browser-health check reads it (2026-09-23 -- see
+  // tools/lib/browser-health.js).
+  const chromeLog = path.join(profileDir, 'chrome.log');
+  const logFd = fs.openSync(chromeLog, 'a');
   const proc = spawn('/opt/google/chrome/chrome', [
     `--remote-debugging-port=${port}`,
     '--enable-features=Vulkan,WebGPUService',
@@ -143,11 +150,12 @@ async function ensureChrome(port) {
     `--user-data-dir=${profileDir}`,
     '--window-size=1400,900',
     'about:blank',
-  ], { env: { ...process.env, DISPLAY: process.env.DISPLAY || ':0' }, detached: true, stdio: 'ignore' });
+  ], { env: { ...process.env, DISPLAY: process.env.DISPLAY || ':0' }, detached: true, stdio: ['ignore', logFd, logFd] });
   proc.unref();
+  fs.closeSync(logFd);
   const ok = await waitFor(() => chromeDebugOk(port), 10000, 300);
   if (!ok) throw new Error(`Chrome did not come up on debug port ${port} within 10s`);
-  return { started: true, profileDir, pid: proc.pid };
+  return { started: true, profileDir, pid: proc.pid, chromeLog };
 }
 
 async function openTab(port, url) {
@@ -204,7 +212,15 @@ async function waitForGlobal(Runtime, globalExpr, timeoutMs) {
 //
 // The stale dirs an adopted-then-orphaned Chrome leaves behind are swept by
 // the next ensureChrome; see sweepStaleProfiles.
+//
+// IT FIRST CHECKS THE WHOLE BROWSER, on every run, keepOpen or not (2026-09-23):
+// a GPU-process crash mid-run left the debug Chrome on SwiftShader, and a
+// session's worth of numbers was produced on it with nothing saying so. See
+// tools/lib/browser-health.js. It does not throw -- teardown runs in `finally`,
+// and a throw here would replace the tool's own error -- it prints a banner and
+// sets a nonzero exit code, which is what a caller scripting on the tool sees.
 async function teardown({ port, tabId, chrome, server, keepOpen }) {
+  await reportBrowserHealth(port, chrome && chrome.chromeLog);
   if (keepOpen) return;
   await closeTab(port, tabId);
   if (chrome.started) {
@@ -224,8 +240,27 @@ async function teardown({ port, tabId, chrome, server, keepOpen }) {
   if (server.started && server.proc) { try { process.kill(-server.proc.pid); } catch { /* already gone */ } }
 }
 
+async function reportBrowserHealth(port, chromeLog) {
+  try {
+    const { checkBrowserHealth, formatHealth } = require('./browser-health');
+    const h = await checkBrowserHealth({ port, chromeLog });
+    if (h.ok && !h.warnings.length) { console.log('[teardown] browser health: OK'); return h; }
+    console.log('\n[teardown] browser health:\n' + formatHealth(h));
+    if (!h.ok) {
+      console.log('\n' + '!'.repeat(78) + '\n!! RESULTS ABOVE ARE NOT TRUSTWORTHY -- the browser failed its health check.'
+        + '\n!! Fix the browser (relaunch on the real GPU, close stray tabs) and re-run.\n' + '!'.repeat(78));
+      process.exitCode = 1;
+    }
+    return h;
+  } catch (e) {
+    console.log(`[teardown] browser health check could not run: ${e.message}`);
+    process.exitCode = 1;
+    return null;
+  }
+}
+
 module.exports = {
   httpsGetOk, waitFor, ensureServer, chromeDebugOk, ensureChrome,
-  openTab, firstTab, closeTab, navigateTo, evalExpr, waitForGlobal, teardown,
+  openTab, firstTab, closeTab, navigateTo, evalExpr, waitForGlobal, teardown, reportBrowserHealth,
   PROFILE_ROOT, liveProfileDirs, sweepStaleProfiles, reapAllChromes,
 };
