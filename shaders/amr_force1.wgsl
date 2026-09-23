@@ -196,6 +196,40 @@ fn fineToCoarseUnitI(fCoordI: i32, origin: f32) -> f32 {
 // the root, which is always full; it clamps rather than inventing a value, so
 // a sparse ring-free level would degrade exactly the way the ringed path does
 // rather than in some third way.
+// RING_FREE_FORCE (plans/2D-backport.md B6-2). The diffuse branch below
+// re-does the streaming gather to get rho and u*, and on a RINGED level it
+// clamped its sources into the tile's own ring -- where the STEP does not
+// read: the step reaches a same-level neighbour's interior directly
+// (DIRECT_GHOST, amr_step1.wgsl). So at every tile edge near the body the
+// force was built from a different gather than the one the fluid felt. On the
+// interp path the ring held a collided, roughly-neighbour-like state and the
+// discrepancy hid; on the explode path the ring is an uncollided inbox/outbox
+// and it did not: a FULLY REFINED amr-N2-diffuse (no coarse seam anywhere)
+// read Cd 1.655 on interp and 1.778 on explode, while bounce-back -- whose
+// link sum reads only the cell's own data -- did not move. With this set,
+// sources outside the interior resolve exactly as the step's do: into the
+// same-level neighbour's interior, falling back to the ring only where there
+// is no neighbour (a coarse seam, which B4's geometry rule keeps away from the
+// body). Default 0 keeps the published numbers byte-identical until the
+// default is deliberately flipped.
+override RING_FREE_FORCE : u32 = 0u;
+
+fn srcCellRinged(slot: u32, blockID: i32, sx: i32, sy: i32, FB: u32) -> u32 {
+  let RB2 = i32(RB * 2u);
+  let G = i32(GHOST);
+  let offX = select(select(0, 1, sx >= G + RB2), -1, sx < G);
+  let offY = select(select(0, 1, sy >= G + RB2), -1, sy < G);
+  let clamped = slot * (FB * FB) + u32(clamp(sy, 0, i32(FB) - 1)) * FB + u32(clamp(sx, 0, i32(FB) - 1));
+  if (offX == 0 && offY == 0) { return clamped; }
+  let bx = u32(blockID) % levelParams.nbx;
+  let by = u32(blockID) / levelParams.nbx;
+  let tbx = u32((i32(bx) + offX + i32(levelParams.nbx)) % i32(levelParams.nbx));
+  let tby = u32((i32(by) + offY + i32(levelParams.nby)) % i32(levelParams.nby));
+  let s = blockSlot[tby * levelParams.nbx + tbx];
+  if (s < 0) { return clamped; }
+  return u32(s) * (FB * FB) + u32(sy - offY * RB2) * FB + u32(sx - offX * RB2);
+}
+
 fn srcCellResolved(slot: u32, blockID: i32, sx: i32, sy: i32, FB: u32) -> u32 {
   var nx = sx; var ny = sy;
   let bx = u32(blockID) % levelParams.nbx;
@@ -303,6 +337,7 @@ fn main(
                           + u32(clamp(sy, 0, i32(FB) - 1)) * FB
                           + u32(clamp(sx, 0, i32(FB) - 1));
               if (GHOST == 0u) { srcCell = srcCellResolved(slot, blockID, sx, sy, FB); }
+              else if (RING_FREE_FORCE != 0u) { srcCell = srcCellRinged(slot, blockID, sx, sy, FB); }
               let fi = fUnpack(f_in[fIdx(i, poolPlaneStride, srcCell)], i);
               rho     += fi;
               ux_star += fi * f32(ex[i]);

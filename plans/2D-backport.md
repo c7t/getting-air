@@ -2510,6 +2510,46 @@ The seam's dissipation fell ~5x and the error stopped growing (6.7e-4 at 512,
 7.1e-4 at 2048). Conservation did not move, as the construction says it
 cannot. `?explin=0` reproduced B6-1's uniform numbers to every digit.
 
+### B6-3 — DONE (2026-09-23). The force read the ring too; the published table on explode.
+
+**THE FIRST EXPLODE CYLINDER TABLE LOOKED LIKE A PHYSICS REGRESSION AND WAS A
+READOUT.** Both diffuse configs rose +0.12 in Cd (N3-diffuse 1.473 -> 1.594, a
+new red cell) while bounce-back barely moved. The referee was the SAME config
+FULLY REFINED -- no coarse seam anywhere -- and it still split, interp 1.655
+against explode 1.778. So not the interface: the diffuse branch of
+`amr_force1.wgsl` re-does the streaming gather for rho and u*, and on a ringed
+level it clamped its sources into the RING, which the step never reads (it goes
+through the neighbour tile, DIRECT_GHOST). Explode's ring is uncollided, so the
+force was built from a gather the fluid never felt; bounce-back's link sum
+reads only the cell's own data, which is why it did not move.
+`RING_FREE_FORCE` resolves the gather exactly as the step does. Fully refined,
+interp and explode then agree TO THE DIGIT (1.655 / 0.1497 both), and interp's
+own number did not move, i.e. its ring happened to hold the right thing.
+
+**THE PUBLISHED TABLE ON `?interface=explode`** (health-checked RTX):
+
+```
+config              interp (baseline)   explode            literature
+amr-N2-diffuse      1.652 / 0.1484      1.652 / 0.1494     1.35 / 0.165
+amr-N2-bounceback   1.356 / 0.1642      1.373 / 0.1665
+amr-N3-diffuse      1.473 / 0.1570      1.493 / 0.1603
+amr-N3-bounceback   1.365 / 0.1645      1.328 / 0.1680
+```
+
+No new red cell; the documented diffuse-band one is unchanged. St moves toward
+0.165 on three of four. All invariants green. The default path is unchanged
+(cylinder fingerprints `57f916c1cf590e12` / `72718a827cbccd57` before and
+after).
+
+**What is left before explode can be the default** -- that call moves the
+published surface, so it is the user's, not this plan's:
+- `amr_render.wgsl`'s stencil, the last listed ring consumer (visual only).
+- `validate-divergence.js` / `validate-amr-vs-dense.js` on explode (the `edge`
+  column is built for exactly this class).
+- Cost: explode adds two passes and keeps interp and average (B6-perf).
+- The card page's moving body and the reentry pages have booted and passed
+  invariants on explode, but nothing has scored their physics.
+
 ### B7 — DONE (2026-09-14)
 
 `?kEps=` threads one `K_EPS` override through all nine chi sites (the render

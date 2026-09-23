@@ -525,6 +525,9 @@ const DC_PRE = urlParams.has('dcpre') ? (parseInt(urlParams.get('dcpre')) || 0) 
 // amr2d-gpu.mjs's readInterfaceMode and makeExplodeCoalesce.
 const INTERFACE = readInterfaceMode(urlParams);
 const COLLIDE_RING = INTERFACE === 'explode' ? 0 : 1;
+// The force gather's ring rule follows the interface unless ?ringfreeforce=
+// says otherwise -- see amr_force1.wgsl's RING_FREE_FORCE (B6-2).
+const RING_FREE_FORCE = urlParams.has('ringfreeforce') ? (parseInt(urlParams.get('ringfreeforce')) ? 1 : 0) : 1 - COLLIDE_RING;
 
 // ── ?ghostcopy=1 -- legacy materialized same-level ghost cells ───────────────
 // Default 0: the fine step resolves a source cell that falls outside its tile
@@ -1334,7 +1337,7 @@ async function init() {
   // LevelParams reads, see amr_force1.wgsl's header).
   const force1PL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [force1BGL] }),
-    compute: { module: force1SM, entryPoint: 'main', constants: { W, H, RB, F16 } }
+    compute: { module: force1SM, entryPoint: 'main', constants: { W, H, RB, F16, RING_FREE_FORCE } }
   });
   // Two pipelines, same module, different entry points -- dispatched as two
   // SEPARATE passes (coarsen fully completing before refine starts) to
