@@ -2492,6 +2492,24 @@ gated on `amp` falling toward the controls.
 explode scheduler read the dev page's `ghostCopy` callback before the state it
 closes over existed (caught by the new health check on its first run).
 
+### B6-2 — DONE (2026-09-23). The linear explosion: 12x interp in the field, 2.3x the controls.
+
+3D's M4.1c-ii in `amr_explode.wgsl` (`EXPLODE_LINEAR`, default on the explode
+path, `?explin=0` for uniform): central difference on axes with two real,
+uncovered parent neighbours, projected orthogonal to `e_i`. Same build, cap 96:
+
+```
+@2048                  whole     amp        shape     conservation
+controls none / all    3.1e-4    +1.9/-1.1e-4  2.4e-4
+interp                 8.34e-3   -7.70e-3   3.21e-3   89x floor
+explode uniform        2.42e-3   -2.14e-3   1.11e-3   0.55x, mass 1.000
+explode LINEAR         7.14e-4   -5.3e-4    4.7e-4    0.50x, mass 0.998
+```
+
+The seam's dissipation fell ~5x and the error stopped growing (6.7e-4 at 512,
+7.1e-4 at 2048). Conservation did not move, as the construction says it
+cannot. `?explin=0` reproduced B6-1's uniform numbers to every digit.
+
 ### B7 — DONE (2026-09-14)
 
 `?kEps=` threads one `K_EPS` override through all nine chi sites (the render

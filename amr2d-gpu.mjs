@@ -1619,13 +1619,16 @@ export function readInterfaceMode(urlParams) {
 // `cur` is the PARENT's time-t buffer ('a' | 'b'). The child side is always
 // its 'a': explode fills the buffer the child's substep A reads, and coalesce
 // harvests the one its substep B wrote, which is 'a' again.
-export function makeExplodeCoalesce(device, layouts, modules, pools, nLevels, { RB, F16 }) {
+export function makeExplodeCoalesce(device, layouts, modules, pools, nLevels, { RB, F16, explodeLinear = true }) {
   const pipe = (layout, module, constants) => device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [layout] }),
     compute: { module, entryPoint: 'main', constants },
   });
-  const explodePL = [pipe(layouts.explodeBGL, modules.explodeSM, { RB, F16, PARENT_GHOST: 0 }),
-                     pipe(layouts.explodeBGL, modules.explodeSM, { RB, F16, PARENT_GHOST: 2 })];
+  // B6-2: the linear explosion is the default on this path; ?explin=0 keeps
+  // the uniform one in the same build for A/B (see amr_explode.wgsl).
+  const EXPLODE_LINEAR = explodeLinear ? 1 : 0;
+  const explodePL = [pipe(layouts.explodeBGL, modules.explodeSM, { RB, F16, PARENT_GHOST: 0, EXPLODE_LINEAR }),
+                     pipe(layouts.explodeBGL, modules.explodeSM, { RB, F16, PARENT_GHOST: 2, EXPLODE_LINEAR })];
   const coalescePL = [pipe(layouts.coalesceBGL, modules.coalesceSM, { RB, F16, PARENT_GHOST: 0 }),
                       pipe(layouts.coalesceBGL, modules.coalesceSM, { RB, F16, PARENT_GHOST: 2 })];
   const FB = 2 * RB + 4;

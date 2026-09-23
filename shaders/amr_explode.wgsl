@@ -41,6 +41,36 @@
 // owner is its block index (PARENT_GHOST = 0, same fold as the interp
 // accessor's).
 //
+// LINEAR EXPLOSION (B6-2, `EXPLODE_LINEAR`, ?explin=0 restores uniform) --
+// 3D's M4.1c-ii. The uniform explosion is a piecewise-CONSTANT reconstruction:
+// first order at the seam, and B6-1's field channel measured what that costs
+// -- the error is almost entirely the mode's AMPLITUDE, i.e. the seam
+// dissipates. Chen et al.'s second-order form is
+//
+//     f_i(child) = f_i(v) + (r_child - r_v) . G_i
+//
+// with G_i a central difference of f_i on the parent grid and the child offset
+// +-1/4 of a parent cell per axis. Two constraints, both inherited:
+//
+//   1. ONLY AXES WITH TWO REAL, UNCOVERED PARENT NEIGHBOURS. A covered
+//      neighbour's parent solution is a restriction nobody pulls (and its
+//      slots may hold coalesced outbox values), and a pool parent two cells
+//      out may have no tile at all. So the test is per axis: it excludes the
+//      seam normal automatically (v + e_i is covered by definition) and
+//      degrades to UNIFORM at a concave corner. No geometry is classified.
+//   2. PROJECTED ORTHOGONAL TO e_i. One explosion feeds both substeps because
+//      the exploded state RECURS under translation by -e_i, and a linear field
+//      does so iff G_i . e_i = 0. A component along e_i would inject a
+//      different value on each substep from one parent state -- a spurious
+//      time variation at the seam, an acoustic source.
+//
+// CONSERVATION IS UNTOUCHED BY CONSTRUCTION: the four children's offsets sum
+// to zero on each axis, and the two substeps draw from the two layers along
+// e_i, whose offsets are equal and opposite. If a conservation gate moves when
+// this is switched on, it is a bug here, not a tolerance to widen. The
+// IN-orphan stays UNIFORM for the reason given above it.
+override EXPLODE_LINEAR : u32 = 1u;
+
 // Dispatched over (ceil(FB/8), ceil(FB/8), child slots), same shape as interp.
 
 // @include "common_lattice.wgsl"
@@ -110,11 +140,37 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     fv[i] = fUnpack(f_parent[fIdx(i, pplane, u32(vIdx))], i);
   }
 
+  // The four parent neighbours for the linear term, and whether each axis can
+  // be central-differenced (both neighbours real and uncovered). Hoisted: they
+  // depend on v alone.
+  var okx = false; var oky = false;
+  var ixm = -1; var ixp = -1; var iym = -1; var iyp = -1;
+  if (EXPLODE_LINEAR != 0u) {
+    let vxm = wrapCoarse(v + vec2<i32>(-1, 0)); let vxp = wrapCoarse(v + vec2<i32>(1, 0));
+    let vym = wrapCoarse(v + vec2<i32>(0, -1)); let vyp = wrapCoarse(v + vec2<i32>(0, 1));
+    ixm = parentCellIndex(vxm); ixp = parentCellIndex(vxp);
+    iym = parentCellIndex(vym); iyp = parentCellIndex(vyp);
+    okx = !coveredCoarse(vxm) && !coveredCoarse(vxp) && ixm >= 0 && ixp >= 0;
+    oky = !coveredCoarse(vym) && !coveredCoarse(vyp) && iym >= 0 && iyp >= 0;
+  }
+  // This child's offset from v's centre, in PARENT cells: -1/4 or +1/4.
+  let d = (vec2<f32>(g - v * 2) - 0.5f) * 0.5f;
+
   var fo: array<f32, 9>;
   for (var i = 0u; i < 9u; i++) {
     let e = vec2<i32>(ex[i], ey[i]);
     if (coveredCoarseU(v + e)) {
       fo[i] = fv[i];                          // the explode proper
+      if (EXPLODE_LINEAR != 0u && (okx || oky)) {
+        var G = vec2<f32>(0f, 0f);
+        if (okx) { G.x = 0.5f * (fUnpack(f_parent[fIdx(i, pplane, u32(ixp))], i) - fUnpack(f_parent[fIdx(i, pplane, u32(ixm))], i)); }
+        if (oky) { G.y = 0.5f * (fUnpack(f_parent[fIdx(i, pplane, u32(iyp))], i) - fUnpack(f_parent[fIdx(i, pplane, u32(iym))], i)); }
+        // i = 0 cannot reach here (e_0 = 0 lands on v, which is uncovered),
+        // so |e_i|^2 >= 1.
+        let ef = vec2<f32>(e);
+        G -= ef * (dot(G, ef) / dot(ef, ef));
+        fo[i] += dot(d, G);
+      }
     } else {
       let dst = wrapFine(g + e);              // the IN-orphan test
       let intoTile = coveredCoarse(dst / 2) && all(blockOfFine(dst) == b);

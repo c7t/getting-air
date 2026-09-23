@@ -675,7 +675,7 @@ async function init() {
     ? makeExplodeCoalesce(device, layouts, {
         explodeSM: await loadShader(device, 'shaders/amr_explode.wgsl'),
         coalesceSM: await loadShader(device, 'shaders/amr_coalesce.wgsl'),
-      }, pools, N_LEVELS, { RB, F16 })
+      }, pools, N_LEVELS, { RB, F16, explodeLinear: urlParams.get('explin') !== '0' })
     : null;
 
   const error = await device.popErrorScope();

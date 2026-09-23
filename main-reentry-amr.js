@@ -1029,7 +1029,7 @@ async function init() {
     ? makeExplodeCoalesce(device, layouts, {
         explodeSM: await loadShader(device, 'shaders/amr_explode.wgsl'),
         coalesceSM: await loadShader(device, 'shaders/amr_coalesce.wgsl'),
-      }, pools, N_LEVELS, { RB, F16 })
+      }, pools, N_LEVELS, { RB, F16, explodeLinear: urlParams.get('explin') !== '0' })
     : null;
 
   // Milestone 8: level 1's own force pass. Always reads pools[1].finePoolF_a
