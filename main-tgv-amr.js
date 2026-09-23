@@ -106,6 +106,9 @@ const DC_PRE = urlParams.has('dcpre') ? (parseInt(urlParams.get('dcpre')) || 0) 
 // amr2d-gpu.mjs's readInterfaceMode and makeExplodeCoalesce.
 const INTERFACE = readInterfaceMode(urlParams);
 const COLLIDE_RING = INTERFACE === 'explode' ? 0 : 1;
+// The render's ring rule follows the interface unless ?ringfreerender= says
+// otherwise -- see amr_render.wgsl's RING_FREE_RENDER (B6-4).
+const RING_FREE_RENDER = urlParams.has('ringfreerender') ? (parseInt(urlParams.get('ringfreerender')) ? 1 : 0) : 1 - COLLIDE_RING;
 
 
 
@@ -573,7 +576,7 @@ async function init() {
       // -- and never drawn. Three of the five AMR pages were in that state.
       // U7-6b: ROOT_IS_POOL must match what makeRenderBindGroup put on binding
       // 0 -- see renderRootIsPool, which is the single statement of that rule.
-      constants: { ...fineConstants, N_POOL_LEVELS: renderPoolLevels(N_LEVELS) } },
+      constants: { ...fineConstants, N_POOL_LEVELS: renderPoolLevels(N_LEVELS), RING_FREE_RENDER } },
     primitive: { topology: 'triangle-list' },
   });
   // plans/2D-backport.md B2: the 2:1 closure's own pipelines. Built but

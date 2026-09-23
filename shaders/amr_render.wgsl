@@ -239,11 +239,48 @@ fn poolSlotOf(m: u32, blockID: i32) -> i32 {
 // units and the central difference spans +/-1 fine cell, so the factor is
 // 1/(2 * 2^-m) = 2^(m-1): 1 at level 1, 2 at level 2, and so on. The two
 // hand-written copies this replaces carried exactly those two constants.
-fn fineOmegaAt(m: u32, slot: u32, cx: i32, cy: i32) -> f32 {
-  let uyp = poolVel(m, slot, cx + 1, cy).y;
-  let uym = poolVel(m, slot, cx - 1, cy).y;
-  let uxp = poolVel(m, slot, cx, cy + 1).x;
-  let uxm = poolVel(m, slot, cx, cy - 1).x;
+// RING_FREE_RENDER (plans/2D-backport.md B6-4). The taps below reach up to
+// two cells past a tile's interior -- the bilinear blend one, the curl's +-1
+// another -- i.e. into the RING. On the interp path a ring cell holds a
+// collided, parent-interpolated state and that was close enough. On the
+// explode path the ring is an inbox/outbox, and at a CONVEX CORNER of the
+// refined region its gathered directions are largely zeros or clamps, so its
+// "velocity" is garbage and the curl turns it into a single bright cell --
+// reported on the cylinder page, and measured to be the render's alone: the
+// tile INTERIORS showed no corner outlier on either path (plans/2D-backport.md
+// B6-4). So on that path a tap outside the interior resolves into the
+// SAME-level neighbour tile, and where there is none (a coarse seam) it takes
+// the tile's own edge cell -- the rule amr_criterion_pool.wgsl's RING_FREE_TAPS
+// uses. Default 0 keeps the interp picture byte-identical.
+override RING_FREE_RENDER : u32 = 0u;
+
+fn poolVelRingFree(m: u32, slot: u32, bx: u32, by: u32, nbxL: u32, nbyL: u32, cx: i32, cy: i32) -> vec2<f32> {
+  let RB2 = i32(RB * 2u);
+  var ix = cx - i32(GHOST); var iy = cy - i32(GHOST);
+  var tbx = bx; var tby = by;
+  if (ix < 0)         { ix += RB2; tbx = (bx + nbxL - 1u) % nbxL; }
+  else if (ix >= RB2) { ix -= RB2; tbx = (bx + 1u) % nbxL; }
+  if (iy < 0)         { iy += RB2; tby = (by + nbyL - 1u) % nbyL; }
+  else if (iy >= RB2) { iy -= RB2; tby = (by + 1u) % nbyL; }
+  var s = i32(slot);
+  if (tbx != bx || tby != by) { s = poolSlotOf(m, i32(tby * nbxL + tbx)); }
+  if (s < 0) {
+    s = i32(slot);
+    ix = clamp(cx - i32(GHOST), 0, RB2 - 1); iy = clamp(cy - i32(GHOST), 0, RB2 - 1);
+  }
+  return poolVel(m, u32(s), ix + i32(GHOST), iy + i32(GHOST));
+}
+
+fn tapVelAt(m: u32, slot: u32, bx: u32, by: u32, nbxL: u32, nbyL: u32, cx: i32, cy: i32) -> vec2<f32> {
+  if (RING_FREE_RENDER != 0u) { return poolVelRingFree(m, slot, bx, by, nbxL, nbyL, cx, cy); }
+  return poolVel(m, slot, cx, cy);
+}
+
+fn fineOmegaAt(m: u32, slot: u32, bx: u32, by: u32, nbxL: u32, nbyL: u32, cx: i32, cy: i32) -> f32 {
+  let uyp = tapVelAt(m, slot, bx, by, nbxL, nbyL, cx + 1, cy).y;
+  let uym = tapVelAt(m, slot, bx, by, nbxL, nbyL, cx - 1, cy).y;
+  let uxp = tapVelAt(m, slot, bx, by, nbxL, nbyL, cx, cy + 1).x;
+  let uxm = tapVelAt(m, slot, bx, by, nbxL, nbyL, cx, cy - 1).x;
   return ((uyp - uym) - (uxp - uxm)) * exp2(f32(m) - 1.0f);
 }
 
@@ -344,9 +381,12 @@ fn fs_main(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> {
   var deepestSlot = 0u;
   var deepestLocal = vec2<f32>(0.0f, 0.0f); // offset within that tile, L0 units
   var deepestFootprint = f32(RB);
+  var deepestB = vec2<u32>(0u, 0u);   // that tile's block coords, for RING_FREE_RENDER
+  var deepestNb = vec2<u32>(1u, 1u);  // and its level's block grid
   {
     var footprint = f32(RB);   // level 1's tile, in L0 units
     var nbxL = nbx;
+    var nbyL = H / BLOCK;
     for (var m = 1u; m <= N_POOL_LEVELS; m++) {
       // THE HALF-CELL SHIFT IS PER LEVEL, AND GETTING THAT WRONG IS VISIBLE.
       //
@@ -377,8 +417,11 @@ fn fs_main(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> {
       deepestSlot = u32(sl);
       deepestLocal = vec2<f32>(dx, dy);
       deepestFootprint = footprint;
+      deepestB = vec2<u32>(bX, bY);
+      deepestNb = vec2<u32>(nbxL, nbyL);
       footprint = footprint * 0.5f;
       nbxL = nbxL * 2u;
+      nbyL = nbyL * 2u;
     }
   }
   // Quadtree outline: additive line color, drawn along each ACTIVE block's
@@ -403,8 +446,8 @@ fn fs_main(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> {
     let fx0 = i32(floor(fxc)); let fy0 = i32(floor(fyc));
     let ftx = fxc - f32(fx0);  let fty = fyc - f32(fy0);
     omega = mix(
-        mix(fineOmegaAt(deepest, deepestSlot, fx0, fy0),         fineOmegaAt(deepest, deepestSlot, fx0 + 1, fy0),     ftx),
-        mix(fineOmegaAt(deepest, deepestSlot, fx0, fy0 + 1),     fineOmegaAt(deepest, deepestSlot, fx0 + 1, fy0 + 1), ftx),
+        mix(fineOmegaAt(deepest, deepestSlot, deepestB.x, deepestB.y, deepestNb.x, deepestNb.y, fx0, fy0),         fineOmegaAt(deepest, deepestSlot, deepestB.x, deepestB.y, deepestNb.x, deepestNb.y, fx0 + 1, fy0),     ftx),
+        mix(fineOmegaAt(deepest, deepestSlot, deepestB.x, deepestB.y, deepestNb.x, deepestNb.y, fx0, fy0 + 1),     fineOmegaAt(deepest, deepestSlot, deepestB.x, deepestB.y, deepestNb.x, deepestNb.y, fx0 + 1, fy0 + 1), ftx),
         fty);
 
     // This tile's own edge distance, periodic within its own footprint. Only

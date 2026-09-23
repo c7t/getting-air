@@ -525,6 +525,9 @@ const DC_PRE = urlParams.has('dcpre') ? (parseInt(urlParams.get('dcpre')) || 0) 
 // amr2d-gpu.mjs's readInterfaceMode and makeExplodeCoalesce.
 const INTERFACE = readInterfaceMode(urlParams);
 const COLLIDE_RING = INTERFACE === 'explode' ? 0 : 1;
+// The render's ring rule follows the interface unless ?ringfreerender= says
+// otherwise -- see amr_render.wgsl's RING_FREE_RENDER (B6-4).
+const RING_FREE_RENDER = urlParams.has('ringfreerender') ? (parseInt(urlParams.get('ringfreerender')) ? 1 : 0) : 1 - COLLIDE_RING;
 // The force gather's ring rule follows the interface unless ?ringfreeforce=
 // says otherwise -- see amr_force1.wgsl's RING_FREE_FORCE (B6-2).
 const RING_FREE_FORCE = urlParams.has('ringfreeforce') ? (parseInt(urlParams.get('ringfreeforce')) ? 1 : 0) : 1 - COLLIDE_RING;
@@ -1243,7 +1246,7 @@ async function init() {
   // U6: how many pool levels the renderer walks. renderPoolLevels() REFUSES a
   // configuration deeper than the shader binds, rather than drawing it without
   // its finest level -- which is what this override replaced HAS_LEVEL2 for.
-  const renderConstants = { W, H, RB, N_POOL_LEVELS: renderPoolLevels(N_LEVELS), K_EPS };
+  const renderConstants = { W, H, RB, N_POOL_LEVELS: renderPoolLevels(N_LEVELS), RING_FREE_RENDER, K_EPS };
   const step1Constants = { COLLIDE_RING, W, H, RB, SDF_FAR, F16, DIRECT_GHOST: GHOST_COPY ? 0 : 1 };
 
   // U7-1: the twelve coupling pipelines, from ONE place. Every page built

@@ -2550,6 +2550,36 @@ published surface, so it is the user's, not this plan's:
 - The card page's moving body and the reentry pages have booted and passed
   invariants on explode, but nothing has scored their physics.
 
+### B6-4 — DONE (2026-09-23). The bright corner cells were the RENDER reading the ring.
+
+Reported by eye on the cylinder page under explode: single very bright cells at
+the corners of refinement boundaries. Two candidates look identical on screen
+-- the renderer reading a ring cell, or a real spike where the orphan passes
+act -- so it was MEASURED IN THE FLUID FIRST, as CLAUDE.md's M6.4 lesson says
+(never an image statistic): the tile INTERIORS, reconstructed at step 8192,
+have their sharpest vorticity outliers on the body on both paths (8.5e-4 on
+each, 32-46 fine cells from any corner). So it was the render: its bilinear
+blend plus the curl's +-1 reach two cells past the interior, into a ring that
+at a convex corner holds mostly zeroed/clamped directions under explode.
+
+`RING_FREE_RENDER` in `amr_render.wgsl` resolves those taps through the
+same-level neighbour tile (own edge at a coarse seam), default on the explode
+path, `?ringfreerender=` to A/B. Magnified crops of all 8 convex corners, same
+build (`plans/img/b6-4-corner-cells.png`): interp clean; explode with the ring
+read shows the bright cells at every corner; explode ring-free matches interp.
+
+**That makes four ring consumers on this path, all found by a failing check,
+never by reading**: the criterion (pool starvation), the diffuse force (Cd
++0.12 with no seam), the render (corner cells), and -- by construction -- the
+step itself, which never reads a ring where a neighbour exists. uniform-levels
+2.5's "a ring cell is not a state" is the rule all four broke.
+
+**Found in passing, not yet explained:** the explode interior has DENSITY
+outliers the interp one does not -- 1.0e-4 (5.4x its p99, against interp's
+2.1x) in 2x2 fine clusters, i.e. single COARSE cells, symmetric about the wake
+axis at x ~ 575, y ~ 480/543, ~32 fine cells from any corner: on a straight
+downstream seam. Too small for the vorticity picture; a real seam signature.
+
 ### B7 — DONE (2026-09-14)
 
 `?kEps=` threads one `K_EPS` override through all nine chi sites (the render
