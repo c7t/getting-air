@@ -413,7 +413,10 @@ Read `plans/perf-characterization.md` BEFORE optimizing anything here. The
 two target devices have **opposite** bottlenecks — the desktop is
 pass-count/latency bound, the mobile PowerVR is memory-bandwidth bound — and
 the obvious optimization (indirect dispatch off the active block count) was
-measured to help neither. It also records the trap that produced a confident
+measured to help neither **at `?levels=2` with 128 slots** -- and at depth it
+is the largest item on the phone: an empty slot's workgroup costs ~14 ns, the
+cost scales with slots x 2^m substeps, and `?levels=4` at res=5 spends ~4 of
+9.4 ms per macro-step launching empty workgroups (2026-09-24, same document). It also records the trap that produced a confident
 wrong conclusion: per-pass GPU timestamps are unusable on that mobile part
 (65536 ns counter granularity vs sub-tick passes), so attribution has to be
 done at frame scale via `?bench=1`.

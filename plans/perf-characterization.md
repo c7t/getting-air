@@ -212,6 +212,40 @@ blocks) desktop frame time went 2.78 ms at `maxFineBlocks=128` and 4.24 ms at
 256, so dispatch width is not free — but it is second-order next to pass
 count.
 
+### ...but it IS the answer at depth: an empty slot costs ~14 ns (2026-09-24)
+
+Everything above was measured at `?levels=2` with 128 slots. It does not
+extrapolate, because an empty slot's cost scales with slots x 2^m substeps, and
+the pool defaults grew with `POOL_PEAKS` (608 / 960 / 1164 slots at `?levels=4`).
+
+**Measured on the phone (img-tec, Chrome 153) with a bare early-return kernel**
+over CDP -- one storage read of `slotToBlock`, `< 0`, return -- so nothing else
+is in the number:
+
+    8x8 workgroup      13.4-15.3 ns each   (50-200 passes, 1164-4096 slots)
+    16x16 workgroup    60-70 ns each
+    dependent pass     ~30 us marginal     (1-800 passes, 16 slots)
+
+So the cost is per THREAD launched (~0.23 ns), not per workgroup: changing the
+workgroup shape does not make an empty slot cheaper, only not launching it does.
+
+**On the shipped page it is the largest item.** `index-amr.html?interface=
+explode&res=5&levels=4`: one root macro-step launches ~305k workgroups, ~13k of
+them on a live tile (16/48/48 active against 16/64/256 blocks that EXIST at
+res=5 -- the pools are sized from res=8 peaks and never clamped to the level's
+own block count). Rough split of the measured 9.4 ms: ~4 ms empty launches,
+~1.5 ms pass floor (~52 passes), ~3.5-4 ms real work. A/B'd on the phone,
+interleaved against thermal drift: default pools 9.42 / 9.38 / 9.54 ms per
+macro-step, `?maxFineBlocks=64&maxFineBlocks2=256&maxFineBlocks3=512` 6.59 /
+6.49 -- 1.45x, and ~190k fewer launches x 15 ns predicts the 2.9 ms saved.
+Clamping to EXACTLY the block count (16/64/256) trips the geometry-refusal
+watch at ~1024 steps; why the allocator needs slack past NBLOCKS is not yet
+known. Launching only live slots (indirect dispatch over a compacted list) is
+estimated at ~5.4 ms, UNMEASURED.
+
+Why 2026-09-07 saw nothing: 62 empty slots x 9 workgroups x a few passes x 2
+substeps is ~3k launches, ~45 us, under 1% of that frame.
+
 ## RE-MEASURED at current defaults (2026-09-07) -- the fusion case is gone
 
 The table above is levels=2, 66 active L1 blocks, `MAX_FINE_BLOCKS=128`, and
