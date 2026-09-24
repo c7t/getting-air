@@ -9,7 +9,6 @@ plans/*
 !plans/uniform-levels.md
 transcripts/
 snapshots/
-https.py
 *.pem
 *~
 *.mp4
