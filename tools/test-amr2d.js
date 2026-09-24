@@ -69,7 +69,7 @@ const sorted = (s) => [...s].sort();
 (async () => {
   const A = await import(path.join(__dirname, '..', 'amr2d.mjs'));
   const {
-    GHOST, RB_DEFAULT, fineToCoarseUnit, coarseUnitToFine, cellSizeL0AtLevel,
+    GHOST, RB_DEFAULT, fineToCoarseUnit, coarseUnitToFine, cellSizeL0AtLevel, cellCentreL0,
     grantAssignment, releaseAssignment,
     tileCellsAtLevel, ghostDepthAtLevel, tileSideAtLevel, blockGridAtLevel,
     parentCellOfFineCell, fineCellsOfParentCell, ringDepth, ringSlotRole,
@@ -142,6 +142,55 @@ const sorted = (s) => [...s].sort();
     }
     // Level 1's own numbers, as shaders/amr_step1.wgsl:120 hardcodes them.
     close(fineToCoarseUnit(GHOST, 24, 0.5), 23.75, 1e-12, 'origin 24, j=GHOST');
+  });
+
+  // ── where a level-m cell IS (plans/uniform-levels.md S8-2) ─────────────
+  //
+  // The test above checks fineToCoarseUnit against its own premise -- that
+  // `origin` is a parent-cell centre -- and so passed at every dx while the
+  // kernels fed it an origin that is a parent-cell centre only at level 1.
+  // These check the POSITION against two routes that share none of its
+  // arithmetic: the transfers' INDEX pairing (children GHOST+2p, GHOST+2p+1 of
+  // parent cell q*RB + p) and the global-index closed form.
+  ok('a fine pair\'s midpoint IS its parent cell\'s centre, at every level', () => {
+    const rb = RB_DEFAULT;
+    for (let m = 1; m <= 4; m++) {
+      for (const b of [0, 1, 2, 3, 7, 12]) {
+        const pb = b >> 1, q = b & 1;
+        for (let p = 0; p < rb; p++) {
+          const mid = (cellCentreL0(b, GHOST + 2 * p, m) + cellCentreL0(b, GHOST + 2 * p + 1, m)) / 2;
+          const parent = cellCentreL0(m === 1 ? b >> 1 : pb, (m === 1 ? 0 : GHOST) + q * rb + p, m - 1);
+          close(mid, parent, 1e-12, `level ${m} block ${b} pair ${p}`);
+        }
+      }
+    }
+  });
+
+  ok('cellCentreL0 is the closed form (g + 1/2)*dx - 1/2 of the global index', () => {
+    const rb = RB_DEFAULT;
+    for (let m = 0; m <= 4; m++) {
+      const dx = cellSizeL0AtLevel(m), g0 = ghostDepthAtLevel(m);
+      for (const b of [0, 1, 5, 9]) for (let k = -g0; k < 2 * rb + g0; k++) {
+        close(cellCentreL0(b, g0 + k, m), (b * 2 * rb + k + 0.5) * dx - 0.5, 1e-12, `m=${m} b=${b} k=${k}`);
+      }
+    }
+    // The root's cells are the integers, which is what the whole rule hangs on.
+    close(cellCentreL0(3, 5, 0), 3 * 2 * rb + 5, 1e-12, 'root cell');
+  });
+
+  ok('the legacy placement is caught: exact at levels 0-1, 1/2 - dx high from level 2', () => {
+    for (let m = 0; m <= 4; m++) {
+      const dx = cellSizeL0AtLevel(m), j = ghostDepthAtLevel(m) + 3;
+      const d = cellCentreL0(4, j, m, { legacy: true }) - cellCentreL0(4, j, m);
+      close(d, m <= 1 ? 0 : 0.5 - dx, 1e-12, `legacy offset at level ${m}`);
+    }
+    let caught = false;
+    const rb = RB_DEFAULT;
+    for (let p = 0; p < rb; p++) {
+      const mid = (cellCentreL0(2, GHOST + 2 * p, 2, { legacy: true }) + cellCentreL0(2, GHOST + 2 * p + 1, 2, { legacy: true })) / 2;
+      if (Math.abs(mid - cellCentreL0(1, GHOST + p, 1)) > 1e-9) caught = true;
+    }
+    assert.ok(caught, 'the pair-midpoint check cannot see the legacy misplacement');
   });
 
   ok('coarseUnitToFine inverts fineToCoarseUnit, ring indices included', () => {

@@ -231,8 +231,19 @@ fn toPhysical(eps: f32) -> f32 { return eps - log2(PARENT_CELL_SIZE_L0); }
 // git history records (a centre off by half a tile, and a quadrant step off by
 // the same factor) were exactly that pair disagreeing.
 fn parentHalfExtentL0() -> f32 { return f32(RB) * PARENT_CELL_SIZE_L0; }
+// THE FOOTPRINT STARTS HALF A ROOT CELL BELOW `origin` (plans/uniform-levels.md
+// S8-2), at every level including the root: root cells are centred on
+// integers, so root block b covers [b*2*RB - 1/2, ...], and every level below
+// inherits that edge. The legacy box started AT `origin` -- half a root cell
+// high in x and y -- which is inside the margin's slack but is the same
+// misregistration amr_step1.wgsl's CELL_CENTRE_AFFINE corrects, so it follows
+// the same switch. amr2d-gpu.mjs's checkGeometryCoverageOnGPU asks the same
+// box question and follows it too.
+override CELL_CENTRE_AFFINE : u32 = 1u;
+fn footprintLoOffset() -> f32 { return select(0.0f, -0.5f, CELL_CENTRE_AFFINE != 0u); }
 fn parentCentreL0(bxP: u32, byP: u32) -> vec2<f32> {
-  return parentOriginL0(bxP, byP) + vec2<f32>(parentHalfExtentL0(), parentHalfExtentL0());
+  let o = footprintLoOffset();
+  return parentOriginL0(bxP, byP) + vec2<f32>(parentHalfExtentL0() + o, parentHalfExtentL0() + o);
 }
 override FORCE_REFINE_MARGIN : f32;
 override FORCE_REFINE_LOOKAHEAD : f32;

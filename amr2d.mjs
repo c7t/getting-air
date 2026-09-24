@@ -69,6 +69,27 @@ export function fineToCoarseUnit(j, origin, dx = 0.5) {
   return origin - 0.5 * dx + dx * (j - GHOST);
 }
 
+// WHERE A LEVEL-m CELL IS, in L0 units -- the question amr_step1.wgsl and
+// amr_force1.wgsl answer for the body, the sponge and the walls
+// (plans/uniform-levels.md S8-2). Root cells are centred on integers, so
+// global cell g of level m is centred at (g + 1/2)*dx - 1/2; from the tile's
+// `tileOriginL0` that is an offset of (1 - dx)/2 -- 1/4 at level 1, 3/8 at
+// level 2.
+//
+// `fineToCoarseUnit` above is NOT this function and is not wrong: it is right
+// for an origin that is the centre of the tile's first PARENT cell, which is
+// how the interp kernel uses it, in parent units. The kernels passed it
+// `tileOriginL0` instead, which is a parent-cell centre at level 1 only (a
+// root cell's centre is an integer; a level-1 cell's is x.25 or x.75). So from
+// level 2 down every cell sat 1/2 - dx high. `legacy` reproduces that, for the
+// ?cellcentre=0 A/B and for the test that proves the check can see it.
+export function cellCentreL0(block, j, m, { rb = RB_DEFAULT, legacy = false } = {}) {
+  const dx = cellSizeL0AtLevel(m);
+  const origin = block * rb * 2 * dx;
+  const off = legacy ? (m === 0 ? 0 : 0.5 * dx) : 0.5 * (1 - dx);
+  return origin - off + dx * (j - ghostDepthAtLevel(m));
+}
+
 // Inverse, for a position known to land on a fine-cell centre.
 export function coarseUnitToFine(p, origin, dx = 0.5) {
   return Math.round((p - origin + 0.5 * dx) / dx) + GHOST;

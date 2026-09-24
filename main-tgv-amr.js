@@ -62,7 +62,7 @@ import { reportFatal, refuseConfig, reportNoWebGPU, reportNoAdapter } from './er
 import { tauChainSingularity, tauSingularityMessage, rootCellIndex, rootPoolSpec, denseCellIndex } from './amr2d.mjs';
 import { loadShader } from './shader-loader.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
-import { check21BalanceOnGPU, readConservedTotals, allocLevelPool, writePoolInitialState, listActiveBlocks, readCardState , checkRefinementClosureOnGPU , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU, makeRenderBindGroup, renderPoolLevels, MAX_RENDER_POOL_LEVELS, makeAMRLayouts, makeCouplingPipelines, makeLevelBindGroups, makeManageBindGroups, makeScheduler, makeRefineRound, allocRootPool, makeRootPool, seedRootFromDense, readDiag, readInterfaceMode, makeExplodeCoalesce } from './amr2d-gpu.mjs';
+import { check21BalanceOnGPU, readConservedTotals, allocLevelPool, writePoolInitialState, listActiveBlocks, readCardState , checkRefinementClosureOnGPU , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU, makeRenderBindGroup, renderPoolLevels, MAX_RENDER_POOL_LEVELS, makeAMRLayouts, makeCouplingPipelines, makeLevelBindGroups, makeManageBindGroups, makeScheduler, makeRefineRound, allocRootPool, makeRootPool, seedRootFromDense, readDiag, readInterfaceMode, readCellCentre, makeExplodeCoalesce } from './amr2d-gpu.mjs';
 // tauAtLevel: extracted to card-params.mjs by B3a-1, which landed the CALL
 // in all five AMR pages and this IMPORT in only main-amr.js. The other four
 // threw `ReferenceError: tauAtLevelOf is not defined` at init -- but only at
@@ -105,6 +105,9 @@ const DC_PRE = urlParams.has('dcpre') ? (parseInt(urlParams.get('dcpre')) || 0) 
 // B6-1). interp is the default until explode's gates are green; see
 // amr2d-gpu.mjs's readInterfaceMode and makeExplodeCoalesce.
 const INTERFACE = readInterfaceMode(urlParams);
+// ?cellcentre=0 -- legacy level >= 2 cell placement; see amr2d-gpu.mjs's
+// readCellCentre and amr_step1.wgsl's CELL_CENTRE_AFFINE (plans/uniform-levels.md S8-2).
+const CELL_CENTRE_AFFINE = readCellCentre(urlParams);
 const COLLIDE_RING = INTERFACE === 'explode' ? 0 : 1;
 // The render's ring rule follows the interface unless ?ringfreerender= says
 // otherwise -- see amr_render.wgsl's RING_FREE_RENDER (B6-4, B6-8): 0 reads the
@@ -550,7 +553,7 @@ async function init() {
   const stepConstants = { W, H, HAS_BODY: 0, SPONGE_W: 0, F16 };
   const fineConstants = { W, H, RB };
 
-  const step1Constants = { COLLIDE_RING, ...stepConstants, RB, DIRECT_GHOST: GHOST_COPY ? 0 : 1 };
+  const step1Constants = { COLLIDE_RING, CELL_CENTRE_AFFINE, ...stepConstants, RB, DIRECT_GHOST: GHOST_COPY ? 0 : 1 };
 
   // U7-1: the twelve coupling pipelines, from ONE place. Every page built
   // these identically; see makeCouplingPipelines for what stays per page and
@@ -577,7 +580,7 @@ async function init() {
       // -- and never drawn. Three of the five AMR pages were in that state.
       // U7-6b: ROOT_IS_POOL must match what makeRenderBindGroup put on binding
       // 0 -- see renderRootIsPool, which is the single statement of that rule.
-      constants: { ...fineConstants, N_POOL_LEVELS: renderPoolLevels(N_LEVELS), RING_FREE_RENDER } },
+      constants: { ...fineConstants, N_POOL_LEVELS: renderPoolLevels(N_LEVELS), RING_FREE_RENDER, CELL_CENTRE_AFFINE } },
     primitive: { topology: 'triangle-list' },
   });
   // plans/2D-backport.md B2: the 2:1 closure's own pipelines. Built but
@@ -612,6 +615,7 @@ async function init() {
       W, H, RB,
       NBX_PARENT: parentPool.NBX, NBY_PARENT: parentPool.NBY,
       PARENT_CELL_SIZE_L0: cellSizeL0AtLevel(m),
+      CELL_CENTRE_AFFINE,
       ...childParams,
       HAS_BODY: 0,
       // U5-4 left DIAG implicit here on the grounds that "this page has no

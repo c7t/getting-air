@@ -22,7 +22,7 @@ import {
   tauAtLevel as tauAtLevelOf,
 } from './card-params.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
-import { check21BalanceOnGPU, allocLevelPool, writePoolInitialState, checkRootPoolIdentity, readConservedTotals, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState, checkGeometryCoverageOnGPU, makeRefusalWatch , checkRefinementClosureOnGPU , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU, makeRenderBindGroup, renderPoolLevels, MAX_RENDER_POOL_LEVELS, makeAMRLayouts, makeCouplingPipelines, makeLevelBindGroups, makeManageBindGroups, makeScheduler, makeRefineRound, allocRootPool, makeRootPool, encodeRootCapture, readRootCapture, restoreRootCapture, seedRootFromDense, readDiag, readInterfaceMode, makeExplodeCoalesce } from './amr2d-gpu.mjs';
+import { check21BalanceOnGPU, allocLevelPool, writePoolInitialState, checkRootPoolIdentity, readConservedTotals, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState, checkGeometryCoverageOnGPU, makeRefusalWatch , checkRefinementClosureOnGPU , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU, makeRenderBindGroup, renderPoolLevels, MAX_RENDER_POOL_LEVELS, makeAMRLayouts, makeCouplingPipelines, makeLevelBindGroups, makeManageBindGroups, makeScheduler, makeRefineRound, allocRootPool, makeRootPool, encodeRootCapture, readRootCapture, restoreRootCapture, seedRootFromDense, readDiag, readInterfaceMode, readCellCentre, makeExplodeCoalesce } from './amr2d-gpu.mjs';
 import { poolSlotsFor, tauChainSingularity, tauSingularityMessage, rootPoolSpec, rootCellIndex } from './amr2d.mjs';
 import { EX, EY, WT } from './lattice-2d.mjs';
 import { makeCanvasFit } from './canvas-fit.mjs';
@@ -524,6 +524,9 @@ const DC_PRE = urlParams.has('dcpre') ? (parseInt(urlParams.get('dcpre')) || 0) 
 // B6-1). interp is the default until explode's gates are green; see
 // amr2d-gpu.mjs's readInterfaceMode and makeExplodeCoalesce.
 const INTERFACE = readInterfaceMode(urlParams);
+// ?cellcentre=0 -- legacy level >= 2 cell placement; see amr2d-gpu.mjs's
+// readCellCentre and amr_step1.wgsl's CELL_CENTRE_AFFINE (plans/uniform-levels.md S8-2).
+const CELL_CENTRE_AFFINE = readCellCentre(urlParams);
 const COLLIDE_RING = INTERFACE === 'explode' ? 0 : 1;
 // The render's ring rule follows the interface unless ?ringfreerender= says
 // otherwise -- see amr_render.wgsl's RING_FREE_RENDER (B6-4, B6-8): 0 reads the
@@ -1247,8 +1250,8 @@ async function init() {
   // U6: how many pool levels the renderer walks. renderPoolLevels() REFUSES a
   // configuration deeper than the shader binds, rather than drawing it without
   // its finest level -- which is what this override replaced HAS_LEVEL2 for.
-  const renderConstants = { W, H, RB, N_POOL_LEVELS: renderPoolLevels(N_LEVELS), RING_FREE_RENDER, K_EPS };
-  const step1Constants = { COLLIDE_RING, W, H, RB, SDF_FAR, F16, DIRECT_GHOST: GHOST_COPY ? 0 : 1 };
+  const renderConstants = { W, H, RB, N_POOL_LEVELS: renderPoolLevels(N_LEVELS), RING_FREE_RENDER, K_EPS, CELL_CENTRE_AFFINE };
+  const step1Constants = { COLLIDE_RING, CELL_CENTRE_AFFINE, W, H, RB, SDF_FAR, F16, DIRECT_GHOST: GHOST_COPY ? 0 : 1 };
 
   // U7-1: the twelve coupling pipelines, from ONE place. Every page built
   // these identically; see makeCouplingPipelines for what stays per page and
@@ -1341,7 +1344,7 @@ async function init() {
   // LevelParams reads, see amr_force1.wgsl's header).
   const force1PL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [force1BGL] }),
-    compute: { module: force1SM, entryPoint: 'main', constants: { W, H, RB, F16, RING_FREE_FORCE } }
+    compute: { module: force1SM, entryPoint: 'main', constants: { W, H, RB, F16, RING_FREE_FORCE, CELL_CENTRE_AFFINE } }
   });
   // Two pipelines, same module, different entry points -- dispatched as two
   // SEPARATE passes (coarsen fully completing before refine starts) to
@@ -1426,6 +1429,7 @@ async function init() {
       W, H, RB, SDF_FAR,
       NBX_PARENT: parentPool.NBX, NBY_PARENT: parentPool.NBY,
       PARENT_CELL_SIZE_L0: cellSizeL0AtLevel(m),
+      CELL_CENTRE_AFFINE,
       SPONGE_EXCLUDE_W,
       ...childParams,
       N_REFINE_INC, N_REFINE_MAX, MAX_LEVEL: N_LEVELS - 1,
@@ -2728,7 +2732,7 @@ async function init() {
   // pages where it moves. tools/lib/amr-invariants.js PROBES for this
   // function and reports SKIPPED when it is missing, precisely so a missing
   // check cannot look greener than a present one; this is that skip closed.
-  const debugCheckGeometryCoverage = async () => checkGeometryCoverageOnGPU(device, pools, {
+  const debugCheckGeometryCoverage = async () => checkGeometryCoverageOnGPU(device, pools, { cellCentreAffine: CELL_CENTRE_AFFINE,
     nLevels: N_LEVELS, W, H, rb: RB, NBX, NBLOCKS,
     cardState: await debugReadCardState(),
     boxRefine: BOX_REFINE !== 0,

@@ -290,7 +290,28 @@ override FORCE_Y : f32 = 0.0f;
 // to still-wrong-but-improved fx=-6.05 (797 triggers) -- real
 // measured progress, not a full fix.
 // The half-cell straddle is a PARENT-RELATIVE term -- see NO_PARENT.
+// CELL_CENTRE_AFFINE (plans/uniform-levels.md S8-2). Root cells are centred
+// on INTEGERS, so cell g of level m covers [g*dx - 1/2, (g+1)*dx - 1/2] and
+// its centre is (g + 1/2)*dx - 1/2 -- the affine map, compounding per rung.
+// From `origin = block*2*RB*dx` that is an offset of (1 - dx)/2: 0 at the
+// root, 1/4 at level 1, 3/8 at level 2, 7/16 at level 3.
+//
+// The legacy offset was `dx/2`, on the premise that `origin` is the centre of
+// the tile's first PARENT cell. That holds at level 1 (a root cell's centre is
+// an integer) and nowhere below it: a level-1 cell's centre is x.25 or x.75,
+// and `origin` is a multiple of RB*dx*2. So from level 2 down every cell was
+// placed 1/2 - dx of a root cell high in x AND y -- 1/4, 3/8, 7/16 -- while
+// the transfers, which pair children (GHOST+2p, GHOST+2p+1) with parent cell
+// q*RB + p by INDEX, kept the data where it belongs. The body, the sponge and
+// the walls were evaluated in the wrong place relative to the flow on every
+// level >= 2. Measured on the pinned cylinder with the body on the tile
+// partition's mirror axis and no seed: startup |Cl| 0.053 (levels=3) and 0.43
+// (res 7 levels=4) against 2e-4 at levels=2 -- and 2e-4 at every depth with
+// this rule. A y-displacement is the only thing that can make a symmetric
+// problem lift. ?cellcentre=0 restores the legacy offset.
+override CELL_CENTRE_AFFINE : u32 = 1u;
 fn cellCentreOffset() -> f32 {
+  if (CELL_CENTRE_AFFINE != 0u) { return 0.5f * (1.0f - levelParams.dxL); }
   return select(0.5f * levelParams.dxL, 0.0f, NO_PARENT != 0u);
 }
 

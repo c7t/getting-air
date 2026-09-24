@@ -267,6 +267,8 @@ fn poolSlotOf(m: u32, blockID: i32) -> i32 {
 // derivative uses whichever of its two taps exist, divided by the spacing it
 // actually spans: central where both do, one-sided at the seam.
 override RING_FREE_RENDER : u32 = 0u;
+// See the walk in fs_main and amr_step1.wgsl's CELL_CENTRE_AFFINE.
+override CELL_CENTRE_AFFINE : u32 = 1u;
 
 // A fine cell (cx, cy) of level-m tile (bx, by), resolved to (slot, ix, iy) in
 // POOL coordinates of the tile that owns it as INTERIOR -- this tile or its
@@ -456,14 +458,24 @@ fn fs_main(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> {
       // screen that is a dark lattice over the refined region -- caught by
       // eye, not by the reachability gate, which only asks whether a level
       // changes the picture at all.
+      //
+      // CELL_CENTRE_AFFINE (plans/uniform-levels.md S8-2) REPLACES THAT RULE.
+      // The 2^-m shift above was derived to match the step kernel's legacy cell
+      // positions, which were themselves 1/2 - dx of a root cell off the data
+      // from level 2 down; it drew level-2+ flow in register with a body the
+      // solver had put in the wrong place. With the positions corrected, every
+      // level's tiles tile the root's own cells, so every tile edge sits half a
+      // ROOT cell below a multiple of the footprint: the shift is 1/2 at every
+      // level, and `local` is measured from that edge.
       let dens = exp2(f32(m));
-      let shift = 1.0f / dens;
+      let shift = select(1.0f / dens, 0.5f, CELL_CENTRE_AFFINE != 0u);
       let bX = u32(wrapf(bufX + shift, f32(W)) / footprint);
       let bY = u32(wrapf(bufY + shift, f32(H)) / footprint);
       let sl = poolSlotOf(m, i32(bY * nbxL + bX));
       if (sl < 0) { break; }
-      var dx = bufX - f32(bX) * footprint; dx -= f32(W) * round(dx / f32(W));
-      var dy = bufY - f32(bY) * footprint; dy -= f32(H) * round(dy / f32(H));
+      let edge = select(0.0f, 0.5f, CELL_CENTRE_AFFINE != 0u);
+      var dx = bufX + edge - f32(bX) * footprint; dx -= f32(W) * round(dx / f32(W));
+      var dy = bufY + edge - f32(bY) * footprint; dy -= f32(H) * round(dy / f32(H));
       deepest = m;
       deepestSlot = u32(sl);
       deepestLocal = vec2<f32>(dx, dy);
@@ -492,8 +504,12 @@ fn fs_main(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> {
     // that way: the shift is defined as half a cell of the level ABOVE, and
     // this is what converts the offset it produced into fine coordinates.
     let dens = exp2(f32(deepest));
-    let fxc = f32(GHOST) + dens * deepestLocal.x + 0.5;
-    let fyc = f32(GHOST) + dens * deepestLocal.y + 0.5;
+    // Continuous fine coordinate with cell CENTRES on integers. Legacy: `local`
+    // from the shifted origin, +0.5. Affine: `local` from the footprint edge,
+    // so cell k's centre is at local = (k + 1/2)/dens, i.e. -0.5.
+    let cc = select(0.5f, -0.5f, CELL_CENTRE_AFFINE != 0u);
+    let fxc = f32(GHOST) + dens * deepestLocal.x + cc;
+    let fyc = f32(GHOST) + dens * deepestLocal.y + cc;
     let fx0 = i32(floor(fxc)); let fy0 = i32(floor(fyc));
     let ftx = fxc - f32(fx0);  let fty = fyc - f32(fy0);
     omega = mix(

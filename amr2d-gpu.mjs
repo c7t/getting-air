@@ -767,8 +767,12 @@ export function assertPoolExtents(pools, nLevels, { W, H, rb }) {
 export async function checkGeometryCoverageOnGPU(device, pools, opts) {
   const {
     nLevels, W, H, rb, NBX, NBLOCKS, cardState,
-    paramsForChildLevel, boxRefine = true,
+    paramsForChildLevel, boxRefine = true, cellCentreAffine = 1,
   } = opts;
+  // The footprint's low edge -- amr_manage_pool.wgsl's footprintLoOffset. The
+  // checker must ask the manager's own box question or it cannot see a wrong
+  // one (plans/uniform-levels.md S8-2).
+  const lo0 = cellCentreAffine ? -0.5 : 0;
   const wantFactory = boxRefine ? nearBodyWant : nearBodyWantCentre;
   const toBody = boxRefine ? bodyFrameL0 : bodyFrameL0Legacy;
   const state = cardState;
@@ -818,7 +822,7 @@ export async function checkGeometryCoverageOnGPU(device, pools, opts) {
     for (let blockID = 0; blockID < NBLOCKS; blockID++) {
       if (blockSlot[blockID] !== -1) continue; // has an L1 child -- not a leaf
       const bx = blockID % NBX, by = Math.floor(blockID / NBX);
-      const lo = [bx * rb, by * rb], hi = [lo[0] + e, lo[1] + e];
+      const lo = [bx * rb + lo0, by * rb + lo0], hi = [lo[0] + e, lo[1] + e];
       checked++;
       if (want({ lo, hi, mid: [lo[0] + e / 2, lo[1] + e / 2] })) record(0, bx, by, lo, hi, -1);
     }
@@ -843,7 +847,7 @@ export async function checkGeometryCoverageOnGPU(device, pools, opts) {
       // level 2 down, the same all-or-nothing invariant
       // amr_manage_pool.wgsl's hasGrandchild leans on.
       if (childBlockSlot[(by * 2) * nbxChild + (bx * 2)] >= 0) continue; // not a leaf
-      const lo = tileOriginL0([bx, by], m, rb);
+      const lo = tileOriginL0([bx, by], m, rb).map(v => v + lo0);
       const hi = [lo[0] + e, lo[1] + e];
       checked++;
       if (want({ lo, hi, mid: [lo[0] + e / 2, lo[1] + e / 2] })) record(m, bx, by, lo, hi, slot);
@@ -1623,6 +1627,18 @@ export function makeRootPool(device, U, layouts, modules, pools, {
 // restriction, NOT conservative (B6-0 measured the seam at 89x the floor) --
 // stays the default until explode's gates are green, the same staging the 3D
 // fork used. Anything else is REFUSED rather than read as the default.
+// ?cellcentre=0|1 -- where a level >= 2 cell is (plans/uniform-levels.md
+// S8-2). 1, the default, is the affine rule the transfers already assumed; 0
+// restores the legacy placement, 1/2 - dx of a root cell high from level 2
+// down, for A/B. Every pipeline that places a cell takes it: the step, the
+// force, the manager's box, the render, and checkGeometryCoverageOnGPU.
+export function readCellCentre(urlParams) {
+  if (!urlParams.has('cellcentre')) return 1;
+  const v = urlParams.get('cellcentre');
+  if (v !== '0' && v !== '1') throw new Error(`?cellcentre=${v}: expected 0 or 1`);
+  return +v;
+}
+
 export function readInterfaceMode(urlParams) {
   const v = urlParams.get('interface') || 'interp';
   if (v !== 'interp' && v !== 'explode') throw new Error(`?interface=${v}: expected interp or explode`);
