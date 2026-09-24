@@ -30,6 +30,13 @@ const urlParams = new URLSearchParams(window.location.search);
 // effective body radius exceeds the nominal one, so Cd converges from ABOVE),
 // and a resolution ladder moves the band and everything else at once.
 const K_EPS = urlParams.has('kEps') ? parseFloat(urlParams.get('kEps')) : 1.5;
+// ?spongeW= -- the far-field sponge's ramp width in THIS page's cells
+// (lbm_step.wgsl's SPONGE_W; default 4, the shader's own default). index-amr.html
+// measures its ?spongeW= in ROOT cells, i.e. 2^(levels-1) finest cells, so a
+// same-physics comparison against it passes spongeW = its value x 2^(levels-1)
+// here (tools/bench-amr-vs-dense.js).
+const SPONGE_W = urlParams.has('spongeW') ? parseFloat(urlParams.get('spongeW')) : 4;
+if (!(SPONGE_W >= 0)) throw new Error(`?spongeW=${urlParams.get('spongeW')} must be >= 0`);
 if (!(K_EPS > 0)) throw new Error(`?kEps=${urlParams.get('kEps')} must be > 0`);
 // ?f16=1 / ?f16=2: real packed-half storage for `f` -- see shaders/common_fpack.wgsl
 // and f-pack.mjs. Wired on EVERY page that consumes those shaders, including
@@ -299,7 +306,7 @@ async function init() {
 
   const stepPL = device.createComputePipeline({ 
     layout: device.createPipelineLayout({ bindGroupLayouts: [stepBGL] }), 
-    compute: { module: stepSM, entryPoint: 'main', constants: fConstants } 
+    compute: { module: stepSM, entryPoint: 'main', constants: { ...fConstants, SPONGE_W } } 
   });
   const frcPL = device.createComputePipeline({ 
     layout: device.createPipelineLayout({ bindGroupLayouts: [frcBGL] }), 
@@ -413,11 +420,66 @@ async function init() {
   const gpuMsEl = document.getElementById('val-gpu-ms');
   const syncMsEl = document.getElementById('val-sync-ms');
 
+  // ONE STEP, as both the frame loop and debugStepSync encode it -- one
+  // function so a benchmark times exactly what the page runs.
+  function encodeStep(enc) {
+    const stepBG = useB ? stepBG_ba : stepBG_ab;
+    const frcBG  = useB ? frcBG_b  : frcBG_a;
+    const frc = enc.beginComputePass(); frc.setPipeline(frcPL); frc.setBindGroup(0, frcBG); frc.dispatchWorkgroups(WGX, WGY); frc.end();
+    const phy = enc.beginComputePass(); phy.setPipeline(phyPL); phy.setBindGroup(0, phyBG); phy.dispatchWorkgroups(1); phy.end();
+    const stp = enc.beginComputePass(); stp.setPipeline(stepPL); stp.setBindGroup(0, stepBG); stp.dispatchWorkgroups(WGX, WGY); stp.end();
+    useB = !useB;
+  }
+
+  // ── Debug/benchmark surface (window.__LBM) ──────────────────────────────
+  // The minimum a CDP tool needs to time this page the way index-amr.html's
+  // window.__AMR is timed: pause the frame loop, step N synchronously in
+  // STEPS_PER_FRAME batches (N even, so useB returns to its frame-boundary
+  // value), and read the step count and the card's state. Added for
+  // tools/bench-amr-vs-dense.js; nothing on the page depends on it.
+  let liveMode = true;
+  async function debugStepSync(n) {
+    liveMode = false;
+    if (paramsDirty) { updateGPUParams(); paramsDirty = false; }
+    for (let k = 0; k < n; k += STEPS_PER_FRAME) {
+      const enc = device.createCommandEncoder();
+      const m = Math.min(STEPS_PER_FRAME, n - k);
+      for (let s = 0; s < m; s++) encodeStep(enc);
+      device.queue.submit([enc.finish()]);
+      await device.queue.onSubmittedWorkDone();
+      step += m;
+    }
+    return { step };
+  }
+  async function debugReadCardState() {
+    const buf = device.createBuffer({ size: 104, usage: U.MAP_READ | U.COPY_DST });
+    const enc = device.createCommandEncoder();
+    enc.copyBufferToBuffer(cardStateBuf, 0, buf, 0, 104);
+    device.queue.submit([enc.finish()]);
+    await buf.mapAsync(GPUMapMode.READ);
+    const d = Array.from(new Float32Array(buf.getMappedRange().slice(0)));
+    buf.unmap(); buf.destroy();
+    return d;
+  }
+  window.__LBM = {
+    setLive: (v) => { liveMode = !!v; if (liveMode) pacer.reset(); },
+    isLive: () => liveMode,
+    getStep: () => step,
+    getDims: () => ({ W, H }),
+    getCardParams: () => ({ A, B, TAU, U_T, RE }),
+    debugStepSync,
+    debugReadCardState,
+  };
+
   async function frame() {
     try {
       if (paramsDirty) {
         updateGPUParams();
         paramsDirty = false;
+      }
+      if (!liveMode) {
+        requestAnimationFrame(() => frame().catch(handleErr));
+        return;
       }
       
       const stage = stages[currentStageIdx];
@@ -438,16 +500,7 @@ async function init() {
       // is worth, capped at STEPS_PER_FRAME. Always even (sim-rate.mjs), so
       // useB returns to its initial value at every frame boundary.
       const nSteps = pacer.stepsForFrame(performance.now(), A / U_T);
-      for (let s = 0; s < nSteps; s++) {
-        const stepBG = useB ? stepBG_ba : stepBG_ab;
-        const frcBG  = useB ? frcBG_b  : frcBG_a;
-        
-        const frc = enc.beginComputePass(); frc.setPipeline(frcPL); frc.setBindGroup(0, frcBG); frc.dispatchWorkgroups(WGX, WGY); frc.end();
-        const phy = enc.beginComputePass(); phy.setPipeline(phyPL); phy.setBindGroup(0, phyBG); phy.dispatchWorkgroups(1); phy.end();
-        const stp = enc.beginComputePass(); stp.setPipeline(stepPL); stp.setBindGroup(0, stepBG); stp.dispatchWorkgroups(WGX, WGY); stp.end();
-        
-        useB = !useB;
-      }
+      for (let s = 0; s < nSteps; s++) encodeStep(enc);
       step += nSteps;
 
       if (hasTimestamp) {

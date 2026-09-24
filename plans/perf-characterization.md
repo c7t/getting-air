@@ -769,3 +769,38 @@ measurements), not a defect. But it does mean "make the refinement follow the
 flow" is a question about the halo/criterion BALANCE, not about tuning the
 criterion alone, which is where several sessions of threshold sweeps kept
 running aground.
+
+## Does AMR win in 2D? Only once the finest grid is large (2026-09-24)
+
+`tools/bench-amr-vs-dense.js`: index-amr.html against index.html at the SAME
+body resolution (flat `res = R + L - 1`), same card, same finest-level tau
+(checked, refused if not), same physical sponge band (flat `spongeW` = AMR's x
+2^(L-1) -- the pages measure it in different cells), scored in simulated time
+(a/u_t) per wall second. AMR is timed at 2 / 10 / 40 a/u_t into one
+`?detslots=1` fall, because its cost grows with the wake; the flat page is
+timed before and after the AMR leg and scored on the faster reading, so any
+thermal drift is charged to AMR. AMR on `?stride=1`.
+
+    AMR vs flat, speed ratio at t = 2 / 10 / 40 a/u_t (>1: AMR faster)
+    pair (finest grid)              desktop (RTX 4080)      phone (img-tec)
+    res5 L4 explode   (256^2)       0.73 / 0.77 / 0.84      0.79 / 0.78 / 0.67
+    res6 L3           (256^2)       0.95 / 0.97 / 1.01      0.81 / 0.78 / 0.72
+    res7 L2           (256^2)       1.01 / 0.96 / 0.98      0.81 / 0.85 / 0.71
+    res8 L3 defaults  (1024^2)      2.99 / 2.91 / 3.11      7.04 / 4.54 / 3.86
+    res8 L3 explode   (1024^2)      2.82 / 2.67 / 2.64      5.89 / 3.82 / 3.34
+
+    flat index.html, synchronous stepping: desktop 256^2 ~1500 MLUPS, 1024^2
+    ~6000; phone 256^2 ~115-120, 1024^2 168 (6.26 ms/step -- 0.12 a/u_t/s).
+
+So at a 256^2 finest grid AMR LOSES on the phone (1.2-1.5x slower) and ties
+on the desktop, and at 1024^2 it wins 3-7x on both. The mechanism is the ratio
+of two numbers the rest of this document measures separately. AMR's cost per
+cell update is ~2-3x flat's (coupling is 32-34% of a phone root step, steps
+42%, force + body 13-14% -- `tools/bench-amr.js --remote --skip`, both
+interfaces), so it has to cut the cell count by more than that to win. At 256^2
+it cannot: with 8-cell root tiles and margins in root cells, levels 1-2 cover
+most of a 32^2 or 64^2 root grid (res5 L4 holds 16 of 16 level-1 blocks), and
+AMR still does ~45% of flat's cell updates. At 1024^2 the refined set is
+~7% of the domain at the finest level, ~11% of flat's updates. The advantage
+also shrinks through a fall on the phone (7.0x -> 3.9x) as the wake refines.
+
