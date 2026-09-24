@@ -121,10 +121,18 @@ fn fineToCoarseUnit(fCoord: u32, origin: u32) -> f32 {
 }
 
 @compute @workgroup_size(8, 8)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) { interpCell(gid, gid.z); }
+
+// ?indirect=1 (main-amr.js): launched over this pool's active-slot list
+// (amr_active_list.wgsl), so z indexes the list rather than the pool. `main`
+// never reads `activeSlots`, so its layout -- every other page's -- is unchanged.
+// `activeSlots` is declared by the includer (amr_interp_pool_parent.wgsl).
+@compute @workgroup_size(8, 8)
+fn mainIndirect(@builtin(global_invocation_id) gid: vec3<u32>) { interpCell(gid, activeSlots[gid.z]); }
+
+fn interpCell(gid: vec3<u32>, slot: u32) {
   if (NOOP != 0u) { return; } // see the NOOP override above
   let fx = gid.x; let fy = gid.y;
-  let slot = gid.z;
   let FB = RB * 2u + 2u * GHOST;
   if (fx >= FB || fy >= FB) { return; }
 

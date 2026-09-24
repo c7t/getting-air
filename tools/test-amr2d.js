@@ -2081,6 +2081,40 @@ const sorted = (s) => [...s].sort();
     assert.strictEqual(A.activeSlotsFromFreeCount(64, -1), 64, 'a mid-round negative count must clamp');
   });
 
+  ok('activeSlotList is the ascending in-use slots, and a scan-by-chunk reproduces it', () => {
+    const s2b = Int32Array.from([-1, 7, -1, -1, 3, 0, -1, 12, 9, -1, -1, 5]);
+    const got = A.activeSlotList(s2b);
+    assert.deepStrictEqual(got, [1, 4, 5, 7, 8, 11]);
+    assert.deepStrictEqual(A.activeSlotList(new Int32Array(8).fill(-1)), []);
+    // Block id 0 is a VALID assignment (-1 is unassigned) -- the bug the pool's
+    // -1 fill exists to prevent, so it is the mutant worth naming.
+    assert.ok(got.includes(5), 'slot holding block 0 was dropped');
+    // The kernel's algorithm, run on the host with a small workgroup so chunks
+    // straddle the active slots: per-thread counts, exclusive scan, in-order
+    // writes. It must agree exactly, at chunk sizes that do and do not divide N.
+    for (const WG of [1, 2, 3, 5, 16, 256]) {
+      const N = s2b.length, chunk = Math.ceil(N / WG), out = [];
+      const counts = [];
+      for (let t = 0; t < WG; t++) {
+        const lo = Math.min(t * chunk, N), hi = Math.min(lo + chunk, N);
+        let n = 0; for (let s = lo; s < hi; s++) if (s2b[s] >= 0) n++;
+        counts.push(n);
+      }
+      let pre = 0;
+      for (let t = 0; t < WG; t++) {
+        const lo = Math.min(t * chunk, N), hi = Math.min(lo + chunk, N);
+        let k = pre; for (let s = lo; s < hi; s++) if (s2b[s] >= 0) out[k++] = s;
+        pre += counts[t];
+      }
+      assert.deepStrictEqual(out, got, `chunked scan disagrees at WG=${WG}`);
+    }
+  });
+
+  ok('activeListArgs: three (x, y, count) triples in shape order', () => {
+    assert.deepStrictEqual(A.activeListArgs(48, [3, 2, 1]), [3, 3, 48, 2, 2, 48, 1, 1, 48]);
+    assert.deepStrictEqual(A.activeListArgs(0, [3, 2, 1]), [3, 3, 0, 2, 2, 0, 1, 1, 0]);
+  });
+
   if (!process.exitCode) console.log(`\n${pass} check(s) passed`);
   else console.log('\nFAILED');
 })();

@@ -52,6 +52,8 @@ const U = {
 const NOT_RESET_STATE = {
   finePoolF_a: 'the scenario\'s initial condition -- initF/initFPool differ per page, so the page writes it',
   finePoolF_b: 'the back phase; the step writes it before anything reads it, and `useB = false` after a reset',
+  activeSlotsBuf: 'derived from slotToBlock by amr_active_list.wgsl at the top of EVERY macro-step, before its consumers (?indirect=1)',
+  activeArgsBuf: 'derived with activeSlotsBuf, same pass, same timing -- never read before that macro-step writes it',
 };
 
 (async () => {

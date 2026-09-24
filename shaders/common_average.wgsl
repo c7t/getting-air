@@ -91,10 +91,18 @@ override NOOP : u32 = 0u;
 const GHOST = 2u;
 
 @compute @workgroup_size(8, 8)
-fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wgid: vec3<u32>) {
+fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wgid: vec3<u32>) { averageCell(lid, wgid.z); }
+
+// ?indirect=1 (main-amr.js): launched over the CHILD pool's active-slot list
+// (amr_active_list.wgsl), so z indexes the list rather than the pool. `main`
+// never reads `activeSlots`, so its layout -- every other page's -- is unchanged.
+// `activeSlots` is declared by the includer (amr_average_pool_parent.wgsl).
+@compute @workgroup_size(8, 8)
+fn mainIndirect(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wgid: vec3<u32>) { averageCell(lid, activeSlots[wgid.z]); }
+
+fn averageCell(lid: vec3<u32>, slot: u32) {
   if (NOOP != 0u) { return; } // see the NOOP override above
   let lcx = lid.x; let lcy = lid.y; // parent-cell-local coords within the block
-  let slot = wgid.z;
 
   let blockID = slotToBlock[slot];
   if (blockID < 0) { return; }

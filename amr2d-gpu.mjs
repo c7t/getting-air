@@ -361,6 +361,13 @@ export function allocLevelPool(device, U, m, NBX_m, NBY_m, maxFineBlocks, NCELLS
     // added four times. COPY_SRC so a test can read the ranks back and score
     // them against amr2d.mjs's grantAssignment.
     candRankBuf: device.createBuffer({ size: NBLOCKS_m * 4, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC }),
+    // ?indirect=1's ACTIVE-SLOT LIST and its three (x, y, count) dispatch
+    // triples, rebuilt from slotToBlock by shaders/amr_active_list.wgsl. On
+    // every pool so no page has to remember to add them; only a page that
+    // encodes the compaction and the `mainIndirect` entry points reads them.
+    // COPY_SRC so the list can be scored against amr2d.mjs's activeSlotList.
+    activeSlotsBuf: device.createBuffer({ size: maxFineBlocks * 4, usage: U.STORAGE | U.COPY_SRC }),
+    activeArgsBuf: device.createBuffer({ size: 9 * 4, usage: U.STORAGE | U.INDIRECT | U.COPY_SRC }),
   };
   pool.quadAlloc = true;
   {
@@ -1237,7 +1244,28 @@ export function makeManageBindGroups(device, layouts, pools, nLevels, { cardStat
 //
 // The buffers it names all come from `allocLevelPool`, which was already
 // shared; only the wiring was not.
-export function makeLevelBindGroups(device, U, layouts, pools, nLevels, { cardStateBuf, forceBuf = null }) {
+// The force pass's entries for one pool reading `fIn`. Exported because
+// main-amr.js builds level 1's and the finest level's 'b' reader itself.
+// Binding 6 is bound but never read at GHOST=2 -- those levels have a ring.
+export const force1Entries = (pool, fIn, { cardStateBuf, forceBuf }) => [
+  { binding: 0, resource: { buffer: cardStateBuf } },
+  { binding: 1, resource: { buffer: fIn } },
+  { binding: 2, resource: { buffer: forceBuf } },
+  { binding: 3, resource: { buffer: pool.slotToBlockBuf } },
+  { binding: 4, resource: { buffer: pool.levelParamsBuf } },
+  { binding: 5, resource: { buffer: pool.debugSlotForceBuf } },
+  { binding: 6, resource: { buffer: pool.blockSlotBuf } },
+];
+
+// `entries` plus one pool's active-slot list at `binding` -- the ?indirect=1
+// twin of a bind group, from the same entry list as the direct one.
+export const withActiveList = (entries, binding, pool) =>
+  [...entries, { binding, resource: { buffer: pool.activeSlotsBuf } }];
+
+// `indirect`: also build each group's ?indirect=1 twin (`*IndBG*`), bound to
+// layouts.indirect. Off on every page but index-amr.html.
+export function makeLevelBindGroups(device, U, layouts, pools, nLevels, { cardStateBuf, forceBuf = null, indirect = false }) {
+  const L = layouts.indirect;
   for (let c = 2; c < nLevels; c++) {
     const parentPool = pools[c - 1];
     const childPool = pools[c];
@@ -1254,30 +1282,31 @@ export function makeLevelBindGroups(device, U, layouts, pools, nLevels, { cardSt
     ];
     childPool.interpPoolParentBG_readA = device.createBindGroup({ layout: layouts.interpPoolParentBGL, entries: interpEntries(parentPool.finePoolF_a) });
     childPool.interpPoolParentBG_readB = device.createBindGroup({ layout: layouts.interpPoolParentBGL, entries: interpEntries(parentPool.finePoolF_b) });
+    if (indirect) {
+      childPool.interpPoolParentIndBG_readA = device.createBindGroup({ layout: L.interpPoolParentBGL, entries: withActiveList(interpEntries(parentPool.finePoolF_a), 9, childPool) });
+      childPool.interpPoolParentIndBG_readB = device.createBindGroup({ layout: L.interpPoolParentBGL, entries: withActiveList(interpEntries(parentPool.finePoolF_b), 9, childPool) });
+    }
     // Fine-fine-only refresh always operates on THIS level's own _b (the
     // buffer its own substep-1 just wrote) -- binding 1 (f_parent_pool) is
     // unused in FINE_FINE_ONLY mode, bound to parent's _a only to satisfy
     // the shared layout (mirrors dense's interpFFBG_b's f_a-unused note).
     childPool.interpPoolParentFFBG_b = device.createBindGroup({ layout: layouts.interpPoolParentBGL, entries: interpEntries(parentPool.finePoolF_a).map((e, i) => i === 2 ? { binding: 2, resource: { buffer: childPool.finePoolF_b } } : e) });
 
-    childPool.step1BG_ab = device.createBindGroup({ layout: layouts.step1BGL, entries: [
+    const step1Entries = (fIn, fOut) => [
       { binding: 0, resource: { buffer: cardStateBuf } },
-      { binding: 1, resource: { buffer: childPool.finePoolF_a } },
-      { binding: 2, resource: { buffer: childPool.finePoolF_b } },
+      { binding: 1, resource: { buffer: fIn } },
+      { binding: 2, resource: { buffer: fOut } },
       { binding: 3, resource: { buffer: childPool.finePoolVel } },
       { binding: 4, resource: { buffer: childPool.slotToBlockBuf } },
       { binding: 5, resource: { buffer: childPool.levelParamsBuf } },
       { binding: 6, resource: { buffer: childPool.blockSlotBuf } },
-    ]});
-    childPool.step1BG_ba = device.createBindGroup({ layout: layouts.step1BGL, entries: [
-      { binding: 0, resource: { buffer: cardStateBuf } },
-      { binding: 1, resource: { buffer: childPool.finePoolF_b } },
-      { binding: 2, resource: { buffer: childPool.finePoolF_a } },
-      { binding: 3, resource: { buffer: childPool.finePoolVel } },
-      { binding: 4, resource: { buffer: childPool.slotToBlockBuf } },
-      { binding: 5, resource: { buffer: childPool.levelParamsBuf } },
-      { binding: 6, resource: { buffer: childPool.blockSlotBuf } },
-    ]});
+    ];
+    childPool.step1BG_ab = device.createBindGroup({ layout: layouts.step1BGL, entries: step1Entries(childPool.finePoolF_a, childPool.finePoolF_b) });
+    childPool.step1BG_ba = device.createBindGroup({ layout: layouts.step1BGL, entries: step1Entries(childPool.finePoolF_b, childPool.finePoolF_a) });
+    if (indirect) {
+      childPool.step1IndBG_ab = device.createBindGroup({ layout: L.step1BGL, entries: withActiveList(step1Entries(childPool.finePoolF_a, childPool.finePoolF_b), 7, childPool) });
+      childPool.step1IndBG_ba = device.createBindGroup({ layout: L.step1BGL, entries: withActiveList(step1Entries(childPool.finePoolF_b, childPool.finePoolF_a), 7, childPool) });
+    }
 
     const avgEntries = (parentBuf) => [
       { binding: 0, resource: { buffer: childPool.levelParamsBuf } },
@@ -1289,6 +1318,10 @@ export function makeLevelBindGroups(device, U, layouts, pools, nLevels, { cardSt
     ];
     childPool.avgPoolBG_targetA = device.createBindGroup({ layout: layouts.avgPoolBGL, entries: avgEntries(parentPool.finePoolF_a) });
     childPool.avgPoolBG_targetB = device.createBindGroup({ layout: layouts.avgPoolBGL, entries: avgEntries(parentPool.finePoolF_b) });
+    if (indirect) {
+      childPool.avgPoolIndBG_targetA = device.createBindGroup({ layout: L.avgPoolBGL, entries: withActiveList(avgEntries(parentPool.finePoolF_a), 6, childPool) });
+      childPool.avgPoolIndBG_targetB = device.createBindGroup({ layout: L.avgPoolBGL, entries: withActiveList(avgEntries(parentPool.finePoolF_b), 6, childPool) });
+    }
 
     // Milestone 8: level c's own force pass.
     //
@@ -1301,16 +1334,10 @@ export function makeLevelBindGroups(device, U, layouts, pools, nLevels, { cardSt
     // investigation) -- see amr_force1.wgsl's own debugSlotForce header.
     if (!forceBuf) continue;
     childPool.debugSlotForceBuf = device.createBuffer({ size: childPool.MAX_FINE_BLOCKS * 8, usage: U.STORAGE | U.COPY_SRC });
-    childPool.force1BG = device.createBindGroup({ layout: layouts.force1BGL, entries: [
-      { binding: 0, resource: { buffer: cardStateBuf } },
-      { binding: 1, resource: { buffer: childPool.finePoolF_a } },
-      { binding: 2, resource: { buffer: forceBuf } },
-      { binding: 3, resource: { buffer: childPool.slotToBlockBuf } },
-      { binding: 4, resource: { buffer: childPool.levelParamsBuf } },
-      { binding: 5, resource: { buffer: childPool.debugSlotForceBuf } },
-          // Bound but never read at GHOST=2 -- these levels have a ring.
-      { binding: 6, resource: { buffer: childPool.blockSlotBuf } },
-    ]});
+    childPool.force1BG = device.createBindGroup({ layout: layouts.force1BGL, entries: force1Entries(childPool, childPool.finePoolF_a, { cardStateBuf, forceBuf }) });
+    if (indirect) {
+      childPool.force1IndBG = device.createBindGroup({ layout: L.force1BGL, entries: withActiveList(force1Entries(childPool, childPool.finePoolF_a, { cardStateBuf, forceBuf }), 7, childPool) });
+    }
   }
 }
 
@@ -1344,7 +1371,7 @@ export function makeLevelBindGroups(device, U, layouts, pools, nLevels, { cardSt
 // root-parent twins of U5 -- must build it from these rather than from its own
 // second copy of the same literal, which is how a measurement twin drifts from
 // the thing it is measuring.
-export function makeCouplingPipelines(device, layouts, modules, { RB, F16, DC_PRE, RING_FREE_SAMPLE = 0 }) {
+export function makeCouplingPipelines(device, layouts, modules, { RB, F16, DC_PRE, RING_FREE_SAMPLE = 0, indirect = false }) {
   const c = {
     // No W/H: a level's own grid extent is a runtime uniform (levelParams),
     // not baked into the pipeline, precisely so ONE compiled pipeline serves
@@ -1366,6 +1393,14 @@ export function makeCouplingPipelines(device, layouts, modules, { RB, F16, DC_PR
     interpPoolParentInitPL: compute(layouts.interpPoolParentBGL, modules.interpPoolSM, 'main', c.interpPoolInit),
     interpPoolParentFFPL:   compute(layouts.interpPoolParentBGL, modules.interpPoolSM, 'main', c.interpPoolFF),
     avgPoolPL:              compute(layouts.avgPoolBGL, modules.avgPoolSM, 'main', c.avgPool),
+    // ?indirect=1 twins of the two that run every substep. Same constants, the
+    // other entry point. The init and fine-fine variants stay direct only:
+    // they run outside the macro-step (refine rounds, debugActivateBlock),
+    // where the list may not describe the slots they are filling.
+    ...(indirect ? {
+      interpPoolParentIndPL: compute(layouts.indirect.interpPoolParentBGL, modules.interpPoolSM, 'mainIndirect', c.interpPool),
+      avgPoolIndPL:          compute(layouts.indirect.avgPoolBGL, modules.avgPoolSM, 'mainIndirect', c.avgPool),
+    } : {}),
   };
 }
 
@@ -1662,10 +1697,58 @@ export function readInterfaceMode(urlParams) {
 // `cur` is the PARENT's time-t buffer ('a' | 'b'). The child side is always
 // its 'a': explode fills the buffer the child's substep A reads, and coalesce
 // harvests the one its substep B wrote, which is 'a' again.
-export function makeExplodeCoalesce(device, layouts, modules, pools, nLevels, { RB, F16, explodeLinear = true }) {
-  const pipe = (layout, module, constants) => device.createComputePipeline({
+// ?indirect=1: byte offsets of the three (x, y, count) triples
+// shaders/amr_active_list.wgsl writes into a pool's activeArgsBuf, one per
+// consumer shape -- the FB-square passes (step, force, explode, interp), the
+// 2*RB-square one (coalesce), and one workgroup per slot (average). The
+// compaction is told the matching x/y by activeListShapes, so the offset and
+// the shape are stated together here.
+export const ACTIVE_ARGS = { fbSquare: 0, interiorSquare: 12, perSlot: 24 };
+export const activeListShapes = (RB, GHOST = 2) =>
+  [Math.ceil((2 * RB + 2 * GHOST) / 8), Math.ceil((2 * RB) / 8), 1];
+
+// ?indirect=1: rebuild every pool level's active-slot list (and its dispatch
+// args) from slotToBlock -- one single-workgroup pass per level >= 1. The ROOT
+// has no list: it is always full, and everything that launches over it stays
+// direct. `encode(enc, beginPass)` takes the page's pass factory so the passes
+// are labelled for debugProfileMacroStep like every other.
+//
+// WHEN, and why that is not an optimization question: a list is only right
+// until the next thing that changes slotToBlock -- the refine round, reset,
+// a snapshot load, a manual debugActivateBlock. Encoding it at the top of
+// EVERY macro-step, after the refine round, covers all of them without a
+// dirty flag that each of those paths would have to remember to set.
+export function makeActiveLists(device, layouts, module, pools, nLevels, { RB }) {
+  const [s0, s1, s2] = activeListShapes(RB);
+  const levels = [];
+  for (let m = 1; m < nLevels; m++) {
+    const pool = pools[m];
+    const pipeline = device.createComputePipeline({
+      layout: device.createPipelineLayout({ bindGroupLayouts: [layouts.activeListBGL] }),
+      compute: { module, entryPoint: 'main',
+        constants: { N_SLOTS: pool.MAX_FINE_BLOCKS, SHAPE0_XY: s0, SHAPE1_XY: s1, SHAPE2_XY: s2 } },
+    });
+    const bg = device.createBindGroup({ layout: layouts.activeListBGL, entries: [
+      { binding: 0, resource: { buffer: pool.slotToBlockBuf } },
+      { binding: 1, resource: { buffer: pool.activeSlotsBuf } },
+      { binding: 2, resource: { buffer: pool.activeArgsBuf } },
+    ]});
+    levels.push({ m, pipeline, bg });
+  }
+  return {
+    encode(enc, beginPass = (e) => e.beginComputePass()) {
+      for (const { m, pipeline, bg } of levels) {
+        const p = beginPass(enc, `L${m} active list`);
+        p.setPipeline(pipeline); p.setBindGroup(0, bg); p.dispatchWorkgroups(1); p.end();
+      }
+    },
+  };
+}
+
+export function makeExplodeCoalesce(device, layouts, modules, pools, nLevels, { RB, F16, explodeLinear = true, indirect = false }) {
+  const pipe = (layout, module, constants, entryPoint = 'main') => device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [layout] }),
-    compute: { module, entryPoint: 'main', constants },
+    compute: { module, entryPoint, constants },
   });
   // B6-2: the linear explosion is the default on this path; ?explin=0 keeps
   // the uniform one in the same build for A/B (see amr_explode.wgsl).
@@ -1674,27 +1757,49 @@ export function makeExplodeCoalesce(device, layouts, modules, pools, nLevels, { 
                      pipe(layouts.explodeBGL, modules.explodeSM, { RB, F16, PARENT_GHOST: 2, EXPLODE_LINEAR })];
   const coalescePL = [pipe(layouts.coalesceBGL, modules.coalesceSM, { RB, F16, PARENT_GHOST: 0 }),
                       pipe(layouts.coalesceBGL, modules.coalesceSM, { RB, F16, PARENT_GHOST: 2 })];
+  // ?indirect=1 twins. Explode launches over the CHILD's list, so both parent
+  // variants get one; coalesce launches over the PARENT's, and a root parent
+  // stays direct -- the root is always full, so it has no empty slot to skip
+  // and no list is kept for it.
+  const I = layouts.indirect;
+  const explodeIndPL = indirect
+    ? [pipe(I.explodeBGL, modules.explodeSM, { RB, F16, PARENT_GHOST: 0, EXPLODE_LINEAR }, 'mainIndirect'),
+       pipe(I.explodeBGL, modules.explodeSM, { RB, F16, PARENT_GHOST: 2, EXPLODE_LINEAR }, 'mainIndirect')]
+    : null;
+  const coalesceIndPL = indirect
+    ? pipe(I.coalesceBGL, modules.coalesceSM, { RB, F16, PARENT_GHOST: 2 }, 'mainIndirect')
+    : null;
   const FB = 2 * RB + 4;
   const bgs = [];
   for (let c = 1; c < nLevels; c++) {
     const parent = pools[c - 1], child = pools[c];
     const pf = { a: parent.finePoolF_a, b: parent.finePoolF_b };
-    const ex = (cur) => device.createBindGroup({ layout: layouts.explodeBGL, entries: [
+    const exEntries = (cur) => [
       { binding: 0, resource: { buffer: child.levelParamsBuf } },
       { binding: 1, resource: { buffer: pf[cur] } },
       { binding: 2, resource: { buffer: child.finePoolF_a } },
       { binding: 3, resource: { buffer: child.slotToBlockBuf } },
       { binding: 4, resource: { buffer: child.blockSlotBuf } },
       { binding: 5, resource: { buffer: parent.blockSlotBuf } },
-    ]});
-    const co = (cur) => device.createBindGroup({ layout: layouts.coalesceBGL, entries: [
+    ];
+    const coEntries = (cur) => [
       { binding: 0, resource: { buffer: child.levelParamsBuf } },
       { binding: 1, resource: { buffer: child.finePoolF_a } },
       { binding: 2, resource: { buffer: pf[cur] } },
       { binding: 3, resource: { buffer: child.blockSlotBuf } },
       { binding: 4, resource: { buffer: parent.slotToBlockBuf } },
-    ]});
+    ];
+    const ex = (cur) => device.createBindGroup({ layout: layouts.explodeBGL, entries: exEntries(cur) });
+    const co = (cur) => device.createBindGroup({ layout: layouts.coalesceBGL, entries: coEntries(cur) });
     bgs[c] = { explode: { a: ex('a'), b: ex('b') }, coalesce: { a: co('a'), b: co('b') } };
+    if (indirect) {
+      const exI = (cur) => device.createBindGroup({ layout: I.explodeBGL, entries: withActiveList(exEntries(cur), 6, child) });
+      bgs[c].explodeInd = { a: exI('a'), b: exI('b') };
+      if (c >= 2) {
+        const coI = (cur) => device.createBindGroup({ layout: I.coalesceBGL, entries: withActiveList(coEntries(cur), 5, parent) });
+        bgs[c].coalesceInd = { a: coI('a'), b: coI('b') };
+      }
+    }
   }
   const which = (level) => (level === 0 ? 0 : 1);
   return {
@@ -1702,19 +1807,35 @@ export function makeExplodeCoalesce(device, layouts, modules, pools, nLevels, { 
     explodeIntoChild: (enc, level, cur) => {
       const child = pools[level + 1];
       const p = enc.beginComputePass();
-      p.setPipeline(explodePL[which(level)]); p.setBindGroup(0, bgs[level + 1].explode[cur]);
-      p.dispatchWorkgroups(Math.ceil(FB / 8), Math.ceil(FB / 8), child.MAX_FINE_BLOCKS); p.end();
+      if (indirect) {
+        p.setPipeline(explodeIndPL[which(level)]); p.setBindGroup(0, bgs[level + 1].explodeInd[cur]);
+        p.dispatchWorkgroupsIndirect(child.activeArgsBuf, ACTIVE_ARGS.fbSquare);
+      } else {
+        p.setPipeline(explodePL[which(level)]); p.setBindGroup(0, bgs[level + 1].explode[cur]);
+        p.dispatchWorkgroups(Math.ceil(FB / 8), Math.ceil(FB / 8), child.MAX_FINE_BLOCKS);
+      }
+      p.end();
     },
     coalesceFromChild: (enc, level, cur) => {
       const parent = pools[level];
       const p = enc.beginComputePass();
-      p.setPipeline(coalescePL[which(level)]); p.setBindGroup(0, bgs[level + 1].coalesce[cur]);
-      p.dispatchWorkgroups(Math.ceil(2 * RB / 8), Math.ceil(2 * RB / 8), parent.MAX_FINE_BLOCKS); p.end();
+      if (indirect && level >= 1) {
+        p.setPipeline(coalesceIndPL); p.setBindGroup(0, bgs[level + 1].coalesceInd[cur]);
+        p.dispatchWorkgroupsIndirect(parent.activeArgsBuf, ACTIVE_ARGS.interiorSquare);
+      } else {
+        p.setPipeline(coalescePL[which(level)]); p.setBindGroup(0, bgs[level + 1].coalesce[cur]);
+        p.dispatchWorkgroups(Math.ceil(2 * RB / 8), Math.ceil(2 * RB / 8), parent.MAX_FINE_BLOCKS);
+      }
+      p.end();
     },
   };
 }
 
 export function makeAMRLayouts(device) {
+  // Each layout's entry list, kept so the ?indirect=1 twins below are built
+  // FROM it rather than restated -- see indirectTwin.
+  const entriesOf = new Map();
+  const mkBGL = (desc) => { const l = device.createBindGroupLayout(desc); entriesOf.set(l, desc.entries); return l; };
   const phyBGL = device.createBindGroupLayout({ label: 'phyBGL', entries: [
     { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
     { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }
@@ -1755,7 +1876,7 @@ export function makeAMRLayouts(device) {
   // Bindings 6/7 (parentSlot/quadrant) are per-slot fields, both this level's
   // own. THE ONLY interp layout since U7-6f -- the root is a pool level, so
   // the dense-parent one went with the dense grid.
-  const interpPoolParentBGL = device.createBindGroupLayout({ label: 'interpPoolParentBGL', entries: [
+  const interpPoolParentBGL = mkBGL({ label: 'interpPoolParentBGL', entries: [
     { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
     { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
@@ -1819,7 +1940,7 @@ export function makeAMRLayouts(device) {
   // kernel: dxL and nbx/nby are what place the tile, now that its origin is
   // derived rather than loaded per slot. Shared verbatim with
   // interpPoolParentBGL/avgPoolBGL.
-  const step1BGL = device.createBindGroupLayout({ label: 'step1BGL', entries: [
+  const step1BGL = mkBGL({ label: 'step1BGL', entries: [
     { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
@@ -1836,7 +1957,7 @@ export function makeAMRLayouts(device) {
   // cellIndex()-addressed dense-parent one went with the dense grid, and
   // common_avg_parent_dense.wgsl with it, so common_average.wgsl now has
   // exactly one destination rather than two behind a fragment.
-  const avgPoolBGL = device.createBindGroupLayout({ label: 'avgPoolBGL', entries: [
+  const avgPoolBGL = mkBGL({ label: 'avgPoolBGL', entries: [
     { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
     { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
@@ -1854,7 +1975,7 @@ export function makeAMRLayouts(device) {
   // second, level-1-only force1BGL here until then), and renumbered
   // contiguous now that the origin buffers and the masking's childBlockSlot
   // are both gone -- see shaders/amr_force1.wgsl's binding block.
-  const force1BGL = device.createBindGroupLayout({ label: 'force1BGL', entries: [
+  const force1BGL = mkBGL({ label: 'force1BGL', entries: [
     { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
@@ -1870,7 +1991,7 @@ export function makeAMRLayouts(device) {
   // a layout is free and a page on the interp path simply never uses them,
   // which keeps "which layouts exist" from forking on a URL flag.
   const ro = { type: 'read-only-storage' };
-  const explodeBGL = device.createBindGroupLayout({ label: 'explodeBGL', entries: [
+  const explodeBGL = mkBGL({ label: 'explodeBGL', entries: [
     { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
     { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: ro },
     { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
@@ -1878,14 +1999,39 @@ export function makeAMRLayouts(device) {
     { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: ro },
     { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: ro },
   ]});
-  const coalesceBGL = device.createBindGroupLayout({ label: 'coalesceBGL', entries: [
+  const coalesceBGL = mkBGL({ label: 'coalesceBGL', entries: [
     { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
     { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: ro },
     { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
     { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: ro },
     { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: ro },
   ]});
-  return { phyBGL, renBGL, interpPoolParentBGL, avgPoolBGL, criterionPoolBGL, managePoolBGL, step1BGL, force1BGL, explodeBGL, coalesceBGL };
+  // ?indirect=1: each per-slot kernel's `mainIndirect` entry point reads one
+  // more buffer, its pool's active-slot list, at the binding its shader
+  // declares. A TWIN layout rather than an extra entry in the shared one, so
+  // `main` -- every other page, every out-of-macro-step caller -- keeps the
+  // layout and bind groups it has. Built from the base layout's own entries,
+  // so the two cannot drift.
+  const indirectTwin = (base, binding) => device.createBindGroupLayout({
+    label: `${base.label}+activeSlots`,
+    entries: [...entriesOf.get(base), { binding, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }],
+  });
+  const indirect = {
+    interpPoolParentBGL: indirectTwin(interpPoolParentBGL, 9),
+    avgPoolBGL: indirectTwin(avgPoolBGL, 6),
+    step1BGL: indirectTwin(step1BGL, 7),
+    force1BGL: indirectTwin(force1BGL, 7),
+    explodeBGL: indirectTwin(explodeBGL, 6),
+    coalesceBGL: indirectTwin(coalesceBGL, 5),
+  };
+  // shaders/amr_active_list.wgsl: slotToBlock in, the list and its args out.
+  const activeListBGL = device.createBindGroupLayout({ label: 'activeListBGL', entries: [
+    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+  ]});
+  return { phyBGL, renBGL, interpPoolParentBGL, avgPoolBGL, criterionPoolBGL, managePoolBGL, step1BGL, force1BGL, explodeBGL, coalesceBGL,
+           indirect, activeListBGL };
 }
 
 // --- the renderer's per-level wiring (plans/uniform-levels.md U6) -----------

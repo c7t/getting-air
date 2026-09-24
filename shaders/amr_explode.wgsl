@@ -89,6 +89,7 @@ struct LevelParams {
 @group(0) @binding(3) var<storage, read>       slotToBlock     : array<i32>; // child
 @group(0) @binding(4) var<storage, read>       blockSlot       : array<i32>; // child -- "covered"
 @group(0) @binding(5) var<storage, read>       parentBlockSlot : array<i32>; // parent -- owner of a parent cell; unread at the root
+@group(0) @binding(6) var<storage, read>       activeSlots     : array<u32>; // child -- read only by `mainIndirect`
 
 override RB : u32;
 override PARENT_GHOST : u32 = 2u;
@@ -112,9 +113,16 @@ fn parentCellIndex(c: vec2<i32>) -> i32 {
 }
 
 @compute @workgroup_size(8, 8)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) { explodeCell(gid, gid.z); }
+
+// ?indirect=1 (main-amr.js): launched over this pool's active-slot list
+// (amr_active_list.wgsl), so z indexes the list rather than the pool. `main`
+// never reads `activeSlots`, so its layout -- every other page's -- is unchanged.
+@compute @workgroup_size(8, 8)
+fn mainIndirect(@builtin(global_invocation_id) gid: vec3<u32>) { explodeCell(gid, activeSlots[gid.z]); }
+
+fn explodeCell(gid: vec3<u32>, slot: u32) {
   let fx = gid.x; let fy = gid.y;
-  let slot = gid.z;
   let FB = RB * 2u + 2u * GHOST;
   if (fx >= FB || fy >= FB) { return; }
   let blockID = slotToBlock[slot];

@@ -80,6 +80,8 @@ struct LevelParams {
 // streaming needs (see DIRECT_GHOST), the same buffer and the same indexing
 // amr_interp_pool_parent.wgsl's fine-fine consultation already uses.
 @group(0) @binding(6) var<storage, read>       blockSlot   : array<i32>;
+// Read only by `mainIndirect` below.
+@group(0) @binding(7) var<storage, read>       activeSlots : array<u32>;
 
 override W : u32; // GLOBAL domain dims (window periodicity), same at every level -- not level-specific, see header.
 override H : u32;
@@ -330,9 +332,16 @@ fn get_chi(phi: f32) -> f32 {
 }
 
 @compute @workgroup_size(8, 8)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) { stepCell(gid, gid.z); }
+
+// ?indirect=1 (main-amr.js): launched over this pool's active-slot list
+// (amr_active_list.wgsl), so z indexes the list rather than the pool. `main`
+// never reads `activeSlots`, so its layout -- every other page's -- is unchanged.
+@compute @workgroup_size(8, 8)
+fn mainIndirect(@builtin(global_invocation_id) gid: vec3<u32>) { stepCell(gid, activeSlots[gid.z]); }
+
+fn stepCell(gid: vec3<u32>, slot: u32) {
   let fx = gid.x; let fy = gid.y;
-  let slot = gid.z;
   let FB = RB * 2u + 2u * GHOST;
   if (fx >= FB || fy >= FB) { return; }
 

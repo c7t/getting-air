@@ -22,8 +22,8 @@ import {
   tauAtLevel as tauAtLevelOf,
 } from './card-params.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
-import { check21BalanceOnGPU, allocLevelPool, writePoolInitialState, checkRootPoolIdentity, readConservedTotals, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState, checkGeometryCoverageOnGPU, makeRefusalWatch , checkRefinementClosureOnGPU , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU, makeRenderBindGroup, renderPoolLevels, MAX_RENDER_POOL_LEVELS, makeAMRLayouts, makeCouplingPipelines, makeLevelBindGroups, makeManageBindGroups, makeScheduler, makeRefineRound, allocRootPool, makeRootPool, encodeRootCapture, readRootCapture, restoreRootCapture, seedRootFromDense, readDiag, readInterfaceMode, readCellCentre, makeExplodeCoalesce } from './amr2d-gpu.mjs';
-import { poolSlotsFor, tauChainSingularity, tauSingularityMessage, rootPoolSpec, rootCellIndex, cellUpdatesPerMacroStep } from './amr2d.mjs';
+import { check21BalanceOnGPU, allocLevelPool, writePoolInitialState, checkRootPoolIdentity, readConservedTotals, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState, checkGeometryCoverageOnGPU, makeRefusalWatch , checkRefinementClosureOnGPU , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU, makeRenderBindGroup, renderPoolLevels, MAX_RENDER_POOL_LEVELS, makeAMRLayouts, makeCouplingPipelines, makeLevelBindGroups, withActiveList, force1Entries, makeActiveLists, ACTIVE_ARGS, makeManageBindGroups, makeScheduler, makeRefineRound, allocRootPool, makeRootPool, encodeRootCapture, readRootCapture, restoreRootCapture, seedRootFromDense, readDiag, readInterfaceMode, readCellCentre, makeExplodeCoalesce } from './amr2d-gpu.mjs';
+import { poolSlotsFor, tauChainSingularity, tauSingularityMessage, rootPoolSpec, rootCellIndex, cellUpdatesPerMacroStep, activeSlotList, activeListArgs } from './amr2d.mjs';
 import { EX, EY, WT } from './lattice-2d.mjs';
 import { makeCanvasFit } from './canvas-fit.mjs';
 
@@ -536,6 +536,14 @@ const CELL_CENTRE_AFFINE = readCellCentre(urlParams);
 // ?forcecull=0 -- sweep every finest tile in the force pass instead of only
 // the body's reach. Exact either way; see amr_force1.wgsl's FORCE_CULL.
 const FORCE_CULL = urlParams.has('forcecull') ? (parseInt(urlParams.get('forcecull')) ? 1 : 0) : 1;
+// ?indirect=1 -- launch the per-substep passes (step, force, explode, coalesce,
+// average, steady interp) over each pool level's ACTIVE-SLOT LIST instead of
+// over every slot, via dispatchWorkgroupsIndirect. An empty slot's
+// early-return workgroup costs ~14 ns on the phone, and at ?levels=4 a root
+// step launched ~305k of them for ~13k live tiles (plans/perf-characterization.md,
+// 2026-09-24). See shaders/amr_active_list.wgsl. Measurement and gate first;
+// default off until both are in.
+const INDIRECT = urlParams.get('indirect') === '1';
 const BODY_SUBSTEP = urlParams.has('bodysub') ? (parseInt(urlParams.get('bodysub')) ? 1 : 0) : 1;
 const COLLIDE_RING = INTERFACE === 'explode' ? 0 : 1;
 // The render's ring rule follows the interface unless ?ringfreerender= says
@@ -1331,7 +1339,8 @@ async function init() {
     constants: couplingConstants,
     interpPoolParentPL, interpPoolParentInitPL, interpPoolParentFFPL,
     avgPoolPL,
-  } = makeCouplingPipelines(device, layouts, modules, { RB, F16, DC_PRE, RING_FREE_SAMPLE: 1 - COLLIDE_RING });
+    interpPoolParentIndPL, avgPoolIndPL,
+  } = makeCouplingPipelines(device, layouts, modules, { RB, F16, DC_PRE, RING_FREE_SAMPLE: 1 - COLLIDE_RING, indirect: INDIRECT });
 
   const phyPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [phyBGL] }),
@@ -1370,6 +1379,13 @@ async function init() {
     layout: device.createPipelineLayout({ bindGroupLayouts: [step1BGL] }),
     compute: { module: step1SM, entryPoint: 'main', constants: step1Constants }
   });
+  // ?indirect=1 twins: same module and constants, the entry point that reads
+  // its slot from the active-slot list. Only the macro-step's own dispatches
+  // use them; everything else keeps the direct pipelines above.
+  const step1IndPL = INDIRECT ? device.createComputePipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [layouts.indirect.step1BGL] }),
+    compute: { module: step1SM, entryPoint: 'mainIndirect', constants: step1Constants }
+  }) : null;
   // ── Measurement-instrument pipeline twins (see benchSkip below) ──────────
   // Built unconditionally but only ever bound when the matching ?benchSkip=
   // group is set, so the normal dispatch path is untouched. Each is the SAME
@@ -1416,10 +1432,15 @@ async function init() {
   // Milestone 8: level>=2's own force pass, one pipeline reused across
   // every such level (no per-level overrides -- hasChild/dxL are runtime
   // LevelParams reads, see amr_force1.wgsl's header).
+  const force1Constants = { W, H, RB, F16, RING_FREE_FORCE, CELL_CENTRE_AFFINE, FORCE_CULL };
   const force1PL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [force1BGL] }),
-    compute: { module: force1SM, entryPoint: 'main', constants: { W, H, RB, F16, RING_FREE_FORCE, CELL_CENTRE_AFFINE, FORCE_CULL } }
+    compute: { module: force1SM, entryPoint: 'main', constants: force1Constants }
   });
+  const force1IndPL = INDIRECT ? device.createComputePipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [layouts.indirect.force1BGL] }),
+    compute: { module: force1SM, entryPoint: 'mainIndirect', constants: force1Constants }
+  }) : null;
   // Two pipelines, same module, different entry points -- dispatched as two
   // SEPARATE passes (coarsen fully completing before refine starts) to
   // avoid a same-dispatch free-list race. See amr_manage.wgsl's header for
@@ -1610,6 +1631,11 @@ async function init() {
   // pipeline for it. plans/2D-backport.md B3-1.
   pools[1].step1BG_ab = device.createBindGroup({ layout: step1BGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: pools[1].finePoolF_a } }, { binding: 2, resource: { buffer: pools[1].finePoolF_b } }, { binding: 3, resource: { buffer: pools[1].finePoolVel } }, { binding: 4, resource: { buffer: pools[1].slotToBlockBuf } }, { binding: 5, resource: { buffer: pools[1].levelParamsBuf } }, { binding: 6, resource: { buffer: pools[1].blockSlotBuf } }]});
   pools[1].step1BG_ba = device.createBindGroup({ layout: step1BGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: pools[1].finePoolF_b } }, { binding: 2, resource: { buffer: pools[1].finePoolF_a } }, { binding: 3, resource: { buffer: pools[1].finePoolVel } }, { binding: 4, resource: { buffer: pools[1].slotToBlockBuf } }, { binding: 5, resource: { buffer: pools[1].levelParamsBuf } }, { binding: 6, resource: { buffer: pools[1].blockSlotBuf } }]});
+  if (INDIRECT) {
+    const l1Step = (fIn, fOut) => [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: fIn } }, { binding: 2, resource: { buffer: fOut } }, { binding: 3, resource: { buffer: pools[1].finePoolVel } }, { binding: 4, resource: { buffer: pools[1].slotToBlockBuf } }, { binding: 5, resource: { buffer: pools[1].levelParamsBuf } }, { binding: 6, resource: { buffer: pools[1].blockSlotBuf } }];
+    pools[1].step1IndBG_ab = device.createBindGroup({ layout: layouts.indirect.step1BGL, entries: withActiveList(l1Step(pools[1].finePoolF_a, pools[1].finePoolF_b), 7, pools[1]) });
+    pools[1].step1IndBG_ba = device.createBindGroup({ layout: layouts.indirect.step1BGL, entries: withActiveList(l1Step(pools[1].finePoolF_b, pools[1].finePoolF_a), 7, pools[1]) });
+  }
   // Fine-fine-only ghost re-exchange, run BETWEEN f1a and f1b. f1a writes the
   // post-substep-1 pool into pools[1].finePoolF_b (the buffer f1b then reads), so this
   // refreshes each block's fine-fine seam ghosts IN PLACE in pools[1].finePoolF_b from
@@ -1659,7 +1685,7 @@ async function init() {
   // ONE place. Three pages had this loop byte-identical and two had it minus
   // the force block; see makeLevelBindGroups.
   makeLevelBindGroups(device, U, layouts, pools, N_LEVELS,
-    { cardStateBuf, forceBuf });
+    { cardStateBuf, forceBuf, indirect: INDIRECT });
   // B6-1: explode/coalesce, when ?interface=explode. Null otherwise, so the
   // pass table below carries no explode passes and makeScheduler's interp
   // order is untouched.
@@ -1667,7 +1693,11 @@ async function init() {
     ? makeExplodeCoalesce(device, layouts, {
         explodeSM: await loadShader(device, 'shaders/amr_explode.wgsl'),
         coalesceSM: await loadShader(device, 'shaders/amr_coalesce.wgsl'),
-      }, pools, N_LEVELS, { RB, F16, explodeLinear: urlParams.get('explin') !== '0' })
+      }, pools, N_LEVELS, { RB, F16, explodeLinear: urlParams.get('explin') !== '0', indirect: INDIRECT })
+    : null;
+  // ?indirect=1: the per-level compaction that the twins above launch over.
+  const activeLists = INDIRECT
+    ? makeActiveLists(device, layouts, await loadShader(device, 'shaders/amr_active_list.wgsl'), pools, N_LEVELS, { RB })
     : null;
 
   // Milestone 8: level 1's own force pass. Always reads pools[1].finePoolF_a
@@ -1677,31 +1707,20 @@ async function init() {
   // depend on the persistent, cross-macro-step `useB` flag for L0's OWN
   // buffer choice).
   pools[1].debugSlotForceBuf = device.createBuffer({ size: pools[1].MAX_FINE_BLOCKS * 8, usage: U.STORAGE | U.COPY_SRC });
-  pools[1].force1BG = device.createBindGroup({ layout: force1BGL, entries: [
-    { binding: 0, resource: { buffer: cardStateBuf } },
-    { binding: 1, resource: { buffer: pools[1].finePoolF_a } },
-    { binding: 2, resource: { buffer: forceBuf } },
-    { binding: 3, resource: { buffer: pools[1].slotToBlockBuf } },
-    { binding: 4, resource: { buffer: pools[1].levelParamsBuf } },
-    { binding: 5, resource: { buffer: pools[1].debugSlotForceBuf } },
-      // Bound but never read at GHOST=2 -- these levels have a ring.
-    { binding: 6, resource: { buffer: pools[1].blockSlotBuf } },
-  ]});
+  pools[1].force1BG = device.createBindGroup({ layout: force1BGL, entries: force1Entries(pools[1], pools[1].finePoolF_a, { cardStateBuf, forceBuf }) });
+  if (INDIRECT) {
+    pools[1].force1IndBG = device.createBindGroup({ layout: layouts.indirect.force1BGL, entries: withActiveList(force1Entries(pools[1], pools[1].finePoolF_a, { cardStateBuf, forceBuf }), 7, pools[1]) });
+  }
   // BODY_SUBSTEP measures the force before EACH finest substep, and the
   // second substep of a cycle starts from the 'b' buffer -- so the finest level
   // needs a force bind group that reads it. The 'a' one above is the one the
   // once-per-root-step path uses, at the cycle boundary.
   {
     const fp = pools[N_LEVELS - 1];
-    fp.force1BG_b = device.createBindGroup({ layout: force1BGL, entries: [
-      { binding: 0, resource: { buffer: cardStateBuf } },
-      { binding: 1, resource: { buffer: fp.finePoolF_b } },
-      { binding: 2, resource: { buffer: forceBuf } },
-      { binding: 3, resource: { buffer: fp.slotToBlockBuf } },
-      { binding: 4, resource: { buffer: fp.levelParamsBuf } },
-      { binding: 5, resource: { buffer: fp.debugSlotForceBuf } },
-      { binding: 6, resource: { buffer: fp.blockSlotBuf } },
-    ]});
+    fp.force1BG_b = device.createBindGroup({ layout: force1BGL, entries: force1Entries(fp, fp.finePoolF_b, { cardStateBuf, forceBuf }) });
+    if (INDIRECT) {
+      fp.force1IndBG_b = device.createBindGroup({ layout: layouts.indirect.force1BGL, entries: withActiveList(force1Entries(fp, fp.finePoolF_b, { cardStateBuf, forceBuf }), 7, fp) });
+    }
   }
 
   const error = await device.popErrorScope();
@@ -1818,6 +1837,44 @@ async function init() {
   // buffer against its dense counterpart word for word; the dense counterpart
   // is gone, so they are not "temporarily unavailable", they are unaskable.
   // See the note above makeRootPool for the whole argument.
+
+  // ?indirect=1: score every level's GPU-built active-slot list and dispatch
+  // args against amr2d.mjs's host statement of them, on the slotToBlock the
+  // list was built from. Read in ONE submit, and only between macro-steps
+  // (liveMode false), so the two cannot be from different topologies.
+  async function debugCheckActiveLists() {
+    if (!INDIRECT) throw new Error('debugCheckActiveLists: needs ?indirect=1 (no lists are built without it)');
+    if (liveMode) throw new Error('debugCheckActiveLists: pause first (setLive(false)) so the list and slotToBlock are one topology');
+    const enc = device.createCommandEncoder();
+    const reads = [];
+    for (let m = 1; m < N_LEVELS; m++) {
+      const pool = pools[m];
+      const n = pool.MAX_FINE_BLOCKS * 4;
+      const st = { m, s2b: device.createBuffer({ size: n, usage: U.MAP_READ | U.COPY_DST }),
+                   list: device.createBuffer({ size: n, usage: U.MAP_READ | U.COPY_DST }),
+                   args: device.createBuffer({ size: 36, usage: U.MAP_READ | U.COPY_DST }) };
+      enc.copyBufferToBuffer(pool.slotToBlockBuf, 0, st.s2b, 0, n);
+      enc.copyBufferToBuffer(pool.activeSlotsBuf, 0, st.list, 0, n);
+      enc.copyBufferToBuffer(pool.activeArgsBuf, 0, st.args, 0, 36);
+      reads.push(st);
+    }
+    device.queue.submit([enc.finish()]);
+    const [s0, s1, s2] = [Math.ceil(FB / 8), Math.ceil(2 * RB / 8), 1];
+    const out = [];
+    for (const st of reads) {
+      await Promise.all([st.s2b.mapAsync(GPUMapMode.READ), st.list.mapAsync(GPUMapMode.READ), st.args.mapAsync(GPUMapMode.READ)]);
+      const s2b = new Int32Array(st.s2b.getMappedRange().slice(0));
+      const list = new Uint32Array(st.list.getMappedRange().slice(0));
+      const args = Array.from(new Uint32Array(st.args.getMappedRange().slice(0)));
+      for (const b of [st.s2b, st.list, st.args]) { b.unmap(); b.destroy(); }
+      const want = activeSlotList(s2b);
+      const wantArgs = activeListArgs(want.length, [s0, s1, s2]);
+      const got = Array.from(list.subarray(0, args[2]));
+      const ok = args.every((v, i) => v === wantArgs[i]) && got.length === want.length && got.every((v, i) => v === want[i]);
+      out.push({ level: st.m, ok, count: args[2], expected: want.length, args, wantArgs });
+    }
+    return { ok: out.every(r => r.ok), levels: out };
+  }
 
   async function debugCheckRootConserved() {
     const spec = rootPoolSpec({ dims: { W, H }, rb: RB });
@@ -2144,8 +2201,14 @@ async function init() {
     interpIntoChild: (enc, level, readCur) => {
       if (skipGroup('interp')) return;
       const childPool = pools[level + 1];
-      const bg = readCur === 'a' ? childPool.interpPoolParentBG_readA : childPool.interpPoolParentBG_readB;
       const p = beginPass(enc, `L${level}->L${level + 1} interp`);
+      if (INDIRECT && !skipGroup('interp-noop')) {
+        p.setPipeline(interpPoolParentIndPL);
+        p.setBindGroup(0, readCur === 'a' ? childPool.interpPoolParentIndBG_readA : childPool.interpPoolParentIndBG_readB);
+        p.dispatchWorkgroupsIndirect(childPool.activeArgsBuf, ACTIVE_ARGS.fbSquare); p.end();
+        return;
+      }
+      const bg = readCur === 'a' ? childPool.interpPoolParentBG_readA : childPool.interpPoolParentBG_readB;
       p.setPipeline(skipGroup('interp-noop') ? noopPLs.interpPool : interpPoolParentPL);
       p.setBindGroup(0, bg);
       p.dispatchWorkgroups(WGX1, WGY1, childPool.MAX_FINE_BLOCKS); p.end();
@@ -2153,8 +2216,14 @@ async function init() {
     averageFromChild: (enc, level, writeCur) => {
       if (skipGroup('avg')) return;
       const childPool = pools[level + 1];
-      const bg = writeCur === 'a' ? childPool.avgPoolBG_targetA : childPool.avgPoolBG_targetB;
       const p = beginPass(enc, `L${level + 1}->L${level} average`);
+      if (INDIRECT && !skipGroup('avg-noop')) {
+        p.setPipeline(avgPoolIndPL);
+        p.setBindGroup(0, writeCur === 'a' ? childPool.avgPoolIndBG_targetA : childPool.avgPoolIndBG_targetB);
+        p.dispatchWorkgroupsIndirect(childPool.activeArgsBuf, ACTIVE_ARGS.perSlot); p.end();
+        return;
+      }
+      const bg = writeCur === 'a' ? childPool.avgPoolBG_targetA : childPool.avgPoolBG_targetB;
       p.setPipeline(skipGroup('avg-noop') ? noopPLs.avgPool : avgPoolPL);
       p.setBindGroup(0, bg);
       p.dispatchWorkgroups(1, 1, childPool.MAX_FINE_BLOCKS); p.end();
@@ -2167,6 +2236,13 @@ async function init() {
       const legacyGhost = GHOST_COPY !== 0 || skipGroup('ghostcopy');
       const pl = skipGroup('step1-ring') ? ringPLs.step1 : (legacyGhost ? legacyGhostPLs.step1 : step1PL);
       const p = beginPass(enc, `L${level} step`);
+      // The measurement twins (step1-ring, ghostcopy) stay direct: they are
+      // compared against the direct baseline, not against this.
+      if (INDIRECT && pl === step1PL) {
+        p.setPipeline(step1IndPL); p.setBindGroup(0, readCur === 'a' ? pool.step1IndBG_ab : pool.step1IndBG_ba);
+        p.dispatchWorkgroupsIndirect(pool.activeArgsBuf, ACTIVE_ARGS.fbSquare); p.end();
+        return;
+      }
       p.setPipeline(pl); p.setBindGroup(0, bg);
       p.dispatchWorkgroups(WGX1, WGY1, pool.MAX_FINE_BLOCKS); p.end();
     },
@@ -2176,9 +2252,17 @@ async function init() {
     ...(BODY_SUBSTEP ? { bodySubstep: (enc, level, readCur) => {
       const pool = pools[level];
       if (!skipGroup('force')) {
-        const p = beginPass(enc, `force L${level}`); p.setPipeline(force1PL);
-        p.setBindGroup(0, readCur === 'a' ? pool.force1BG : pool.force1BG_b);
-        p.dispatchWorkgroups(WGX1, WGY1, pool.MAX_FINE_BLOCKS); p.end();
+        const p = beginPass(enc, `force L${level}`);
+        if (INDIRECT) {
+          p.setPipeline(force1IndPL);
+          p.setBindGroup(0, readCur === 'a' ? pool.force1IndBG : pool.force1IndBG_b);
+          p.dispatchWorkgroupsIndirect(pool.activeArgsBuf, ACTIVE_ARGS.fbSquare);
+        } else {
+          p.setPipeline(force1PL);
+          p.setBindGroup(0, readCur === 'a' ? pool.force1BG : pool.force1BG_b);
+          p.dispatchWorkgroups(WGX1, WGY1, pool.MAX_FINE_BLOCKS);
+        }
+        p.end();
       }
       if (!skipGroup('phy')) { const phy = beginPass(enc, 'body dynamics'); phy.setPipeline(phySubPL); phy.setBindGroup(0, phyBG); phy.dispatchWorkgroups(1); phy.end(); }
     } } : {}),
@@ -2349,6 +2433,13 @@ async function init() {
     }
     macroStepCounter++;
 
+    // ?indirect=1: every consumer below launches over the lists this rebuilds,
+    // so it runs AFTER the refine round -- the last thing in a macro-step that
+    // changes slotToBlock -- and before anything reads them. Every macro-step,
+    // not only refine rounds: that also covers reset, snapshot load and a
+    // manual debugActivateBlock between steps, none of which has to know.
+    if (activeLists) activeLists.encode(enc, beginPass);
+
     // ONE FORCE PASS, AT THE FINEST LEVEL (plans/2D-backport.md B4-3).
     //
     // Milestone 8 ran EVERY level's force pass and had each mask itself out
@@ -2372,7 +2463,10 @@ async function init() {
       {
         // NO LEVEL SPLIT SINCE B3-4: one kernel, one pipeline, every level.
         const pool = pools[finestLevel];
-        const p = beginPass(enc, `force L${finestLevel}`); p.setPipeline(force1PL); p.setBindGroup(0, pool.force1BG); p.dispatchWorkgroups(WGX1, WGY1, pool.MAX_FINE_BLOCKS); p.end();
+        const p = beginPass(enc, `force L${finestLevel}`);
+        if (INDIRECT) { p.setPipeline(force1IndPL); p.setBindGroup(0, pool.force1IndBG); p.dispatchWorkgroupsIndirect(pool.activeArgsBuf, ACTIVE_ARGS.fbSquare); }
+        else { p.setPipeline(force1PL); p.setBindGroup(0, pool.force1BG); p.dispatchWorkgroups(WGX1, WGY1, pool.MAX_FINE_BLOCKS); }
+        p.end();
       }
     }
     if (!BODY_SUBSTEP && !skipGroup('phy')) { const phy = beginPass(enc, 'body dynamics'); phy.setPipeline(phyPL); phy.setBindGroup(0, phyBG); phy.dispatchWorkgroups(1); phy.end(); }
@@ -3444,6 +3538,8 @@ async function init() {
     debugListActiveBlocks,
     debugCheckRootPool: () => checkRootPoolIdentity(device, pools),
     debugCheckRootConserved,
+    debugCheckActiveLists,
+    isIndirect: () => INDIRECT,
     getRootPool: () => ({ ...rootPoolSpec({ dims: { W, H }, rb: RB }), stepped: true }),
     debugRenderOnce,
     debugPerturbLevelVel,

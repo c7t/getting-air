@@ -57,6 +57,7 @@ struct LevelParams {
 @group(0) @binding(2) var<storage, read_write> f_parent          : array<u32>; // parent's TIME-t buffer
 @group(0) @binding(3) var<storage, read>       blockSlot         : array<i32>; // child -- "covered", and the ring's owner
 @group(0) @binding(4) var<storage, read>       parentSlotToBlock : array<i32>; // parent -- which block this thread's slot is
+@group(0) @binding(5) var<storage, read>       parentActiveSlots : array<u32>; // parent -- read only by `mainIndirect`
 
 override RB : u32;
 override PARENT_GHOST : u32 = 2u;
@@ -71,10 +72,17 @@ fn childCell(s: u32, l: vec2<i32>) -> u32 {
 }
 
 @compute @workgroup_size(8, 8)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) { coalesceCell(gid, gid.z); }
+
+// ?indirect=1 (main-amr.js): launched over this pool's active-slot list
+// (amr_active_list.wgsl), so z indexes the list rather than the pool. `main`
+// never reads `activeSlots`, so its layout -- every other page's -- is unchanged.
+@compute @workgroup_size(8, 8)
+fn mainIndirect(@builtin(global_invocation_id) gid: vec3<u32>) { coalesceCell(gid, parentActiveSlots[gid.z]); }
+
+fn coalesceCell(gid: vec3<u32>, pslot: u32) {
   let RB2 = RB * 2u;
   if (gid.x >= RB2 || gid.y >= RB2) { return; }
-  let pslot = gid.z;
   if (pslot >= arrayLength(&parentSlotToBlock)) { return; }
   let pbid = parentSlotToBlock[pslot];
   if (pbid < 0) { return; }

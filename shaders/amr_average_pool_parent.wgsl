@@ -38,6 +38,9 @@ struct LevelParams {
 // data (plans/2D-backport.md B6-9c). Same treatment as the interp entry's.
 @group(0) @binding(4) var<storage, read>       parentSlot    : array<i32>;
 @group(0) @binding(5) var<storage, read>       quadrant      : array<u32>;
+// The child pool's active-slot list, read only by common_average.wgsl's
+// `mainIndirect` (?indirect=1).
+@group(0) @binding(6) var<storage, read>       activeSlots   : array<u32>;
 
 // @include "common_avg_parent_pool.wgsl"
 // @include "common_average.wgsl"

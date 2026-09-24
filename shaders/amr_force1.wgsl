@@ -119,6 +119,8 @@ struct LevelParams {
 // This level's own blockSlot, for the ring-free gather below. Always bound;
 // only read when GHOST == 0.
 @group(0) @binding(6) var<storage, read>       blockSlot      : array<i32>;
+// Read only by `mainIndirect` below.
+@group(0) @binding(7) var<storage, read>       activeSlots    : array<u32>;
 // RENUMBERED CONTIGUOUS by B3-4. The layout had holes: 4/5 were
 // originX/originY (gone -- the origin is derived, see header), 7 was the
 // masking's childBlockSlot (gone in B4-3) and 8 sat past the hole because
@@ -296,8 +298,7 @@ fn safeFixed(x: f32) -> i32 {
 override FORCE_CULL : u32 = 1u;
 var<workgroup> wg_cull : u32;
 
-fn cullWorkgroup(wid: vec3<u32>) -> u32 {
-  let slot = wid.z;
+fn cullWorkgroup(wid: vec3<u32>, slot: u32) -> u32 {
   let blockID = slotToBlock[slot];
   if (blockID < 0) { return 1u; }
   let lo = max(wid.xy * 8u, vec2<u32>(GHOST, GHOST));
@@ -323,13 +324,24 @@ fn main(
   @builtin(global_invocation_id) gid: vec3<u32>,
   @builtin(local_invocation_index) lid: u32,
   @builtin(workgroup_id) wid: vec3<u32>
-) {
+) { forceCell(gid, lid, wid, gid.z); }
+
+// ?indirect=1 (main-amr.js): launched over this pool's active-slot list
+// (amr_active_list.wgsl), so z indexes the list rather than the pool. `main`
+// never reads `activeSlots`, so its layout -- every other page's -- is unchanged.
+@compute @workgroup_size(8, 8)
+fn mainIndirect(
+  @builtin(global_invocation_id) gid: vec3<u32>,
+  @builtin(local_invocation_index) lid: u32,
+  @builtin(workgroup_id) wid: vec3<u32>
+) { forceCell(gid, lid, wid, activeSlots[gid.z]); }
+
+fn forceCell(gid: vec3<u32>, lid: u32, wid: vec3<u32>, slot: u32) {
   if (FORCE_CULL != 0u) {
-    if (lid == 0u) { wg_cull = cullWorkgroup(wid); }
+    if (lid == 0u) { wg_cull = cullWorkgroup(wid, slot); }
     if (workgroupUniformLoad(&wg_cull) != 0u) { return; }
   }
   let fx = gid.x; let fy = gid.y;
-  let slot = gid.z;
   let FB = RB * 2u + 2u * GHOST;
 
   var fx_body = 0.0f;

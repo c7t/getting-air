@@ -47,6 +47,9 @@ struct LevelParams {
 // ring -- see common_interp_parent_pool.wgsl's RING_FREE_SAMPLE. Unread on the
 // root-parent pipeline (ringless, always full) and wherever that override is 0.
 @group(0) @binding(8) var<storage, read>       parentBlockSlot : array<i32>;
+// The child pool's active-slot list, read only by common_interp_kernel.wgsl's
+// `mainIndirect` (?indirect=1).
+@group(0) @binding(9) var<storage, read>       activeSlots     : array<u32>;
 
 // @include "common_interp_parent_pool.wgsl"
 // @include "common_interp_kernel.wgsl"
