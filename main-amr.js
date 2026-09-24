@@ -624,12 +624,23 @@ if (!(FORCE_REFINE_MARGIN > 0)) {
 // alone isolates the predicate with the margin held at its honest scaled
 // default, which is usually the comparison you actually want.
 const BOX_REFINE = urlParams.has('boxrefine') ? (parseInt(urlParams.get('boxrefine')) ? 1 : 0) : 1;
+// ?spongeW= -- the far-field sponge's ramp width in ROOT cells (amr_step1.wgsl
+// SPONGE_W; every level measures it in L0 window units). Default 4 is the
+// shader's own, so an unset page is byte-identical. It matters at a LOW root:
+// the ramp is a fixed number of root cells, so at res 5 the default takes a
+// quarter of the domain. The cylinder sweep (plans/uniform-levels.md S8-5)
+// measured ~2 root cells as the floor before the drag noise rises, with the
+// only cost of a wider one being confinement. 0 disables it -- the domain is
+// then periodic and the wake wraps back onto the card.
+const SPONGE_W = urlParams.has('spongeW') ? parseFloat(urlParams.get('spongeW')) : 4;
+if (!(SPONGE_W >= 0)) refuseConfig(statusEl, `?spongeW=${urlParams.get('spongeW')} must be >= 0`);
 // L0 window-space edge band (coarse cells) excluded from vorticity-driven
-// refinement -- keeps fine blocks out of the ALBC sponge (amr_step.wgsl
-// SPONGE_W=4). A fixed L0-window strip, so the same value applies at every
-// refinement level (unlike FORCE_REFINE_MARGIN). Default 8; ?spongeExclude=0
-// disables it.
-const SPONGE_EXCLUDE_W = urlParams.has('spongeExclude') ? parseFloat(urlParams.get('spongeExclude')) : 8;
+// refinement -- keeps fine blocks out of the ALBC sponge. A fixed L0-window
+// strip, so the same value applies at every refinement level (unlike
+// FORCE_REFINE_MARGIN). Default 2 * SPONGE_W -- the 8 it always was at the
+// default sponge -- so narrowing the sponge frees the band it no longer
+// occupies; ?spongeExclude= sets it outright, 0 disables it.
+const SPONGE_EXCLUDE_W = urlParams.has('spongeExclude') ? parseFloat(urlParams.get('spongeExclude')) : 2 * SPONGE_W;
 
 // ?detslots=1 -- deterministic pool slot handout (plans/uniform-levels.md D0).
 //
@@ -771,6 +782,28 @@ function recalculate() {
     deriveCardParams({ W, BLOCKAGE, ASPECT, I_STAR, RE, U_T }));
 }
 recalculate();
+
+// ?spongeW= as a slider, reloading like Resolution (it is a pipeline
+// constant). The label gives the width in CHORDS too, since that is what it
+// means physically and it moves with Resolution and Blockage.
+{
+  const sl = document.getElementById('slider-SPONGE');
+  const val = document.getElementById('val-SPONGE');
+  const show = () => {
+    const w = parseFloat(sl.value);
+    val.textContent = `${w} (${(w / (2 * A)).toFixed(2)} chord)`;
+  };
+  if (sl) {
+    sl.value = SPONGE_W;
+    show();
+    sl.oninput = show;
+    sl.onchange = () => {
+      const url = new URL(window.location);
+      url.searchParams.set('spongeW', sl.value);
+      window.location.href = url.href;
+    };
+  }
+}
 
 // ── Milestone 6 (plans/AMR-multilevel.md): recursive fine tau. L0's own tau
 // is TAU (read live off CardState by the dense shader); every deeper level
@@ -1278,7 +1311,7 @@ async function init() {
   // configuration deeper than the shader binds, rather than drawing it without
   // its finest level -- which is what this override replaced HAS_LEVEL2 for.
   const renderConstants = { W, H, RB, N_POOL_LEVELS: renderPoolLevels(N_LEVELS), RING_FREE_RENDER, K_EPS, CELL_CENTRE_AFFINE };
-  const step1Constants = { COLLIDE_RING, CELL_CENTRE_AFFINE, W, H, RB, SDF_FAR, F16, DIRECT_GHOST: GHOST_COPY ? 0 : 1 };
+  const step1Constants = { COLLIDE_RING, CELL_CENTRE_AFFINE, W, H, RB, SDF_FAR, SPONGE_W, F16, DIRECT_GHOST: GHOST_COPY ? 0 : 1 };
 
   // U7-1: the twelve coupling pipelines, from ONE place. Every page built
   // these identically; see makeCouplingPipelines for what stays per page and
