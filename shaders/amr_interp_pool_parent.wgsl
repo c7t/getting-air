@@ -48,7 +48,7 @@ struct LevelParams {
 // root-parent pipeline (ringless, always full) and wherever that override is 0.
 @group(0) @binding(8) var<storage, read>       parentBlockSlot : array<i32>;
 // The child pool's active-slot list, read only by common_interp_kernel.wgsl's
-// `mainIndirect`/`mainStride` (?launch=indirect|stride).
+// `mainStride` (?launch=stride).
 @group(0) @binding(9) var<storage, read>       activeList      : ActiveList;
 // @include "common_active_list.wgsl"
 

@@ -413,10 +413,12 @@ Read `plans/perf-characterization.md` BEFORE optimizing anything here. The
 two target devices have **opposite** bottlenecks — the desktop is
 pass-count/latency bound, the mobile PowerVR is memory-bandwidth bound — and
 the obvious optimization (indirect dispatch off the active block count) was
-measured to help neither **at `?levels=2` with 128 slots** -- and at depth it
-is the largest item on the phone: an empty slot's workgroup costs ~14 ns, the
-cost scales with slots x 2^m substeps, and `?levels=4` at res=5 spends ~4 of
-9.4 ms per macro-step launching empty workgroups (2026-09-24, same document). It also records the trap that produced a confident
+measured to help neither **at `?levels=2` with 128 slots** -- and at depth
+empty slots are the largest item on the phone (~14 ns per empty workgroup,
+scaling with slots x 2^m substeps). **`dispatchWorkgroupsIndirect` itself costs
+~230 us (phone) / ~390 us (desktop) PER CALL in this Chrome**, so the fix that
+shipped is `?stride=1` -- a direct dispatch walking an active-slot list -- not
+indirect dispatch (2026-09-24, same document). It also records the trap that produced a confident
 wrong conclusion: per-pass GPU timestamps are unusable on that mobile part
 (65536 ns counter granularity vs sub-tick passes), so attribution has to be
 done at frame scale via `?bench=1`.
@@ -525,6 +527,15 @@ predicted was wrong. Both
 paths are live in one build, so they can be A/B'd for speed
 (`?benchSkip=ghostcopy`, also in the `?bench=1` default sweep) and for physics
 (`node tools/validate-all.js --extra=ghostcopy=1`).
+
+`?stride=0` -- restores the every-slot launch on `index-amr.html`. Default 1:
+the per-substep passes walk each level's active-slot list
+(`shaders/amr_active_list.wgsl`, `mainStride` in each kernel) instead of
+launching every pool slot; -10% on the phone at the defaults, -37% at res=5
+levels=4. Bit-identical by construction and gated so by
+`tools/validate-stride.js`. The other four AMR pages still launch every slot:
+their layouts and bind groups are untouched, because only a `mainStride`
+entry point reads the list.
 
 Timing/measurement entry points:
 - `?telemetry=1` — POSTs periodic samples (device, adapter, config, frame

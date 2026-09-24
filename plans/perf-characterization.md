@@ -246,6 +246,43 @@ estimated at ~5.4 ms, UNMEASURED.
 Why 2026-09-07 saw nothing: 62 empty slots x 9 workgroups x a few passes x 2
 substeps is ~3k launches, ~45 us, under 1% of that frame.
 
+### The fix is a STRIDE over an active-slot list -- NOT indirect dispatch (2026-09-24)
+
+**Indirect dispatch was built first and loses on both devices.** Each pool
+level's in-use slots are compacted into a list (`shaders/amr_active_list.wgsl`,
+one deterministic single-workgroup scan per level per macro-step), and the
+obvious consumer is `dispatchWorkgroupsIndirect` off its count. It was
+bit-identical and SLOWER, because each indirect call carries a large fixed cost
+in this Chrome -- measured with an isolated early-return kernel:
+
+    per dispatch      direct     indirect
+    phone (img-tec)   ~29 us     ~233 us
+    desktop (4080)    ~5 us      ~390 us
+
+and it is per DISPATCH, not per pass (400 indirect dispatches in one pass cost
+the same as in 400). On the page, same topology both arms: phone 10.3 -> 13.2
+ms per root step, desktop 0.55 -> 21.5 ms. That build is commit 8e67789; the
+code is gone.
+
+**What ships is `?stride=1` (index-amr.html's default).** A DIRECT dispatch of
+K workgroups in z, each walking the list at stride K up to its count (each
+kernel's `mainStride`), so no empty slot is launched and no indirect call is
+made. K comes from the lists' own counts, read back lagged (+25% + 4); it sets
+only the parallelism, so a stale K is slower, never wrong. `?stride=0` is the
+control and `tools/validate-stride.js` gates the two BIT-FOR-BIT (`?detslots=1`,
+including a K=3 leg where every workgroup walks many entries). Phone, same
+topology both arms, min of three 512-step runs, interleaved:
+
+    config                         ?stride=0    ?stride=1
+    default (interp, L3, res 8)    4.94 ms      4.45 ms    -10%
+    explode, L3                    5.87 ms      5.33 ms     -9%
+    explode, res 5, L4             10.29 ms     6.50 ms    -37%
+
+K swept on the last row: 8 -> 10.0 ms, 24 -> 7.6, 48 -> 6.8, lagged-count
+default 6.50, 96 -> 6.51, 200 -> 6.62. The default is at the optimum. Desktop:
+-19% at res 5 L4, within its noise at the L3 defaults -- it is pass-bound, and
+this removes launches, not passes.
+
 ## RE-MEASURED at current defaults (2026-09-07) -- the fusion case is gone
 
 The table above is levels=2, 66 active L1 blocks, `MAX_FINE_BLOCKS=128`, and

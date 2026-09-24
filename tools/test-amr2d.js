@@ -2110,11 +2110,6 @@ const sorted = (s) => [...s].sort();
     }
   });
 
-  ok('activeListArgs: three (x, y, count) triples in shape order', () => {
-    assert.deepStrictEqual(A.activeListArgs(48, [3, 2, 1]), [3, 3, 48, 2, 2, 48, 1, 1, 48]);
-    assert.deepStrictEqual(A.activeListArgs(0, [3, 2, 1]), [3, 3, 0, 2, 2, 0, 1, 1, 0]);
-  });
-
   if (!process.exitCode) console.log(`\n${pass} check(s) passed`);
   else console.log('\nFAILED');
 })();

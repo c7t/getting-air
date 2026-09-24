@@ -5,7 +5,7 @@
 // this type rather than by a convention about index 0.
 //
 // Every includer declares `activeList` at its own binding; only its
-// `mainIndirect`/`mainStride` entry points read it, so a pipeline built on
+// `mainStride` entry point reads it, so a pipeline built on
 // `main` never needs it bound.
 struct ActiveList {
   count : u32,

@@ -574,15 +574,11 @@ export function activeSlotsFromFreeCount(maxSlots, freeQuads) {
 // THE ACTIVE-SLOT LIST -- shaders/amr_active_list.wgsl's host statement. The
 // in-use slots of one pool level in ASCENDING order (the kernel's chunked
 // scan preserves slot order, so this is a total specification of its output,
-// not just of its set), and the three indirect-dispatch triples that launch
-// exactly that many tiles at each consumer shape.
+// not just of its set); the kernel writes its length as `count`.
 export function activeSlotList(slotToBlock) {
   const out = [];
   for (let s = 0; s < slotToBlock.length; s++) if (slotToBlock[s] >= 0) out.push(s);
   return out;
-}
-export function activeListArgs(count, shapesXY) {
-  return shapesXY.flatMap(xy => [xy, xy, count]);
 }
 
 // DOES ANY POINT OF THIS BLOCK COME WITHIN `margin` OF THE BODY?

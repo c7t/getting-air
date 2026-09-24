@@ -123,18 +123,12 @@ fn fineToCoarseUnit(fCoord: u32, origin: u32) -> f32 {
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) { interpCell(gid, gid.z); }
 
-// ?launch=indirect (main-amr.js): launched over this pool's active-slot list
-// (amr_active_list.wgsl), so z indexes the list rather than the pool. `main`
-// never reads `activeList`, so its layout -- every other page's -- is unchanged.
-// `activeList` is declared by the includer (amr_interp_pool_parent.wgsl).
-@compute @workgroup_size(8, 8)
-fn mainIndirect(@builtin(global_invocation_id) gid: vec3<u32>) { interpCell(gid, activeList.slots[gid.z]); }
-
-// ?launch=stride: a DIRECT dispatch of K workgroups in z, each walking the
-// list at stride K -- the saving of indirect dispatch without its per-call
-// cost (plans/perf-characterization.md). K is the host's lagged estimate of
-// the count and only sets the parallelism; the loop covers every entry
-// whatever it is. The barrier lets the body reuse workgroup memory.
+// ?launch=stride (main-amr.js): a DIRECT dispatch of K workgroups in z, each
+// walking this pool's active-slot list (amr_active_list.wgsl) at stride K,
+// so an empty slot is never launched. K is the host's lagged estimate of the
+// count and only sets the parallelism; the loop covers every entry whatever
+// it is. The barrier lets the body reuse workgroup memory. `main` never reads
+// `activeList`, so its layout -- every other page's -- is unchanged.
 @compute @workgroup_size(8, 8)
 fn mainStride(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_index) li: u32,
               @builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {

@@ -1,29 +1,34 @@
 #!/usr/bin/env node
-// ?indirect=1 must be BIT-IDENTICAL to ?indirect=0 -- a gate, not a tolerance.
+// ?stride=1 (the default) must be BIT-IDENTICAL to ?stride=0, the every-slot
+// launch -- a gate, not a tolerance.
 //
-// WHY IT CAN BE EXACT. Indirect dispatch changes only WHICH z launches a tile
-// (z indexes shaders/amr_active_list.wgsl's compacted list instead of the
-// pool). Every per-slot kernel's work is a function of its slot alone, and the
-// one cross-tile reduction -- the force pass's per-workgroup partials -- is
-// summed with INTEGER atomics, which are order-independent. So with the slot
-// HANDOUT deterministic (`?detslots=1`; the default atomicSub free list races,
-// see CLAUDE.md on attractors), the two runs must agree to the bit. Anything
-// less is a list that is stale, short, or pointing at the wrong pool.
+// WHY IT CAN BE EXACT. ?stride=1 changes only WHICH workgroup runs a tile (K
+// workgroups walk shaders/amr_active_list.wgsl's compacted list at stride K,
+// instead of one workgroup group per pool slot). Every per-slot kernel's work
+// is a function of its slot alone, and the one cross-tile reduction -- the
+// force pass's per-workgroup partials -- is summed with INTEGER atomics, which
+// are order-independent. So with the slot HANDOUT deterministic
+// (`?detslots=1`; the default atomicSub free list races, see CLAUDE.md on
+// attractors), the runs must agree to the bit. Anything less is a list that is
+// stale, short, or pointing at the wrong pool, or a loop that skips an entry.
 //
 // ── THE PROTOCOL, per configuration ─────────────────────────────────────────
 //
-//   direct    ?indirect=0, reset, N steps, snapshot
-//   direct'   the same again                       -- THE CONTROL
-//   indirect  ?indirect=1, reset, N steps (in chunks, with the GPU list scored
-//             against amr2d.mjs's activeSlotList after each), snapshot
+//   direct    ?stride=0, reset, N steps, snapshot
+//   direct'   the same again                          -- THE CONTROL
+//   stride    ?stride=1 (K from the lagged count), reset, N steps (in chunks,
+//             with the GPU list scored against amr2d.mjs's activeSlotList
+//             after each), snapshot
+//   stride3   ?stride=1&strideK=3: every workgroup walks MANY entries, with
+//             counts 3 does not divide -- the loop and its per-iteration
+//             barrier, exercised hard
 //
-//   require   direct == direct'     else the comparison below cannot mean anything
-//             direct == indirect    the gate
-//             stepping moved the state, and the finest level holds tiles --
-//             or the equality was measured on a run with nothing to launch
+//   require   direct == direct'     else nothing below can mean anything
+//             direct == stride == stride3
+//             stepping moved the state, and the finest level holds tiles
 //
-//     node tools/validate-indirect.js
-//     node tools/validate-indirect.js --steps=2048 --only=explode
+//     node tools/validate-stride.js
+//     node tools/validate-stride.js --steps=2048 --only=explode
 //
 // VERIFY WHICH TREE THE DEV SERVER IS SERVING first -- `ensureServer` reuses
 // whatever already answers on the port.
@@ -103,11 +108,13 @@ async function main() {
   Runtime.exceptionThrown(e => console.error('[browser exception]', e.exceptionDetails.text));
   const G = 'window.__AMR';
 
-  const leg = async (cfg, indirect) => {
-    await navigateTo(Page, `${o.baseUrl}/index-amr.html?${cfg.q}&detslots=1&indirect=${indirect ? 1 : 0}`);
+  // `extra` is '&stride=0' (every slot) or a ?stride=1 query.
+  const leg = async (cfg, extra) => {
+    const listed = !extra.includes('stride=0');
+    await navigateTo(Page, `${o.baseUrl}/index-amr.html?${cfg.q}&detslots=1${extra}`);
     await waitForGlobal(Runtime, G, 60000);
     await ev(Runtime, `${G}.setLive(false)`);
-    if ((await ev(Runtime, `${G}.isIndirect()`)) !== indirect) throw new Error(`page did not take ?indirect=${indirect ? 1 : 0}`);
+    if ((await ev(Runtime, `${G}.isStride()`)) !== listed) throw new Error(`page did not take '${extra}'`);
     await ev(Runtime, `${G}.reset()`, 120000);
     const start = parts(await ev(Runtime, `${G}.debugSnapshotSave()`, 300000));
     const listFailures = [];
@@ -115,7 +122,7 @@ async function main() {
     for (let done = 0; done < o.steps; done += o.chunk) {
       await ev(Runtime, `${G}.debugStepSync(${o.chunk})`, 900000);
       await ev(Runtime, `${G}.setLive(false)`);
-      if (indirect) {
+      if (listed) {
         const r = await ev(Runtime, `${G}.debugCheckActiveLists()`, 60000);
         listChecks++;
         if (!r.ok) listFailures.push({ atStep: done + o.chunk, levels: r.levels.filter(l => !l.ok) });
@@ -129,26 +136,32 @@ async function main() {
 
   const rows = [];
   try {
-    console.log(`  ?indirect=1 vs ?indirect=0, ?detslots=1, ${o.steps} steps from reset()\n`);
+    console.log(`  ?stride=1 vs ?stride=0, ?detslots=1, ${o.steps} steps from reset()\n`);
     for (const cfg of configs) {
-      const d1 = await leg(cfg, false);
-      const d2 = await leg(cfg, false);
-      const ind = await leg(cfg, true);
+      const d1 = await leg(cfg, '&stride=0');
+      const d2 = await leg(cfg, '&stride=0');
+      const st = await leg(cfg, '&stride=1');
+      const st3 = await leg(cfg, '&stride=1&strideK=3');
       const deterministic = hash(d1.end) === hash(d2.end);
-      const same = hash(d1.end) === hash(ind.end);
+      const same = hash(d1.end) === hash(st.end) && hash(d1.end) === hash(st3.end);
       const alive = hash(d1.end) !== hash(d1.start);
-      const refined = d1.finestTiles > 0 && ind.finestTiles > 0;
-      const listsOk = ind.listFailures.length === 0 && ind.listChecks > 0;
+      const refined = d1.finestTiles > 0 && st.finestTiles > 0;
+      const lists = [st, st3].reduce((a, l) => ({ n: a.n + l.listChecks, bad: a.bad + l.listFailures.length }), { n: 0, bad: 0 });
+      const listsOk = lists.bad === 0 && lists.n > 0;
       const ok = deterministic && same && alive && refined && listsOk;
       rows.push({ cfg, ok });
       const tag = !deterministic ? 'NDET' : !alive ? 'DEAD' : !refined ? 'NOTL' : ok ? 'ok  ' : 'FAIL';
-      console.log(`  ${tag} ${cfg.name.padEnd(18)} direct ${hash(d1.end)}  direct' ${hash(d2.end)}  indirect ${hash(ind.end)}`
-        + `  finest tiles ${d1.finestTiles}/${ind.finestTiles}  lists ${ind.listChecks - ind.listFailures.length}/${ind.listChecks}`);
+      console.log(`  ${tag} ${cfg.name.padEnd(18)} direct ${hash(d1.end)}  direct' ${hash(d2.end)}  stride ${hash(st.end)}  stride3 ${hash(st3.end)}`
+        + `  finest tiles ${d1.finestTiles}  lists ${lists.n - lists.bad}/${lists.n}`);
       if (!deterministic) console.log('       the direct legs disagree with EACH OTHER -- detslots did not make the run deterministic, so no comparison here means anything');
       if (!alive) console.log('       stepping did not change the snapshot -- the equality below it proves nothing');
-      if (!refined) console.log('       the finest level holds no tiles -- indirect dispatch had nothing to launch');
-      if (deterministic && !same) for (const [k, n] of Object.entries(diffShape(d1.end, ind.end))) console.log(`       ${String(n).padStart(8)}  ${k}`);
-      for (const f of ind.listFailures.slice(0, 3)) console.log(`       list wrong at step ${f.atStep}: ${JSON.stringify(f.levels)}`);
+      if (!refined) console.log('       the finest level holds no tiles -- the list had nothing to launch');
+      if (deterministic) for (const [name, l] of [['stride', st], ['stride3', st3]]) {
+        if (hash(l.end) === hash(d1.end)) continue;
+        console.log(`       ${name} differs:`);
+        for (const [k, n] of Object.entries(diffShape(d1.end, l.end))) console.log(`       ${String(n).padStart(8)}  ${k}`);
+      }
+      for (const f of [...st.listFailures, ...st3.listFailures].slice(0, 3)) console.log(`       list wrong at step ${f.atStep}: ${JSON.stringify(f.levels)}`);
     }
   } finally {
     await client.close();
@@ -158,7 +171,7 @@ async function main() {
   const bad = rows.filter(r => !r.ok);
   console.log('');
   if (bad.length) { console.log(`FAIL: ${bad.length} of ${rows.length} configuration(s).`); process.exit(1); }
-  console.log(`PASS: ?indirect=1 is bit-identical to ?indirect=0 on ${rows.length} configuration(s), with a`);
+  console.log(`PASS: ?stride=1 (lagged K and K=3) is bit-identical to ?stride=0 on ${rows.length} configuration(s), with a`);
   console.log('deterministic control, a moving state, a refined finest level, and every GPU list matching its host twin.');
   process.exit(0);
 }

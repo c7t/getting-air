@@ -39,7 +39,7 @@ struct LevelParams {
 @group(0) @binding(4) var<storage, read>       parentSlot    : array<i32>;
 @group(0) @binding(5) var<storage, read>       quadrant      : array<u32>;
 // The child pool's active-slot list, read only by common_average.wgsl's
-// `mainIndirect`/`mainStride` (?launch=indirect|stride).
+// `mainStride` (?launch=stride).
 @group(0) @binding(6) var<storage, read>       activeList    : ActiveList;
 // @include "common_active_list.wgsl"
 
