@@ -1313,6 +1313,11 @@ async function init() {
       NBX_PARENT: parentPool.NBX, NBY_PARENT: parentPool.NBY,
       PARENT_CELL_SIZE_L0: cellSizeL0AtLevel(m),
       CELL_CENTRE_AFFINE,
+      // The ladder's ceiling (common_refine.wgsl). The shader's default is 2 and
+      // only main-amr.js passed it until 2026-09-23, so on this page the WAKE
+      // could never earn a level deeper than 2 at ?levels>=4 -- only the
+      // geometry shell reached the finest level (plans/uniform-levels.md S8-3).
+      MAX_LEVEL: N_LEVELS - 1,
       ...childParams,
       BOX_REFINE,
       // U5-4: the refusal counter is opt-in the same way the dense manager's
