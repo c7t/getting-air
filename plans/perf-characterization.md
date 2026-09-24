@@ -100,8 +100,8 @@ rather than silently reporting ~0% -- a mistyped entry used to be
 indistinguishable from a real measurement, which is unrecoverable on a device
 that gets one sweep per session.
 
-**The phone DOES have a CDP endpoint, over adb -- and it is still not the way
-to measure it (2026-09-08).** `adb forward tcp:9222
+**The phone DOES have a CDP endpoint, over adb (2026-09-08; usable since
+2026-09-24 -- see below).** `adb forward tcp:9222
 localabstract:chrome_devtools_remote` exposes Chrome for Android's DevTools
 endpoint, so `tools/`-style CDP driving is possible in principle. Two things
 found the hard way:
@@ -123,8 +123,8 @@ found the hard way:
   that does not.
 
 **So the phone CAN be driven the way `tools/bench-amr.js` drives the desktop**
-(2026-09-24), which retires the conclusion below this line in its original
-form. adb is still how to launch a parameterised URL
+(2026-09-24), which retires the 2026-09-08 conclusion quoted at the end of
+this paragraph. adb is still how to launch a parameterised URL
 (`am start -a android.intent.action.VIEW -d '<url>'`), keep the screen on
 (`svc power stayon usb`), and bring Chrome back to the foreground
 (`am start -n com.android.chrome/com.google.android.apps.chrome.Main`) -- CDP
