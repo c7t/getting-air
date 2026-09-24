@@ -720,8 +720,33 @@ resSlider.onchange = () => {
 };
 resSlider.oninput = () => {
   resVal.textContent = 1 << parseInt(resSlider.value);
+  showLevels();
 };
 
+// ?levels= as a slider, reloading like Resolution. The label carries the
+// FINEST level's effective resolution, W * 2^(levels-1), because that -- not
+// `res` -- is the body's resolution: res - 1 with levels + 1 is the same body
+// on a cheaper root (plans/uniform-levels.md S8-5), and a pair that differs
+// in it is not that comparison. Range: the page's own floor (2) to the
+// renderer's ceiling (MAX_RENDER_POOL_LEVELS + 1), both refused above.
+const levelsSlider = document.getElementById('slider-LEVELS');
+const levelsVal    = document.getElementById('val-LEVELS');
+function showLevels() {
+  if (!levelsSlider) return;
+  const n = parseInt(levelsSlider.value);
+  levelsVal.textContent = `${n} (finest ${(1 << parseInt(resSlider.value)) << (n - 1)})`;
+}
+if (levelsSlider) {
+  levelsSlider.max = MAX_RENDER_POOL_LEVELS + 1;
+  levelsSlider.value = N_LEVELS;
+  showLevels();
+  levelsSlider.oninput = showLevels;
+  levelsSlider.onchange = () => {
+    const url = new URL(window.location);
+    url.searchParams.set('levels', levelsSlider.value);
+    window.location.href = url.href;
+  };
+}
 
 // ── Pesavento & Wang (2004) physical parameters ───────────────────────────────
 // Shared verbatim with main.js via card-params.mjs -- see that module's
