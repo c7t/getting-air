@@ -196,7 +196,7 @@ async function main() {
   const server = await BL.ensureServer(BASE_URL, REPO_ROOT);
   const chrome = await BL.ensureChrome(PORT);
   const tabId = await BL.openTab(PORT, 'about:blank');
-  const client = await CDP({ port: PORT, target: tabId });
+  const client = await CDP({ local: true, port: PORT, target: tabId });
   const { Page, Runtime } = client;
   await Page.enable(); await Runtime.enable();
   Runtime.exceptionThrown(e => console.error('[browser exception]', e.exceptionDetails.text));

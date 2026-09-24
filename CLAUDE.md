@@ -527,11 +527,13 @@ Timing/measurement entry points:
 - `?telemetry=1` — POSTs periodic samples (device, adapter, config, frame
   GPU/sync ms) to the dev server's `/_telemetry`, appended to
   `telemetry.log`. The way to see a device `tools/bench-amr.js` cannot drive,
-  e.g. a phone on the LAN. (A phone on USB does expose CDP via `adb forward
-  tcp:9222 localabstract:chrome_devtools_remote`, but only while Chrome is
-  foregrounded, and driving `debugStepSync` over it killed Chrome — see
-  `plans/perf-characterization.md`. Use `?bench=1` + this.) Opt-in,
-  same-origin, local-only.
+  e.g. a phone on the LAN. (A phone on USB CAN be driven over CDP via `adb
+  forward tcp:9222 localabstract:chrome_devtools_remote`, only while Chrome is
+  foregrounded, and **only with chrome-remote-interface's `local: true`**:
+  Chrome for Android crashes outright on the `/json/protocol` request CRI
+  otherwise makes on every connect. That crash was the "debugStepSync killed
+  Chrome" once recorded here. `tools/test-cdp-local.js` gates it — see
+  `plans/perf-characterization.md`.) Opt-in, same-origin, local-only.
 - `?profile=1` — attaches `debugProfileMacroStep`'s per-pass breakdown to
   those samples. Trustworthy only where the timestamp counter is
   fine-grained; check the values are not all multiples of one number first.

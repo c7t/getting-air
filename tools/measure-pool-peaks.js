@@ -167,7 +167,7 @@ async function main() {
   const server = await ensureServer(o.baseUrl, REPO_ROOT);
   const chrome = await ensureChrome(o.port);
   const tabId = await openTab(o.port, 'about:blank');
-  const client = await CDP({ port: o.port, target: tabId });
+  const client = await CDP({ local: true, port: o.port, target: tabId });
   const { Runtime, Page } = client;
   await Runtime.enable();
   await Page.enable();

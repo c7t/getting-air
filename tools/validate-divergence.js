@@ -278,7 +278,7 @@ async function main() {
   const server = await BL.ensureServer(opts.baseUrl, REPO_ROOT);
   const chrome = await BL.ensureChrome(opts.port);
   const tabId = await BL.openTab(opts.port, 'about:blank');
-  const client = await CDP({ port: opts.port, target: tabId });
+  const client = await CDP({ local: true, port: opts.port, target: tabId });
   const { Page, Runtime } = client;
   await Page.enable(); await Runtime.enable();
 

@@ -46,7 +46,7 @@ function parseArgs(argv) {
 }
 
 async function connect(port) {
-  const client = await CDP({ port });
+  const client = await CDP({ local: true, port });
   const { Runtime } = client;
   await Runtime.enable();
   Runtime.exceptionThrown(e => console.error('[browser exception]', e.exceptionDetails.text));

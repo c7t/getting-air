@@ -79,7 +79,7 @@ const CHROME_LOG_BAD = [
 ];
 
 async function probeTab(port, t, timeoutMs) {
-  const c = await CDP({ port, target: t });
+  const c = await CDP({ local: true, port, target: t });
   try {
     const r = await c.Runtime.evaluate({ expression: PROBE, awaitPromise: true, returnByValue: true, timeout: timeoutMs });
     if (r.exceptionDetails) return { probeError: r.exceptionDetails.text };

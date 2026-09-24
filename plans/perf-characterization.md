@@ -110,20 +110,29 @@ found the hard way:
   `/json/list` stops responding and any attached socket drops, which surfaces
   as a bare `socket hang up` with no other clue.
 - driving `debugStepSync` through it **killed Chrome outright**, twice
-  (`pidof com.android.chrome` empty afterwards, socket refused). NOT isolated:
-  three WebGPU tabs were alive at the time, so memory pressure is as good a
-  candidate as the long synchronous call. Not worth chasing, because the
-  in-page `?bench=1` sweep worked first time on the same device and is
-  purpose-built for it.
+  (`pidof com.android.chrome` empty afterwards, socket refused). NOT isolated
+  at the time -- **and it was not `debugStepSync` (2026-09-24).** Chrome for
+  Android 153.0.8010.52 crashes its whole browser process (a SIGTRAP CHECK on
+  the main thread) on a single `GET /json/protocol`: reproduced with a bare
+  `curl`, while `/json/version` and `/json/list` are fine. chrome-remote-interface
+  fetches that endpoint on every `CDP({...})` unless given `local: true`, so
+  every tool here crashed the phone the moment it connected. With
+  `local: true` the same attach, `Runtime.evaluate`, and a 640-step
+  `debugStepSync` all ran with Chrome staying up. Every connect in `tools/`
+  now passes it, and `tools/test-cdp-local.js` (in `make test`) fails a new one
+  that does not.
 
-So adb is genuinely useful here -- for launching a parameterised URL
-(`am start -a android.intent.action.VIEW -d '<url>'`), for keeping the screen
-on (`svc power stayon usb`), and for confirming Chrome stayed foregrounded for
-the whole sweep -- but the measurement itself should still be `?bench=1` +
-`?telemetry=1`, read out of `telemetry.log` locally. Earlier text in this
-document saying the phone "has no CDP endpoint" is what this corrects; what it
-was really saying, and what is still true, is that the phone cannot be driven
-the way `tools/bench-amr.js` drives the desktop.
+**So the phone CAN be driven the way `tools/bench-amr.js` drives the desktop**
+(2026-09-24), which retires the conclusion below this line in its original
+form. adb is still how to launch a parameterised URL
+(`am start -a android.intent.action.VIEW -d '<url>'`), keep the screen on
+(`svc power stayon usb`), and bring Chrome back to the foreground
+(`am start -n com.android.chrome/com.google.android.apps.chrome.Main`) -- CDP
+answers only while it is foregrounded. `?bench=1` + `?telemetry=1` remain the
+way to measure a phone that is NOT on USB. What the 2026-09-08 text concluded,
+superseded: "the measurement itself should still be `?bench=1` +
+`?telemetry=1` ... the phone cannot be driven the way `tools/bench-amr.js`
+drives the desktop."
 
 **Do not trust per-pass timestamps on mobile.** The PowerVR part's timestamp
 counter ticks at 65536 ns. A macro-step is ~1125 µs — about 17 ticks spread

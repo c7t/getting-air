@@ -229,7 +229,7 @@ function report(rows) {
   const server = await ensureServer(o.baseUrl, REPO_ROOT);
   const chrome = await ensureChrome(o.port);
   const tabId = chrome.started ? await firstTab(o.port) : await openTab(o.port, 'about:blank');
-  const client = await CDP({ port: o.port, target: tabId });
+  const client = await CDP({ local: true, port: o.port, target: tabId });
   const { Page, Runtime, Network } = client;
   await Page.enable(); await Runtime.enable(); await Network.enable();
   // A cached main-cylinder-amr.js would run the previous build and still
