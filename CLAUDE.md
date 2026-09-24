@@ -159,6 +159,19 @@ plausible numbers. See the webgpu-verify skill's section 0.
   shipped picture's body edge `2^(levels-1)` times crisper. Any screenshot
   taken before that date shows a halo the solver never used -- see
   plans/uniform-levels.md U7-6g item 5 for the measured widths.
+  **THE SUITE'S CYLINDER WINDOW OPENS ON THE SHEDDING ONSET RAMP**
+  (plans/uniform-levels.md S8-4, 2026-09-23). Onset is 41-60 D/U0 after reset;
+  `cylinder-metrics.js`'s transient is 40. Settled (150 D/U0) values read
+  0.6-3% HIGHER than the suite: N2-diffuse 1.688/0.1495, N2-bounceback
+  1.365/0.1651, N3-diffuse 1.476/0.1570, N3-bounceback 1.370/0.1649. The
+  suite's numbers are still reproducible regression markers; they are not the
+  flow's Cd. `tools/probe-field-scaling.js` uses 150 and reports `settle`.
+  **AND S8-2 MOVED THE LEVELS>=3 ROWS** (level >= 2 cells were placed 1/2 - dx
+  of a root cell off their data; `?cellcentre=0` restores that): suite-window
+  N3-diffuse 1.473 -> 1.433, N3-bounceback 1.365 -> 1.353. Level-1 CELLS are
+  placed identically by construction, but the manager's proximity box moved
+  half a root cell at every level, so N2 can move in the last digit:
+  N2-bounceback is bit-identical (1.356/0.1642), N2-diffuse St 0.1484 -> 0.1485.
   **AMR Cd is only reproducible to ~+/-0.001; dense Cd is exact.** Measured
   2026-09-09: two runs of the SAME build gave `amr-N2-diffuse` Cd 1.619 and
   1.620, while `dense-reference` was bit-identical (1.950 / St 0.1258) across

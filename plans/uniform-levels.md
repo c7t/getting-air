@@ -5465,3 +5465,160 @@ no coarse/fine seam intersects the ramp. It belongs in the invariant sweep
 alongside the other eight, and — per this project's own standard — it has to be
 shown to go red on a deliberately bad configuration (`?spongeExclude=0` with a
 criterion that fires at the edge) before it is believed when it is green.
+
+### 8.6 MEASURED (2026-09-23). The field can scale at FALLING cost; the sponge is not the obstacle; two ladders found two bugs.
+
+Instrument: `tools/probe-field-scaling.js` (pinned cylinder, Re = 100,
+`?interface=explode&detslots=1`, deterministic -- repeats agree to the last
+digit). Three ladders, all at FIXED finest-level dx (D = 42.7 finest cells):
+`grid` (res - 1, levels + 1, same physical domain), `extent` (res fixed,
+levels + 1, domain x2 per axis), `sponge` (width swept). `model` cost is
+cell-substeps per D/U0 (tools/lib/amr-cost.js's accounting); wall time on the
+desktop is pass-count bound and flat along both ladders (~150-200 ms per
+D/U0), so it cannot rank them -- the model cost is what the bandwidth-bound
+phone would feel (plans/perf-characterization.md).
+
+#### S8-1 -- the knobs
+
+`?spongeW=` (ramp width in ROOT cells, default 4 = the shader default, so an
+unset page is byte-identical) and `?cy0=` (the cylinder's transverse position)
+on index-cylinder-amr.html. `getParams()` reports `spongeW`, `nLevels`,
+`interface`.
+
+#### S8-2 -- LEVEL >= 2 CELLS WERE PLACED 1/2 - dx OF A ROOT CELL OFF THEIR DATA (fixed, `?cellcentre=0` to A/B)
+
+The grid ladder's first result was a SHEDDING ONSET that was not invariant:
+57 / 19 / 0 D/U0 from reset at res 9/8/7 x levels 2/3/4, with a startup lift
+kick |Cl| of 0.022 / 0.15 / 0.42 in the first half D/U0 -- before any
+instability can grow. Not the seed (doubling or quartering `?perturb=` barely
+moved it; `perturb=1e-9` left the kick intact) and not the interface (interp
+and explode identical). Chased with a mirror-asymmetry probe on each level's
+pool velocity, body on the tile partition's axis:
+
+- the root alone stays symmetric to round-off;
+- the tile SETS are mirror-symmetric at every level (checked tile by tile);
+- a hand-made level-2 birth (`debugActivateBlock`, refinement frozen) is
+  symmetric to 4e-6 -- and ONE macro-step later both levels are 12% of U0
+  asymmetric at the body surface.
+
+Cause: `amr_step1.wgsl`/`amr_force1.wgsl` placed tile-local cell j at
+`origin - dx/2 + dx*(j - GHOST)` with `origin = block*2*RB*dx`. That is right
+only if `origin` is the centre of the tile's first PARENT cell -- true at level
+1 (root cells are centred on integers), false below it (a level-1 cell's centre
+is x.25 or x.75). The transfers pair children (GHOST+2p, GHOST+2p+1) with parent
+cell q*RB + p BY INDEX, so the data sat where the affine rule
+`(g + 1/2)*dx - 1/2` puts it, and the body, the sponge and the walls were
+evaluated 1/4 (level 2), 3/8 (level 3), 7/16 (level 4) of a root cell high in
+x AND y. Only a y-displacement makes a symmetric problem lift, which is why it
+surfaced as Cl. The render's per-level `2^-m` ownership shift had been derived
+to match the wrong placement, and the manager's proximity box started at
+`origin` rather than `origin - 1/2` (half a root cell high at EVERY level; inside
+the margin's slack, same family). All four now follow `CELL_CENTRE_AFFINE`.
+
+Why nothing caught it: `tools/test-amr2d.js` asserted fineToCoarseUnit against
+its OWN premise ("j = GHOST is the first child of the parent cell centred at
+`origin`") at dx = 1/2, 1/4, 1/8, and the coverage checker built its boxes from
+the same origin the manager did. Each twin agreed with the kernel it mirrored.
+The new checks go through routes that share none of the arithmetic -- a fine
+pair's midpoint must be its parent cell's centre, computed through the parent
+level's own map, and every cell must equal the global-index closed form -- and
+the legacy placement is mutation-checked to fail them.
+
+Measured: startup |Cl| (body on axis, no seed) 0.053 -> 3e-4 at levels 3,
+0.43 -> 2e-4 at res 7 levels 4, i.e. the levels-2 floor at every depth.
+Level-1 CELLS are placed identically by construction (`(1 - dx)/2 = dx/2` at
+dx = 1/2); the manager's box moved at every level, so levels-2 configs can
+move in the last digit: `amr-N2-bounceback` is bit-identical (1.356 / 0.1642),
+`amr-N2-diffuse` St 0.1484 -> 0.1485. The standing suite
+moved where it should: `amr-N3-diffuse` 1.473 -> 1.433, `amr-N3-bounceback`
+1.365 -> 1.353 (suite window -- see S8-4). All invariants green, render
+reachability green at levels 4, all five AMR pages boot on both settings.
+
+**This touches the shipped card (index-amr.html defaults to `?levels=3`)**: its
+finest level saw the card 1/4 of a root cell up and to the right of its flow,
+and the torque arm with it.
+
+#### S8-3 -- THE WAKE COULD NOT REFINE PAST LEVEL 2 ON FOUR OF FIVE PAGES (fixed)
+
+`amr_manage_pool.wgsl`'s `MAX_LEVEL` (the criterion ladder's ceiling) defaults
+to 2 and only main-amr.js passed `N_LEVELS - 1`. On the cylinder, reentry,
+channel and TGV pages, at `?levels>=4` the finest level held the geometry
+shell and nothing else -- exactly 48 tiles at every sample on the cylinder
+(mean = max). Passing it: 101 at levels 4, matching the ~97-105 the finest
+level holds at levels 2 and 3. The same one-page-wired shape as the
+`HAS_LEVEL2` render defect CLAUDE.md records.
+
+#### S8-4 -- validate-all's cylinder window opens on the ONSET RAMP (recorded, not changed)
+
+Shedding starts 41-60 D/U0 after reset on this page (white-noise seed, 2% of
+U0 per root cell); `cylinder-metrics.js`'s transient is 40 D/U0. Settled
+(150 D/U0, interp, detslots) against what the suite reads today:
+
+    config            settled Cd / St     suite (40 D/U0)
+    amr-N2-diffuse    1.688 / 0.1495      1.652 / 0.1485   (-2.2%)
+    amr-N2-bounceback 1.365 / 0.1651      1.356 / 0.1642   (-0.6%)
+    amr-N3-diffuse    1.476 / 0.1570      1.433 / 0.1523   (-2.9%)
+    amr-N3-bounceback 1.370 / 0.1649      1.353 / 0.1637   (-1.3%)
+
+The suite's numbers are reproducible, so they still work as regression
+markers; they are not the flow's Cd. Two fixes, neither taken here because both
+re-baseline the suite: a longer transient (doubles the sweep), or a seed that
+does not scale with dx (white noise's amplitude at the body scale goes as
+dx/D, which is also the residual onset drift 57 -> 49 on the grid ladder). The
+dense reference seeds the same way and was not measured.
+
+#### S8-5 -- the ladders, with both fixes
+
+GRID (same 24 D domain, same body; sponge pinned PHYSICALLY at 0.19 D):
+
+    res lvl  tau0     Cd      St      Cl rms  onset  finest tiles  model
+     9   2  0.5256  1.6985  0.1511  0.355    57       97         166
+     8   3  0.5128  1.6989  0.1512  0.356    49      105          62
+     7   4  0.5064  1.7016  0.1513  0.360    49       93          50
+
+Invariant, which is what the question asked: Cd +0.18% and Cl rms +1.4% on a
+root 4x coarser, in the direction a coarser far field predicts; St to the
+fourth digit. With the sponge in ROOT cells instead (physically 2x wider per
+rung) Cd reads 1.7021 / 1.7097 -- the sponge's own confinement, measured below.
+And at 96 D, (res 8, levels 5) matches (res 9, levels 4) to 0.07% in Cd with St
+identical, for 43% less model cost: the two ladders compose.
+
+EXTENT (root fixed at 512, one level per rung, sponge 4 ROOT cells):
+
+    domain  lvl  tau0     Cd      St      model   sponge
+     24 D    2  0.5256  1.6985  0.1511   166     0.19 D
+     48 D    3  0.5128  1.6520  0.1484   111     0.38 D
+     96 D    4  0.5064  1.6309  0.1471    85     0.75 D
+    192 D    5  0.5032  1.6198  0.1463    58     1.5 D
+
+Cd converges at FIRST order in 1/L (differences 0.047, 0.021, 0.011) toward
+~1.609: the default 24 D box is +5.6% of confinement, 96 D is +1.4%. And the
+cost FALLS while the area grows 64x -- sec 8.2 said "linear", it is better
+than that, because the root takes half as many steps per unit time per rung
+and the near-body work is fixed. The root survived tau = 0.5032 (sec 8.3b);
+the ceiling is below that and was not reached.
+
+SPONGE (48 D, levels 3; width in root cells, 1 root cell = 0.094 D):
+
+    width   0 (periodic)   1       2       4       8       16      32
+    Cd      0.918          1.6513  1.6515  1.6520  1.6532  1.6557  1.6608
+    Cd rms  0.215          0.0153  0.0148  0.0147  0.0148  0.0152  0.0150
+
+No sponge wraps the wake into the inlet (the control). From 2 cells up the only
+effect is CONFINEMENT, linear in the physical width, ~+0.2% Cd per D of ramp;
+at 1 cell the drag noise rises 4% (a faint reflection). So the minimum is ~2
+root cells and the default 4 costs ~0.03%.
+
+**What that does to sec 8.5.** Its premise -- a ramp fixed in root cells keeps a
+constant area FRACTION, "so growing the domain buys nothing" -- has the
+arithmetic backwards: a constant fraction means the usable area grows WITH the
+domain, and the extent ladder is exactly that policy converging. The sponge's
+bias is a fixed fraction (width / domain) that stays ~0.1% at 4 root cells on
+every rung. Nothing measured here needs the force-refined edge ring; it
+remains the tool for a reflection problem this observable set does not see.
+
+**Open:** at levels 5 the finest level holds 62 tiles against 86-105 at
+levels 2-4 (geometry shell 36). Refining every 2 root steps instead of 16
+leaves it at 59 with Cd unchanged to four digits, so it is not the refine
+cadence; Cd does not feel it. levels 5 is past this page's measured
+`POOL_PEAKS`.
