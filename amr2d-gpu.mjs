@@ -1048,6 +1048,11 @@ export function makeRefineRound({ nLevels, pools, cascade, encodeCascade, passes
 // identical five times over; the content legitimately differs, because
 // main-amr.js carries measurement twins the shipped pages do not.
 export function makeScheduler({ nLevels, ghostCopy, passes, explode = false }) {
+  // `passes.bodySubstep(enc, level, cur)`, OPTIONAL: called before every
+  // substep of the FINEST level (the one with no child), with that substep's
+  // input buffer. A page that integrates its body at the finest level's rate
+  // (main-amr.js) supplies it; one that does not leaves it undefined and gets
+  // exactly the order it had. plans/uniform-levels.md S8-6.
   // B6-1: THE EXPLODE/COALESCE ORDER (plans/2D-backport.md), per substep of
   // a parent level:
   //
@@ -1103,6 +1108,7 @@ export function makeScheduler({ nLevels, ghostCopy, passes, explode = false }) {
         S_AdvanceExplode(level + 1, enc, useB);
         passes.coalesceFromChild(enc, level, cur);
       }
+      if (!hasChild && passes.bodySubstep) passes.bodySubstep(enc, level, cur);
       passes.substep(enc, level, cur);
       if (hasChild && !b6skip.has('average')) passes.averageFromChild(enc, level, next);
     }
@@ -1133,6 +1139,7 @@ export function makeScheduler({ nLevels, ghostCopy, passes, explode = false }) {
 
     let cur = 'a'; // THIS level's own current buffer, local to this call
     if (hasChild) passes.interpIntoChild(enc, level, cur);
+    if (!hasChild && passes.bodySubstep) passes.bodySubstep(enc, level, cur);
     passes.substep(enc, level, cur);   // reads 'a', writes 'b'
     cur = 'b';
     if (hasChild) {
@@ -1146,6 +1153,7 @@ export function makeScheduler({ nLevels, ghostCopy, passes, explode = false }) {
     // than a copy taken before that average landed. See the DIRECT_GHOST
     // override in shaders/amr_step1.wgsl.
     if (ghostCopy()) passes.fineFineRefresh(enc, level);
+    if (!hasChild && passes.bodySubstep) passes.bodySubstep(enc, level, cur);
     passes.substep(enc, level, cur);   // reads 'b', writes 'a'
     cur = 'a';
     if (hasChild) {

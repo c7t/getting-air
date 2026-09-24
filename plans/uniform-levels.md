@@ -5622,3 +5622,43 @@ levels 2-4 (geometry shell 36). Refining every 2 root steps instead of 16
 leaves it at 59 with Cd unchanged to four digits, so it is not the refine
 cadence; Cd does not feel it. levels 5 is past this page's measured
 `POOL_PEAKS`.
+
+#### S8-6 -- THE CARD IS INTEGRATED AT THE FINEST LEVEL'S RATE (index-amr.html, `?bodysub=0` to A/B)
+
+Found on a low root (res 5, levels 5, blockage 16: the card ONE root cell
+long): its orientation locked. Stepped one root step at a time, omega read
+-0.025, +0.025, -0.025 ... -- exactly the `o_max` clamp, sign flipping every
+step, theta rocking between two values -- with the torque flipping with it.
+An explicit update with gain > 2: the fluid torque over ONE ROOT STEP was
+~2.6x what I*omega could absorb (tz/I ~ 0.065 against o_max 0.025). At
+blockage 8 the card's inertia is 16x larger and the same page rotated
+smoothly. The body lives on the finest level, but it was updated once per
+root step, so the coarser the root relative to the card, the longer that
+update interval against the card's own response -- the low-root regime is
+exactly where it breaks.
+
+Now: force (on that substep's own input buffer) and body update run before
+EVERY finest-level substep, at `BODY_DT = 2^-(levels-1)` root steps
+(amr_physics.wgsl; makeScheduler's optional `bodySubstep` hook, which only
+main-amr.js supplies). Units are unchanged -- the force pass already returns
+root-unit force, and v_max/o_max are rates.
+
+    config (16384 steps)            bodysub  net rev  arc rev  max|omega|
+    res 8 levels 3 (default)          1       0.47     2.49    3.1e-3
+                                      0      -0.84     2.70    3.1e-3
+    res 5 levels 5                    1      -2.51    20.3     1.9e-2
+                                      0      -4.35    23.5     2.5e-2  (clamp)
+    res 5 levels 5 blockage 16        1      -0.24    34.9     2.5e-2
+                                      0       0.00     0.00    locked
+
+At the default card the character is unchanged (one chaotic draw each). The
+locked card now rotates, with omega smooth at single-step resolution well into
+the run; its clamp touches are peaks of a very light card two finest cells
+thick, not a flip. Every other page is untouched (`amr-N2-bounceback`
+bit-identical, 1.356 / 0.1642); invariants green.
+
+COST on the desktop: +19% (levels 3) to +23% (levels 5) wall time -- one force
+and one body pass per finest substep instead of per root step, on a
+pass-count-bound GPU. The force pass sweeps every finest tile though only the
+body's shell contributes; restricting it to that shell is the obvious saving,
+not taken yet.

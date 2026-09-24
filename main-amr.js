@@ -528,6 +528,12 @@ const INTERFACE = readInterfaceMode(urlParams);
 // ?cellcentre=0 -- legacy level >= 2 cell placement; see amr2d-gpu.mjs's
 // readCellCentre and amr_step1.wgsl's CELL_CENTRE_AFFINE (plans/uniform-levels.md S8-2).
 const CELL_CENTRE_AFFINE = readCellCentre(urlParams);
+// ?bodysub=0 -- integrate the card ONCE per root step, as every page did until
+// 2026-09-23. Default 1: force and body update before EVERY finest-level
+// substep, at dt = 2^-(levels-1) root steps, because the body lives on the
+// finest level and that is where the fluid/body exchange happens
+// (plans/uniform-levels.md S8-6; amr_physics.wgsl's BODY_DT).
+const BODY_SUBSTEP = urlParams.has('bodysub') ? (parseInt(urlParams.get('bodysub')) ? 1 : 0) : 1;
 const COLLIDE_RING = INTERFACE === 'explode' ? 0 : 1;
 // The render's ring rule follows the interface unless ?ringfreerender= says
 // otherwise -- see amr_render.wgsl's RING_FREE_RENDER (B6-4, B6-8): 0 reads the
@@ -1328,6 +1334,11 @@ async function init() {
     layout: device.createPipelineLayout({ bindGroupLayouts: [phyBGL] }),
     compute: { module: phySM, entryPoint: 'main', constants }
   });
+  // The same kernel at the finest level's time step, for BODY_SUBSTEP.
+  const phySubPL = device.createComputePipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [phyBGL] }),
+    compute: { module: phySM, entryPoint: 'main', constants: { ...constants, BODY_DT: Math.pow(2, -(N_LEVELS - 1)) } }
+  });
   // VORT_SCALE/VORT_GAMMA are pipeline-overridable constants specialized into
   // the fragment shader here, so changing them live means rebuilding this one
   // pipeline. vort-controls.mjs owns the sliders and the per-frame coalescing
@@ -1673,6 +1684,22 @@ async function init() {
       // Bound but never read at GHOST=2 -- these levels have a ring.
     { binding: 6, resource: { buffer: pools[1].blockSlotBuf } },
   ]});
+  // BODY_SUBSTEP measures the force before EACH finest substep, and the
+  // second substep of a cycle starts from the 'b' buffer -- so the finest level
+  // needs a force bind group that reads it. The 'a' one above is the one the
+  // once-per-root-step path uses, at the cycle boundary.
+  {
+    const fp = pools[N_LEVELS - 1];
+    fp.force1BG_b = device.createBindGroup({ layout: force1BGL, entries: [
+      { binding: 0, resource: { buffer: cardStateBuf } },
+      { binding: 1, resource: { buffer: fp.finePoolF_b } },
+      { binding: 2, resource: { buffer: forceBuf } },
+      { binding: 3, resource: { buffer: fp.slotToBlockBuf } },
+      { binding: 4, resource: { buffer: fp.levelParamsBuf } },
+      { binding: 5, resource: { buffer: fp.debugSlotForceBuf } },
+      { binding: 6, resource: { buffer: fp.blockSlotBuf } },
+    ]});
+  }
 
   const error = await device.popErrorScope();
   if (error) { handleErr(error); return; }
@@ -2134,6 +2161,18 @@ async function init() {
       p.setPipeline(pl); p.setBindGroup(0, bg);
       p.dispatchWorkgroups(WGX1, WGY1, pool.MAX_FINE_BLOCKS); p.end();
     },
+    // BODY_SUBSTEP: force on this substep's input, then the body at the
+    // finest level's dt, so the substep that follows sees the updated pose.
+    // Same skip groups as the once-per-root-step pair it replaces.
+    ...(BODY_SUBSTEP ? { bodySubstep: (enc, level, readCur) => {
+      const pool = pools[level];
+      if (!skipGroup('force')) {
+        const p = beginPass(enc, `force L${level}`); p.setPipeline(force1PL);
+        p.setBindGroup(0, readCur === 'a' ? pool.force1BG : pool.force1BG_b);
+        p.dispatchWorkgroups(WGX1, WGY1, pool.MAX_FINE_BLOCKS); p.end();
+      }
+      if (!skipGroup('phy')) { const phy = beginPass(enc, 'body dynamics'); phy.setPipeline(phySubPL); phy.setBindGroup(0, phyBG); phy.dispatchWorkgroups(1); phy.end(); }
+    } } : {}),
     fineFineRefresh: (enc, level) => {
       const pool = pools[level];
       const p = beginPass(enc, level === 1 ? 'L1 fine-fine ghost' : `L${level} fine-fine ghost`);
@@ -2296,14 +2335,14 @@ async function init() {
     // is loud -- which is why B4's remaining work is to REFUSE rather than
     // degrade when the constraint cannot be met.
     const finestLevel = N_LEVELS - 1;
-    if (!skipGroup('force')) {
+    if (!BODY_SUBSTEP && !skipGroup('force')) {
       {
         // NO LEVEL SPLIT SINCE B3-4: one kernel, one pipeline, every level.
         const pool = pools[finestLevel];
         const p = beginPass(enc, `force L${finestLevel}`); p.setPipeline(force1PL); p.setBindGroup(0, pool.force1BG); p.dispatchWorkgroups(WGX1, WGY1, pool.MAX_FINE_BLOCKS); p.end();
       }
     }
-    if (!skipGroup('phy')) { const phy = beginPass(enc, 'body dynamics'); phy.setPipeline(phyPL); phy.setBindGroup(0, phyBG); phy.dispatchWorkgroups(1); phy.end(); }
+    if (!BODY_SUBSTEP && !skipGroup('phy')) { const phy = beginPass(enc, 'body dynamics'); phy.setPipeline(phyPL); phy.setBindGroup(0, phyBG); phy.dispatchWorkgroups(1); phy.end(); }
 
     S_Advance(0, enc);
 
