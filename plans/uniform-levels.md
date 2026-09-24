@@ -5662,3 +5662,20 @@ and one body pass per finest substep instead of per root step, on a
 pass-count-bound GPU. The force pass sweeps every finest tile though only the
 body's shell contributes; restricting it to that shell is the obvious saving,
 not taken yet.
+
+#### S8-7 -- the force pass skips workgroups beyond the body's reach (exact; `?forcecull=0` on the card page)
+
+S8-6 put the force pass before every finest substep, over every finest tile,
+though only the body's shell can contribute. `amr_force1.wgsl`'s FORCE_CULL
+returns a workgroup before it reads any `f` when its 8x8 sub-tile is provably
+out of reach: phi at the box centre minus the half-diagonal exceeds
+9 eps + 2 dx, beyond both the diffuse cutoff (chi < 1e-6 at 7.25 eps) and the
+bounce-back reach (sqrt 2 dx). phi is a distance or, past SDF_FAR, a lower
+bound on one, so that bounds every cell in the box.
+
+BIT-IDENTICAL, all 26 CardState fields after 4096 steps, on the card at
+levels 3 (substepped and not) and at res 5 levels 5; the cylinder's N2
+bounce-back, N2 diffuse and N3 diffuse read exactly their previous Cd/St.
+Wall time per 512 steps: res 5 levels 5 837 -> 687 ms (-18%); levels 3 no
+change on this desktop, which is pass-count bound (plans/perf-characterization.md)
+-- the saving there is bandwidth, which is what the phone is bound by.

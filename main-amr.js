@@ -533,6 +533,9 @@ const CELL_CENTRE_AFFINE = readCellCentre(urlParams);
 // substep, at dt = 2^-(levels-1) root steps, because the body lives on the
 // finest level and that is where the fluid/body exchange happens
 // (plans/uniform-levels.md S8-6; amr_physics.wgsl's BODY_DT).
+// ?forcecull=0 -- sweep every finest tile in the force pass instead of only
+// the body's reach. Exact either way; see amr_force1.wgsl's FORCE_CULL.
+const FORCE_CULL = urlParams.has('forcecull') ? (parseInt(urlParams.get('forcecull')) ? 1 : 0) : 1;
 const BODY_SUBSTEP = urlParams.has('bodysub') ? (parseInt(urlParams.get('bodysub')) ? 1 : 0) : 1;
 const COLLIDE_RING = INTERFACE === 'explode' ? 0 : 1;
 // The render's ring rule follows the interface unless ?ringfreerender= says
@@ -1415,7 +1418,7 @@ async function init() {
   // LevelParams reads, see amr_force1.wgsl's header).
   const force1PL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [force1BGL] }),
-    compute: { module: force1SM, entryPoint: 'main', constants: { W, H, RB, F16, RING_FREE_FORCE, CELL_CENTRE_AFFINE } }
+    compute: { module: force1SM, entryPoint: 'main', constants: { W, H, RB, F16, RING_FREE_FORCE, CELL_CENTRE_AFFINE, FORCE_CULL } }
   });
   // Two pipelines, same module, different entry points -- dispatched as two
   // SEPARATE passes (coarsen fully completing before refine starts) to

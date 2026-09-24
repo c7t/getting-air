@@ -276,6 +276,44 @@ fn safeFixed(x: f32) -> i32 {
     return i32(clamp(s, -2.0e9f, 2.0e9f));
 }
 
+// FORCE_CULL (plans/uniform-levels.md S8-7): a workgroup whose 8x8 sub-tile
+// lies entirely beyond the body's reach returns before reading any `f`.
+// EXACT, not approximate -- it only skips workgroups whose sum is provably
+// zero already:
+//   diffuse      a cell contributes only if chi >= 1e-6 (below), i.e.
+//                phi < eps * atanh(1 - 2e-6) = 7.25 eps;
+//   bounce-back  only if phi >= 0 with a SOLID source one link away, i.e.
+//                phi < sqrt(2) dx.
+// phi is a 1-Lipschitz distance (or, past SDF_FAR, a proven LOWER bound on
+// one), so phi(centre) minus the box's half-diagonal bounds every cell in it
+// from below -- the same argument common_geometry.wgsl's nearBodyBox rests
+// on. The margin, 9 eps + 2 dx, clears both reaches and the Newton residual.
+//
+// It matters because BODY_SUBSTEP (main-amr.js) runs this pass before every
+// finest substep: 2^(levels-1) times per root step over every finest tile,
+// of which only the body's shell can contribute. ?forcecull=0 on the card
+// page restores the full sweep.
+override FORCE_CULL : u32 = 1u;
+var<workgroup> wg_cull : u32;
+
+fn cullWorkgroup(wid: vec3<u32>) -> u32 {
+  let slot = wid.z;
+  let blockID = slotToBlock[slot];
+  if (blockID < 0) { return 1u; }
+  let lo = max(wid.xy * 8u, vec2<u32>(GHOST, GHOST));
+  let hi = min(wid.xy * 8u + vec2<u32>(7u, 7u), vec2<u32>(GHOST + RB * 2u - 1u, GHOST + RB * 2u - 1u));
+  if (lo.x > hi.x || lo.y > hi.y) { return 1u; }   // ring-only workgroup
+  let bx = u32(blockID) % levelParams.nbx;
+  let by = u32(blockID) / levelParams.nbx;
+  let originX_L0 = f32(bx * RB) * 2.0f * levelParams.dxL;
+  let originY_L0 = f32(by * RB) * 2.0f * levelParams.dxL;
+  let pLo = vec2<f32>(fineToCoarseUnit(lo.x, originX_L0), fineToCoarseUnit(lo.y, originY_L0));
+  let pHi = vec2<f32>(fineToCoarseUnit(hi.x, originX_L0), fineToCoarseUnit(hi.y, originY_L0));
+  let R = length(0.5f * (pHi - pLo));
+  let reach = 9.0f * levelParams.kEps * levelParams.dxL + 2.0f * levelParams.dxL;
+  return select(0u, 1u, get_phi(0.5f * (pLo + pHi), state) - R > reach);
+}
+
 var<workgroup> wg_fx : array<f32, 64>;
 var<workgroup> wg_fy : array<f32, 64>;
 var<workgroup> wg_tz : array<f32, 64>;
@@ -283,8 +321,13 @@ var<workgroup> wg_tz : array<f32, 64>;
 @compute @workgroup_size(8, 8)
 fn main(
   @builtin(global_invocation_id) gid: vec3<u32>,
-  @builtin(local_invocation_index) lid: u32
+  @builtin(local_invocation_index) lid: u32,
+  @builtin(workgroup_id) wid: vec3<u32>
 ) {
+  if (FORCE_CULL != 0u) {
+    if (lid == 0u) { wg_cull = cullWorkgroup(wid); }
+    if (workgroupUniformLoad(&wg_cull) != 0u) { return; }
+  }
   let fx = gid.x; let fy = gid.y;
   let slot = gid.z;
   let FB = RB * 2u + 2u * GHOST;
