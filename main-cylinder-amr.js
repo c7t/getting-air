@@ -32,7 +32,7 @@ import { check21BalanceOnGPU, allocLevelPool, writePoolInitialState, readPoolInd
 // ?levels>=3, because updateLevelParams's `for (c = 2; c < N_LEVELS; c++)`
 // loop is VACUOUS at the levels=2 default every one of them ships. See
 // plans/2D-backport.md B4.
-import { tauAtLevel as tauAtLevelOf } from './card-params.mjs';
+import { tauAtLevel as tauAtLevelOf, resLog2Problem } from './card-params.mjs';
 import { poolSlotsFor, tauChainSingularity, tauSingularityMessage } from './amr2d.mjs';
 import { EX, EY, WT } from './lattice-2d.mjs';
 import { makeCanvasFit } from './canvas-fit.mjs';
@@ -60,9 +60,11 @@ const urlParams = new URLSearchParams(window.location.search);
 // misleading about the thing being swept.
 const K_EPS = urlParams.has('kEps') ? parseFloat(urlParams.get('kEps')) : 1.5;
 if (!(K_EPS > 0)) throw new Error(`?kEps=${urlParams.get('kEps')} must be > 0`);
-let resLog2 = parseInt(urlParams.get('res')) || 9;
-if (resLog2 < 7) resLog2 = 7;
-if (resLog2 > 11) resLog2 = 11;
+// REFUSED outside [5, 11], never clamped -- see card-params.mjs's
+// resLog2Problem for the floor (2x2 root tiles) and for why a silent
+// clamp was the defect. This page's floor was 7.
+let resLog2 = urlParams.has('res') ? parseInt(urlParams.get('res')) : 9;
+{ const why = resLog2Problem(resLog2); if (why) refuseConfig(statusEl, why); }
 
 let W = 1 << resLog2;
 let H = W;

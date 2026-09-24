@@ -1,4 +1,4 @@
-import { reportFatal, reportNoWebGPU, reportNoAdapter } from './error-overlay.mjs';
+import { reportFatal, refuseConfig, reportNoWebGPU, reportNoAdapter } from './error-overlay.mjs';
 import { installVortControls } from './vort-controls.mjs';
 import { createTrail } from './trajectory-trail.mjs';
 import { createTotalUnwrapper } from './card-total.mjs';
@@ -8,7 +8,7 @@ import { packF, unpackF, fWords } from './f-pack.mjs';
 import { EX, EY, WT } from './lattice-2d.mjs';
 import { makeCanvasFit } from './canvas-fit.mjs';
 import {
-  deriveCardParams, parseCardParams, parseResLog2, reynoldsFromTau,
+  deriveCardParams, parseCardParams, parseResLog2, resLog2Problem, reynoldsFromTau,
   DENSE_DEFAULT_RES_LOG2,
 } from './card-params.mjs';
 
@@ -48,6 +48,7 @@ const VORT_SCALE = parseFloat(urlParams.get('vortScale')) || 40.0;
 const VORT_GAMMA = parseFloat(urlParams.get('vortGamma')) || 1.2;
 
 let resLog2 = parseResLog2(urlParams, DENSE_DEFAULT_RES_LOG2);
+{ const why = resLog2Problem(resLog2); if (why) refuseConfig(statusEl, why); }
 
 // Fixed simulation RATE (sim-rate.mjs). STEPS_PER_FRAME below is now a
 // CEILING, not a target: the pacer asks for however many steps a wall-clock

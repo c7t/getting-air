@@ -46,7 +46,7 @@ import { check21BalanceOnGPU, allocLevelPool, writePoolInitialState, readPoolInd
 // ?levels>=3, because updateLevelParams's `for (c = 2; c < N_LEVELS; c++)`
 // loop is VACUOUS at the levels=2 default every one of them ships. See
 // plans/2D-backport.md B4.
-import { tauAtLevel as tauAtLevelOf } from './card-params.mjs';
+import { tauAtLevel as tauAtLevelOf, resLog2Problem } from './card-params.mjs';
 import { EX, EY, WT } from './lattice-2d.mjs';
 import { makeCanvasFit } from './canvas-fit.mjs';
 
@@ -139,9 +139,11 @@ const GHOST_COPY = urlParams.has('ghostcopy') ? (parseInt(urlParams.get('ghostco
 // zero-cost when off: the DIAG override gates every atomic.
 const DIAG = urlParams.has('diag') ? (parseInt(urlParams.get('diag')) || 0) : 0;
 
-let resLog2 = parseInt(urlParams.get('res')) || 8;
-if (resLog2 < 6) resLog2 = 6;
-if (resLog2 > 11) resLog2 = 11;
+// REFUSED outside [5, 11], never clamped -- see card-params.mjs's
+// resLog2Problem for the floor (2x2 root tiles) and for why a silent
+// clamp was the defect. This page's floor was 6.
+let resLog2 = urlParams.has('res') ? parseInt(urlParams.get('res')) : 8;
+{ const why = resLog2Problem(resLog2); if (why) refuseConfig(statusEl, why); }
 
 let W = 1 << resLog2;
 let H = W;

@@ -17,7 +17,7 @@ import { createSimPacer, parseSimRate, DEFAULT_TU_PER_SEC } from './sim-rate.mjs
 import { installChromeToggle } from './ui-chrome.mjs';
 import { loadShader } from './shader-loader.mjs';
 import {
-  deriveCardParams, parseCardParams, parseResLog2, reynoldsFromTau,
+  deriveCardParams, parseCardParams, parseResLog2, resLog2Problem, reynoldsFromTau,
   AMR_DEFAULT_RES_LOG2, AMR_DEFAULT_LEVELS,
   tauAtLevel as tauAtLevelOf,
 } from './card-params.mjs';
@@ -76,6 +76,7 @@ if (!(K_EPS > 0)) throw new Error(`?kEps=${urlParams.get('kEps')} must be > 0`);
 // that run is `index.html?res=10` (card-params.mjs's
 // AMR_EQUIVALENT_DENSE_RES_LOG2, and see DENSE_DEFAULT_RES_LOG2's comment).
 let resLog2 = parseResLog2(urlParams, AMR_DEFAULT_RES_LOG2);
+{ const why = resLog2Problem(resLog2); if (why) refuseConfig(statusEl, why); }
 
 // Fixed simulation RATE (sim-rate.mjs). STEPS_PER_FRAME below is now a
 // CEILING, not a target: the pacer asks for however many steps a wall-clock
@@ -720,6 +721,7 @@ resSlider.onchange = () => {
 resSlider.oninput = () => {
   resVal.textContent = 1 << parseInt(resSlider.value);
 };
+
 
 // ── Pesavento & Wang (2004) physical parameters ───────────────────────────────
 // Shared verbatim with main.js via card-params.mjs -- see that module's
