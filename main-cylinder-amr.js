@@ -702,6 +702,14 @@ let BLOCKAGE = parseFloat(urlParams.get('blockage')) || 24;
 // It is real relative to the CYLINDER's diameter, so at a non-default
 // ?blockage= the body no longer lands at W/2 -- which is the knob working.
 let UPSTREAM = parseFloat(urlParams.get('upstream')) || 12;
+// ?spongeW= -- the far-field sponge's ramp width, in ROOT cells, at every
+// level (the step kernel measures it in L0 window units whatever level it is
+// running). Default 4 is the shader's own default, so an unset page is
+// byte-identical. It exists for plans/uniform-levels.md sec 8: the width in
+// root cells is PHYSICALLY 2^k wider for every level prepended above the body,
+// and a ladder that cannot pin it is measuring the sponge. 0 disables it.
+const SPONGE_W = urlParams.has('spongeW') ? parseFloat(urlParams.get('spongeW')) : 4;
+if (!(SPONGE_W >= 0)) throw new Error(`?spongeW=${urlParams.get('spongeW')} must be >= 0`);
 let R = W / (2 * BLOCKAGE);
 
 let U0 = parseFloat(urlParams.get('u0')) || 0.04;
@@ -845,7 +853,18 @@ function initFPool(maxBlocks = MAX_FINE_BLOCKS, velOut) {
 // transversely -- see main-cylinder.js's cardInit comment for why this is
 // in diameters, not a fixed W/4 or W/2.
 const CX0 = UPSTREAM * 2 * R;
-const CY0 = H / 2;
+// ?cy0= -- the cylinder's transverse position in L0 units, default H/2. Cell
+// centres are at INTEGERS at every level (fineToCoarseUnit), so H/2 puts the
+// body on a cell centre and every level's cell lattice is mirror-symmetric
+// about it -- but the TILE partition is not: block b covers cells
+// [8b, 8b+7], so its mirror axis is H/2 - 0.5, and every seam near the body
+// sits half a root cell off-mirror. Measured (plans/uniform-levels.md S8-2),
+// body unseeded: at ?levels=2 the startup lift kick is |Cl| 0.022 at H/2 and
+// 2e-4 at H/2 - 0.5 -- the partition offset is the whole story there. At
+// ?levels>=3 moving the body changed nothing, and the cause was S8-2's cell
+// misplacement, not this. The default stays H/2: moving it re-baselines every
+// cylinder number for an effect that onset (S8-4) mostly absorbs.
+const CY0 = urlParams.has('cy0') ? parseFloat(urlParams.get('cy0')) : H / 2;
 function initCardState() {
   return new Float32Array([
     CX0, CY0, 0,     // cx, cy, theta
@@ -1193,7 +1212,7 @@ async function init() {
   // Fine step(s) also need the freestream sponge target (see amr_step1*.wgsl's
   // SPONGE_UX/UY -- both L1's dedicated file and the level>=2 shared one have
   // their own copy of the sponge, not shared with the coarse kernel).
-  const step1Constants = { COLLIDE_RING, W, H, RB, SPONGE_UX: U0, SPONGE_UY: 0, USE_BOUNCEBACK, F16, DIRECT_GHOST: GHOST_COPY ? 0 : 1, SOLID_EQ };
+  const step1Constants = { COLLIDE_RING, W, H, RB, SPONGE_UX: U0, SPONGE_UY: 0, SPONGE_W, USE_BOUNCEBACK, F16, DIRECT_GHOST: GHOST_COPY ? 0 : 1, SOLID_EQ };
 
   // U7-1: the twelve coupling pipelines, from ONE place. Every page built
   // these identically; see makeCouplingPipelines for what stays per page and
@@ -2611,7 +2630,7 @@ async function init() {
     setRe,
     getStep: () => step,
     getDims: () => ({ W, H }),
-    getParams: () => ({ R, D: 2 * R, U0, Re: RE, TAU, blockage: BLOCKAGE, upstream: UPSTREAM, perturb: PERTURB, seed: SEED, W, H }),
+    getParams: () => ({ R, D: 2 * R, U0, Re: RE, TAU, blockage: BLOCKAGE, upstream: UPSTREAM, perturb: PERTURB, seed: SEED, W, H, spongeW: SPONGE_W, nLevels: N_LEVELS, interface: INTERFACE }),
     getForceHistory: () => trajectory.slice(),
     debugRunAndCollect,
     debugSnapshotSave,
