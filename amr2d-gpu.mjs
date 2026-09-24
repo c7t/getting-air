@@ -40,6 +40,7 @@ import {
   cascade21, quadrantOfSlot, tileOriginL0, poolInverseViolations, rootPoolSpec,
   denseL0ToRootF,
   denseL0ToRootVel,
+  activeSlotsFromFreeCount,
 } from './amr2d.mjs';
 
 // Every level's blockSlot, copied in one command encoder and one submit, so
@@ -2013,7 +2014,11 @@ export function makeRefusalWatch({ device, pools, nLevels, checkCoverage, minInt
   const U = GPUBufferUsage;
   let inFlight = false;
   let last = -Infinity;
-  const watch = { error: null };
+  // `activeByLevel` is a by-product, not the watch's job: the free counts this
+  // polls are exactly what a page needs to count every level's work in its
+  // MLUPS readout, so they are kept rather than read a second time. Null until
+  // the first poll lands; at most minIntervalMs stale after that.
+  const watch = { error: null, activeByLevel: null };
 
   watch.poll = () => {
     if (watch.error || inFlight) return;
@@ -2036,12 +2041,15 @@ export function makeRefusalWatch({ device, pools, nLevels, checkCoverage, minInt
         device.queue.submit([enc.finish()]);
         await Promise.all(stages.map(s => s.stage.mapAsync(GPUMapMode.READ)));
         const saturated = [];
+        const activeByLevel = {};
         for (const { m, stage } of stages) {
           const free = new Int32Array(stage.getMappedRange())[0];
           stage.unmap();
           stage.destroy();
           if (free <= 0) saturated.push(m);
+          activeByLevel[m] = activeSlotsFromFreeCount(pools[m].MAX_FINE_BLOCKS, free);
         }
+        watch.activeByLevel = activeByLevel;
         if (saturated.length === 0) return;
 
         const cov = await checkCoverage();

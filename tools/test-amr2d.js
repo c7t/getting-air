@@ -2055,6 +2055,32 @@ const sorted = (s) => [...s].sort();
     assert.strictEqual(nbx1 * nby1, spec.nblocks * 4, 'a root tile does not carry four level-1 blocks');
   });
 
+  ok('cellUpdatesPerMacroStep is amr-cost.js\'s costAMR, and each term is live', () => {
+    // Two statements of one unit (the page's MLUPS numerator and the
+    // validate-amr-vs-dense cost accounting), held to each other.
+    const { computeCostSavings } = require('./lib/amr-cost.js');
+    const rb = 8, W0 = 32, H0 = 32, activeByLevel = { 1: 16, 2: 48, 3: 48 };
+    const got = A.cellUpdatesPerMacroStep({ rootCells: W0 * H0, rb, activeByLevel });
+    const { costAMR } = computeCostSavings({ W0, H0, RB: rb, nLevels: 4,
+      W_target: 256, H_target: 256, activeCountsByLevel: activeByLevel });
+    assert.strictEqual(got, costAMR);
+    // The phone's measured config, by hand: 1024 + 16*256*2 + 48*256*4 + 48*256*8.
+    assert.strictEqual(got, 156672);
+    // Mutants: the ring counted, the substeps dropped, the root dropped.
+    const ring = 1024 + [16, 48, 48].reduce((s, a, i) => s + a * 20 * 20 * 2 ** (i + 1), 0);
+    const noSub = 1024 + (16 + 48 + 48) * 256;
+    for (const [name, v] of [['ring counted', ring], ['no substeps', noSub], ['no root', got - 1024]]) {
+      assert.notStrictEqual(got, v, `mutant "${name}" is indistinguishable`);
+    }
+  });
+
+  ok('activeSlotsFromFreeCount reads the free count in quads', () => {
+    assert.strictEqual(A.activeSlotsFromFreeCount(1164, 1164 / 4), 0, 'a full free list is not empty');
+    assert.strictEqual(A.activeSlotsFromFreeCount(1164, 279), 48);
+    assert.strictEqual(A.activeSlotsFromFreeCount(64, 0), 64);
+    assert.strictEqual(A.activeSlotsFromFreeCount(64, -1), 64, 'a mid-round negative count must clamp');
+  });
+
   if (!process.exitCode) console.log(`\n${pass} check(s) passed`);
   else console.log('\nFAILED');
 })();

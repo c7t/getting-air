@@ -543,6 +543,34 @@ export function poolSlotsFor(peaks, m, nLevels) {
   return quad(base * POOL_HEADROOM * Math.pow(POOL_GROWTH, m - deepest));
 }
 
+// LATTICE UPDATES IN ONE ROOT MACRO-STEP, every level counted -- the numerator
+// of an honest MLUPS. The overlay used to divide the ROOT's cells alone by the
+// frame's GPU time, so every fine level's work was in the denominator and none
+// of it in the numerator: on the phone at res=5 levels=4 that read 0.1-3 MLUPS
+// against ~17 of real work, "orders of magnitude" under index.html's 54 while
+// the two advanced physical time at about the same rate (2026-09-24).
+//
+// The same unit as tools/lib/amr-cost.js's costAMR, and test-amr2d.js holds
+// the two to each other: the root's cells once, plus each level's ACTIVE tiles
+// x its (2*RB)^2 INTERIOR cells (the ring is bookkeeping, not lattice) x 2^m
+// substeps. A tile with active children still counts -- it still steps -- so
+// this is work performed, not a non-overlapping partition of the domain.
+export function cellUpdatesPerMacroStep({ rootCells, rb, activeByLevel }) {
+  let n = rootCells;
+  for (const [m, active] of Object.entries(activeByLevel)) {
+    n += active * (2 * rb) * (2 * rb) * 2 ** Number(m);
+  }
+  return n;
+}
+
+// A level's in-use slots from its free-list count. The count is in QUADS
+// (writePoolInitialState, amr_manage_pool.wgsl), and an exhausted refine
+// undoes its own atomicSub, so between rounds it is exact and >= 0 -- the
+// clamp is for a read that lands mid-round.
+export function activeSlotsFromFreeCount(maxSlots, freeQuads) {
+  return maxSlots - 4 * Math.max(0, freeQuads);
+}
+
 // DOES ANY POINT OF THIS BLOCK COME WITHIN `margin` OF THE BODY?
 //
 // THE TWO PREDICATES BELOW ANSWER DIFFERENT QUESTIONS, AND THE DIFFERENCE IS

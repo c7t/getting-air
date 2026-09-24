@@ -23,7 +23,7 @@ import {
 } from './card-params.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
 import { check21BalanceOnGPU, allocLevelPool, writePoolInitialState, checkRootPoolIdentity, readConservedTotals, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState, checkGeometryCoverageOnGPU, makeRefusalWatch , checkRefinementClosureOnGPU , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU, makeRenderBindGroup, renderPoolLevels, MAX_RENDER_POOL_LEVELS, makeAMRLayouts, makeCouplingPipelines, makeLevelBindGroups, makeManageBindGroups, makeScheduler, makeRefineRound, allocRootPool, makeRootPool, encodeRootCapture, readRootCapture, restoreRootCapture, seedRootFromDense, readDiag, readInterfaceMode, readCellCentre, makeExplodeCoalesce } from './amr2d-gpu.mjs';
-import { poolSlotsFor, tauChainSingularity, tauSingularityMessage, rootPoolSpec, rootCellIndex } from './amr2d.mjs';
+import { poolSlotsFor, tauChainSingularity, tauSingularityMessage, rootPoolSpec, rootCellIndex, cellUpdatesPerMacroStep } from './amr2d.mjs';
 import { EX, EY, WT } from './lattice-2d.mjs';
 import { makeCanvasFit } from './canvas-fit.mjs';
 
@@ -2118,7 +2118,13 @@ async function init() {
   // per-pass profiling labels, and the root pool's parallel passes, none of
   // which belong on a shipped page.
   const passes = {
-    ...(seam || {}),
+    // The explode/coalesce pair is the SHARED seam (amr2d-gpu.mjs, every AMR
+    // page); only this page wraps it in skip groups, the same split as the
+    // ?benchSkip= twins below.
+    ...(seam ? {
+      explodeIntoChild: (enc, level, cur) => { if (!skipGroup('explode')) seam.explodeIntoChild(enc, level, cur); },
+      coalesceFromChild: (enc, level, cur) => { if (!skipGroup('coalesce')) seam.coalesceFromChild(enc, level, cur); },
+    } : {}),
     l0InterpIntoL1: (enc, useB) => {
       if (skipGroup('interp')) return;
       const p = beginPass(enc, 'L0->L1 interp');
@@ -2229,6 +2235,8 @@ async function init() {
   //                                       to clamped streaming, so its share is
   //                                       NEGATIVE and its magnitude is what
   //                                       neighbour-addressed streaming buys
+  //   explode, coalesce                -- the ?interface=explode coupling
+  //                                       passes, not encoded (B6-1)
   //
   // The `ghost` and `ghost-noop` groups are gone with the pass they named --
   // measuring "skip the fine-fine copy" is meaningless now that the default
@@ -2250,18 +2258,40 @@ async function init() {
   // Every valid group name. Enumerated rather than free-form because an
   // unrecognised name is otherwise INVISIBLE: it just never matches a
   // skipGroup() call, the passes all run, and the configuration reports a ~0%
-  // share that reads as a real measurement. That is unrecoverable on the phone,
-  // which tools/bench-amr.js cannot drive and which gets one sweep per
-  // session (see plans/perf-characterization.md on adb) -- the same class
-  // of silent-failure trap as a sweep interrupted by backgrounding, which this
+  // share that reads as a real measurement. That is expensive on a phone,
+  // where a sweep is minutes of a device you are holding -- the same class of
+  // silent-failure trap as a sweep interrupted by backgrounding, which this
   // file already refuses to report quietly.
   const BENCH_GROUPS = new Set([
     'force', 'phy', 'step1', 'interp', 'avg',
     'interp-noop', 'avg-noop', 'step1-ring', 'ghostcopy',
+    'explode', 'coalesce',
   ]);
+  // A KNOWN name can still be INERT under the current ?interface=, which is
+  // the same silent ~0% the enumeration exists to prevent -- and it happened:
+  // on ?interface=explode the steady interp pass is not encoded at all (B6-7;
+  // only ?b6interp=1 puts it back), so `interp` and `interp-noop` skip nothing,
+  // and `ghostcopy` THROWS from the scheduler mid-sweep, which aborted the
+  // phone's default ?bench=1 on this branch and left the page stalled with
+  // refinement frozen. Refused up front, with the reason.
+  const B6_INTERP = urlParams.get('b6interp') === '1';
+  const INERT_GROUPS = INTERFACE === 'explode'
+    ? new Map([
+        ...(B6_INTERP ? [] : [
+          ['interp', 'the steady interp pass is not encoded on ?interface=explode (add ?b6interp=1 to put it back)'],
+          ['interp-noop', 'the steady interp pass is not encoded on ?interface=explode (add ?b6interp=1 to put it back)'],
+        ]),
+        ['ghostcopy', '?interface=explode refuses the legacy ghost copy (it would overwrite the advecting outbox)'],
+      ])
+    : new Map([
+        ['explode', 'explode/coalesce only run on ?interface=explode'],
+        ['coalesce', 'explode/coalesce only run on ?interface=explode'],
+      ]);
   function validateSkipGroups(groups, where) {
     const bad = [...groups].filter(g => !BENCH_GROUPS.has(g));
     if (bad.length) throw new Error(`${where}: unknown benchSkip group(s) ${bad.join(', ')} -- known: ${[...BENCH_GROUPS].join(', ')}`);
+    const inert = [...groups].filter(g => INERT_GROUPS.has(g));
+    if (inert.length) throw new Error(`${where}: benchSkip group(s) inert here -- ${inert.map(g => `${g}: ${INERT_GROUPS.get(g)}`).join('; ')}`);
   }
   const benchSkip = new Set((urlParams.get('benchSkip') || '').split(',').filter(Boolean));
   validateSkipGroups(benchSkip, '?benchSkip=');
@@ -2986,7 +3016,17 @@ async function init() {
   // short phone session report nothing useful.
   let telemetryProfileLast = -Infinity;
   let telemetryInfo = null;
-  async function telemetrySample(gpuMs, syncMs, stepNow) {
+  // MLUPS over EVERY level's lattice updates (amr2d.mjs's
+  // cellUpdatesPerMacroStep), comparable with index.html's. Null until the
+  // refusal watch's first free-count poll has landed (<= 500 ms), rather than
+  // a root-only figure standing in for it -- that figure was the readout's
+  // whole defect.
+  function allLevelMlups(steps, gpuMs) {
+    const activeByLevel = refusalWatch.activeByLevel;
+    if (!activeByLevel || !(gpuMs > 0)) return null;
+    return (cellUpdatesPerMacroStep({ rootCells: NCELLS, rb: RB, activeByLevel }) * steps) / (gpuMs * 1e3);
+  }
+  async function telemetrySample(gpuMs, syncMs, stepNow, stepsNow) {
     if (!TELEMETRY) return;
     const now = performance.now();
     if (now - telemetryLast < TELEMETRY_EVERY_MS) return;
@@ -3007,6 +3047,9 @@ async function init() {
         config: {
           res: resLog2, W, levels: N_LEVELS, blockage: BLOCKAGE, aspect: ASPECT,
           re: RE, tau: TAU, maxFineBlocks: MAX_FINE_BLOCKS,
+          // Every level's cap, not just level 1's: `maxFineBlocks` alone
+          // cannot tell two ?maxFineBlocks<m>= runs apart.
+          maxFineBlocksByLevel: pools.slice(1).map(p => p.MAX_FINE_BLOCKS),
           forceRefineMargin: FORCE_REFINE_MARGIN, refineThresh: REFINE_THRESH,
           stepsPerFrame: STEPS_PER_FRAME,
         },
@@ -3021,8 +3064,14 @@ async function init() {
       step: stepNow,
       gpuMs: Number.isFinite(gpuMs) ? +gpuMs.toFixed(3) : null,
       syncMs: Number.isFinite(syncMs) ? +syncMs.toFixed(3) : null,
-      // L0-cell throughput only -- see the mlups comment in the frame loop.
-      l0Mlups: gpuMs > 0 ? +((NCELLS * STEPS_PER_FRAME) / (gpuMs * 1e3)).toFixed(1) : null,
+      // Steps this frame actually dispatched: the pacer makes it vary, and
+      // l0Mlups used to divide STEPS_PER_FRAME by it, which overstated it
+      // whenever the pacer asked for fewer than 64 steps.
+      steps: stepsNow,
+      mlups: (m => m == null ? null : +m.toFixed(1))(allLevelMlups(stepsNow, gpuMs)),
+      activeByLevel: refusalWatch.activeByLevel,
+      // ROOT cells only -- kept so older telemetry.log lines stay comparable.
+      l0Mlups: gpuMs > 0 ? +((NCELLS * stepsNow) / (gpuMs * 1e3)).toFixed(1) : null,
       watch: {
         frames: readbackWatch.n,
         stepBack: readbackWatch.stepBack,
@@ -3116,18 +3165,25 @@ async function init() {
   // 13 configurations at BENCH_ROUNDS=3 is (3+1)*13*5s = ~4.3 min of sweep on
   // top of the warm-up, so budget ~5 min of foregrounded, screen-on device.
   // The -noop and step1-ring entries are the instrument variants documented
-  // at benchSkip above; they are here rather than desktop-only because the
-  // phone cannot be driven the way tools/bench-amr.js drives the desktop (adb
-  // does expose CDP, but debugStepSync over it killed Chrome -- see
-  // plans/perf-characterization.md), so this sweep is the way to ask that
-  // device the same questions.
+  // at benchSkip above; they are here rather than desktop-only because this
+  // sweep is how to ask a phone that is NOT on USB the same questions. (One on
+  // USB can be driven by tools/bench-amr.js over adb CDP since 2026-09-24,
+  // with chrome-remote-interface's `local: true` -- see
+  // plans/perf-characterization.md.)
   // ?benchConfigs=none,interp,avg,ghostcopy,interp+avg trims the list. Worth
   // using on a device you have to hold in your hand: every configuration costs
   // (BENCH_ROUNDS+1) * BENCH_MEASURE_MS, and a shorter sweep also spends less
   // of itself inside this device's own thermal ramp. 'none' is always kept --
   // every share is relative to it.
-  const BENCH_CONFIGS_DEFAULT = ['none', 'force', 'phy', 'force+phy', 'interp', 'avg', 'ghostcopy', 'step1', 'interp+avg',
-                                 'interp-noop', 'avg-noop', 'step1-ring'];
+  // Per interface: each list names only groups that do something on it (see
+  // INERT_GROUPS). On explode the coupling is explode+coalesce+avg, so that is
+  // the combined row, in the place interp+avg holds on the interp path.
+  const BENCH_CONFIGS_DEFAULT = INTERFACE === 'explode'
+    ? ['none', 'force', 'phy', 'force+phy', 'explode', 'coalesce', 'avg', 'step1', 'explode+coalesce+avg',
+       'avg-noop', 'step1-ring',
+       ...(B6_INTERP ? ['interp', 'interp-noop'] : [])]
+    : ['none', 'force', 'phy', 'force+phy', 'interp', 'avg', 'ghostcopy', 'step1', 'interp+avg',
+       'interp-noop', 'avg-noop', 'step1-ring'];
   const BENCH_CONFIGS = urlParams.has('benchConfigs')
     // URLSearchParams decodes '+' as a space, and '+' is this list's own
     // combine operator, so an unencoded ?benchConfigs=interp+avg+ghost arrives
@@ -3136,8 +3192,27 @@ async function init() {
     ? [...new Set(['none', ...urlParams.get('benchConfigs').split(',')
         .map(c => c.trim().replace(/\s+/g, '+')).filter(Boolean)])]
     : BENCH_CONFIGS_DEFAULT;
+  // Refuses a bad configuration BEFORE touching the page, and puts the page
+  // back if the sweep throws partway: an abort used to leave refinement
+  // frozen, a skip set applied and the frame loop stopped, so the page sat
+  // there looking alive until someone reloaded it.
   async function runBenchSweep() {
+    // Fail before the sweep, not silently during it: a mistyped entry in
+    // BENCH_CONFIGS would otherwise cost a whole ~5 min device session and
+    // report a plausible-looking 0% share for that row.
+    for (const cfg of BENCH_CONFIGS) {
+      if (cfg !== 'none') validateSkipGroups(cfg.split('+'), `BENCH_CONFIGS entry "${cfg}"`);
+    }
     const wasAuto = autoRefine;
+    try {
+      return await runBenchSweepBody(wasAuto);
+    } finally {
+      benchSkip.clear();
+      if (wasAuto && !autoRefine) await setAutoRefine(true);
+      liveMode = true;
+    }
+  }
+  async function runBenchSweepBody(wasAuto) {
     await setAutoRefine(false);
     const activeByLevel = {};
     for (let m = 1; m < N_LEVELS; m++) {
@@ -3185,12 +3260,6 @@ async function init() {
       benchSkip.clear();
       if (cfg !== 'none') for (const g of cfg.split('+')) benchSkip.add(g);
     };
-    // Fail before the sweep, not silently during it: a mistyped entry in
-    // BENCH_CONFIGS would otherwise cost a whole ~5 min device session and
-    // report a plausible-looking 0% share for that row.
-    for (const cfg of BENCH_CONFIGS) {
-      if (cfg !== 'none') validateSkipGroups(cfg.split('+'), `BENCH_CONFIGS entry "${cfg}"`);
-    }
     // Discard a whole settling round -- one discarded run was measurably not
     // enough on the desktop (44-85% spread on the early rows).
     const totalSteps = (BENCH_ROUNDS + 1) * BENCH_CONFIGS.length;
@@ -3671,15 +3740,15 @@ async function init() {
         trail.push(xTotal, yTotal, 2 * A);
 
         if (performance.now() - lastT > 250) {
-          // L0 cells only -- it deliberately ignores every fine level, so it
-          // is a coarse-grid-throughput figure, NOT total work done, and is
-          // not comparable across level counts. tools/bench-amr.js computes
-          // the honest cell-updates/s using live per-level active counts.
-          const mlups = (NCELLS * (st.steps || 0)) / (gpuTime * 1e3);
-          mlupsEl.textContent = mlups.toFixed(1);
+          // EVERY level's lattice updates, so this is comparable with
+          // index.html's MLUPS and across level counts. It counted the root's
+          // cells alone until 2026-09-24, which on the phone read 0.1-3
+          // against ~17 of real work (see allLevelMlups).
+          const mlups = allLevelMlups(st.steps || 0, gpuTime);
+          mlupsEl.textContent = mlups == null ? '…' : mlups.toFixed(1);
           gpuMsEl.textContent = gpuTime.toFixed(2);
           syncMsEl.textContent = (performance.now() - tSubmit).toFixed(2);
-          telemetrySample(gpuTime, performance.now() - tSubmit, st.step);
+          telemetrySample(gpuTime, performance.now() - tSubmit, st.step, st.steps || 0);
           // Not while a benchmark sweep owns the status line: this runs on
           // every readback and silently overwrote the sweep's own progress
           // messages within a frame, so "benchmark round 2/3" was never
