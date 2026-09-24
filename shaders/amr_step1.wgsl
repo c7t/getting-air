@@ -81,7 +81,8 @@ struct LevelParams {
 // amr_interp_pool_parent.wgsl's fine-fine consultation already uses.
 @group(0) @binding(6) var<storage, read>       blockSlot   : array<i32>;
 // Read only by `mainIndirect` below.
-@group(0) @binding(7) var<storage, read>       activeSlots : array<u32>;
+@group(0) @binding(7) var<storage, read>       activeList  : ActiveList;
+// @include "common_active_list.wgsl"
 
 override W : u32; // GLOBAL domain dims (window periodicity), same at every level -- not level-specific, see header.
 override H : u32;
@@ -334,11 +335,23 @@ fn get_chi(phi: f32) -> f32 {
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) { stepCell(gid, gid.z); }
 
-// ?indirect=1 (main-amr.js): launched over this pool's active-slot list
+// ?launch=indirect (main-amr.js): launched over this pool's active-slot list
 // (amr_active_list.wgsl), so z indexes the list rather than the pool. `main`
-// never reads `activeSlots`, so its layout -- every other page's -- is unchanged.
+// never reads `activeList`, so its layout -- every other page's -- is unchanged.
 @compute @workgroup_size(8, 8)
-fn mainIndirect(@builtin(global_invocation_id) gid: vec3<u32>) { stepCell(gid, activeSlots[gid.z]); }
+fn mainIndirect(@builtin(global_invocation_id) gid: vec3<u32>) { stepCell(gid, activeList.slots[gid.z]); }
+
+// ?launch=stride: a DIRECT dispatch of K workgroups in z, each walking the
+// list at stride K -- the saving of indirect dispatch without its per-call
+// cost (plans/perf-characterization.md). K is the host's lagged estimate of
+// the count and only sets the parallelism; the loop covers every entry
+// whatever it is. The barrier lets the body reuse workgroup memory.
+@compute @workgroup_size(8, 8)
+fn mainStride(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_index) li: u32,
+              @builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+  let n = activeListCount(li);
+  for (var z = wid.z; z < n; z += nwg.z) { stepCell(gid, activeList.slots[z]); workgroupBarrier(); }
+}
 
 fn stepCell(gid: vec3<u32>, slot: u32) {
   let fx = gid.x; let fy = gid.y;

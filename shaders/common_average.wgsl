@@ -93,12 +93,24 @@ const GHOST = 2u;
 @compute @workgroup_size(8, 8)
 fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wgid: vec3<u32>) { averageCell(lid, wgid.z); }
 
-// ?indirect=1 (main-amr.js): launched over the CHILD pool's active-slot list
+// ?launch=indirect (main-amr.js): launched over the CHILD pool's active-slot list
 // (amr_active_list.wgsl), so z indexes the list rather than the pool. `main`
-// never reads `activeSlots`, so its layout -- every other page's -- is unchanged.
-// `activeSlots` is declared by the includer (amr_average_pool_parent.wgsl).
+// never reads `activeList`, so its layout -- every other page's -- is unchanged.
+// `activeList` is declared by the includer (amr_average_pool_parent.wgsl).
 @compute @workgroup_size(8, 8)
-fn mainIndirect(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wgid: vec3<u32>) { averageCell(lid, activeSlots[wgid.z]); }
+fn mainIndirect(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wgid: vec3<u32>) { averageCell(lid, activeList.slots[wgid.z]); }
+
+// ?launch=stride: a DIRECT dispatch of K workgroups in z, each walking the
+// list at stride K -- the saving of indirect dispatch without its per-call
+// cost (plans/perf-characterization.md). K is the host's lagged estimate of
+// the count and only sets the parallelism; the loop covers every entry
+// whatever it is. The barrier lets the body reuse workgroup memory.
+@compute @workgroup_size(8, 8)
+fn mainStride(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(local_invocation_index) li: u32,
+              @builtin(workgroup_id) wgid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+  let n = activeListCount(li);
+  for (var z = wgid.z; z < n; z += nwg.z) { averageCell(lid, activeList.slots[z]); workgroupBarrier(); }
+}
 
 fn averageCell(lid: vec3<u32>, slot: u32) {
   if (NOOP != 0u) { return; } // see the NOOP override above

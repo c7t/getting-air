@@ -57,7 +57,8 @@ struct LevelParams {
 @group(0) @binding(2) var<storage, read_write> f_parent          : array<u32>; // parent's TIME-t buffer
 @group(0) @binding(3) var<storage, read>       blockSlot         : array<i32>; // child -- "covered", and the ring's owner
 @group(0) @binding(4) var<storage, read>       parentSlotToBlock : array<i32>; // parent -- which block this thread's slot is
-@group(0) @binding(5) var<storage, read>       parentActiveSlots : array<u32>; // parent -- read only by `mainIndirect`
+@group(0) @binding(5) var<storage, read>       activeList        : ActiveList; // PARENT's -- read only by `mainIndirect`/`mainStride`
+// @include "common_active_list.wgsl"
 
 override RB : u32;
 override PARENT_GHOST : u32 = 2u;
@@ -74,11 +75,23 @@ fn childCell(s: u32, l: vec2<i32>) -> u32 {
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) { coalesceCell(gid, gid.z); }
 
-// ?indirect=1 (main-amr.js): launched over this pool's active-slot list
+// ?launch=indirect (main-amr.js): launched over this pool's active-slot list
 // (amr_active_list.wgsl), so z indexes the list rather than the pool. `main`
-// never reads `activeSlots`, so its layout -- every other page's -- is unchanged.
+// never reads `activeList`, so its layout -- every other page's -- is unchanged.
 @compute @workgroup_size(8, 8)
-fn mainIndirect(@builtin(global_invocation_id) gid: vec3<u32>) { coalesceCell(gid, parentActiveSlots[gid.z]); }
+fn mainIndirect(@builtin(global_invocation_id) gid: vec3<u32>) { coalesceCell(gid, activeList.slots[gid.z]); }
+
+// ?launch=stride: a DIRECT dispatch of K workgroups in z, each walking the
+// list at stride K -- the saving of indirect dispatch without its per-call
+// cost (plans/perf-characterization.md). K is the host's lagged estimate of
+// the count and only sets the parallelism; the loop covers every entry
+// whatever it is. The barrier lets the body reuse workgroup memory.
+@compute @workgroup_size(8, 8)
+fn mainStride(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_index) li: u32,
+              @builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+  let n = activeListCount(li);
+  for (var z = wid.z; z < n; z += nwg.z) { coalesceCell(gid, activeList.slots[z]); workgroupBarrier(); }
+}
 
 fn coalesceCell(gid: vec3<u32>, pslot: u32) {
   let RB2 = RB * 2u;

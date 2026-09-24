@@ -120,7 +120,8 @@ struct LevelParams {
 // only read when GHOST == 0.
 @group(0) @binding(6) var<storage, read>       blockSlot      : array<i32>;
 // Read only by `mainIndirect` below.
-@group(0) @binding(7) var<storage, read>       activeSlots    : array<u32>;
+@group(0) @binding(7) var<storage, read>       activeList     : ActiveList;
+// @include "common_active_list.wgsl"
 // RENUMBERED CONTIGUOUS by B3-4. The layout had holes: 4/5 were
 // originX/originY (gone -- the origin is derived, see header), 7 was the
 // masking's childBlockSlot (gone in B4-3) and 8 sat past the hole because
@@ -326,15 +327,31 @@ fn main(
   @builtin(workgroup_id) wid: vec3<u32>
 ) { forceCell(gid, lid, wid, gid.z); }
 
-// ?indirect=1 (main-amr.js): launched over this pool's active-slot list
+// ?launch=indirect (main-amr.js): launched over this pool's active-slot list
 // (amr_active_list.wgsl), so z indexes the list rather than the pool. `main`
-// never reads `activeSlots`, so its layout -- every other page's -- is unchanged.
+// never reads `activeList`, so its layout -- every other page's -- is unchanged.
 @compute @workgroup_size(8, 8)
 fn mainIndirect(
   @builtin(global_invocation_id) gid: vec3<u32>,
   @builtin(local_invocation_index) lid: u32,
   @builtin(workgroup_id) wid: vec3<u32>
-) { forceCell(gid, lid, wid, activeSlots[gid.z]); }
+) { forceCell(gid, lid, wid, activeList.slots[gid.z]); }
+
+// ?launch=stride: a DIRECT dispatch of K workgroups in z, each walking the
+// list at stride K -- the saving of indirect dispatch without its per-call
+// cost (plans/perf-characterization.md). K is the host's lagged estimate of
+// the count and only sets the parallelism; the loop covers every entry
+// whatever it is. The barrier lets the body reuse workgroup memory.
+@compute @workgroup_size(8, 8)
+fn mainStride(
+  @builtin(global_invocation_id) gid: vec3<u32>,
+  @builtin(local_invocation_index) lid: u32,
+  @builtin(workgroup_id) wid: vec3<u32>,
+  @builtin(num_workgroups) nwg: vec3<u32>
+) {
+  let n = activeListCount(lid);
+  for (var z = wid.z; z < n; z += nwg.z) { forceCell(gid, lid, wid, activeList.slots[z]); workgroupBarrier(); }
+}
 
 fn forceCell(gid: vec3<u32>, lid: u32, wid: vec3<u32>, slot: u32) {
   if (FORCE_CULL != 0u) {
