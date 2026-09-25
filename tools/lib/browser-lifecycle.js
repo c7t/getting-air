@@ -147,13 +147,105 @@ async function ensureChrome(port) {
   proc.unref();
   const ok = await waitFor(() => chromeDebugOk(port), 10000, 300);
   if (!ok) throw new Error(`Chrome did not come up on debug port ${port} within 10s`);
+  if (process.env.CHROME_WORKSPACE) await moveToWorkspace(proc.pid, process.env.CHROME_WORKSPACE);
   return { started: true, profileDir, pid: proc.pid };
 }
 
+// A new window maps on the CURRENT workspace and takes focus (xfwm4's
+// focus_new), and nothing on Chrome's command line prevents it. With
+// CHROME_WORKSPACE=N set, the launched window is sent to workspace N
+// (0-based, wmctrl's numbering) as soon as it maps, so it flashes up rather
+// than sitting on top of the user's work. openTab keeps it from being
+// activated -- and so from dragging the user over there -- afterwards.
+async function moveToWorkspace(pid, ws) {
+  const { execFileSync } = require('child_process');
+  const run = (cmd, args) => execFileSync(cmd, args, { encoding: 'utf8', env: process.env });
+  let home, ids = [];
+  try { home = run('wmctrl', ['-d']).split('\n').find(l => /^\d+\s+\*/.test(l)).split(/\s+/)[0]; }
+  catch { return; }  // no wmctrl / no EWMH window manager: nothing to do
+  const windows = () => run('wmctrl', ['-lp']).split('\n').map(l => l.split(/\s+/))
+    .filter(f => f[2] === String(pid)).map(f => parseInt(f[0], 16));
+  const active = () => parseInt((run('xprop', ['-root', '_NET_ACTIVE_WINDOW']).match(/0x[0-9a-f]+/i) || ['0'])[0], 16);
+  // Wait for the window to map AND take its startup focus: Chrome activates
+  // its first window a beat after mapping it, and an activation that lands
+  // after the move is exactly the workspace switch this is here to prevent.
+  await waitFor(() => { try { ids = windows(); return ids.length > 0 && ids.includes(active()); } catch { return false; } }, 5000, 50);
+  if (!ids.length) { console.log(`[setup] CHROME_WORKSPACE=${ws}: Chrome's window never appeared in wmctrl -lp; left where it is`); return; }
+  for (const id of ids) { try { run('wmctrl', ['-i', '-r', '0x' + id.toString(16), '-t', String(ws)]); } catch { /* best-effort */ } }
+  // Belt and braces: if something still pulled the view over, put it back.
+  await new Promise(r => setTimeout(r, 300));
+  try { if (!run('wmctrl', ['-d']).split('\n').some(l => l.startsWith(home + ' ') && /^\d+\s+\*/.test(l))) run('wmctrl', ['-s', home]); } catch { /* best-effort */ }
+  console.log(`[setup] moved Chrome's window to workspace ${ws} (CHROME_WORKSPACE)`);
+}
+
+// A tab a finished run leaves behind for the next one (see teardown). An
+// about:blank document, so no WebGPU context survives in it.
+const PARKED_URL = 'about:blank#harness-idle';
+
+// Returns a tab for the run WITHOUT raising the debug Chrome's window.
+//
+// WHY NOT JUST /json/new. Creating a foreground tab ACTIVATES its window, and
+// under xfwm4 with activate_action=switch (this desktop's setting) activation
+// switches the user to whichever workspace the debug Chrome lives on --
+// every run, mid-whatever-they-were-doing. Measured under Xvfb+xfwm4 with the
+// same xfconf settings: /json/new, Target.activateTarget and Page.bringToFront
+// all switch workspace; Page.navigate on an existing tab does not. The
+// no-activation ways to CREATE a tab are no use: a background tab is
+// document.hidden, so rAF never fires and a chain of 20 setTimeout(0)s took
+// 14 s, and createTarget({newWindow, background}) maps a new window on the
+// CURRENT workspace and focuses it. So the only quiet tab is one that already
+// exists: reuse a VISIBLE idle one (a parked one, or a bare about:blank) by
+// navigating it, and fall back to /json/new -- once per Chrome lifetime,
+// since teardown parks the tab instead of closing it.
 async function openTab(port, url) {
+  const CDP = require('/usr/lib/node_modules/chrome-remote-interface');
+  let targets = [];
+  try { targets = await (await fetch(`http://localhost:${port}/json/list`)).json(); } catch { /* fall through */ }
+  for (const t of targets) {
+    if (t.type !== 'page' || (t.url !== PARKED_URL && t.url !== 'about:blank')) continue;
+    let c = null;
+    try {
+      c = await CDP({ port, target: t.id });
+      const ev = async (e) => (await c.Runtime.evaluate({ expression: e, returnByValue: true })).result.value;
+      // A tab that is not its window's selected tab is hidden, and a hidden
+      // tab is throttled into uselessness (above). Skip it rather than
+      // activate it, which is the very thing being avoided.
+      if (await ev('document.visibilityState') !== 'visible') continue;
+      // Claim it with a mark unique to this run, then check the mark stuck,
+      // so two tools adopting the same Chrome cannot both take one tab.
+      const mark = `about:blank#harness-busy-${process.pid}-${Date.now()}`;
+      await c.Page.navigate({ url: mark });
+      if (await ev('location.href') !== mark) continue;
+      if (url !== 'about:blank') await c.Page.navigate({ url });
+      console.log(`[setup] reusing idle tab ${t.id.slice(0, 8)} (no window activation)`);
+      return t.id;
+    } catch { /* try the next one */ }
+    finally { if (c) await c.close().catch(() => {}); }
+  }
+  console.log('[setup] no visible idle tab to reuse -- opening one (activates the Chrome window this once)');
   const res = await fetch(`http://localhost:${port}/json/new?${encodeURIComponent(url)}`, { method: 'PUT' });
   const target = await res.json();
   return target.id;
+}
+
+// Navigates a finished run's tab to PARKED_URL rather than closing it: the
+// page (and its GPU buffers) is torn down all the same, but the tab survives
+// for openTab to reuse quietly next time. Closing it would force the next
+// run back onto /json/new and its window activation; and if it was the
+// window's last tab, closing it quits the whole Chrome.
+async function parkTab(port, id) {
+  const CDP = require('/usr/lib/node_modules/chrome-remote-interface');
+  try {
+    const c = await CDP({ port, target: id });
+    await c.Page.navigate({ url: PARKED_URL });
+    // Wait for it to land: mid-navigation /json/list reports the url as "",
+    // and a run starting straight after this one would pass the tab over.
+    await waitFor(async () => {
+      try { return (await c.Runtime.evaluate({ expression: 'location.href', returnByValue: true })).result.value === PARKED_URL; }
+      catch { return false; }
+    }, 3000, 50);
+    await c.close();
+  } catch { await closeTab(port, id); }
 }
 
 async function firstTab(port) {
@@ -317,10 +409,12 @@ async function assertPageHealthy(Runtime, watch, what, allowStatus) {
 //
 // The stale dirs an adopted-then-orphaned Chrome leaves behind are swept by
 // the next ensureChrome; see sweepStaleProfiles.
+//
+// An adopted Chrome's tab is PARKED, not closed -- see parkTab/openTab.
 async function teardown({ port, tabId, chrome, server, keepOpen }) {
   if (keepOpen) return;
-  await closeTab(port, tabId);
-  if (chrome.started) {
+  if (!chrome.started) { await parkTab(port, tabId); }
+  else {
     // Group kill: Chrome is spawned detached, so it leads its own process
     // group and its renderer/GPU children belong to it. Signalling just the
     // parent pid left those children alive holding a GPU context.
@@ -339,7 +433,7 @@ async function teardown({ port, tabId, chrome, server, keepOpen }) {
 
 module.exports = {
   httpsGetOk, waitFor, ensureServer, chromeDebugOk, ensureChrome,
-  openTab, firstTab, closeTab, navigateTo, evalExpr, waitForGlobal, teardown,
+  openTab, parkTab, PARKED_URL, firstTab, closeTab, navigateTo, evalExpr, waitForGlobal, teardown,
   attachPageWatch, statusError, assertPageHealthy,
   PROFILE_ROOT, liveProfileDirs, sweepStaleProfiles, reapAllChromes,
 };
