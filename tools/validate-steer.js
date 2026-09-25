@@ -20,6 +20,14 @@
 //   world    ?comFrame=world must also move the trajectory, and its d must
 //            track reach*cos(theta) -- the world-horizontal shift projected
 //            onto the chord.
+//   authority  the centre of mass parked at the TIP (?comReach=1) must fly
+//            --authoritySteps steps with the step-frequency stabilizer on,
+//            and the SAME run with it off (?stab=0) must die: without the
+//            control this could not tell a working stabilizer from a run too
+//            short to fail. (physics_steer.wgsl 2a, probe-steer-damping.js.)
+//   lowfreq  with the stabilizer on and input 0 the card must still be
+//            index.html's to 1e-3 after the first checkpoint -- it acts at
+//            the step frequency only.
 //
 //   node tools/validate-steer.js
 //   node tools/validate-steer.js --steps=8192 --res=7
@@ -33,7 +41,7 @@ const {
 const REPO_ROOT = path.resolve(__dirname, '..');
 
 function parseArgs(argv) {
-  const o = { baseUrl: 'https://localhost:4444', port: 9349, steps: 4096, start: 512, chunk: 256, res: 7 };
+  const o = { baseUrl: 'https://localhost:4444', port: 9349, steps: 4096, start: 512, chunk: 256, res: 7, authoritySteps: 8192 };
   for (const a of argv) {
     const [k, v] = a.replace(/^--/, '').split('=');
     if (k in o && v !== undefined) o[k] = k === 'baseUrl' ? v : parseInt(v);
@@ -89,7 +97,10 @@ async function main() {
   try {
     console.log(`  res=${o.res}, input applied at step ${o.start}, checkpoints every ${o.chunk} to ${o.steps}\n`);
     const ref = await leg('index.html', '', 0);
-    const zero = await leg('index-steer.html', '&comFrame=body', 0);
+    // The identity is with the step-frequency stabilizer OFF (?stab=0): that
+    // is the page's claim to BE physics.wgsl. With it on, see 'lowfreq'.
+    const zero = await leg('index-steer.html', '&comFrame=body&stab=0', 0);
+    const zeroStab = await leg('index-steer.html', '&comFrame=body', 0);
     const plus = await leg('index-steer.html', '&comFrame=body', 1);
     const minus = await leg('index-steer.html', '&comFrame=body', -1);
     const world = await leg('index-steer.html', '&comFrame=world', 1);
@@ -105,6 +116,17 @@ async function main() {
     report('identity', !firstBad && dZero, firstBad
       ? `input 0 departs from index.html at step ${firstBad.step}, word ${firstBad.k}: ${firstBad.a} vs ${firstBad.b}`
       : `input 0 == index.html, ${compared} values over ${ref.rows.length} checkpoints; ballast stayed at 0: ${dZero}`);
+
+    // lowfreq: the stabilizer is a virtual inertia at the STEP frequency
+    // only, so on the card's own time scales it should be invisible. Scored
+    // at the first checkpoint, before the flutter's own sensitivity to
+    // initial conditions amplifies ANY perturbation (a single ULP included).
+    {
+      const a = ref.rows[0].card, b = zeroStab.rows[0].card;
+      const dth = Math.abs(a[2] - b[2]), dv = Math.hypot(a[3] - b[3], a[4] - b[4]) / Math.hypot(a[3], a[4]);
+      report('lowfreq', dth < 1e-3 && dv < 1e-3,
+        `stabilizer on, input 0, ${o.chunk} steps after release: |dtheta| ${dth.toExponential(2)} rad, |dv|/|v| ${dv.toExponential(2)} (want both < 1e-3)`);
+    }
 
     const last = (l) => l.rows[l.rows.length - 1].card;
     // Travel, from the accumulators, over the steered window only: [20]/[21]
@@ -138,6 +160,25 @@ async function main() {
     const wMoved = dist(world, ref);
     report('world', wMoved > 0.5 && worldErr < 0.05 * reach,
       `moves the card ${wMoved.toFixed(2)} cells; d tracks reach*cos(theta) to ${(worldErr / reach * 100).toFixed(2)}% of reach`);
+
+    // authority: res 8 (the page's default), where the unstabilized run is
+    // measured to die in ~4000 steps from rest.
+    const fly = async (stab) => {
+      await navigateTo(Page, `${o.baseUrl}/index-steer.html?startPaused=1&comFrame=body&comReach=1&stab=${stab}`);
+      await waitForGlobal(Runtime, L, 60000);
+      await ev(Runtime, `${L}.setSteer(1)`);
+      for (let s = 0; s < o.authoritySteps; s += 512) {
+        await ev(Runtime, `${L}.debugStepSync(512)`, 600000);
+        const c = await ev(Runtime, `${L}.debugReadCardState()`);
+        // Dead: non-finite, or the force reduction reading exactly zero, which
+        // is what NaN containment reports for a non-finite fluid.
+        if (!c.every(Number.isFinite) || (c[6] === 0 && c[7] === 0)) return s + 512;
+      }
+      return null;
+    };
+    const on = await fly(1), off = await fly(0);
+    report('authority', on === null && off !== null,
+      `tip-parked centre of mass, ${o.authoritySteps} steps: stabilizer on ${on === null ? 'flies' : `DIES at ${on}`}, off ${off === null ? 'ALSO FLIES (control failed to fail)' : `dies at ${off}`}`);
   } finally {
     await client.close();
     await teardown({ port: o.port, tabId, chrome, server });

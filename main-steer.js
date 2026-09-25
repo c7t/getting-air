@@ -74,6 +74,13 @@ const START_PAUSED = urlParams.get('startPaused') === '1';
 // physics, so both sides of the exchange see the same body state and the
 // pair is exactly equal and opposite.
 const COUPLING = urlParams.get('coupling') || 'shipped';
+// ?stab= the step-frequency stabilizer's scale (physics_steer.wgsl 2a):
+// virtual inertia at the step frequency only, sized as the displaced fluid's
+// inertia about the centre of mass times this. Default 1; 0 is exactly the
+// explicit update index.html runs, and is what tools/validate-steer.js's
+// identity gate compares against.
+const STAB = urlParams.has('stab') ? parseFloat(urlParams.get('stab')) : 1;
+if (!(STAB >= 0)) throw new Error(`?stab=${urlParams.get('stab')} must be >= 0`);
 if (COUPLING !== 'shipped' && COUPLING !== 'paired') throw new Error(`?coupling=${COUPLING} must be shipped or paired`);
 
 // THE DIFFUSE BAND'S WIDTH, in units of a level's own cell size:
@@ -297,9 +304,10 @@ async function init() {
   // input and its scales) and writes ONLY those; word 5 is the ballast's
   // current position, which the kernel owns -- a whole-struct write would
   // snap it back to the input and skip the rate limit.
-  const STEER_BYTES = 40, STEER_D_OFFSET = 20, STEER_KICK_OFFSET = 32;
+  const STEER_BYTES = 56, STEER_D_OFFSET = 20, STEER_KICK_OFFSET = 32;
   const steerBuf = device.createBuffer({ size: STEER_BYTES, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
   device.queue.writeBuffer(steerBuf, 0, new Float32Array(STEER_BYTES / 4));
+
   let steerS = 0;
   const writeSteer = () => {
     device.queue.writeBuffer(steerBuf, 0, new Float32Array([
@@ -420,7 +428,7 @@ async function init() {
   });
   const phyPL = device.createComputePipeline({ 
     layout: device.createPipelineLayout({ bindGroupLayouts: [phyBGL] }), 
-    compute: { module: phySM, entryPoint: 'main', constants } 
+    compute: { module: phySM, entryPoint: 'main', constants: { ...constants, STAB } } 
   });
   // VORT_SCALE/VORT_GAMMA are pipeline-overridable constants specialized into
   // the fragment shader here, so changing them live means rebuilding this one
@@ -700,7 +708,7 @@ async function init() {
     // Steering, for tools/validate-steer.js: null hands control back to the
     // page's own input.
     setSteer: (s) => { steerOverride = s; pollSteer(); },
-    getSteerParams: () => ({ COM_REACH, COM_FRAME, COM_SLEW, STEER_MAX, reach: COM_REACH * A, slew: COM_SLEW * U_T, fb: MASS * (G_LU - G_EFF) }),
+    getSteerParams: () => ({ COM_REACH, COM_FRAME, COM_SLEW, STEER_MAX, STAB, reach: COM_REACH * A, slew: COM_SLEW * U_T, fb: MASS * (G_LU - G_EFF) }),
     debugReadSteer: async () => {
       const buf = device.createBuffer({ size: STEER_BYTES, usage: U.MAP_READ | U.COPY_DST });
       const enc = device.createCommandEncoder();

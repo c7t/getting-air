@@ -67,6 +67,10 @@ struct Steer {
                  // (along (-sin theta, cos theta), the broadside normal), so
                  // it measures the TRANSLATIONAL coupling and exerts no torque
                  // about C. 0 = off, exactly.
+  _p10   : f32,
+  dw_prev  : f32,  // kernel: last step's increments of omega and of v_C,
+  dvx_prev : f32,  //   AFTER the stabilizer -- the filter's one word of
+  dvy_prev : f32,  //   memory per degree of freedom
 }
 @group(0) @binding(2) var<storage, read_write> steer : Steer;
 
@@ -78,6 +82,13 @@ const FSCALE = 10000000.0f;
 // wrap -- see step 4b below, and card-total.mjs, which unwraps them back into
 // a true running total on the host and MUST use the same number.
 override TOTAL_WRAP_SCREENS : u32 = 16u;
+// The STEP-FREQUENCY STABILIZER's scale (2a below; main-steer.js's ?stab=).
+// An OVERRIDE and not a Steer word, and that is load-bearing: as a runtime
+// word, even with the branch never taken, the kernel compiled to different
+// floating-point contractions and the card moved by a few ULP at stab = 0,
+// which breaks tools/validate-steer.js's exact identity with index.html. As
+// an override, 0 folds the whole block away before code generation.
+override STAB : f32 = 0.0f;
 
 @compute @workgroup_size(1)
 fn main() {
@@ -113,9 +124,51 @@ fn main() {
   steer.kick_sign = select(1.0f, 0.0f, steer.kick_sign > 0.5f);
   let tz_c = tz_fluid - (r0.x * fy_fluid - r0.y * fx_fluid) + r0.x * steer.fb + steer.kick * kick_s;
 
-  vcx         += (fx_fluid - steer.kick_f * kick_s * s0) / state.mass;
-  vcy         += (fy_fluid + state.mass * state.g_eff + steer.kick_f * kick_s * c0) / state.mass;
-  state.omega += tz_c / state.i_body;
+  // 2a. THE STEP-FREQUENCY STABILIZER (?stab=, tools/probe-steer-damping.js).
+  // The fluid's reaction, evaluated at the START of a step and applied over
+  // all of it, acts at the step frequency as a damper tau = -D omega, so the
+  // explicit update multiplies that mode by (1 - D/I) every step: it flips
+  // sign past D/I = 1 and diverges past 2. D is a property of the fluid and
+  // its diffuse band -- measured independent of I*, and about C it grows like
+  // a parallel-axis term with the offset while I_C does not, which is why
+  // moving the mass to the tip crossed 2.
+  //
+  // (I + D_e) Delta_{n+1} - D_e Delta_n = tau_n, i.e.
+  //
+  //     Delta_{n+1} = (I Delta_raw + D_e Delta_prev) / (I + D_e)
+  //
+  // is a virtual inertia D_e at the step frequency and NONE at low
+  // frequency: a constant increment passes unchanged (gravity, a steady
+  // couple) and the error is D_e * (second difference of omega), second
+  // order. For the one-tap damper the mode is stable for D < 2 (I + 2 D_e),
+  // for ANY D_e >= 0 that was already stable, so an estimate need not be
+  // accurate, only not tiny. D_e is taken as the displaced fluid's own
+  // inertia about C (rho_f = 1): pi a b for translation, and
+  // pi a b ((a^2 + b^2)/4 + d^2) for rotation. Measured D at res 8 runs
+  // 1-2x those, well inside the margin.
+  //
+  // The off path is spelled exactly as it was before the stabilizer existed.
+  if (STAB != 0.0f) {
+    var dvx = (fx_fluid - steer.kick_f * kick_s * s0) / state.mass;
+    var dvy = (fy_fluid + state.mass * state.g_eff + steer.kick_f * kick_s * c0) / state.mass;
+    var dw  = tz_c / state.i_body;
+    let area = 3.14159265f * state.a * state.b;
+    let dv_e = STAB * area;
+    let dw_e = STAB * area * ((state.a * state.a + state.b * state.b) * 0.25f + d0 * d0);
+    dvx = (state.mass * dvx + dv_e * steer.dvx_prev) / (state.mass + dv_e);
+    dvy = (state.mass * dvy + dv_e * steer.dvy_prev) / (state.mass + dv_e);
+    dw  = (state.i_body * dw + dw_e * steer.dw_prev) / (state.i_body + dw_e);
+    steer.dvx_prev = dvx;
+    steer.dvy_prev = dvy;
+    steer.dw_prev  = dw;
+    vcx         += dvx;
+    vcy         += dvy;
+    state.omega += dw;
+  } else {
+    vcx         += (fx_fluid - steer.kick_f * kick_s * s0) / state.mass;
+    vcy         += (fy_fluid + state.mass * state.g_eff + steer.kick_f * kick_s * c0) / state.mass;
+    state.omega += tz_c / state.i_body;
+  }
   state.omega = clamp(state.omega, -state.o_max, state.o_max);
 
   // 2b. Slide the ballast toward the input, rate-limited: an unlimited
