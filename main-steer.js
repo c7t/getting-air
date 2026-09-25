@@ -57,6 +57,24 @@ const STEER_MAX = parseFloat(urlParams.get('steerMax')) || 45;
 if (!(COM_REACH >= 0 && COM_REACH <= 1)) throw new Error(`?comReach=${urlParams.get('comReach')} must be in [0, 1] (fraction of the semi-chord)`);
 if (COM_FRAME !== 'world' && COM_FRAME !== 'body') throw new Error(`?comFrame=${COM_FRAME} must be world or body`);
 if (!(COM_SLEW > 0)) throw new Error(`?comSlew=${urlParams.get('comSlew')} must be > 0`);
+// ?theta0= the card's release angle, radians (default 0.2, index.html's).
+// pi/2 is EDGE-ON: the chord vertical, falling along itself, no torque and
+// almost no outside added mass -- tools/probe-steer-inertia.js's release.
+// ?startPaused=1 holds the frame loop from the first frame, so a tool's step 0
+// is the true initial condition rather than whatever the loop ran first.
+const THETA0 = urlParams.has('theta0') ? parseFloat(urlParams.get('theta0')) : 0.2;
+if (!Number.isFinite(THETA0)) throw new Error(`?theta0=${urlParams.get('theta0')} must be a number (radians)`);
+const START_PAUSED = urlParams.get('startPaused') === '1';
+// ?coupling=paired -- EXPERIMENT (tools/probe-steer-inertia.js). The shipped
+// order is force -> physics -> step: the body is charged rho chi (v_n - u*),
+// then its velocity is updated, then the fluid is forced with
+// rho chi (v_{n+1} - u*). The two differ by rho chi (v_{n+1} - v_n) summed
+// over the card, so every step the fluid under the card is accelerated by
+// m_chi * a that the body never pays for. 'paired' runs force -> step ->
+// physics, so both sides of the exchange see the same body state and the
+// pair is exactly equal and opposite.
+const COUPLING = urlParams.get('coupling') || 'shipped';
+if (COUPLING !== 'shipped' && COUPLING !== 'paired') throw new Error(`?coupling=${COUPLING} must be shipped or paired`);
 
 // THE DIFFUSE BAND'S WIDTH, in units of a level's own cell size:
 // epsilon = K_EPS * dx_level (plans/2D-backport.md B7). Threaded into every
@@ -254,20 +272,20 @@ async function init() {
 
   const f_a     = device.createBuffer({ size: fSize, usage: U.STORAGE | U.COPY_DST });
   const f_b     = device.createBuffer({ size: fSize, usage: U.STORAGE });
-  const velBuf  = device.createBuffer({ size: NCELLS * 2 * 4, usage: U.STORAGE });
+  const velBuf  = device.createBuffer({ size: NCELLS * 2 * 4, usage: U.STORAGE | U.COPY_SRC });   // COPY_SRC: debugReadVelocity
   const forceBuf = device.createBuffer({ size: 16, usage: U.STORAGE | U.COPY_SRC | U.COPY_DST });
 
   // CardState: 26 floats = 104 bytes
   const cardStateBuf   = device.createBuffer({ size: 104, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
 
   const cardInit = new Float32Array([
-    W/2, cardY0(), 0.2,   // cx, cy, theta
+    W/2, cardY0(), THETA0,   // cx, cy, theta
     0, 0, 0,         // vx, vy, omega
     0, 0, 0,         // fx, fy, tz
     MASS, I_BODY, G_EFF,
     A, B,
     0.3, 0.025,      // v_max, o_max
-    W/2, cardY0(), 0.2,   // cx_old, cy_old, th_old
+    W/2, cardY0(), THETA0,   // cx_old, cy_old, th_old
     TAU,             // tau
     0, 0,            // y_total, x_total
     0, 0, 0, 0       // off_x, off_y, off_x_old, off_y_old
@@ -538,12 +556,27 @@ async function init() {
 
   // ONE STEP, as both the frame loop and debugStepSync encode it -- one
   // function so a benchmark times exactly what the page runs.
+  // THE ORDER IS LOAD-BEARING, and it is why the card's inertia is the
+  // CONFIGURED one. The fluid under the card (chi ~ 1) is forced to follow it
+  // and does, but because the step reads the body's velocity AFTER physics
+  // updates it while the body was charged with the velocity BEFORE, the body
+  // never pays for accelerating that interior fluid -- which is the standard
+  // immersed-boundary treatment of it (Uhlmann 2005: the interior is part of
+  // the body, not extra mass). What is conserved is card + OUTSIDE fluid.
+  // Measured by tools/probe-steer-inertia.js: an edge-on release from rest
+  // shows the extra inertia drop by ~1.0 pi a b (the interior's chi-mass,
+  // 1.14 pi a b) between ?coupling=paired and this order, at two I*; and
+  // paired's fluid momentum budget closes where this order's exceeds the
+  // impulse by exactly the interior's momentum. Reorder these and the card
+  // silently gains ~37% inertia at the default I*.
   function encodeStep(enc) {
     const stepBG = useB ? stepBG_ba : stepBG_ab;
     const frcBG  = useB ? frcBG_b  : frcBG_a;
     const frc = enc.beginComputePass(); frc.setPipeline(frcPL); frc.setBindGroup(0, frcBG); frc.dispatchWorkgroups(WGX, WGY); frc.end();
-    const phy = enc.beginComputePass(); phy.setPipeline(phyPL); phy.setBindGroup(0, phyBG); phy.dispatchWorkgroups(1); phy.end();
+    const phy = () => { const p = enc.beginComputePass(); p.setPipeline(phyPL); p.setBindGroup(0, phyBG); p.dispatchWorkgroups(1); p.end(); };
+    if (COUPLING === 'shipped') phy();
     const stp = enc.beginComputePass(); stp.setPipeline(stepPL); stp.setBindGroup(0, stepBG); stp.dispatchWorkgroups(WGX, WGY); stp.end();
+    if (COUPLING === 'paired') phy();
     useB = !useB;
   }
 
@@ -613,7 +646,7 @@ async function init() {
   // STEPS_PER_FRAME batches (N even, so useB returns to its frame-boundary
   // value), and read the step count and the card's state. Added for
   // tools/bench-amr-vs-dense.js; nothing on the page depends on it.
-  let liveMode = true;
+  let liveMode = !START_PAUSED;
   // ONE WRITER FOR liveMode, so the pause button's label cannot disagree with
   // the flag when a tool (window.__LBM.setLive, debugStepSync) writes it.
   // pacer.reset() on resume: a paused frame() never reaches the pacer, so its
@@ -629,6 +662,7 @@ async function init() {
     }
   }
   if (pauseBtn) pauseBtn.onclick = () => setLive(!liveMode);
+  if (START_PAUSED) setLive(false);   // label the button to match
   const controlsEl = document.getElementById('controls');
   if (controlsEl) for (const ev of ['input', 'change']) controlsEl.addEventListener(ev, () => { redrawWanted = true; });
   async function debugStepSync(n) {
@@ -678,6 +712,19 @@ async function init() {
       return { input: v[0], reach: v[1], mode: v[2], slew: v[3], fb: v[4], d: v[5], dd: v[6] };
     },
     steerDiag: () => steer.diag(),
+    // The fluid velocity field (lbm_step.wgsl's vel: u = u* + F/2rho, in
+    // BUFFER cells, x-major pairs) -- for tools/probe-steer-inertia.js, which
+    // asks whether the fluid INSIDE the card moves with it.
+    debugReadVelocity: async () => {
+      const buf = device.createBuffer({ size: NCELLS * 8, usage: U.MAP_READ | U.COPY_DST });
+      const enc = device.createCommandEncoder();
+      enc.copyBufferToBuffer(velBuf, 0, buf, 0, NCELLS * 8);
+      device.queue.submit([enc.finish()]);
+      await buf.mapAsync(GPUMapMode.READ);
+      const v = Array.from(new Float32Array(buf.getMappedRange().slice(0)));
+      buf.unmap(); buf.destroy();
+      return v;
+    },
   };
 
   // The scene's render pass, shared by the live frame and the paused repaint.
