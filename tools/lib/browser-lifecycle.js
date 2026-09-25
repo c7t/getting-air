@@ -426,10 +426,16 @@ async function assertPageHealthy(Runtime, watch, what, allowStatus) {
 // and a throw here would replace the tool's own error -- it prints a banner and
 // sets a nonzero exit code, which is what a caller scripting on the tool sees.
 async function teardown({ port, tabId, chrome, server, keepOpen }) {
+  // Park our OWN tab before the health check, not after: the tool has already
+  // judged its own page, and a config whose point is to trip a refusal (e.g.
+  // validate-d3-invariants.js's body-refine, which must end with the pool
+  // EXHAUSTED) otherwise leaves an `error:` in #status that the whole-browser
+  // check charges to the browser. Everything that check exists for -- the
+  // adapter, stray tabs, another run's errors -- it still sees.
+  if (!keepOpen && tabId) await parkTab(port, tabId);
   await reportBrowserHealth(port, chrome && chrome.chromeLog);
   if (keepOpen) return;
-  if (!chrome.started) { await parkTab(port, tabId); }
-  else {
+  if (chrome.started) {
     // Group kill: Chrome is spawned detached, so it leads its own process
     // group and its renderer/GPU children belong to it. Signalling just the
     // parent pid left those children alive holding a GPU context.
