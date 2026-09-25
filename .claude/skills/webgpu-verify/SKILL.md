@@ -47,7 +47,12 @@ DISPLAY=:0 nohup /opt/google/chrome/chrome \
 echo $! > /tmp/vpm-chrome.pid
 sleep 3
 curl -s http://localhost:9333/json/version   # confirms the debug port is up
+# optional: send it to its own workspace (0-based) so it isn't on top of your work
+wmctrl -lp | awk -v p=$(cat /tmp/vpm-chrome.pid) '$3==p {print $1}' | xargs -rI{} wmctrl -i -r {} -t 3
 ```
+
+The Node tools do the same when `CHROME_WORKSPACE=N` is set in the environment
+(`tools/lib/browser-lifecycle.js`'s `moveToWorkspace`).
 
 `DISPLAY=:0` is required — this launches headed (not `--headless`), since headless
 Chrome's WebGPU/GPU support is unreliable here and the real GPU process gives a much
@@ -107,8 +112,20 @@ canvas is a failure to render, not success.
   caused by anything in the driving script. Prefer: launch Chrome once already pointed
   at the target URL (as above), attach with `CDP({ port })` without navigating again,
   and drive everything through `Runtime.evaluate` / `Page.captureScreenshot` from
-  there. If you do need a fresh load, close the tab and open a genuinely new one
-  (`curl -X PUT http://localhost:9333/json/new?<url>`) rather than re-navigating.
+  there. If you do need a fresh load, navigate to a genuinely different URL
+  (`about:blank` in between is enough) rather than re-navigating to the same one.
+- **Never raise, activate or create a foreground tab in the debug Chrome.**
+  `/json/new`, `Target.activateTarget` and `Page.bringToFront` all ACTIVATE its
+  window, and this desktop's xfwm4 has `activate_action=switch`, so each one
+  yanks the user onto whatever workspace that Chrome lives on. `Page.navigate`
+  on an existing tab does not. A background tab (`Target.createTarget
+  {background:true}`) doesn't switch either but is `document.hidden` -- no rAF,
+  timers throttled ~700x -- so it is useless for this app. Reuse a visible tab.
+  `openTab()` in `tools/lib/browser-lifecycle.js` does exactly that: it claims a
+  visible `about:blank` / `about:blank#harness-idle` tab, and `teardown()`
+  PARKS the tab at `#harness-idle` instead of closing it, so only the first run
+  against a given Chrome ever needs `/json/new`. (Closing the last tab also
+  quits Chrome outright.)
 - **This app runs two independent WebGPU pipelines at once** (`main.js` for the LBM
   sim, `vpm.js` for the vortex-particle sim) — check `console --errors`-equivalent
   (the `Runtime.exceptionThrown` listener above) for either one; a validation error in

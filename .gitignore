@@ -2,14 +2,21 @@
 *.pdf
 AGAL/
 notes.txt
-plans/*
-!plans/perf-characterization.md
-!plans/AMR-vs-dense-validation.md
 transcripts/
 snapshots/
 https.py
 *.pem
 *~
 *.mp4
+# tools/render-d3-movie.js writes here by default, in whichever container
+# format was asked for. *.mp4 was already ignored; the other two are the same
+# thing under a different --out=.
+*.gif
+*.webm
 *.log
 telemetry.log
+
+# Emacs lock files (.#name, dangling symlinks) and autosaves (#name#).
+# Both are swept in by `git add -A`, and both just were.
+.#*
+\#*\#
