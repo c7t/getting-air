@@ -128,6 +128,12 @@ if (!(ASPECT > 0 && ASPECT <= 1)) throw new Error(`?aspect=${urlParams.get('aspe
 if (!Number.isFinite(ALPHA_DEG)) throw new Error(`?alpha=${urlParams.get('alpha')} must be a number of degrees`);
 const ALPHA = ALPHA_DEG * Math.PI / 180;
 const LIFT_SIGN = (ASPECT === 1 && ALPHA_DEG === 0) ? 1 : -1;   // the circle keeps its historical sign
+// Cm: the pitching moment about the body's CENTRE, per chord^2, POSITIVE
+// NOSE-UP (the sense that increases alpha: physics.wgsl turns theta by +tz,
+// and theta = alpha). Andersen, Pesavento & Wang (2005) fig. 12 reports the
+// same moment for this ellipse, which is what makes it a second, independent
+// comparison. Appended as a sixth trajectory column, so every reader of the
+// first five is unchanged.
 
 let U0 = parseFloat(urlParams.get('u0')) || 0.04;
 let RE = parseFloat(urlParams.get('re')) || 100;
@@ -426,7 +432,7 @@ async function init() {
   }
 
   document.getElementById('download').onclick = () => {
-    const header = "step,fx,fy,Cd,Cl\n";
+    const header = "step,fx,fy,Cd,Cl,Cm\n";
     const rows = trajectory.map(r => r.map(v => v.toFixed(6)).join(",")).join("\n");
     const blob = new Blob([header + rows], { type: 'text/csv' });
     const url = URL.createObjectURL(blob);
@@ -465,7 +471,8 @@ async function init() {
       const fx = d[6], fy = d[7];
       const Cd = 2 * fx / (U0 * U0 * D);
       const Cl = LIFT_SIGN * 2 * fy / (U0 * U0 * D);
-      trajectory.push([step, fx, fy, Cd, Cl]);
+      const Cm = 2 * d[8] / (U0 * U0 * D * D);
+      trajectory.push([step, fx, fy, Cd, Cl, Cm]);
       stage.unmap();
     }
     return { step, history: trajectory.slice() };
@@ -572,7 +579,8 @@ async function init() {
         const fx = d[6], fy = d[7];
         const Cd = 2 * fx / (U0 * U0 * D);
         const Cl = LIFT_SIGN * 2 * fy / (U0 * U0 * D);
-        if (st.step < 500000) trajectory.push([st.step, fx, fy, Cd, Cl]);
+        const Cm = 2 * d[8] / (U0 * U0 * D * D);
+        if (st.step < 500000) trajectory.push([st.step, fx, fy, Cd, Cl, Cm]);
 
         if (performance.now() - lastT > 250) {
           statusEl.textContent = `step ${st.step}  Re=${RE.toFixed(0)}  Cd=${Cd.toFixed(3)}  Cl=${Cl.toFixed(3)}`;

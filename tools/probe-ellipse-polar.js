@@ -94,9 +94,10 @@ async function main() {
         // containment), which would average to a perfectly plausible 0.
         const dead = !finite || win.slice(-4).every(r => r[1] === 0 && r[2] === 0);
         const cd = mean(win.map(r => r[3])), cl = mean(win.map(r => r[4])), clsd = sd(win.map(r => r[4]));
-        const row = { config: cfg.name, alpha, cd, cl, ld: cl / cd, clsd, dead, tau: p.TAU, chord: p.D, secs: (Date.now() - t0) / 1000 };
+        const cm = mean(win.map(r => r[5]));
+        const row = { config: cfg.name, alpha, cd, cl, cm, ld: cl / cd, clsd, dead, tau: p.TAU, chord: p.D, secs: (Date.now() - t0) / 1000 };
         results.push(row);
-        console.log(`  ${cfg.name.padEnd(14)} alpha ${String(alpha).padStart(4)}  Cd ${cd.toFixed(4)}  Cl ${cl.toFixed(4)}  L/D ${(cl / cd).toFixed(3).padStart(7)}`
+        console.log(`  ${cfg.name.padEnd(14)} alpha ${String(alpha).padStart(4)}  Cd ${cd.toFixed(4)}  Cl ${cl.toFixed(4)}  Cm ${cm.toFixed(4)}  L/D ${(cl / cd).toFixed(3).padStart(7)}`
           + `  Cl sd ${clsd.toFixed(4)}  (tau ${p.TAU.toFixed(5)}, chord ${p.D.toFixed(1)}, ${row.secs.toFixed(0)} s)${dead ? '  FLUID DIED -- read nothing' : ''}`);
       }
     }

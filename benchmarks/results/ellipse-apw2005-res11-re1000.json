@@ -1,0 +1,44 @@
+{
+  "args": {
+    "baseUrl": "https://localhost:4444",
+    "port": 9333,
+    "alphas": "10,40",
+    "configs": "bounceback:bounceback=1",
+    "res": 11,
+    "blockage": 32,
+    "re": 1000,
+    "u0": 0.05,
+    "aspect": 0.125,
+    "transient": 30,
+    "window": 30,
+    "out": "benchmarks/results/ellipse-apw2005-res11-re1000.json"
+  },
+  "results": [
+    {
+      "config": "bounceback",
+      "alpha": 10,
+      "cd": 0.17664801441909123,
+      "cl": 0.4365071839032073,
+      "cm": 0.14021180096703267,
+      "ld": 2.471056271640899,
+      "clsd": 0.017364152650460433,
+      "dead": false,
+      "tau": 0.5096,
+      "chord": 64,
+      "secs": 63.559
+    },
+    {
+      "config": "bounceback",
+      "alpha": 40,
+      "cd": 1.9163936890351272,
+      "cl": 1.9882919229567046,
+      "cm": 0.10885330674652018,
+      "ld": 1.037517465400221,
+      "clsd": 0.4961399235431117,
+      "dead": false,
+      "tau": 0.5096,
+      "chord": 64,
+      "secs": 63.563
+    }
+  ]
+}
