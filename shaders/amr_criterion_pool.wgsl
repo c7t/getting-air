@@ -1,15 +1,15 @@
 // Milestone 9 (plans/AMR-multilevel.md): per-quadrant vorticity criterion
 // for deciding whether a level-(m+1) child should exist -- sibling of
-// amr_criterion.wgsl (which stays exactly as-is: it decides L0->L1,
+// the deleted dense-parent criterion (which decided L0->L1 until U7-6f,
 // reading L0's own dense velBuf; this decides L(m)->L(m+1) for any m>=1,
 // reading level m's own finePoolVel).
 //
 // Dispatch: (2, 2, MAX_FINE_BLOCKS[m]) with workgroup_size(8,8). A parent
 // slot's own interior is 2*RB x 2*RB cells -- exactly 4 RB*RB=64-cell
 // quadrants, each exactly one workgroup (same "one workgroup = one
-// reduction unit" convention as amr_criterion.wgsl/amr_force*.wgsl).
+// reduction unit" convention as amr_force1.wgsl).
 // workgroup_id.xy IS the quadrant (qx,qy) directly -- no separate
-// quadrant math needed the way amr_step1_pool.wgsl's quadrant lookup
+// quadrant math needed the way amr_step1.wgsl's quadrant lookup
 // requires, since here we're producing a criterion for a NOT-YET-existing
 // child, not consuming an already-assigned quadrant.
 //
@@ -31,16 +31,95 @@
 // consultation or coarse interpolation), unlike the dense L0 criterion
 // which must wrap around the WHOLE domain itself.
 
+// @include "common_criterion.wgsl"
+
 @group(0) @binding(0) var<storage, read>       vel            : array<f32>; // parent level's finePoolVel
 @group(0) @binding(1) var<storage, read>       slotToBlock    : array<i32>; // parent level's own
 @group(0) @binding(2) var<storage, read_write> childCriterion : array<f32>; // child level's blockCriterion
+// Parent level's blockSlot, for the ring-free stencil below. Always bound;
+// only read when GHOST == 0.
+@group(0) @binding(3) var<storage, read>       blockSlot      : array<i32>; // parent level's own
 
 override RB : u32;
 override NBX_PARENT : u32;
-const GHOST = 2u;
+// Only read on the ring-free path; every ringed pipeline leaves it at the
+// default, where it is folded away unused.
+override NBY_PARENT : u32 = 1u;
+
+// GHOST is an OVERRIDE since plans/uniform-levels.md U4-1: the ROOT level has
+// no ring (amr2d.mjs's ghostDepthAtLevel(0) is 0). Default 2 keeps every
+// existing pipeline byte-identical.
+override GHOST : u32 = 2u;
 
 fn velAt(slot: u32, fx: u32, fy: u32, FB: u32, comp: u32) -> f32 {
   return vel[(slot * (FB * FB) + fy * FB + fx) * 2u + comp];
+}
+
+// One stencil tap, resolved against the OWNING same-level tile when it leaves
+// this one's interior.
+//
+// THE RING-FREE PATH, AND IT IS DERIVED FROM GHOST RATHER THAN FLAGGED. At
+// GHOST == 0 a slot is exactly its own 2*RB x 2*RB cells and there is no ring
+// to read, so resolving against the neighbour is not an option among several
+// -- it is the only correct behaviour. A separate override could be left unset
+// on a ring-free pipeline, and U3 already paid for exactly that shape once
+// (the root inheriting DIRECT_GHOST: 0 from step1Constants, which asked a
+// level with no ring to read a ghost cell nothing fills).
+//
+// The rule is amr2d.mjs's resolveSource, which reads the POOL's own ring depth
+// -- at 0 a tap of -1 lands at 2*RB - 1 in the tile on the low side, and one
+// of 2*RB lands at 0 in the tile on the high side. The block grid is periodic,
+// matching every other kernel here.
+//
+// THE ROOT IS ALWAYS FULL, so `blockSlot` is the identity and the `< 0` branch
+// is unreachable there. It is written anyway because the same ring-free path
+// would be wrong to leave open-coded if a future level is ever ring-free and
+// sparse, and because a `cannot happen` branch that returns a plausible number
+// silently is exactly what plans/2D-backport.md B6-9c is about: 0 velocity is
+// what a quiescent cell reads.
+fn tapVel(bx: u32, by: u32, sx: i32, sy: i32, FB: u32, comp: u32) -> f32 {
+  var nx = sx; var ny = sy;
+  var tbx = bx; var tby = by;
+  if (nx < 0)            { nx += i32(FB); tbx = (bx + NBX_PARENT - 1u) % NBX_PARENT; }
+  else if (nx >= i32(FB)) { nx -= i32(FB); tbx = (bx + 1u) % NBX_PARENT; }
+  if (ny < 0)            { ny += i32(FB); tby = (by + NBY_PARENT - 1u) % NBY_PARENT; }
+  else if (ny >= i32(FB)) { ny -= i32(FB); tby = (by + 1u) % NBY_PARENT; }
+  let s = blockSlot[tby * NBX_PARENT + tbx];
+  if (s < 0) { return 0f; }
+  return velAt(u32(s), u32(nx), u32(ny), FB, comp);
+}
+
+// Read by common_criterion.wgsl's wgReduceMax1 -- see its own comment.
+// RING_FREE_TAPS (plans/2D-backport.md B6-1): 1 on the explode/coalesce path.
+// The +-1 stencil at a tile's edge reaches one cell past the interior. On the
+// interp path that cell is the RING, which holds a collided, parent-
+// interpolated state -- close enough to a velocity. On the explode path the
+// ring is an inbox/outbox (plans/uniform-levels.md 2.5): its moments are not a
+// velocity, and reading them measured as spurious edge vorticity that drove
+// level-2 refinement until the pool starved (amr-dev-invariants: 2669
+// refines refused at step 5120). So the tap is resolved the way the root's
+// already is -- into the SAME-level neighbour tile's interior -- and where no
+// neighbour exists (a coarse seam), it takes the tile's own edge cell, i.e. a
+// one-sided difference. Default 0 keeps the interp path byte-identical.
+override RING_FREE_TAPS : u32 = 0u;
+
+// Interior-local (ix, iy) of tile (bx, by), one cell past either edge allowed.
+fn tapInterior(slot: u32, bx: u32, by: u32, ix: i32, iy: i32, FB: u32, comp: u32) -> f32 {
+  let RB2 = i32(RB * 2u);
+  var nx = ix; var ny = iy;
+  var tbx = bx; var tby = by;
+  if (nx < 0)         { nx += RB2; tbx = (bx + NBX_PARENT - 1u) % NBX_PARENT; }
+  else if (nx >= RB2) { nx -= RB2; tbx = (bx + 1u) % NBX_PARENT; }
+  if (ny < 0)         { ny += RB2; tby = (by + NBY_PARENT - 1u) % NBY_PARENT; }
+  else if (ny >= RB2) { ny -= RB2; tby = (by + 1u) % NBY_PARENT; }
+  var s = i32(slot);
+  if (tbx != bx || tby != by) { s = blockSlot[tby * NBX_PARENT + tbx]; }
+  if (s < 0) {
+    // No same-level neighbour: the tile's own edge cell.
+    s = i32(slot);
+    nx = clamp(ix, 0, RB2 - 1); ny = clamp(iy, 0, RB2 - 1);
+  }
+  return velAt(u32(s), u32(nx) + GHOST, u32(ny) + GHOST, FB, comp);
 }
 
 var<workgroup> wg_omega : array<f32, 64>;
@@ -61,19 +140,36 @@ fn main(
   var omega = 0f;
   if (blockID >= 0) {
     let fx = lx + GHOST; let fy = ly + GHOST;
-    // Discrete vorticity: du_y/dx - du_x/dy, same formula as
-    // amr_criterion.wgsl/amr_render.wgsl -- ghost border guarantees fx+-1
-    // in range (see header).
-    omega = (velAt(slot, fx + 1u, fy, FB, 1u) - velAt(slot, fx - 1u, fy, FB, 1u)) * 0.5f
-          - (velAt(slot, fx, fy + 1u, FB, 0u) - velAt(slot, fx, fy - 1u, FB, 0u)) * 0.5f;
+    if (GHOST == 0u) {
+      // Ring-free: every tap that leaves the tile is resolved against the
+      // owning one. See tapVel.
+      let bx = u32(blockID) % NBX_PARENT;
+      let by = u32(blockID) / NBX_PARENT;
+      let ix = i32(fx); let iy = i32(fy);
+      omega = discreteCurl(tapVel(bx, by, ix + 1, iy, FB, 1u), tapVel(bx, by, ix - 1, iy, FB, 1u),
+                           tapVel(bx, by, ix, iy + 1, FB, 0u), tapVel(bx, by, ix, iy - 1, FB, 0u));
+    } else if (RING_FREE_TAPS != 0u) {
+      // Explode path: never read the ring -- see RING_FREE_TAPS.
+      let bx = u32(blockID) % NBX_PARENT;
+      let by = u32(blockID) / NBX_PARENT;
+      let ix = i32(lx); let iy = i32(ly);
+      omega = discreteCurl(tapInterior(slot, bx, by, ix + 1, iy, FB, 1u), tapInterior(slot, bx, by, ix - 1, iy, FB, 1u),
+                           tapInterior(slot, bx, by, ix, iy + 1, FB, 0u), tapInterior(slot, bx, by, ix, iy - 1, FB, 0u));
+    } else {
+      // The ghost border guarantees fx+-1 is in range (see header), which is
+      // the whole difference from the dense kernel's periodic wrap.
+      omega = discreteCurl(velAt(slot, fx + 1u, fy, FB, 1u), velAt(slot, fx - 1u, fy, FB, 1u),
+                           velAt(slot, fx, fy + 1u, FB, 0u), velAt(slot, fx, fy - 1u, FB, 0u));
+    }
   }
 
   wg_omega[lid] = abs(omega);
   workgroupBarrier();
+  // Unconditional: every invocation must reach the barriers inside.
+  wgReduceMax1(lid);
 
   if (lid == 0u && blockID >= 0) {
-    var m = 0f;
-    for (var i = 0u; i < 64u; i++) { m = max(m, wg_omega[i]); }
+    let m = wg_omega[0];
     let bx = u32(blockID) % NBX_PARENT;
     let by = u32(blockID) / NBX_PARENT;
     let nbxChild = NBX_PARENT * 2u;

@@ -1,27 +1,25 @@
-// Milestone 7 (plans/AMR-multilevel.md): fine -> parent-pool averaging
-// (restriction) for every L(m)->L(m-1) hop with m>=2 -- sibling of
-// amr_average_f2c.wgsl, which stays exactly as-is and is now specifically
-// the L1->L0 case (writing into the dense buffer via cellIndex()).
+// Fine -> parent-pool averaging (restriction) for every L(m) -> L(m-1) hop
+// with m>=2: the parent is another POOL tile, not the dense grid.
+// Milestone 7 (plans/AMR-multilevel.md).
 //
-// Same restriction math (arithmetic-mean rho, momentum-weighted velocity,
-// inverse-Dupuis-Chopard-rescaled fneq) -- the only structural difference
-// is WHERE the averaged result is written: not a dense cellIndex()
-// address, but a specific (lx,ly) position inside the PARENT's own FB*FB
-// tile, found via this slot's own parentSlot+quadrant (the same two
-// fields amr_interp_pool_parent.wgsl already reads for the forward/
-// prolongation direction -- no new per-slot fields needed here).
-//
-// Dispatch shape identical to amr_average_f2c.wgsl: (1, 1, MAX_FINE_BLOCKS)
-// with workgroup_size(8,8) -- RB*RB=64 cells is exactly one workgroup, one
-// thread per coarse-equivalent cell of THIS level's own footprint.
+// The kernel itself is shaders/common_average.wgsl, shared with
+// the deleted dense-parent entry file since plans/2D-backport.md B3-2; the pool parent's tau
+// and destination addressing are shaders/common_avg_parent_pool.wgsl. What is
+// left here is the binding layout (which must match avgPoolBGL in the pages
+// one-to-one).
 
 // @include "common_lattice.wgsl"
 // @include "common_fpack.wgsl"
 
 struct LevelParams {
-  nbx: u32,        // unused here (destination is parentSlot+quadrant, not a
-  nby: u32,        // cellIndex() lookup) -- shared verbatim with the interp/
-                   // step1 pool-parent shaders' uniform, not a near-duplicate.
+  nbx: u32,        // READ ON THE ROOT-PARENT PATH ONLY (PARENT_GHOST = 0),
+  nby: u32,        // where parentSlot/quadrant are derived from this level's
+                   // own block index instead of read -- see
+                   // common_avg_parent_pool.wgsl. Unused on every ringed
+                   // parent, where the destination is parentSlot+quadrant and
+                   // not a block-index lookup. Shared verbatim with the
+                   // interp/step1 pool-parent shaders' uniform, not a
+                   // near-duplicate. `nby` genuinely is unused here.
   parentTau: f32,
   dxL: f32,        // also unused here -- see amr_interp_pool_parent.wgsl's
                    // comment; real field, not padding (amr_force1_pool.wgsl
@@ -32,116 +30,18 @@ struct LevelParams {
 @group(0) @binding(1) var<storage, read>       f_pool        : array<u32>;
 @group(0) @binding(2) var<storage, read_write> f_parent_pool : array<u32>;
 @group(0) @binding(3) var<storage, read>       slotToBlock   : array<i32>;
+// UNREAD ON THE ROOT-PARENT PIPELINE (PARENT_GHOST = 0), where both are
+// derived from the child's own block index instead. They stay DECLARED because
+// WGSL module scope has no conditional bindings and this entry file serves both
+// pipelines; main-amr.js binds a sentinel buffer there rather than a plausible
+// one, so a read that should not happen cannot return a number that looks like
+// data (plans/2D-backport.md B6-9c). Same treatment as the interp entry's.
 @group(0) @binding(4) var<storage, read>       parentSlot    : array<i32>;
 @group(0) @binding(5) var<storage, read>       quadrant      : array<u32>;
+// The child pool's active-slot list, read only by common_average.wgsl's
+// `mainStride` (?launch=stride).
+@group(0) @binding(6) var<storage, read>       activeList    : ActiveList;
+// @include "common_active_list.wgsl"
 
-override RB : u32;
-// ── Measurement instrument: ?benchSkip=<group>-noop ──────────────────────────
-// Returns before touching any buffer, so the pass is still encoded and
-// dispatched at full width but does no work. Skipping the pass ENTIRELY vs.
-// running this no-op variant separates the fixed per-pass cost (encode,
-// dispatch, pipeline switch, barrier) from the work the pass actually does --
-// a split the plain ?benchSkip= groups cannot make, because removing a pass
-// removes both at once.
-//
-// Measured 2026-09-07, desktop RTX 4080, res=8 levels=3 blockage=3.3, via
-// tools/bench-amr.js --skip. Share of frame GPU time recovered:
-//
-//   group    pass removed   dispatched as no-op   -> work
-//   ghost    15.5-18.5%     1.7-4.3%                 ~13%
-//   interp   17.3%          2.0%                     ~15%
-//   avg      15.9%          5.6%                     ~10%
-//
-// So AMR coupling costs its WORK, not its pass count, and fusing coupling
-// passes is not a lever -- the same verdict plans/perf-characterization.md
-// reached for the force pass by a different route. Default 0 is byte-identical
-// to having no instrument at all (an override constant, folded at pipeline
-// creation), matching how ?f16=0 is kept in the tree.
-override NOOP : u32 = 0u;
-
-const GHOST = 2u;
-
-@compute @workgroup_size(8, 8)
-fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wgid: vec3<u32>) {
-  if (NOOP != 0u) { return; } // see the NOOP override above
-  let lcx = lid.x; let lcy = lid.y; // coarse-cell-local coords within this level's own footprint
-  let slot = wgid.z;
-
-  let blockID = slotToBlock[slot];
-  if (blockID < 0) { return; }
-
-  let FB = RB * 2u + 2u * GHOST;
-  let poolPlaneStride = arrayLength(&f_pool) / 9u;
-
-  let fx0 = GHOST + 2u * lcx; let fx1 = fx0 + 1u;
-  let fy0 = GHOST + 2u * lcy; let fy1 = fy0 + 1u;
-  let children = array<u32, 4>(
-    slot * (FB * FB) + fy0 * FB + fx0, slot * (FB * FB) + fy0 * FB + fx1,
-    slot * (FB * FB) + fy1 * FB + fx0, slot * (FB * FB) + fy1 * FB + fx1
-  );
-
-  var rho_sum = 0f;
-  var rhou_x_sum = 0f; var rhou_y_sum = 0f;
-  var f_children: array<array<f32, 9>, 4>;
-  var rho_children: array<f32, 4>;
-  var ux_children: array<f32, 4>;
-  var uy_children: array<f32, 4>;
-
-  for (var c = 0u; c < 4u; c++) {
-    let cell = children[c];
-    var rho = 0f; var ux = 0f; var uy = 0f;
-    var f: array<f32, 9>;
-    for (var i = 0u; i < 9u; i++) {
-      f[i] = fUnpack(f_pool[fIdx(i, poolPlaneStride, cell)], i);
-      rho += f[i];
-      ux  += f[i] * f32(ex[i]);
-      uy  += f[i] * f32(ey[i]);
-    }
-    ux /= max(rho, 1e-6f); uy /= max(rho, 1e-6f);
-    f_children[c] = f;
-    rho_children[c] = rho; ux_children[c] = ux; uy_children[c] = uy;
-    rho_sum += rho;
-    rhou_x_sum += rho * ux;
-    rhou_y_sum += rho * uy;
-  }
-
-  let rho_avg = rho_sum * 0.25f;
-  let rho_sum_den = max(rho_sum, 1e-6f);
-  let ux_avg = rhou_x_sum / rho_sum_den;
-  let uy_avg = rhou_y_sum / rho_sum_den;
-
-  // Relative to THIS level's own parent, not L0 -- see header.
-  let tau_coarse = levelParams.parentTau;
-  let tau_fine = 2.0f * tau_coarse - 0.5f;
-  let rescale = 2.0f * tau_coarse / tau_fine;
-
-  var fneq_avg: array<f32, 9>;
-  for (var i = 0u; i < 9u; i++) {
-    var s = 0f;
-    for (var c = 0u; c < 4u; c++) {
-      s += f_children[c][i] - feqD2Q9(rho_children[c], ux_children[c], uy_children[c], i);
-    }
-    fneq_avg[i] = s * 0.25f;
-  }
-
-  // Destination: a specific (lx,ly) inside the PARENT's own tile, found via
-  // this slot's parentSlot+quadrant (no cellIndex() -- the parent isn't the
-  // dense grid, see file header).
-  let pSlot = u32(parentSlot[slot]);
-  let q = quadrant[slot];
-  let qx = q & 1u;
-  let qy = (q >> 1u) & 1u;
-  let plx = qx * RB + lcx;
-  let ply = qy * RB + lcy;
-  let parentPlaneStride = arrayLength(&f_parent_pool) / 9u;
-  let parentCell = pSlot * (FB * FB) + (ply + GHOST) * FB + (plx + GHOST);
-
-  var fo: array<f32,9>;
-  for (var i = 0u; i < 9u; i++) {
-    fo[i] = feqD2Q9(rho_avg, ux_avg, uy_avg, i) + rescale * fneq_avg[i];
-  }
-  let nw = fWords();
-  for (var wi = 0u; wi < nw; wi++) {
-    f_parent_pool[wi * parentPlaneStride + parentCell] = fPack(fo[fLo(wi)], fo[fHi(wi)], wi);
-  }
-}
+// @include "common_avg_parent_pool.wgsl"
+// @include "common_average.wgsl"

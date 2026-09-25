@@ -67,7 +67,7 @@
 // magnitude is tiny (~0.02, vs ux's ~0.04) almost everywhere except right at
 // that shear layer, so relL2 (which normalizes by the reference field's own
 // norm) is a harsh metric here: a handful of cells where two INDEPENDENTLY-
-// implemented WGSL kernels (lbm_step.wgsl vs amr_step.wgsl/amr_step1.wgsl)
+// implemented WGSL kernels (lbm_step.wgsl vs amr_step1.wgsl)
 // disagree by a small absolute amount, right where gradients are sharpest,
 // can dominate the norm of an otherwise-tiny field. Cd/ux/rho are the
 // reliable corroborating signals for steady, near-symmetric cases (Re=20,
@@ -125,7 +125,7 @@ function parseArgs(argv) {
     // default) -- see this file's own header, "KNOWN ISSUE" -- diffuse
     // coupling is currently failing its own Cd/St check independent of
     // this tool. Pass --diffuse to override.
-    blockage: 24, upstream: 8, u0: 0.04, seed: 12345, bounceback: true, perturb: 0,
+    blockage: 24, upstream: 12, u0: 0.04, seed: 12345, bounceback: true, perturb: 0,
     mode: 'both',
     maxFineBlocksByLevel: {},
     tol: 0.05, tolOmega: 0.15, tolFullrefine: 0.01,
@@ -328,7 +328,7 @@ async function main() {
   const chrome = await ensureChrome(opts.port);
   if (chrome.started) await new Promise(r => setTimeout(r, 2000));
   const tabId = chrome.started ? await firstTab(opts.port) : await openTab(opts.port, 'about:blank');
-  const client = await CDP({ port: opts.port, target: tabId });
+  const client = await CDP({ local: true, port: opts.port, target: tabId });
   const { Runtime, Page } = client;
   await Runtime.enable();
   await Page.enable();

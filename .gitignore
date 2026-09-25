@@ -4,7 +4,6 @@ AGAL/
 notes.txt
 transcripts/
 snapshots/
-https.py
 *.pem
 *~
 *.mp4

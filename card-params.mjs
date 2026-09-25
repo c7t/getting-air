@@ -122,11 +122,34 @@ export const AMR_EQUIVALENT_DENSE_RES_LOG2 =
 // silently back into a wrong comparison.
 export const DENSE_DEFAULT_RES_LOG2 = 8;
 
-// Resolution clamp both pages enforce. Kept here so the AMR-vs-dense
-// resolution ladder (tools/lib/amr-resolution-mapping.js) and the pages
-// agree on one set of bounds.
-export const RES_LOG2_MIN = 6;
+// The range of ?res= both card pages accept -- REFUSED outside it, never
+// clamped (2026-09-23). The floor was 6 and the page CLAMPED to it silently,
+// so `?res=5&levels=4` and `?res=4&levels=5` both ran a 64-cell root and the
+// pair read as a grid-scale ladder while really being one root at two body
+// resolutions (plans/uniform-levels.md S8-5). A clamp that changes the
+// experiment without saying so is worse than a refusal.
+//
+// 5 IS STRUCTURAL, not a taste: the root pool's tile is 2*RB = 16 cells and
+// the root itself is allocated in QUADS of tiles, so W must hold 2x2 root
+// tiles = 32 cells. res 4 (one tile) is refused by the allocator as
+// "MAX_FINE_BLOCKS (1) must be a multiple of 4" -- measured. Low roots
+// are the point -- the grid ladder (S8-5) measured a 4x coarser root at the
+// same body resolution invariant to 0.2% in Cd for a third of the cell
+// updates, which is what the phone needs -- but they are not free: the card's
+// chord is W/BLOCKAGE root cells (4 at res 5), and the sponge is SPONGE_W = 4
+// ROOT cells a side, so at res 5 the sponge is a quarter of the domain. That is a
+// physics choice the URL makes, not one this module should hide.
+export const RES_LOG2_MIN = 5;
 export const RES_LOG2_MAX = 11;
+
+// Why `resLog2` cannot run, or null if it can. The pages hand the string to
+// error-overlay.mjs's refuseConfig.
+export function resLog2Problem(resLog2) {
+  if (!Number.isInteger(resLog2)) return `?res=${resLog2} must be an integer (log2 of the root grid width)`;
+  if (resLog2 < RES_LOG2_MIN) return `?res=${resLog2} is below ${RES_LOG2_MIN}: the root pool needs 2x2 tiles of 16 cells (W = 2^res >= 32)`;
+  if (resLog2 > RES_LOG2_MAX) return `?res=${resLog2} is above ${RES_LOG2_MAX}`;
+  return null;
+}
 
 // ── Reynolds <-> tau ─────────────────────────────────────────────────────────
 // nu = (tau - 0.5)/3 and Re = 2*u*a/nu, solved each way. The factor of 2 is
@@ -233,8 +256,6 @@ export function parseCardParams(params) {
 // defaults one step lower, so that at its default levels=2 it covers the same
 // physical extent as the dense page with a coarser far field -- the AMR win).
 export function parseResLog2(params, fallback) {
-  let resLog2 = parseInt(params.get('res')) || fallback;
-  if (resLog2 < RES_LOG2_MIN) resLog2 = RES_LOG2_MIN;
-  if (resLog2 > RES_LOG2_MAX) resLog2 = RES_LOG2_MAX;
-  return resLog2;
+  // No clamp -- see resLog2Problem, which the caller must consult.
+  return params.has('res') ? parseInt(params.get('res')) : fallback;
 }

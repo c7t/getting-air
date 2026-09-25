@@ -37,7 +37,7 @@ function parseArgs(argv) {
 }
 
 async function connect(port) {
-  const client = await CDP({ port });
+  const client = await CDP({ local: true, port });
   const { Runtime, Page } = client;
   await Runtime.enable();
   await Page.enable();

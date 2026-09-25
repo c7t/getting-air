@@ -40,6 +40,14 @@
 // DEPENDS ON THE INCLUDER declaring the overrides `REFINE_THRESH`,
 // `N_REFINE_INC`, `N_REFINE_MAX` and `MAX_LEVEL` -- the same arrangement
 // common_geometry.wgsl uses for `override W`/`override H`.
+//
+// THIS FILE HAS TWO INCLUDERS, amr_manage_pool.wgsl (2D) and
+// d3_manage_q{19,27}.wgsl (3D, which uses the ladder alone), so it must depend
+// on nothing else. The 2D manager's geometry predicates, which need the `state`
+// binding, `W`/`H`, `HAS_BODY` and `BOX_REFINE`, live in
+// common_refine_predicates.wgsl for that reason: appended here they left the 3D
+// manager with undeclared identifiers, which WGSL rejects even in a function
+// nobody calls (see common_criterion.wgsl's header for the general case).
 
 // Desired level for a block whose physical log2|omega| is epsPhys.
 // Returns 0 (no refinement) up to MAX_LEVEL (finest configured).
@@ -69,3 +77,4 @@ fn desiredLevel(epsPhys: f32) -> i32 {
 fn desiredLevelCoarsen(epsPhys: f32) -> i32 {
   return desiredLevelAt(epsPhys, COARSEN_THRESH);
 }
+

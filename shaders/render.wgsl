@@ -27,8 +27,24 @@ fn vs_main(@builtin(vertex_index) vi : u32) -> VSOut {
   return out;
 }
 
+// THE DIFFUSE BAND'S WIDTH, as a multiple of THIS level's own cell size --
+// epsilon = K_EPS * dx_level. It was a bare literal here and an override only
+// on the pool path, so the one number that sets how sharp the solid boundary
+// is could not be swept across the whole solver (plans/2D-backport.md B7).
+//
+// 1.5 is the value every one of these sites already had, so the default is
+// byte-identical to the previous build. ?kEps= moves all of them together.
+//
+// WHY IT IS WORTH A KNOB. CLAUDE.md records `dense-reference` and
+// `amr-N2-diffuse` failing Cd at Re=100 and diagnoses it as diffuse-interface
+// width -- the band is a fixed number of cells regardless of resolution, so
+// the effective body radius exceeds the nominal one and Cd converges from
+// ABOVE. The instrument that settles that is a BAND ladder at fixed
+// resolution, not a resolution ladder (which moves the band and everything
+// else at once), and a band ladder needs this to be a parameter.
+override K_EPS : f32 = 1.5f;
 fn get_chi(phi: f32) -> f32 {
-    return chiFromPhiEps(phi, 1.5f);
+    return chiFromPhiEps(phi, K_EPS);
 }
 
 fn get_uy(x: i32, y: i32) -> f32 {
@@ -77,7 +93,9 @@ fn fs_main(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> {
   let fx = uv.x * f32(W) + subX; let fy = (1.0 - uv.y) * f32(H) + subY;
   let ix = i32(fx); let iy = i32(fy);
   
-  let chi = get_chi(get_phi(vec2(fx, fy), state));
+  // The render draws the WINDOW; under ?window=0 the body lives in buffer
+  // coordinates, so this is the one place that converts the other way.
+  let chi = get_chi(get_phi(windowToBufferPos(vec2(fx, fy), state), state));
 
   // Discrete vorticity: du_y/dx - du_x/dy
   let omega = (get_uy(ix + 1, iy) - get_uy(ix - 1, iy)) * 0.5f

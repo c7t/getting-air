@@ -110,10 +110,28 @@ wgsl: ## validate every WGSL shader with naga (needs Rust-built naga)
 
 .PHONY: js
 js: ## syntax-check every JS/MJS module with `node --check`
+# `node --check FILE` PARSES AS A SCRIPT, AND ON A FILE THAT USES ESM `import`
+# IT EXITS 0 WITHOUT CHECKING ANYTHING. Measured on node v26.1.0:
+#
+#     printf 'const a = {p: 1\nb();\n'                  > s.js   -> exit 1  caught
+#     printf 'import x from "./y.mjs";\nconst a = {p: 1\nb();\n' > m.js -> exit 0  MISSED
+#
+# Every page entry point here (main*.js) opens with `import`, so this gate --
+# CLAUDE.md's first one -- was silently skipping the exact files most likely to
+# break, and had been since they became modules. Found 2026-09-15 when a
+# mangled object literal in main.js passed `make js` and then wedged
+# index.html at "initializing..." with an uncaught SyntaxError, which only the
+# GPU boot smoke caught.
+#
+# Piping the file to stdin under --input-type=module is what actually parses it
+# as a module. It is used for EVERY file, not just the ones that look like
+# modules: a CommonJS file is valid module syntax too (`require(...)` is a call
+# and `module.exports = x` an assignment), so this strictly widens what is
+# checked rather than trading one blind spot for another.
 	@command -v node >/dev/null 2>&1 || { echo "node not found -- install Node.js"; exit 1; }
 	@test -n "$(strip $(JS))" || { echo "no JS modules found matching *.js or *.mjs (run from repo root?)"; exit 1; }
 	@rc=0; for f in $(JS); do \
-	  if out=$$(node --check "$$f" 2>&1); then echo "  ok    $$f"; \
+	  if out=$$(node --input-type=module --check < "$$f" 2>&1); then echo "  ok    $$f"; \
 	  else echo "  FAIL  $$f"; echo "$$out" | sed 's/^/        /'; rc=1; fi; \
 	done; \
 	if [ $$rc -eq 0 ]; then echo "js: $(words $(JS)) module(s) parse"; else echo "js: FAILED"; fi; \

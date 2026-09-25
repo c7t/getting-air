@@ -83,19 +83,30 @@ fn main() {
   if (state.y_total >= wrap_y) { state.y_total -= wrap_y; }
   else if (state.y_total <= -wrap_y) { state.y_total += wrap_y; }
 
-  // 5. Moving Window Panning
-  // We want to keep (cx, cy) near (W/2, H*2/3)
-  let initial_cx = f32(W) / 2.0f;
-  let initial_cy = f32(H) / 2.0f;
-
+  // 5. THE BODY'S POSITION, AND THE VIEW, ARE NOW SEPARATE THINGS.
+  //
+  // The body is integrated in BUFFER coordinates and wrapped into
+  // [0, W) x [0, H) every step, so its magnitude -- and therefore the ULP of
+  // its sub-cell position, which get_phi and the whole solid coupling inherit
+  // -- is bounded by the domain, not by how long the page has been running.
+  //
+  // THE VIEW TRACKS TRAVEL, NOT POSITION, and that distinction cost a
+  // measurement to find. Deriving off from the body's absolute position
+  // (floor(cx - W/2)) assumes the view is centred on the body. It is not:
+  // main-cylinder.js places its cylinder UPSTREAM diameters in, at cx = 170.67
+  // with W = 512, so that put off_x at 426, the sponge band landed mid-domain
+  // and Cd came back 808.897 against a literature 1.35. off therefore keeps
+  // deriving from x_total, and only its INTEGER part is ever consulted.
+  //
+  // So x_total/y_total are still load-bearing for the VIEW (and for the trail
+  // and CSV export, via card-total.mjs) but no longer for the BODY. That is
+  // the half of card-total.mjs's rationale that B5 retired -- see its header.
+  state.cx = wrapf(state.cx + state.vx, f32(W));
+  state.cy = wrapf(state.cy + state.vy, f32(H));
   let shift_x = i32(floor(state.x_total));
   let shift_y = i32(floor(state.y_total));
-
   state.off_x = f32((shift_x % i32(W) + i32(W)) % i32(W));
   state.off_y = f32((shift_y % i32(H) + i32(H)) % i32(H));
-
-  state.cx = initial_cx + (state.x_total - f32(shift_x));
-  state.cy = initial_cy + (state.y_total - f32(shift_y));
 
   state.fx = fx_fluid;
   state.fy = fy_fluid;

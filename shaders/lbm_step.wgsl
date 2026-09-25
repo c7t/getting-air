@@ -1,5 +1,27 @@
 // Fused LBM Kernel: Pull-Streaming + Collision + Source Term
 // This kernel performs a full LBM step in one pass over memory.
+//
+// BUFFER-COORDINATE DISPATCH (plans/2D-backport.md B5, first step). A thread
+// owns a BUFFER cell and converts to window coordinates only where something
+// is physically anchored -- the body SDF, the ALBC sponge, and the WALL_Y
+// channel walls. It used to be the other way round: a thread owned a WINDOW
+// cell and converted at every load and store, which meant streaming computed
+// a window source and then mapped it straight back to a buffer source --
+// composing a shift with its own inverse, once per direction per cell.
+//
+// This is the shape the AMR step kernels have always had, and the shape 3D
+// settled on. The dense path was the last window-dispatch kernel in the tree.
+//
+// PROVABLY INERT, not merely believed so: the two readings visit the same
+// cells and compute the same per-cell arithmetic, with no reduction anywhere
+// in this kernel, so the only question is the index algebra --
+//
+//     window:  wsrc = (x - e) mod W,  bsrc = (wsrc + off) mod W
+//     buffer:  bsrc = (bx - e) mod W                 with x = (bx - off) mod W
+//
+// -- and those compose to the same integer. B5's own gate (unshift the field
+// and compare bit-for-bit) is the general form of that; here the shift is the
+// identity, because the cell each thread WRITES has not moved at all.
 
 // @include "common_geometry.wgsl"
 // @include "common_lattice.wgsl"
@@ -38,6 +60,35 @@ override SPONGE_W : f32 = 4.0f;
 // shaders/amr_step*.wgsl for the AMR-side copies of this same flag.
 override USE_BOUNCEBACK : u32 = 0u;
 
+// SOLID_EQ: under BOUNCE-BACK, hold cells INSIDE the body at the local solid
+// equilibrium instead of letting them evolve (plans/2D-backport.md B8).
+//
+// THE HAZARD, and why 2D cannot currently see it. Under bounce-back `chi` is
+// forced to 0, so the penalty term that damps the interior under the diffuse
+// coupling is not there -- and the gather above only redirects a source that
+// is solid, which says nothing about a cell that IS solid. Interior cells are
+// therefore stepped as ordinary fluid with reflected gathers and nothing
+// bounds them: 3D measured max|u| inside the body at 6x the body's own speed
+// at tau=0.6, and a moving body dead in 200 steps at tau=0.514.
+//
+// A PINNED body never notices, because nothing reads a solid cell: the
+// bounce-back branch reads f_in[opp[i]] at the FLUID cell, and the force
+// kernel runs only where phi >= 0. 2D's only bounce-back body is pinned
+// (?bounceback lives in main-cylinder.js and main-cylinder-amr.js, both
+// fixed), so this fix cannot move a single 2D number today -- which is
+// exactly why it is worth landing now rather than after ?bounceback=1 is
+// first pointed at a moving body.
+//
+// IT IS ALSO THE FRESH-NODE REFILL, done unconditionally. A cell the body
+// vacates becomes fluid holding whatever it last had; writing the solid
+// equilibrium every step means the value it is uncovered with is already the
+// right one, at no cost and with no need to detect the uncovering. rho = 1 is
+// the same near-incompressible choice the bounce-back correction term above
+// already makes.
+//
+// ?solideq=0 restores the old behaviour for A/B.
+override SOLID_EQ : u32 = 1u;
+
 // When 0, skip all CardState/get_phi/chi solid-coupling work entirely --
 // there is no interior body at all (channel-flow and Taylor-Green-vortex
 // validation scenarios, which have no card, only domain-edge conditions).
@@ -63,20 +114,46 @@ override WALL_U1 : f32 = 0.0f;
 override FORCE_X : f32 = 0.0f;
 override FORCE_Y : f32 = 0.0f;
 
+// THE DIFFUSE BAND'S WIDTH, as a multiple of THIS level's own cell size --
+// epsilon = K_EPS * dx_level. It was a bare literal here and an override only
+// on the pool path, so the one number that sets how sharp the solid boundary
+// is could not be swept across the whole solver (plans/2D-backport.md B7).
+//
+// 1.5 is the value every one of these sites already had, so the default is
+// byte-identical to the previous build. ?kEps= moves all of them together.
+//
+// WHY IT IS WORTH A KNOB. CLAUDE.md records `dense-reference` and
+// `amr-N2-diffuse` failing Cd at Re=100 and diagnoses it as diffuse-interface
+// width -- the band is a fixed number of cells regardless of resolution, so
+// the effective body radius exceeds the nominal one and Cd converges from
+// ABOVE. The instrument that settles that is a BAND ladder at fixed
+// resolution, not a resolution ladder (which moves the band and everything
+// else at once), and a band ladder needs this to be a parameter.
+override K_EPS : f32 = 1.5f;
 fn get_chi(phi: f32) -> f32 {
-    return chiFromPhiEps(phi, 1.5f);
+    return chiFromPhiEps(phi, K_EPS);
 }
 
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let x = gid.x; let y = gid.y;
-  if (x >= W || y >= H) { return; }
+  // THE BUFFER CELL THIS THREAD OWNS. Everything it writes is indexed by
+  // this, with no conversion (see file header).
+  let bx = gid.x; let by = gid.y;
+  if (bx >= W || by >= H) { return; }
+  let cell = by * W + bx;
+
+  // ... its WINDOW position, needed by the two things genuinely anchored to
+  // the window: the sponge band and the WALL_Y walls.
+  let w = bufferToWindowCell(vec2<u32>(bx, by), state);
+  let x = w.x; let y = w.y;
+  // ... and the BODY's frame, which since B5 is just this cell's own buffer
+  // position (common_geometry.wgsl).
+  let p = vec2<f32>(f32(bx), f32(by));
 
   // Position/solid-velocity/own-cell-index terms, hoisted ABOVE the gather
   // loop (unchanged math, just moved earlier from where section "3" used
   // to compute them) -- USE_BOUNCEBACK's gather-time sharp test and
   // own-cell reflection lookup both need these before streaming, not after.
-  let p = vec2<f32>(f32(x), f32(y));
   var rx = p.x - state.cx;
   var ry = p.y - state.cy;
   rx -= f32(W) * round(rx / f32(W));
@@ -87,18 +164,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   let phi = get_phi(p, state);
 
-  let bx = (x + u32(state.off_x)) % W;
-  let by = (y + u32(state.off_y)) % H;
-  let cell = by * W + bx;
-
-  // 1. Pull Streaming: Read populations from neighbors that will arrive at (x,y)
+  // 1. Pull Streaming: the neighbours that arrive at this cell.
   var f: array<f32,9>;
   for (var i = 0u; i < 9u; i++) {
-    // Window coordinates of source neighbor
-    let wx_src = (x + W - u32(ex[i])) % W;
-    let wy_src = (y + H - u32(ey[i])) % H;
-
-    if (USE_BOUNCEBACK != 0u && HAS_BODY != 0u && get_phi(vec2<f32>(f32(wx_src), f32(wy_src)), state) < 0f) {
+    // The source cell, in BUFFER coordinates -- one wrap, no round trip.
+    let bx_src = (bx + W - u32(ex[i])) % W;
+    let by_src = (by + H - u32(ey[i])) % H;
+    if (USE_BOUNCEBACK != 0u && HAS_BODY != 0u && get_phi(vec2<f32>(f32(bx_src), f32(by_src)), state) < 0f) {
       // Bounce-back: the streaming source is inside the solid, so there's
       // no valid fluid population to pull -- reflect this cell's OWN
       // pre-streaming population that was heading toward that same
@@ -121,9 +193,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       let corr = 2f * wt[i] * f32(ex[i]) * wallUx / CS2;
       f[i] = fUnpack(f_in[fIdx(opp[i], (W * H), cell)], opp[i]) + corr;
     } else {
-      // Map window source to buffer source
-      let bx_src = (wx_src + u32(state.off_x)) % W;
-      let by_src = (wy_src + u32(state.off_y)) % H;
       f[i] = fUnpack(f_in[fIdx(i, (W * H), (by_src * W + bx_src))], i);
     }
   }
@@ -156,7 +225,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let uy = uy_star + Fy / (2.0f * rhoDen);
   let u_sq = ux*ux + uy*uy;
 
-  // Store velocity for rendering (buffer cell index)
+  // Store velocity for rendering (the buffer cell this thread owns)
   vel[cell * 2u] = ux; vel[cell * 2u + 1u] = uy;
 
   // 4. Collision and ALBC Sponge
@@ -168,6 +237,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   // Gathered, then stored a whole cell at a time: under F16 two planes share
   // a word, so a per-plane store would be a read-modify-write race. See
   // common_fpack.wgsl.
+  // Uniform over this cell: is it INSIDE the body, on the bounce-back path?
+  let inSolid = SOLID_EQ != 0u && USE_BOUNCEBACK != 0u && HAS_BODY != 0u && phi < 0f;
   var fo: array<f32,9>;
   for (var i = 0u; i < 9u; i++) {
     let exf = f32(ex[i]); let eyf = f32(ey[i]);
@@ -184,7 +255,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let eu_far = exf*SPONGE_UX + eyf*SPONGE_UY;
     let f_target = wt[i] * (1.0f + 3.0f*eu_far + 4.5f*eu_far*eu_far - 1.5f*(SPONGE_UX*SPONGE_UX + SPONGE_UY*SPONGE_UY)); // rho=1.0, u=(SPONGE_UX,SPONGE_UY) equilibrium
 
-    fo[i] = mix(f_collide, f_target, sponge_weight);
+    // SOLID_EQ (see header): inside the body, discard the collision entirely
+    // and write the local solid equilibrium. Hoisted flag, per-direction
+    // value -- the branch is uniform across the cell.
+    fo[i] = select(mix(f_collide, f_target, sponge_weight),
+                   feqD2Q9(1.0f, usx, usy, i), inSolid);
   }
   // Whole-cell store -- see common_fpack.wgsl on why planes cannot be
   // written individually.

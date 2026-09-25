@@ -50,7 +50,7 @@ async function main() {
     CARD_PARAM_DEFAULTS, DENSE_DEFAULT_RES_LOG2, AMR_DEFAULT_RES_LOG2,
     AMR_DEFAULT_LEVELS, AMR_EQUIVALENT_DENSE_RES_LOG2, RES_LOG2_MIN, RES_LOG2_MAX,
     tauFromReynolds, reynoldsFromTau, tauAtLevel, deriveCardParams,
-    parseCardParams, parseResLog2,
+    parseCardParams, parseResLog2, resLog2Problem,
   } = CP;
 
   const D = CARD_PARAM_DEFAULTS;
@@ -346,9 +346,15 @@ async function main() {
     assert.deepStrictEqual(got, { BLOCKAGE: 4, ASPECT: 0.2, I_STAR: 0.5, RE: 250, U_T: 0.03 });
   });
 
-  test('parseResLog2 clamps to the range both pages enforce', () => {
-    assert.strictEqual(parseResLog2(new URLSearchParams('res=3'), 8), RES_LOG2_MIN);
-    assert.strictEqual(parseResLog2(new URLSearchParams('res=99'), 8), RES_LOG2_MAX);
+  test('parseResLog2 does NOT clamp; resLog2Problem refuses outside the range', () => {
+    // It clamped until 2026-09-23, silently: ?res=5 and ?res=4 both ran res 6.
+    assert.strictEqual(parseResLog2(new URLSearchParams('res=3'), 8), 3);
+    assert.strictEqual(parseResLog2(new URLSearchParams('res=99'), 8), 99);
+    assert.ok(resLog2Problem(4), 'res 4 is one root tile; the root allocates in 2x2 quads');
+    assert.ok(resLog2Problem(12));
+    assert.ok(resLog2Problem(NaN), 'a garbage ?res= must refuse, not fall back');
+    assert.strictEqual(RES_LOG2_MIN, 5, 'the floor is one root QUAD (2x2 tiles of 2*RB = 16 cells)');
+    for (let r = RES_LOG2_MIN; r <= RES_LOG2_MAX; r++) assert.strictEqual(resLog2Problem(r), null, `res ${r}`);
     assert.strictEqual(parseResLog2(new URLSearchParams('res=9'), 8), 9);
     assert.strictEqual(parseResLog2(new URLSearchParams(''), 8), 8);
   });

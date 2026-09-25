@@ -123,7 +123,7 @@ function reapAllChromes() {
 async function ensureChrome(port) {
   if (await chromeDebugOk(port)) {
     console.log(`[setup] Chrome already listening on debug port ${port}`);
-    return { started: false, profileDir: null, pid: null };
+    return { started: false, profileDir: null, pid: null, chromeLog: process.env.GA_CHROME_LOG || null };
   }
   console.log('[setup] launching dedicated WebGPU-capable Chrome');
   const profileRoot = PROFILE_ROOT;
@@ -134,6 +134,12 @@ async function ensureChrome(port) {
   // about:blank, not a config's own URL -- callers drive ONE tab for the
   // whole run (Page.navigate between configs, see navigateTo), never more
   // than one WebGPU context alive at once.
+  // Chrome's own stderr goes to a file, NOT to 'ignore': it is where a GPU-
+  // process crash and the Vulkan failures behind a silent SwiftShader fallback
+  // show up, and teardown's browser-health check reads it (2026-09-23 -- see
+  // tools/lib/browser-health.js).
+  const chromeLog = path.join(profileDir, 'chrome.log');
+  const logFd = fs.openSync(chromeLog, 'a');
   const proc = spawn('/opt/google/chrome/chrome', [
     `--remote-debugging-port=${port}`,
     '--enable-features=Vulkan,WebGPUService',
@@ -143,12 +149,13 @@ async function ensureChrome(port) {
     `--user-data-dir=${profileDir}`,
     '--window-size=1400,900',
     'about:blank',
-  ], { env: { ...process.env, DISPLAY: process.env.DISPLAY || ':0' }, detached: true, stdio: 'ignore' });
+  ], { env: { ...process.env, DISPLAY: process.env.DISPLAY || ':0' }, detached: true, stdio: ['ignore', logFd, logFd] });
   proc.unref();
+  fs.closeSync(logFd);
   const ok = await waitFor(() => chromeDebugOk(port), 10000, 300);
   if (!ok) throw new Error(`Chrome did not come up on debug port ${port} within 10s`);
   if (process.env.CHROME_WORKSPACE) await moveToWorkspace(proc.pid, process.env.CHROME_WORKSPACE);
-  return { started: true, profileDir, pid: proc.pid };
+  return { started: true, profileDir, pid: proc.pid, chromeLog };
 }
 
 // A new window maps on the CURRENT workspace and takes focus (xfwm4's
@@ -205,7 +212,7 @@ async function openTab(port, url) {
     if (t.type !== 'page' || (t.url !== PARKED_URL && t.url !== 'about:blank')) continue;
     let c = null;
     try {
-      c = await CDP({ port, target: t.id });
+      c = await CDP({ local: true, port, target: t.id });
       const ev = async (e) => (await c.Runtime.evaluate({ expression: e, returnByValue: true })).result.value;
       // A tab that is not its window's selected tab is hidden, and a hidden
       // tab is throttled into uselessness (above). Skip it rather than
@@ -236,7 +243,7 @@ async function openTab(port, url) {
 async function parkTab(port, id) {
   const CDP = require('/usr/lib/node_modules/chrome-remote-interface');
   try {
-    const c = await CDP({ port, target: id });
+    const c = await CDP({ local: true, port, target: id });
     await c.Page.navigate({ url: PARKED_URL });
     // Wait for it to land: mid-navigation /json/list reports the url as "",
     // and a run starting straight after this one would pass the tab over.
@@ -411,10 +418,24 @@ async function assertPageHealthy(Runtime, watch, what, allowStatus) {
 // the next ensureChrome; see sweepStaleProfiles.
 //
 // An adopted Chrome's tab is PARKED, not closed -- see parkTab/openTab.
+//
+// IT FIRST CHECKS THE WHOLE BROWSER, on every run, keepOpen or not (2026-09-23):
+// a GPU-process crash mid-run left the debug Chrome on SwiftShader, and a
+// session's worth of numbers was produced on it with nothing saying so. See
+// tools/lib/browser-health.js. It does not throw -- teardown runs in `finally`,
+// and a throw here would replace the tool's own error -- it prints a banner and
+// sets a nonzero exit code, which is what a caller scripting on the tool sees.
 async function teardown({ port, tabId, chrome, server, keepOpen }) {
+  // Park our OWN tab before the health check, not after: the tool has already
+  // judged its own page, and a config whose point is to trip a refusal (e.g.
+  // validate-d3-invariants.js's body-refine, which must end with the pool
+  // EXHAUSTED) otherwise leaves an `error:` in #status that the whole-browser
+  // check charges to the browser. Everything that check exists for -- the
+  // adapter, stray tabs, another run's errors -- it still sees.
+  if (!keepOpen && tabId) await parkTab(port, tabId);
+  await reportBrowserHealth(port, chrome && chrome.chromeLog);
   if (keepOpen) return;
-  if (!chrome.started) { await parkTab(port, tabId); }
-  else {
+  if (chrome.started) {
     // Group kill: Chrome is spawned detached, so it leads its own process
     // group and its renderer/GPU children belong to it. Signalling just the
     // parent pid left those children alive holding a GPU context.
@@ -431,9 +452,28 @@ async function teardown({ port, tabId, chrome, server, keepOpen }) {
   if (server.started && server.proc) { try { process.kill(-server.proc.pid); } catch { /* already gone */ } }
 }
 
+async function reportBrowserHealth(port, chromeLog) {
+  try {
+    const { checkBrowserHealth, formatHealth } = require('./browser-health');
+    const h = await checkBrowserHealth({ port, chromeLog });
+    if (h.ok && !h.warnings.length) { console.log('[teardown] browser health: OK'); return h; }
+    console.log('\n[teardown] browser health:\n' + formatHealth(h));
+    if (!h.ok) {
+      console.log('\n' + '!'.repeat(78) + '\n!! RESULTS ABOVE ARE NOT TRUSTWORTHY -- the browser failed its health check.'
+        + '\n!! Fix the browser (relaunch on the real GPU, close stray tabs) and re-run.\n' + '!'.repeat(78));
+      process.exitCode = 1;
+    }
+    return h;
+  } catch (e) {
+    console.log(`[teardown] browser health check could not run: ${e.message}`);
+    process.exitCode = 1;
+    return null;
+  }
+}
+
 module.exports = {
   httpsGetOk, waitFor, ensureServer, chromeDebugOk, ensureChrome,
   openTab, parkTab, PARKED_URL, firstTab, closeTab, navigateTo, evalExpr, waitForGlobal, teardown,
-  attachPageWatch, statusError, assertPageHealthy,
+  reportBrowserHealth, attachPageWatch, statusError, assertPageHealthy,
   PROFILE_ROOT, liveProfileDirs, sweepStaleProfiles, reapAllChromes,
 };

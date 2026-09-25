@@ -37,6 +37,7 @@ const { evalExpr: evalExprCyl, runCase } = require('./lib/cylinder-metrics');
 const { evalExpr: evalExprChan, runCase: runChanCase } = require('./lib/channel-metrics');
 const { evalExpr: evalExprTgv, runCase: runTgvCase } = require('./lib/tgv-metrics');
 const { runInvariantSweep } = require('./lib/amr-invariants');
+const { runRenderLevels } = require('./lib/render-levels');
 const {
   caseUrl: d3CaseUrl, runDuctCase, runBeltramiCase, runTgvReport,
 } = require('./lib/d3-metrics');
@@ -181,17 +182,126 @@ function defaultConfigs(baseUrl) {
       url: `${baseUrl}/index-3d.html?scenario=sphere&n=8&re=100&bounceback=1&levels=2&refine=body&view=volume`,
       checkBoots: true,
     },
+    // THE OTHER THREE AMR PAGES, AT ?levels=3 -- and the level is the point.
+    //
+    // Four of the five AMR pages default to levels=2, and at levels=2
+    // updateLevelParams's `for (c = 2; c < N_LEVELS; c++)` loop runs ZERO
+    // times. A whole init path therefore exists that nothing in this suite
+    // reached cheaply: the cylinder page's levels=3 configs did reach it, but
+    // only via the most expensive runs here, and the two bodyless AMR pages
+    // had no boot coverage at all.
+    //
+    // That is not hypothetical. B3a-1 extracted `tauAtLevel` into
+    // card-params.mjs, landed the CALL in all five pages and the IMPORT in
+    // one, and the other four threw `ReferenceError: tauAtLevelOf is not
+    // defined` at init -- invisible at every page's own default, fatal at
+    // levels=3, and `make check` green throughout (it is a PARSE check; the
+    // name is perfectly good syntax). Exactly the shape CLAUDE.md records
+    // checkBoots being added for after 238e48c, one octave deeper.
+    {
+      name: 'cylinder-amr-boot-N3',
+      url: `${baseUrl}/index-cylinder-amr.html?levels=3`,
+      checkBoots: true,
+    },
+    {
+      name: 'tgv-amr-boot-N3',
+      url: `${baseUrl}/index-tgv-amr.html?levels=3`,
+      checkBoots: true,
+    },
+    {
+      name: 'channel-amr-boot-N3',
+      url: `${baseUrl}/index-channel-amr.html?levels=3`,
+      checkBoots: true,
+    },
+    // REFUSALS UNDER TEST (plans/2D-backport.md B4-4). Each deliberately
+    // misconfigures a page and requires the refusal to ARRIVE -- see
+    // runBootSmoke's expectError note on why a guard that never fires and a
+    // guard that cannot fire are indistinguishable from a green suite.
+    {
+      // A module-scope guard. It was always there and always correct, and
+      // until B4-4 it threw where init().catch(handleErr) could not see it,
+      // so the page sat at "initializing..." with the reason only in the
+      // console (plans/2D-backport.md B0b recorded the symptom).
+      name: 'refuse-levels-1',
+      url: `${baseUrl}/index-tgv-amr.html?levels=1`,
+      checkBoots: true,
+      expectError: /levels=1 invalid/i,
+    },
+    {
+      // The refine-ahead requirement: a lookahead below the decision interval
+      // leaves part of every refinement round unprotected by construction.
+      name: 'refuse-short-lookahead',
+      url: `${baseUrl}/index-cylinder-amr.html?levels=2&refineEvery=16&forceRefineLookahead=1`,
+      checkBoots: true,
+      expectError: /forceRefineLookahead/i,
+    },
+    {
+      // The RUNTIME latch: an under-provisioned pool means geometry-forced
+      // refinement is being refused, which since B4-3 means the body's force
+      // is simply missing rather than crude. Starved hard enough that the
+      // trip-wire and the coverage check must both agree.
+      name: 'refuse-pool-exhausted',
+      url: `${baseUrl}/index-cylinder-amr.html?levels=3&maxFineBlocks=8`,
+      checkBoots: true,
+      expectError: /geometry-forced refinement REFUSED/i,
+    },
+    {
+      // tau = 1 makes the post-collision coarse<->fine transfer 0/0
+      // (plans/2D-backport.md B1). ?tau=0.75 puts LEVEL 1 exactly on it while
+      // L0 itself is perfectly ordinary -- which is the case worth gating,
+      // because the value the user typed is not the value that is singular,
+      // and a guard that only looked at L0 would pass this.
+      name: 'refuse-tau-unity',
+      url: `${baseUrl}/index-tgv-amr.html?levels=2&tau=0.75`,
+      checkBoots: true,
+      expectError: /at level 1 is within .* of 1/i,
+    },
+    {
+      // ...and the same config with the legacy factor selected must BOOT.
+      // The singularity belongs to the post-collision form alone, so refusing
+      // it under ?dcpre=1 would be refusing a configuration that works. This
+      // is the negative half of the gate above: without it, a guard that
+      // simply banned tau near 1 outright would look identical.
+      name: 'tau-unity-ok-under-dcpre',
+      url: `${baseUrl}/index-tgv-amr.html?levels=2&tau=0.75&dcpre=1`,
+      checkBoots: true,
+    },
     // index-amr.html under the structural-invariant sweep. This is the page
     // the project SHIPS, it defaults to levels=3, and until now the sweep
     // only ever drove window.__CYL -- so the falling-card page's own 2:1
     // balance was never under test on any config, only boot-smoked above.
-    // It exposes no body-geometry coverage scan and no card-state readback,
-    // so those two report n/a rather than OK (see tools/lib/amr-invariants.js).
+    // It exposed no body-geometry coverage scan and no card-state readback
+    // until plans/2D-backport.md B4 -- so the SHIPPED page, whose body
+    // MOVES, was the one running geometry-forced refinement with nothing
+    // checking it, while the only implementation in the project sat on the
+    // pinned-cylinder page. Both now report OK rather than n/a.
     {
       name: 'amr-dev-invariants',
       url: `${baseUrl}/index-amr.html`,
       global: 'window.__AMR',
       checkInvariants: true,
+    },
+    // RENDER REACHABILITY -- in the default sweep since plans/uniform-levels.md
+    // U6 closed it, and deliberately not before: a known-red gate does not get
+    // to turn the whole sweep red. It perturbs one level's velocity pool with a
+    // value no flow produces, redraws, and asks whether the picture moved.
+    //
+    // BOTH PAGES, because the defect it found was not the one it was written
+    // for. index-amr.html was missing level 3; index-cylinder-amr.html -- and
+    // the TGV and channel pages with it -- never passed a level override to the
+    // render fragment at all, so level 2 was solved and never drawn on the page
+    // the Cd/St numbers come from.
+    {
+      name: 'render-levels-card',
+      url: `${baseUrl}/index-amr.html?levels=4`,
+      global: 'window.__AMR',
+      checkRenderLevels: true,
+    },
+    {
+      name: 'render-levels-cylinder',
+      url: `${baseUrl}/index-cylinder-amr.html?levels=3`,
+      global: 'window.__CYL',
+      checkRenderLevels: true,
     },
     {
       name: 'dense-reference',
@@ -236,7 +346,7 @@ function defaultConfigs(baseUrl) {
     // runChannelPhysics. `url` here is a display label only, not
     // navigated to directly. AMR configs default to a single mid-sweep
     // resolution (chanResFilter) -- AMR channel flow's own marginal value
-    // is "does amr_step.wgsl match lbm_step.wgsl," already the same at
+    // is "does the AMR step match lbm_step.wgsl," already the same at
     // every resolution, not a resolution study of its own (see
     // main-channel-amr.js's header on autoRefine defaulting off here).
     {
@@ -389,14 +499,29 @@ async function waitForCYL(Runtime, timeoutMs, global = 'window.__CYL') {
 // either starting with "error:" or never advancing past its initial
 // "initializing..." text, so that's what this polls for instead of relying
 // on the exception listener.
-async function runBootSmoke(Runtime) {
+// `expectError` inverts this check: the config PASSES only if #status reaches
+// an `error:` matching that pattern, and FAILS if the page boots happily.
+//
+// WHY AN INVERTED CONFIG IS WORTH HAVING. Every refusal added by
+// plans/2D-backport.md B4 is code that runs only when something has gone
+// wrong, which is exactly the code most likely to be broken without anyone
+// noticing -- a guard that never fires and a guard that cannot fire look
+// identical from a green suite. These configs deliberately misconfigure a
+// page and require the refusal to arrive, so "refuse rather than degrade" is
+// itself under test rather than asserted in a comment.
+async function runBootSmoke(Runtime, expectError = null) {
   const readStatus = async () => {
     const r = await evalExprCyl(Runtime, `document.getElementById('status') ? document.getElementById('status').textContent : null`);
     return r.exceptionDetails ? null : r.result.value;
   };
+  const matchesExpected = (t) => expectError && /^error:/i.test(t) && expectError.test(t);
+  const wrongError = (t) => (expectError
+    ? `status shows an error, but not the expected one: "${t}" (wanted ${expectError})`
+    : `status shows an error: "${t}"`);
   const first = await readStatus();
   if (first == null) return { ok: false, reason: 'no #status element found' };
-  if (/^error:/i.test(first)) return { ok: false, reason: `status shows an error: "${first}"` };
+  if (matchesExpected(first)) return { ok: true, first, second: first };
+  if (/^error:/i.test(first)) return { ok: false, reason: wrongError(first) };
   // POLL until the status advances, rather than sampling once after a fixed
   // sleep. The fixed-4s version this replaces was flaky on a COLD run: a
   // freshly-launched Chrome with an empty profile has no pipeline cache, and
@@ -420,12 +545,18 @@ async function runBootSmoke(Runtime) {
     await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
     second = await readStatus();
     if (second == null) return { ok: false, reason: 'no #status element found (second read)' };
-    if (/^error:/i.test(second)) return { ok: false, reason: `status shows an error: "${second}"` };
-    if (second !== first) return { ok: true, first, second };
+    if (matchesExpected(second)) return { ok: true, first, second };
+    if (/^error:/i.test(second)) return { ok: false, reason: wrongError(second) };
+    // An expectError config is waiting for the refusal, so a status that
+    // merely ADVANCED is not success there -- it is the page running on,
+    // which is the failure this config exists to catch.
+    if (!expectError && second !== first) return { ok: true, first, second };
   }
   return {
     ok: false,
-    reason: `status never advanced past "${first}" in ${BOOT_SMOKE_TIMEOUT_MS}ms -- page may be stuck`,
+    reason: expectError
+      ? `expected a refusal matching ${expectError} within ${BOOT_SMOKE_TIMEOUT_MS}ms, but the page kept running (status "${second}")`
+      : `status never advanced past "${first}" in ${BOOT_SMOKE_TIMEOUT_MS}ms -- page may be stuck`,
   };
 }
 
@@ -436,7 +567,18 @@ async function runPhysics(Runtime, opts) {
   await evalExprCyl(Runtime, `window.__CYL.setLive(false)`);
   const results = [];
   for (const c of cases) {
-    results.push(await runCase(Runtime, { timeout: opts.physicsTimeout }, c, s => console.log('    ' + s)));
+    const r = await runCase(Runtime, { timeout: opts.physicsTimeout }, c, s => console.log('    ' + s));
+    // THE NUMBERS, PRINTED ON PASS TOO -- the same gap 46157cd closed for the
+    // analytic gates, still open here. Cd/St were computed and thrown away
+    // unless they FAILED, so "did this change move the cylinder?" could only
+    // be answered by a config that happened to be red. That is the wrong way
+    // round for the several stages of plans/2D-backport.md that deliberately
+    // change the refined region and must REPORT the move rather than absorb
+    // it -- and CLAUDE.md's own AMR-Cd reproducibility caveat (~1e-3, the
+    // atomicSub free list) is unusable without the digits it is about.
+    console.log(`      Cd ${r.cd.measured?.toFixed(3)} / ${r.cd.target}±${r.cd.tol} ${r.cd.pass ? 'ok' : 'FAIL'}`
+      + `   St ${r.st.measured?.toFixed(4)} / ${r.st.target}±${r.st.tol} ${r.st.pass ? 'ok' : 'FAIL'}`);
+    results.push(r);
   }
   const ok = results.every(r => r.cd.pass && r.st.pass);
   return { ok, results };
@@ -475,7 +617,18 @@ async function runChannelPhysics(Page, Runtime, opts, config) {
     await waitForGlobal(Runtime, 'window.__CYL', 15000);
     await evalExprChan(Runtime, `window.__CYL.setLive(false)`);
     for (const c of groupCases) {
-      results.push(await runChanCase(Runtime, { timeout: opts.physicsTimeout }, c, s => console.log('    ' + s)));
+      const r = await runChanCase(Runtime, { timeout: opts.physicsTimeout }, c, s => console.log('    ' + s));
+      // THE MARGIN, PRINTED ON PASS TOO. A gate that prints only a tick
+      // cannot answer "did this change help", which is the question every
+      // precision or storage change here has to answer -- and CLAUDE.md names
+      // these analytic checks, not Cd/St, as the gate for exactly those.
+      // Before this the numbers were computed and thrown away unless they
+      // failed, so a re-baseline meant driving the pages from a second,
+      // parallel harness that did not share this one's case filtering (and
+      // got different answers for that reason).
+      console.log(`      L2rel ${r.l2rel.toExponential(4)} / ${c.l2_tol.toExponential(1)}`
+        + `  maxErr ${r.maxErr.toExponential(3)}  ${r.converged ? `converged at ${r.step}` : `NOT CONVERGED (${r.step})`}`);
+      results.push(r);
     }
   }
   const ok = results.every(r => r.l2.pass && r.converged);
@@ -504,7 +657,13 @@ async function runTgvPhysics(Page, Runtime, opts, config) {
     await navigateTo(Page, url);
     await waitForGlobal(Runtime, 'window.__CYL', 15000);
     await evalExprTgv(Runtime, `window.__CYL.setLive(false)`);
-    results.push({ name: c.name, ...(await runTgvCase(Runtime, { timeout: opts.physicsTimeout }, c, s => console.log('    ' + s))) });
+    const r = await runTgvCase(Runtime, { timeout: opts.physicsTimeout }, c, s => console.log('    ' + s));
+    // The margin, on PASS too -- see runChannelPhysics' note.
+    const num = (v) => (typeof v === 'number' && isFinite(v) ? v.toExponential(4) : String(v));
+    console.log('      ' + Object.entries(r)
+      .filter(([k, v]) => typeof v === 'number' && k !== 'step')
+      .map(([k, v]) => `${k} ${num(v)}`).join('  '));
+    results.push({ name: c.name, ...r });
   }
   const ok = results.every(r => r.fieldCheck.pass && r.rateCheck.pass);
   return { ok, results };
@@ -559,23 +718,30 @@ async function runInvariants(Runtime, opts, global) {
       // its bilinear parent stencil reads the parent's corner cell directly --
       // and is NOT required by the default ring path. Asserted exactly when
       // the run is a ghost-free one. See plans/ghost-free.md.
-      requireCornerBalance: /(^|&)ghostfree=1(&|$)/.test(opts.extra || ''),
+      // Gated by default since B2-2d -- see tools/lib/amr-invariants.js. The
+      // ?ghostfree=1 special case is gone with it: that path NEEDED corner
+      // balance (its bilinear parent stencil reads the parent's corner cell
+      // directly), which is why it alone used to require it. Now everything
+      // does, so there is nothing to special-case.
+      requireCornerBalance: true,
     steps: opts.invariantSteps,
     checkEvery: opts.invariantCheckEvery,
     timeout: opts.physicsTimeout,
     global,
     // cov/bad come back null (not empty) on a page that exposes no
     // geometry-coverage scan or card-state readback -- print n/a, never OK.
-    onCheckpoint: (stepsDone, { diag, bal, cov, bad }) => {
+    onCheckpoint: (stepsDone, { diag, bal, cov, closure, quad, bad }) => {
       const corner = bal.cornerOk === undefined ? ''
         : `, corner ${bal.cornerOk ? 'OK' : `${bal.cornerViolations.length}`}`;
       // `n/a` is printed, never nothing: an invariant that silently is not
       // checked is the failure mode this whole exercise kept running into.
-      const conv = !diag ? ', converged n/a (no debugReadDiag)' : (!diag.diagEnabled ? ', converged n/a (?diag=1 not set)'
-        : `, converged ${diag.converged ? 'OK' : `NO (${diag.refineByCascadeLastIter} cascade grants outstanding, ${diag.refinePoolExhausted} starved)`}`);
+      const conv = !diag ? ', pool n/a (no debugReadDiag)' : (!diag.diagEnabled ? ', pool n/a (?diag=1 not set)'
+        : `, pool ${diag.poolOk ? 'OK' : `STARVED (${diag.refineStarved} refine(s) refused)`}`);
       console.log(`    step ${stepsDone}: 2:1-balance ${bal.ok ? 'OK' : `FAIL (${bal.violations.length})`}${corner}, ` +
         `coverage ${cov === null ? 'n/a' : cov.ok ? 'OK' : `FAIL (${cov.violations.length})`}, ` +
-        `field ${bad === null ? 'n/a' : bad.length ? `FAIL (${bad.join(',')})` : 'OK'}${conv}`);
+        `field ${bad === null ? 'n/a' : bad.length ? `FAIL (${bad.join(',')})` : 'OK'}${conv}` +
+        `${closure === null ? '' : `, closure ${closure.ok ? 'OK' : `${closure.missing} missing`}`}` +
+        `${quad === null ? '' : `, quadrants ${quad.ok ? 'OK' : `FAIL (${quad.violations.length})`}`}`);
     },
   });
 }
@@ -609,7 +775,7 @@ async function main() {
   // one new tab rather than disturbing whatever the caller already had open;
   // if we launched Chrome ourselves, its one about:blank tab IS that tab.
   const tabId = chrome.started ? await firstTab(opts.port) : await openTab(opts.port, 'about:blank');
-  const client = await CDP({ port: opts.port, target: tabId });
+  const client = await CDP({ local: true, port: opts.port, target: tabId });
   const { Runtime, Page } = client;
   await Runtime.enable();
   await Page.enable();
@@ -631,8 +797,13 @@ async function main() {
     for (const config of configs) {
       console.log(`\n=== ${config.name} (${config.url}) ===`);
       currentConfigName = config.name;
+      // Errors seen so far belong to the configs that raised them (and were
+      // printed then, by onError). Without this they are charged to the next
+      // config that asserts on the watch -- the refuse-* configs raise their
+      // errors ON PURPOSE, and runD3Physics then failed d3-duct with them.
+      watch.drain();
 
-      let physics = null, invariants = null, boot = null;
+      let physics = null, invariants = null, boot = null, renderLevels = null;
 
       if (config.checkChannelPhysics) {
         // Owns its own per-(mode,res) navigation -- see runChannelPhysics's
@@ -650,13 +821,22 @@ async function main() {
         await navigateTo(Page, config.url);
         if (config.checkBoots) {
           console.log('  -- boot smoke (#status advancing, no error) --');
-          boot = await runBootSmoke(Runtime);
+          boot = await runBootSmoke(Runtime, config.expectError || null);
           console.log(`    ${boot.ok ? 'OK' : 'FAIL: ' + boot.reason}`);
         } else {
           await waitForCYL(Runtime, 15000, config.global);
           if (config.checkPhysics) {
             console.log('  -- physics (Cd/St) --');
             physics = await runPhysics(Runtime, opts);
+          }
+          if (config.checkRenderLevels) {
+            console.log('  -- render reachability (every level reaches the picture) --');
+            renderLevels = await runRenderLevels({
+              Page, Runtime, global: config.global, steps: opts.renderSteps || 4096,
+              log: (m) => console.log('  ' + m),
+            });
+            for (const r of renderLevels.rows) console.log(`    level ${r.level}  ${r.verdict.padEnd(8)} ${r.note}`);
+            if (renderLevels.aborted) console.log(`    ABORTED: ${renderLevels.aborted}`);
           }
           if (config.checkInvariants) {
             console.log('  -- structural invariants --');
@@ -675,7 +855,7 @@ async function main() {
         }
       }
 
-      report.push({ config, physics, invariants, boot });
+      report.push({ config, physics, invariants, boot, renderLevels });
     }
   } finally {
     await client.close();
@@ -691,14 +871,25 @@ async function main() {
   console.log('SUMMARY');
   console.log('='.repeat(72));
   const pad = (s, n) => (String(s) + ' '.repeat(n)).slice(0, Math.max(String(s).length, n)) + ' ';
-  console.log(pad('config', 26) + pad('boot', 8) + pad('physics', 12) + pad('invariants', 12));
+  console.log(pad('config', 26) + pad('boot', 8) + pad('physics', 12) + pad('invariants', 12) + pad('render', 10));
   let allOk = true;
-  for (const { config, physics, invariants, boot } of report) {
+  for (const { config, physics, invariants, boot, renderLevels } of report) {
     const bootStr = boot ? (boot.ok ? 'PASS' : 'FAIL') : 'n/a';
     const physStr = physics ? (physics.ok ? 'PASS' : 'FAIL') : 'n/a';
     const invStr = invariants ? (invariants.ok ? 'PASS' : 'FAIL') : 'n/a';
-    console.log(pad(config.name, 26) + pad(bootStr, 8) + pad(physStr, 12) + pad(invStr, 12));
+    // A run that ABORTED is not a pass and not a fail -- it is a comparison
+    // that could not be made, and it must not be reported as either. An
+    // ABSTAIN row (a level with no tiles) likewise does not pass; only the
+    // absence of FAIL rows over at least one real PASS does.
+    let renStr = 'n/a';
+    if (renderLevels) {
+      const bad = renderLevels.rows.filter(r => r.verdict === 'FAIL').length;
+      const good = renderLevels.rows.filter(r => r.verdict === 'PASS').length;
+      renStr = renderLevels.aborted ? 'ABORTED' : (bad || !good ? 'FAIL' : 'PASS');
+    }
+    console.log(pad(config.name, 26) + pad(bootStr, 8) + pad(physStr, 12) + pad(invStr, 12) + pad(renStr, 10));
     if (boot && !boot.ok) allOk = false;
+    if (renStr === 'FAIL' || renStr === 'ABORTED') allOk = false;
     if (physics && !physics.ok) allOk = false;
     if (invariants && !invariants.ok) allOk = false;
   }
@@ -726,17 +917,21 @@ async function main() {
     if (invariants && !invariants.ok) {
       console.log(`  [${config.name}] invariants (over ${invariants.stepsDone} steps):`);
       if (invariants.balanceViolations.length) console.log(`    2:1-balance FAIL @ step ${invariants.balanceViolations[0].step}: ${JSON.stringify(invariants.balanceViolations[0].violations.slice(0, 4))}`);
-      if (invariants.convergenceViolations && invariants.convergenceViolations.length) {
-        const v = invariants.convergenceViolations[0];
-        console.log(`    refinement NOT CONVERGED @ step ${v.step}: the 2:1-balance cascade granted ${v.byCascade} tile(s) in the FINAL ` +
-          `fixed-point iteration (${v.poolExhausted} starved by an exhausted pool), ${invariants.convergenceViolations.length} checkpoint(s) affected.`);
-        console.log(`      Balance was still spreading outward when the loop ran out of iterations. Criterion-driven grants are NOT`);
-        console.log(`      counted here -- those are normal input to the process. If more rounds (?refineIters=) do NOT fix it, this is`);
-        console.log(`      an OSCILLATION -- refine granting tiles that coarsen then releases -- not slow propagation.`);
+      if (invariants.starvationViolations && invariants.starvationViolations.length) {
+        const v = invariants.starvationViolations[0];
+        console.log(`    refinement STARVED @ step ${v.step}: ${v.starved} refine(s) refused for want of a pool slot ` +
+          `(${v.granted} granted the same round), ${invariants.starvationViolations.length} checkpoint(s) affected.`);
+        console.log(`      A refused refine is abandoned silently. For a criterion-driven one that is the pool working as a budget;`);
+        console.log(`      for a GEOMETRY-forced one it means a coarse/fine seam through the body, and since B4-3 only the finest`);
+        console.log(`      level computes force, so the refused region contributes NOTHING. Raise ?maxFineBlocks= or lower ?levels=.`);
+        console.log(`      (The live rAF loop latches on this itself -- makeRefusalWatch -- but debugStepSync does not go through it,`);
+        console.log(`      which is why the harness needs its own signal.)`);
       }
-      if (invariants.convergenceChecked === false) console.log(`    refinement convergence: NOT CHECKED (page exposes no debugReadDiag, or ?diag=1 did not take)`);
+      if (invariants.starvationChecked === false) console.log(`    pool starvation: NOT CHECKED (page exposes no debugReadDiag, or ?diag=1 did not take)`);
       if (invariants.requireCornerBalance && invariants.cornerViolations.length) console.log(`    corner 2:1-balance FAIL @ step ${invariants.cornerViolations[0].step}: ${invariants.cornerViolations[0].count} violation(s)`);
       if (invariants.coverageViolations.length) console.log(`    geometry-coverage FAIL @ step ${invariants.coverageViolations[0].step}: ${JSON.stringify(invariants.coverageViolations[0].violations.slice(0, 4))}`);
+      if (invariants.closureViolations.length) console.log(`    2:1-closure FAIL @ step ${invariants.closureViolations[0].step}: ${invariants.closureViolations[0].missing} block(s) the rule requires are absent, ${JSON.stringify(invariants.closureViolations[0].byReason)}`);
+      if (invariants.quadrantViolations.length) console.log(`    slot-quadrant rule FAIL @ step ${invariants.quadrantViolations[0].step}: ${JSON.stringify(invariants.quadrantViolations[0].violations.slice(0, 4))}`);
       if (invariants.fieldViolations.length) console.log(`    field blowup @ step ${invariants.fieldViolations[0].step}: ${JSON.stringify(invariants.fieldViolations[0])}`);
     }
   }

@@ -156,7 +156,7 @@ async function main() {
   if (chrome.started) await new Promise(r => setTimeout(r, 2000));
 
   const tabId = chrome.started ? await firstTab(opts.port) : await openTab(opts.port, 'about:blank');
-  const client = await CDP({ port: opts.port, target: tabId });
+  const client = await CDP({ local: true, port: opts.port, target: tabId });
   const { Runtime, Page } = client;
   await Runtime.enable();
   await Page.enable();
