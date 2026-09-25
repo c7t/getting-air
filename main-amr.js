@@ -84,14 +84,15 @@ let resLog2 = parseResLog2(urlParams, AMR_DEFAULT_RES_LOG2);
 { const why = resLog2Problem(resLog2); if (why) refuseConfig(statusEl, why); }
 
 // WHERE THE CARD SITS IN THE WINDOW (?cardY=, fraction of the window height
-// from the top; default 0.5, the centre). The window scrolls by the card's
+// from the top; default 0.6 -- a little below centre, chosen by eye
+// 2026-09-25 -- where 0.5 is the centre). The window scrolls by the card's
 // TRAVEL, so the card stays wherever it STARTED relative to the window -- and
 // to the sponge band at its edges, which is anchored to the window. So this is
 // just the initial buffer cy. Below centre (> 0.5) shows more of the wake,
 // which trails above a falling card, at the cost of room ahead of it.
 // Refused outside [0.2, 0.8] rather than clamped: much further and the card's
 // own chord reaches the sponge.
-const CARD_Y = urlParams.has('cardY') ? parseFloat(urlParams.get('cardY')) : 0.5;
+const CARD_Y = urlParams.has('cardY') ? parseFloat(urlParams.get('cardY')) : 0.6;
 if (!(CARD_Y >= 0.2 && CARD_Y <= 0.8)) refuseConfig(statusEl, `?cardY=${urlParams.get('cardY')} invalid -- must be in [0.2, 0.8] (fraction of the window height from the top)`);
 // Whole cells, as W/2 always was, so a moved card keeps the same sub-cell
 // phase against the lattice.
