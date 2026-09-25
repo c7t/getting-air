@@ -7,6 +7,7 @@ import { loadShader } from './shader-loader.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
 import { EX, EY, WT } from './lattice-2d.mjs';
 import { makeCanvasFit } from './canvas-fit.mjs';
+import { installChromeToggle } from './ui-chrome.mjs';
 import {
   deriveCardParams, parseCardParams, parseResLog2, resLog2Problem, reynoldsFromTau,
   DENSE_DEFAULT_RES_LOG2,
@@ -14,6 +15,12 @@ import {
 
 const canvas   = document.getElementById('c');
 const statusEl = document.getElementById('status');
+
+// The show/hide button for the controls. Wired at module top level, not in
+// init(): if WebGPU setup throws, init() never finishes, and a toggle wired
+// there would strand a collapsed page. Same as main-amr.js; error-overlay.mjs
+// also force-reveals on any fatal.
+installChromeToggle(document.getElementById('ui-toggle'));
 
 const urlParams = new URLSearchParams(window.location.search);
 
@@ -174,6 +181,13 @@ async function init() {
   // pass on its own. See redrawWanted in frame().
   let redrawWanted = false;
   window.addEventListener('resize', () => { resize(); redrawWanted = true; });
+  // A ResizeObserver on the canvas as well as the window listener: showing or
+  // hiding the controls (ui-chrome.mjs) resizes the canvas through LAYOUT,
+  // with no window resize event, which left the drawing buffer at its old
+  // size and the picture scaled. makeCanvasFit only reconfigures on a real
+  // size change, so the observer and the window listener firing for the same
+  // resize cost nothing.
+  if (typeof ResizeObserver !== 'undefined') new ResizeObserver(() => { resize(); redrawWanted = true; }).observe(canvas);
   resize();
 
   const U = GPUBufferUsage;

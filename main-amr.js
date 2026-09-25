@@ -1045,6 +1045,13 @@ async function init() {
   // See redrawWanted in frame().
   let redrawWanted = false;
   window.addEventListener('resize', () => { resize(); redrawWanted = true; });
+  // A ResizeObserver on the canvas as well as the window listener: showing or
+  // hiding the controls (ui-chrome.mjs) resizes the canvas through LAYOUT,
+  // with no window resize event, which left the drawing buffer at its old
+  // size and the picture scaled. makeCanvasFit only reconfigures on a real
+  // size change, so the observer and the window listener firing for the same
+  // resize cost nothing.
+  if (typeof ResizeObserver !== 'undefined') new ResizeObserver(() => { resize(); redrawWanted = true; }).observe(canvas);
   resize();
 
   const U = GPUBufferUsage;
