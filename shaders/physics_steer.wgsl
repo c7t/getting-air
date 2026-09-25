@@ -58,7 +58,15 @@ struct Steer {
   fb     : f32,  // buoyancy magnitude M * G_LU / RHO_B
   d      : f32,  // CURRENT chord offset of C from G, lattice cells
   dd     : f32,  // the last step's change in d -- the ballast's velocity
-  _p1    : f32,
+  kick_sign : f32,  // kernel-owned: 0 -> this step's kick is +, 1 -> -
+  kick   : f32,  // host: amplitude of a probe torque about C that flips sign
+                 // EVERY step -- a lock-in on the coupling's stiffness at the
+                 // step frequency (tools/probe-steer-damping.js). 0 = off, and
+                 // then exactly off: tz_c + 0 * sign.
+  kick_f : f32,  // host: the same probe as a FORCE at C, across the chord
+                 // (along (-sin theta, cos theta), the broadside normal), so
+                 // it measures the TRANSLATIONAL coupling and exerts no torque
+                 // about C. 0 = off, exactly.
 }
 @group(0) @binding(2) var<storage, read_write> steer : Steer;
 
@@ -101,10 +109,12 @@ fn main() {
   // r x F as a z-component, the same sign convention as the force
   // kernels' tz = rx * fy - ry * fx. Buoyancy acts at G, i.e. at -r from
   // C, pointing -y (gravity is +y here): (-r) x (0, -fb) = r.x * fb.
-  let tz_c = tz_fluid - (r0.x * fy_fluid - r0.y * fx_fluid) + r0.x * steer.fb;
+  let kick_s = select(1.0f, -1.0f, steer.kick_sign > 0.5f);
+  steer.kick_sign = select(1.0f, 0.0f, steer.kick_sign > 0.5f);
+  let tz_c = tz_fluid - (r0.x * fy_fluid - r0.y * fx_fluid) + r0.x * steer.fb + steer.kick * kick_s;
 
-  vcx         += fx_fluid / state.mass;
-  vcy         += (fy_fluid + state.mass * state.g_eff) / state.mass;
+  vcx         += (fx_fluid - steer.kick_f * kick_s * s0) / state.mass;
+  vcy         += (fy_fluid + state.mass * state.g_eff + steer.kick_f * kick_s * c0) / state.mass;
   state.omega += tz_c / state.i_body;
   state.omega = clamp(state.omega, -state.o_max, state.o_max);
 

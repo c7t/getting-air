@@ -42,7 +42,7 @@ const {
 const REPO_ROOT = path.resolve(__dirname, '..');
 
 function parseArgs(argv) {
-  const o = { baseUrl: 'https://localhost:4444', port: 9349, istar: '0.17,0.4', res: 8, steps: 200, fitFrom: 10, kEps: 1.5, coupling: 'shipped' };
+  const o = { baseUrl: 'https://localhost:4444', port: 9349, istar: '0.17,0.4', res: 8, steps: 200, fitFrom: 10, kEps: 1.5, coupling: 'shipped', theta0: Math.PI / 2 };
   for (const a of argv) {
     const [k, v] = a.replace(/^--/, '').split('=');
     if (!(k in o) || v === undefined) { console.error(`unknown argument: ${a}`); process.exit(2); }
@@ -106,7 +106,7 @@ async function main() {
 
   try {
     for (const istar of o.istar.split(',').map(Number)) {
-      await navigateTo(Page, `${o.baseUrl}/index-steer.html?res=${o.res}&istar=${istar}&theta0=${Math.PI / 2}&startPaused=1&coupling=${o.coupling}`);
+      await navigateTo(Page, `${o.baseUrl}/index-steer.html?res=${o.res}&istar=${istar}&theta0=${o.theta0}&startPaused=1&coupling=${o.coupling}`);
       await waitForGlobal(Runtime, L, 60000);
       if ((await ev(Runtime, `${L}.getStep()`)) !== 0) throw new Error('page stepped before the probe took over -- ?startPaused=1 not honoured');
       const { A, B } = await ev(Runtime, `${L}.getCardParams()`);
@@ -155,7 +155,8 @@ async function main() {
       for (const [k1, k2] of [[0, 1], [1, 2], [2, 5], [5, 10], [10, 20], [20, 40], [40, 80], [80, 160], [160, o.steps]]) {
         if (k2 > o.steps || k1 >= k2) continue;
         const a = (v[k2] - v[k1]) / (k2 - k1);
-        console.log(`    ${String(k1).padStart(4)}-${String(k2).padEnd(4)}    ${(a / g).toFixed(4)}     ${(X(a) / V).toFixed(3)}`);
+        console.log(`    ${String(k1).padStart(4)}-${String(k2).padEnd(4)}    ${(a / g).toFixed(4)}     ${(X(a) / V).toFixed(3)}`
+          + (k1 === 1 ? `     <- per-step damping D = M (1 - a/g) = ${(M * (1 - a / g)).toFixed(1)}` : ''));
       }
       console.log('  THE FIELD: does the fluid under the card move with it?');
       console.log('    step   interior u/v_card   sum(chi)/(pi a b)   entrained sum(chi u)/(pi a b v)   fluid P / (W t - M v)   share of fluid P under chi');

@@ -297,9 +297,9 @@ async function init() {
   // input and its scales) and writes ONLY those; word 5 is the ballast's
   // current position, which the kernel owns -- a whole-struct write would
   // snap it back to the input and skip the rate limit.
-  const STEER_BYTES = 32, STEER_D_OFFSET = 20;
+  const STEER_BYTES = 40, STEER_D_OFFSET = 20, STEER_KICK_OFFSET = 32;
   const steerBuf = device.createBuffer({ size: STEER_BYTES, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
-  device.queue.writeBuffer(steerBuf, 0, new Float32Array(8));
+  device.queue.writeBuffer(steerBuf, 0, new Float32Array(STEER_BYTES / 4));
   let steerS = 0;
   const writeSteer = () => {
     device.queue.writeBuffer(steerBuf, 0, new Float32Array([
@@ -709,7 +709,12 @@ async function init() {
       await buf.mapAsync(GPUMapMode.READ);
       const v = Array.from(new Float32Array(buf.getMappedRange().slice(0)));
       buf.unmap(); buf.destroy();
-      return { input: v[0], reach: v[1], mode: v[2], slew: v[3], fb: v[4], d: v[5], dd: v[6] };
+      return { input: v[0], reach: v[1], mode: v[2], slew: v[3], fb: v[4], d: v[5], dd: v[6], kickSign: v[7], kick: v[8], kickF: v[9] };
+    },
+    // The step-frequency probe torque (physics_steer.wgsl's `kick`).
+    // `force`: the broadside force probe at C instead of the torque one.
+    debugSetKick: (eps, force = false) => {
+      device.queue.writeBuffer(steerBuf, STEER_KICK_OFFSET, new Float32Array(force ? [0, eps] : [eps, 0]));
     },
     steerDiag: () => steer.diag(),
     // The fluid velocity field (lbm_step.wgsl's vel: u = u* + F/2rho, in
