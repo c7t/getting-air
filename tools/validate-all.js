@@ -797,6 +797,11 @@ async function main() {
     for (const config of configs) {
       console.log(`\n=== ${config.name} (${config.url}) ===`);
       currentConfigName = config.name;
+      // Errors seen so far belong to the configs that raised them (and were
+      // printed then, by onError). Without this they are charged to the next
+      // config that asserts on the watch -- the refuse-* configs raise their
+      // errors ON PURPOSE, and runD3Physics then failed d3-duct with them.
+      watch.drain();
 
       let physics = null, invariants = null, boot = null, renderLevels = null;
 
