@@ -1,0 +1,815 @@
+import { reportFatal, refuseConfig, reportNoWebGPU, reportNoAdapter } from './error-overlay.mjs';
+import { installVortControls } from './vort-controls.mjs';
+import { createTrail } from './trajectory-trail.mjs';
+import { createRefOverlay, cardAt, REF_MODES } from './ref-overlay.mjs';
+import { createTotalUnwrapper } from './card-total.mjs';
+import { createSimPacer, parseSimRate, DEFAULT_TU_PER_SEC } from './sim-rate.mjs';
+import { loadShader } from './shader-loader.mjs';
+import { packF, unpackF, fWords } from './f-pack.mjs';
+import { EX, EY, WT } from './lattice-2d.mjs';
+import { makeCanvasFit } from './canvas-fit.mjs';
+import { installChromeToggle } from './ui-chrome.mjs';
+import { installAboutCard } from './about-card.mjs';
+import { installSteerInput } from './steer-input.mjs';
+import {
+  deriveCardParams, parseCardParams, parseResLog2, resLog2Problem, reynoldsFromTau,
+  DENSE_DEFAULT_RES_LOG2,
+} from './card-params.mjs';
+
+const canvas   = document.getElementById('c');
+const statusEl = document.getElementById('status');
+
+// The show/hide button for the controls. Wired at module top level, not in
+// init(): if WebGPU setup throws, init() never finishes, and a toggle wired
+// there would strand a collapsed page. Same as main-amr.js; error-overlay.mjs
+// also force-reveals on any fatal.
+installChromeToggle(document.getElementById('ui-toggle'));
+// The about/references card -- see about-card.mjs. Top level for the same
+// reason as the toggle: it needs no GPU.
+installAboutCard(document.getElementById('canvas-container'));
+
+const urlParams = new URLSearchParams(window.location.search);
+
+// ── STEERING: a centre of mass you can move (index-steer.html) ─────────────
+// A fork of main.js. Everything above the physics kernel is index.html's; the
+// card's centre of mass slides along its chord under a steering input
+// (steer-input.mjs: the phone held as a wheel, or the slider/arrow keys), and
+// shaders/physics_steer.wgsl carries the rigid-body side -- see its header for
+// why that one kernel is all that has to know. At input 0 this page runs
+// index.html's trajectory exactly (tools/validate-steer.js).
+//
+// ?comReach= how far the centre of mass can move, as a fraction of the
+//            semi-chord A (default 0.5: halfway to the tip).
+// ?comFrame= world (default): steer right and the weight goes to whichever end
+//            of the card is on the right -- hang-glider weight shift, and the
+//            only mapping under which a wheel means the same thing whatever
+//            the card's attitude. It fades to nothing as the card stands
+//            edge-on (the chord has no horizontal extent to shift along).
+//            body: the input is a fixed position along the chord.
+// ?comSlew=  the ballast's top speed, in units of U_T (default 0.5): a sudden
+//            shift of the mass is a sudden kick to the body (the reaction term
+//            in physics_steer.wgsl), and the fluid sees it.
+// ?steerMax= wheel angle, degrees, for full input (default 45).
+const COM_REACH = urlParams.has('comReach') ? parseFloat(urlParams.get('comReach')) : 0.5;
+const COM_FRAME = (urlParams.get('comFrame') || 'world');
+const COM_SLEW  = urlParams.has('comSlew') ? parseFloat(urlParams.get('comSlew')) : 0.5;
+const STEER_MAX = parseFloat(urlParams.get('steerMax')) || 45;
+if (!(COM_REACH >= 0 && COM_REACH <= 1)) throw new Error(`?comReach=${urlParams.get('comReach')} must be in [0, 1] (fraction of the semi-chord)`);
+if (COM_FRAME !== 'world' && COM_FRAME !== 'body') throw new Error(`?comFrame=${COM_FRAME} must be world or body`);
+if (!(COM_SLEW > 0)) throw new Error(`?comSlew=${urlParams.get('comSlew')} must be > 0`);
+
+// THE DIFFUSE BAND'S WIDTH, in units of a level's own cell size:
+// epsilon = K_EPS * dx_level (plans/2D-backport.md B7). Threaded into every
+// shader that evaluates chi -- step, force and render, at every level -- so
+// the band can be swept without touching a literal in nine files.
+//
+// Default 1.5 is the value every one of those sites already hardcoded, so
+// this build is byte-identical to the previous one. ?kEps=0.75 halves it.
+//
+// It is a BAND ladder, not a resolution ladder, that settles the standing
+// Cd red cells: CLAUDE.md diagnoses them as diffuse-interface width (the
+// effective body radius exceeds the nominal one, so Cd converges from ABOVE),
+// and a resolution ladder moves the band and everything else at once.
+const K_EPS = urlParams.has('kEps') ? parseFloat(urlParams.get('kEps')) : 1.5;
+// ?spongeW= -- the far-field sponge's ramp width in THIS page's cells
+// (lbm_step.wgsl's SPONGE_W; default 4, the shader's own default). index-amr.html
+// measures its ?spongeW= in ROOT cells, i.e. 2^(levels-1) finest cells, so a
+// same-physics comparison against it passes spongeW = its value x 2^(levels-1)
+// here (tools/bench-amr-vs-dense.js).
+const SPONGE_W = urlParams.has('spongeW') ? parseFloat(urlParams.get('spongeW')) : 4;
+if (!(SPONGE_W >= 0)) throw new Error(`?spongeW=${urlParams.get('spongeW')} must be >= 0`);
+if (!(K_EPS > 0)) throw new Error(`?kEps=${urlParams.get('kEps')} must be > 0`);
+// ?f16=1 / ?f16=2: real packed-half storage for `f` -- see shaders/common_fpack.wgsl
+// and f-pack.mjs. Wired on EVERY page that consumes those shaders, including
+// the ones with no accuracy check of their own: a page that quietly ignored
+// ?f16= would make a green `validate-all --extra=f16=1` sweep look like it
+// covered ground it never touched, which is the kind of false confidence
+// this repo has been bitten by before.
+const F16 = urlParams.has('f16') ? (parseInt(urlParams.get('f16')) || 0) : 0;
+
+// Vorticity color tone curve (shaders/common_vortcolor.wgsl). Overridable
+// per-run so the look can be dialed against a live sim rather than guessed
+// at: ?vortScale= moves the curve's knee, ?vortGamma= shapes the low end.
+// Parsed identically on both pages -- the two views are meant to be compared
+// by eye, so a knob that existed on only one of them would defeat that.
+const VORT_SCALE = parseFloat(urlParams.get('vortScale')) || 40.0;
+const VORT_GAMMA = parseFloat(urlParams.get('vortGamma')) || 1.2;
+
+let resLog2 = parseResLog2(urlParams, DENSE_DEFAULT_RES_LOG2);
+{ const why = resLog2Problem(resLog2); if (why) refuseConfig(statusEl, why); }
+
+// WHERE THE CARD SITS IN THE WINDOW (?cardY=, fraction of the window height
+// from the top; default 0.6 -- a little below centre, chosen by eye
+// 2026-09-25 -- where 0.5 is the centre). The window scrolls by the card's
+// TRAVEL, so the card stays wherever it STARTED relative to the window -- and
+// to the sponge band at its edges, which is anchored to the window. So this is
+// just the initial buffer cy. Below centre (> 0.5) shows more of the wake,
+// which trails above a falling card, at the cost of room ahead of it.
+// Refused outside [0.2, 0.8] rather than clamped: much further and the card's
+// own chord reaches the sponge.
+const CARD_Y = urlParams.has('cardY') ? parseFloat(urlParams.get('cardY')) : 0.6;
+if (!(CARD_Y >= 0.2 && CARD_Y <= 0.8)) refuseConfig(statusEl, `?cardY=${urlParams.get('cardY')} invalid -- must be in [0.2, 0.8] (fraction of the window height from the top)`);
+// Whole cells, as W/2 always was, so a moved card keeps the same sub-cell
+// phase against the lattice.
+const cardY0 = () => Math.round(H * CARD_Y);
+
+// Fixed simulation RATE (sim-rate.mjs). STEPS_PER_FRAME below is now a
+// CEILING, not a target: the pacer asks for however many steps a wall-clock
+// interval is worth, so the physics runs at the same speed on every device
+// that can keep up, and slower devices are clamped to exactly their old
+// behaviour. ?simRate= is in a/u_t per wall-second, the paper's own time unit.
+const SIM_RATE = parseSimRate(urlParams);
+
+
+let W = 1 << resLog2;
+let H = W;
+let NCELLS = W * H;
+
+const resSlider = document.getElementById('slider-RES');
+const resVal    = document.getElementById('val-RES');
+resSlider.value = resLog2;
+resVal.textContent = W;
+resSlider.onchange = () => {
+  const url = new URL(window.location);
+  url.searchParams.set('res', resSlider.value);
+  window.location.href = url.href;
+};
+resSlider.oninput = () => {
+  resVal.textContent = 1 << parseInt(resSlider.value);
+};
+
+// ── Pesavento & Wang (2004) physical parameters ───────────────────────────────
+// Paper: "Falling Paper: Navigating the Trade-Off between Density and Aspect
+// Ratio". The parameterization and all the derived-quantity arithmetic live
+// in card-params.mjs, shared verbatim with main-amr.js -- see that module's
+// header for why it is shared rather than copied, and for the meaning of
+// each quantity. The short version: card size and flow regime are stored as
+// resolution-independent physical quantities (BLOCKAGE/ASPECT/RE), not raw
+// lattice-cell counts, so pasting the same ?blockage=&aspect=&re=&ut= onto
+// this page and index-amr.html reproduces the identical physical system.
+let { BLOCKAGE, ASPECT, I_STAR, RE, U_T } = parseCardParams(urlParams);
+
+// Derived in recalculate() below, from the physical parameters above plus W.
+let A, B, TAU, RHO_B, MASS, I_BODY, G_LU, G_EFF;
+
+function recalculate() {
+  ({ A, B, TAU, RHO_B, MASS, I_BODY, G_LU, G_EFF } =
+    deriveCardParams({ W, BLOCKAGE, ASPECT, I_STAR, RE, U_T }));
+}
+recalculate();
+
+
+// FSCALE: Atomic Scaling Factor.
+// Used to convert floating-point forces/torques to integers for the GPU atomics.
+// Must be large enough for precision (1e4 = 0.0001 precision) but small enough
+// to avoid 32-bit integer overflow when summing 1000s of cells.
+const FSCALE  = 1e7;
+
+// The D2Q9 basis, from the ONE place it is derived -- lattice-2d.mjs, which
+// also generates shaders/common_lattice.wgsl. Typed out here (and in nine
+// sibling pages) until 2026-09-14, in f64 EXACT FRACTIONS while the shader
+// held eight-digit f32 decimals: the host built its initial condition from
+// weights the GPU did not have. WT is now the shader's own f32 values.
+// EX/EY were already identical everywhere and are unchanged.
+
+function feq(rho, ux, uy, i) {
+  const eu = EX[i]*ux + EY[i]*uy;
+  return WT[i] * rho * (1 + eu*3 + eu*eu*4.5 - (ux*ux+uy*uy)*1.5);
+}
+
+function initF() {
+  const f = new Float32Array(NCELLS * 9);
+  for (let c = 0; c < NCELLS; c++) {
+    for (let i = 0; i < 9; i++) {
+      f[i * NCELLS + c] = feq(1, 0, 0, i);
+    }
+  }
+  return f;
+}
+
+function handleErr(e) {
+  // Status line AND a legible on-page overlay -- see error-overlay.mjs for why
+  // the 12px status line alone was not enough.
+  reportFatal(statusEl, e);
+}
+
+async function init() {
+  if (!navigator.gpu) { reportNoWebGPU(statusEl); return; }
+  const adapter = await navigator.gpu.requestAdapter();
+  if (!adapter) { reportNoAdapter(statusEl); return; }
+  
+  const hasTimestamp = 0 && adapter.features.has('timestamp-query');
+  const device = await adapter.requestDevice({
+    requiredFeatures: hasTimestamp ? ['timestamp-query'] : []
+  });
+
+  const querySet = hasTimestamp ? device.createQuerySet({
+    type: 'timestamp',
+    count: 2
+  }) : null;
+  const queryResolveBuffer = hasTimestamp ? device.createBuffer({
+    size: 16,
+    usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC
+  }) : null;
+  const queryReadBuffer = hasTimestamp ? device.createBuffer({
+    size: 16,
+    usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+  }) : null;
+  
+  device.pushErrorScope('validation');
+
+  const ctx = canvas.getContext('webgpu');
+  const fmt = navigator.gpu.getPreferredCanvasFormat();
+  
+  // Canvas sizing and swapchain reconfiguration -- see canvas-fit.mjs,
+  // which carries the reasoning for the changed-size guard (it was ten
+  // identical copies of it).
+  const resize = makeCanvasFit({ canvas, ctx, device, format: fmt });
+  // A PAUSED page must repaint after a resize: assigning canvas.width/height
+  // CLEARS the drawing buffer, and a paused frame() never reaches the render
+  // pass on its own. See redrawWanted in frame().
+  let redrawWanted = false;
+  window.addEventListener('resize', () => { resize(); redrawWanted = true; });
+  // A ResizeObserver on the canvas as well as the window listener: showing or
+  // hiding the controls (ui-chrome.mjs) resizes the canvas through LAYOUT,
+  // with no window resize event, which left the drawing buffer at its old
+  // size and the picture scaled. makeCanvasFit only reconfigures on a real
+  // size change, so the observer and the window listener firing for the same
+  // resize cost nothing.
+  if (typeof ResizeObserver !== 'undefined') new ResizeObserver(() => { resize(); redrawWanted = true; }).observe(canvas);
+  resize();
+
+  const U = GPUBufferUsage;
+  const fSize   = NCELLS * 9 * 4;
+
+  // See main-amr.js's copy for the rationale: the GPU buffer holds packed
+  // half pairs under F16, everything else speaks f32 plane-major, and these
+  // two are the only places the two meet.
+  const writeF = (buf, f32, ncells) => {
+    const src = packF(f32, ncells, F16);
+    device.queue.writeBuffer(buf, 0, src.buffer, src.byteOffset, ncells * fWords(F16) * 4);
+  };
+  const readF = (mapped, ncells) =>
+    F16 ? unpackF(new Uint32Array(mapped), ncells, true) : new Float32Array(mapped).slice();
+
+  const f_a     = device.createBuffer({ size: fSize, usage: U.STORAGE | U.COPY_DST });
+  const f_b     = device.createBuffer({ size: fSize, usage: U.STORAGE });
+  const velBuf  = device.createBuffer({ size: NCELLS * 2 * 4, usage: U.STORAGE });
+  const forceBuf = device.createBuffer({ size: 16, usage: U.STORAGE | U.COPY_SRC | U.COPY_DST });
+
+  // CardState: 26 floats = 104 bytes
+  const cardStateBuf   = device.createBuffer({ size: 104, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
+
+  const cardInit = new Float32Array([
+    W/2, cardY0(), 0.2,   // cx, cy, theta
+    0, 0, 0,         // vx, vy, omega
+    0, 0, 0,         // fx, fy, tz
+    MASS, I_BODY, G_EFF,
+    A, B,
+    0.3, 0.025,      // v_max, o_max
+    W/2, cardY0(), 0.2,   // cx_old, cy_old, th_old
+    TAU,             // tau
+    0, 0,            // y_total, x_total
+    0, 0, 0, 0       // off_x, off_y, off_x_old, off_y_old
+  ]);
+  device.queue.writeBuffer(cardStateBuf, 0, cardInit);
+  writeF(f_a, initF(), NCELLS);
+
+  // physics_steer.wgsl's Steer struct: 8 words. The host owns words 0-4 (the
+  // input and its scales) and writes ONLY those; word 5 is the ballast's
+  // current position, which the kernel owns -- a whole-struct write would
+  // snap it back to the input and skip the rate limit.
+  const STEER_BYTES = 32, STEER_D_OFFSET = 20;
+  const steerBuf = device.createBuffer({ size: STEER_BYTES, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
+  device.queue.writeBuffer(steerBuf, 0, new Float32Array(8));
+  let steerS = 0;
+  const writeSteer = () => {
+    device.queue.writeBuffer(steerBuf, 0, new Float32Array([
+      steerS,
+      COM_REACH * A,
+      COM_FRAME === 'world' ? 1 : 0,
+      COM_SLEW * U_T,
+      MASS * (G_LU - G_EFF),   // buoyancy, M G_LU / RHO_B -- see the shader
+    ]));
+  };
+  writeSteer();
+
+  let paramsDirty = false;
+  const updateGPUParams = () => {
+    const data = new Float32Array([MASS, I_BODY, G_EFF, A, B]);
+    device.queue.writeBuffer(cardStateBuf, 9 * 4, data);
+    device.queue.writeBuffer(cardStateBuf, 19 * 4, new Float32Array([TAU]));
+    writeSteer();   // reach, slew and buoyancy all derive from the card
+  };
+
+  // BLOCKAGE/ASPECT/I_STAR/U_T all move the physical inputs to recalculate();
+  // RE is the canonical flow-regime state (recalculate() always re-derives
+  // TAU = tauFromReynolds(RE, A, U_T) from it), and TAU is the one exception
+  // that goes the other way: dragging it back-solves RE first, so the two
+  // stay mutually consistent regardless of which one the user drags.
+  const blockageEl = document.getElementById('slider-BLOCKAGE');
+  const aspectEl   = document.getElementById('slider-ASPECT');
+  const iStarEl    = document.getElementById('slider-I_STAR');
+  const reEl       = document.getElementById('slider-RE');
+  const tauEl      = document.getElementById('slider-TAU');
+  const utEl       = document.getElementById('slider-U_T');
+
+  // Each readout shows the control's OWN value first, then the lattice-unit
+  // quantity it derives, e.g. "2.0 (A=64.0)". An earlier revision showed only
+  // the derived A/B under labels reading "Blockage"/"e (aspect)", so the
+  // panel actively misreported what the slider was set to -- worth avoiding
+  // in a project where a lot of debugging happens by reading this panel.
+  const refreshDerivedReadouts = () => {
+    document.getElementById('val-BLOCKAGE').textContent = `${BLOCKAGE.toFixed(1)} (A=${A.toFixed(1)})`;
+    document.getElementById('val-ASPECT').textContent = `${ASPECT.toFixed(3)} (B=${B.toFixed(1)})`;
+    document.getElementById('val-I_STAR').textContent = I_STAR.toFixed(2);
+    document.getElementById('val-RE').textContent = Math.round(RE);
+    document.getElementById('val-TAU').textContent = TAU.toFixed(4);
+    document.getElementById('val-U_T').textContent = U_T.toFixed(3);
+  };
+
+  blockageEl.oninput = () => { BLOCKAGE = parseFloat(blockageEl.value); recalculate(); refreshDerivedReadouts(); paramsDirty = true; };
+  aspectEl.oninput   = () => { ASPECT   = parseFloat(aspectEl.value);   recalculate(); refreshDerivedReadouts(); paramsDirty = true; };
+  iStarEl.oninput    = () => { I_STAR   = parseFloat(iStarEl.value);    recalculate(); refreshDerivedReadouts(); paramsDirty = true; };
+  utEl.oninput       = () => { U_T      = parseFloat(utEl.value);       recalculate(); refreshDerivedReadouts(); paramsDirty = true; };
+  reEl.oninput       = () => { RE       = parseFloat(reEl.value);       recalculate(); refreshDerivedReadouts(); paramsDirty = true; };
+  tauEl.oninput      = () => {
+    const tau = parseFloat(tauEl.value);
+    RE = reynoldsFromTau(tau, A, U_T);
+    reEl.value = RE;
+    recalculate(); // re-derives TAU from the just-updated RE (reproduces `tau`, mod float noise)
+    refreshDerivedReadouts();
+    paramsDirty = true;
+  };
+
+  // Sync widget positions to the actual initial state (fixes a pre-existing
+  // bug where the HTML's hardcoded slider defaults didn't match the real
+  // initial JS values) and show the initial derived readouts.
+  blockageEl.value = BLOCKAGE;
+  aspectEl.value   = ASPECT;
+  iStarEl.value    = I_STAR;
+  reEl.value       = RE;
+  tauEl.value      = TAU;
+  utEl.value       = U_T;
+  refreshDerivedReadouts();
+
+  const [stepSM, frcSM, phySM, renSM] = await Promise.all([
+    loadShader(device, 'shaders/lbm_step.wgsl'),
+    loadShader(device, 'shaders/lbm_force.wgsl'),
+    loadShader(device, 'shaders/physics_steer.wgsl'),
+    loadShader(device, 'shaders/render.wgsl'),
+  ]);
+
+  const stepBGL = device.createBindGroupLayout({ label: 'stepBGL', entries: [
+    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }
+  ]});
+  const frcBGL = device.createBindGroupLayout({ label: 'frcBGL', entries: [
+    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }
+  ]});
+  const phyBGL = device.createBindGroupLayout({ label: 'phyBGL', entries: [
+    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }
+  ]});
+  const renBGL = device.createBindGroupLayout({ label: 'renBGL', entries: [
+    { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
+    { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } }
+  ]});
+
+  const constants = { W, H };
+  // Separate dict for the pipelines whose shaders @include common_fpack.wgsl;
+  // phy/render don't declare F16 and WebGPU makes that a hard error.
+  const fConstants = { W, H, F16, K_EPS };
+  // Likewise the render fragment needs its own dict: only render.wgsl declares
+  // VORT_SCALE/VORT_GAMMA (via common_vortcolor.wgsl), and supplying an
+  // override a pipeline's shader does not declare is the same hard error.
+  // The two VORT_* values are supplied by makeRenderPipeline below, which is
+  // the only thing that ever varies them.
+  const renderConstants = { W, H, K_EPS };
+
+  const stepPL = device.createComputePipeline({ 
+    layout: device.createPipelineLayout({ bindGroupLayouts: [stepBGL] }), 
+    compute: { module: stepSM, entryPoint: 'main', constants: { ...fConstants, SPONGE_W } } 
+  });
+  const frcPL = device.createComputePipeline({ 
+    layout: device.createPipelineLayout({ bindGroupLayouts: [frcBGL] }), 
+    compute: { module: frcSM, entryPoint: 'main', constants: fConstants } 
+  });
+  const phyPL = device.createComputePipeline({ 
+    layout: device.createPipelineLayout({ bindGroupLayouts: [phyBGL] }), 
+    compute: { module: phySM, entryPoint: 'main', constants } 
+  });
+  // VORT_SCALE/VORT_GAMMA are pipeline-overridable constants specialized into
+  // the fragment shader here, so changing them live means rebuilding this one
+  // pipeline. vort-controls.mjs owns the sliders and the per-frame coalescing
+  // (and documents why these are not uniforms); this side owns only the
+  // pipeline itself.
+  const makeRenderPipeline = (scale, gamma) => device.createRenderPipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [renBGL] }),
+    vertex: { module: renSM, entryPoint: 'vs_main', constants },
+    fragment: {
+      module: renSM, entryPoint: 'fs_main', targets: [{ format: fmt }],
+      constants: { ...renderConstants, VORT_SCALE: scale, VORT_GAMMA: gamma },
+    },
+    primitive: { topology: 'triangle-list' },
+  });
+  let renPL = makeRenderPipeline(VORT_SCALE, VORT_GAMMA);
+  installVortControls({
+    scale: VORT_SCALE, gamma: VORT_GAMMA,
+    rebuild: (scale, gamma) => { renPL = makeRenderPipeline(scale, gamma); },
+  });
+
+  const stepBG_ab = device.createBindGroup({ layout: stepBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_a } }, { binding: 2, resource: { buffer: f_b } }, { binding: 3, resource: { buffer: velBuf } }]});
+  const stepBG_ba = device.createBindGroup({ layout: stepBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_b } }, { binding: 2, resource: { buffer: f_a } }, { binding: 3, resource: { buffer: velBuf } }]});
+  
+  const frcBG_a = device.createBindGroup({ layout: frcBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_a } }, { binding: 2, resource: { buffer: forceBuf } }]});
+  const frcBG_b = device.createBindGroup({ layout: frcBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_b } }, { binding: 2, resource: { buffer: forceBuf } }]});
+  
+  const phyBG = device.createBindGroup({ layout: phyBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: forceBuf } }, { binding: 2, resource: { buffer: steerBuf } }]});
+  const renBG = device.createBindGroup({ layout: renBGL, entries: [{ binding: 0, resource: { buffer: velBuf } }, { binding: 1, resource: { buffer: cardStateBuf } }]});
+
+  const error = await device.popErrorScope();
+  if (error) { handleErr(error); return; }
+
+  const WGX = Math.ceil(W / 8), WGY = Math.ceil(H / 8);
+  const STEPS_PER_FRAME = 64;
+
+  // The pacer replaces the fixed 64-steps-per-frame loop. STEPS_PER_FRAME is
+  // passed as the ceiling; see sim-rate.mjs for why that is what keeps the
+  // phone at full speed while halving the desktop.
+  const pacer = createSimPacer({ maxStepsPerFrame: STEPS_PER_FRAME, tuPerSec: SIM_RATE });
+  const rateSlider = document.getElementById('slider-SIM_RATE');
+  const rateValEl = document.getElementById('val-SIM_RATE');
+  if (rateSlider) {
+    rateSlider.value = SIM_RATE;   // ?simRate= wins over the markup
+    if (rateValEl) rateValEl.textContent = SIM_RATE.toFixed(2);
+    rateSlider.oninput = () => {
+      const v = parseFloat(rateSlider.value);
+      if (rateValEl) rateValEl.textContent = v.toFixed(2);
+      pacer.setRate(v);
+    };
+  }
+
+  let step = 0, lastT = performance.now();
+  let useB = false;
+
+  const trajectory = [];
+
+  // Rolling trajectory trail (trajectory-trail.mjs). Fed from the SAME
+  // CardState readback that fills trajectory[] for the CSV export -- the
+  // debug log and the on-screen line are one source of truth. The CSV keeps
+  // the full run; only the trail's own buffer rolls, since it needs just
+  // enough history to draw one window of descent.
+  const trail = createTrail(document.getElementById('trail'));
+  // WORLD-FIXED POSITION REFERENCE (ref-overlay.mjs): grid / stars / crosses,
+  // so the card's speed can be read off the screen. ?ref= picks the initial
+  // mode, the Position reference control or the `r` key switch it live.
+  // Spacing is in CHORDS so it means the same at every resolution: grid and
+  // stars every half chord, crosses every chord (reseau-style, sparser),
+  // all times ?refSpacing= (default 3).
+  const refOverlay = createRefOverlay(document.getElementById('ref'));
+  // Defaults chosen by eye (2026-09-24): crosses, three chords apart.
+  let refMode = REF_MODES.includes(urlParams.get('ref')) ? urlParams.get('ref') : 'crosses';
+  const REF_SCALE = parseFloat(urlParams.get('refSpacing')) || 3;
+  let lastCard = null;   // { x, y, vx, vy, step } from the latest readback
+  const refSelect = document.getElementById('select-REF');
+  const setRefMode = (m) => { refMode = m; if (refSelect) refSelect.value = m; redrawWanted = true; };
+  if (refSelect) { refSelect.value = refMode; refSelect.onchange = () => setRefMode(refSelect.value); }
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'r' || e.ctrlKey || e.metaKey || e.altKey) return;
+    const t = e.target && e.target.tagName;
+    if (t === 'INPUT' || t === 'SELECT' || t === 'TEXTAREA') return;
+    setRefMode(REF_MODES[(REF_MODES.indexOf(refMode) + 1) % REF_MODES.length]);
+  });
+  const drawRef = () => {
+    const c = cardAt(lastCard, step);
+    const chord = 2 * A;
+    // The overlay maps the SCREEN CENTRE; the card sits cardY0() - H/2 cells
+    // below it (?cardY=), so the centre's world y is that much above the card.
+    refOverlay.draw(refMode, c ? { cx: c.x, cy: c.y + (H / 2 - cardY0()), spanX: W, spanY: H,
+      spacing: (refMode === 'crosses' ? chord : 0.5 * chord) * REF_SCALE } : {});
+  };
+  // The shaders keep x_total/y_total wrapped so their f32 precision stops
+  // decaying with run length; this turns them back into true float64 totals.
+  // Everything below reads xTotal/yTotal, never d[21]/d[20] -- see
+  // card-total.mjs.
+  const totals = createTotalUnwrapper(W, H);
+  let trailOpacity = 1.0;
+  const trailSlider = document.getElementById('slider-TRAIL');
+  const trailValEl = document.getElementById('val-TRAIL');
+  if (trailSlider) {
+    trailOpacity = parseFloat(trailSlider.value);
+    if (trailValEl) trailValEl.textContent = trailOpacity.toFixed(2);
+    trailSlider.oninput = () => {
+      trailOpacity = parseFloat(trailSlider.value);
+      if (trailValEl) trailValEl.textContent = trailOpacity.toFixed(2);
+    };
+  }
+
+  document.getElementById('download').onclick = () => {
+    const header = "step,cx,cy_total,cx_total,theta,vx,vy,omega,fx,fy,tz,com_d\n";
+    const rows = trajectory.map(r => r.map(v => v.toFixed(6)).join(",")).join("\n");
+    const blob = new Blob([header + rows], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `trajectory_steer_${W}x${H}.csv`;
+    a.click();
+  };
+
+  // Triple-buffering for readbacks to avoid CPU-GPU stalls
+  const STAGES = 3;
+  const stages = Array.from({ length: STAGES }, () => ({
+    card: device.createBuffer({ size: 108, usage: U.MAP_READ | U.COPY_DST }),   // CardState + the ballast's d
+    query: hasTimestamp ? device.createBuffer({ size: 16, usage: U.MAP_READ | U.COPY_DST }) : null,
+    inFlight: false,
+    step: 0
+  }));
+  let currentStageIdx = 0;
+
+  const mlupsEl = document.getElementById('val-mlups');
+  const gpuMsEl = document.getElementById('val-gpu-ms');
+  const syncMsEl = document.getElementById('val-sync-ms');
+
+  // ONE STEP, as both the frame loop and debugStepSync encode it -- one
+  // function so a benchmark times exactly what the page runs.
+  function encodeStep(enc) {
+    const stepBG = useB ? stepBG_ba : stepBG_ab;
+    const frcBG  = useB ? frcBG_b  : frcBG_a;
+    const frc = enc.beginComputePass(); frc.setPipeline(frcPL); frc.setBindGroup(0, frcBG); frc.dispatchWorkgroups(WGX, WGY); frc.end();
+    const phy = enc.beginComputePass(); phy.setPipeline(phyPL); phy.setBindGroup(0, phyBG); phy.dispatchWorkgroups(1); phy.end();
+    const stp = enc.beginComputePass(); stp.setPipeline(stepPL); stp.setBindGroup(0, stepBG); stp.dispatchWorkgroups(WGX, WGY); stp.end();
+    useB = !useB;
+  }
+
+  // ── Steering input and the centre-of-mass marker ───────────────────────
+  const steer = installSteerInput({
+    slider: document.getElementById('slider-STEER'),
+    valEl: document.getElementById('val-STEER'),
+    button: document.getElementById('steer-btn'),
+    hud: document.getElementById('steer-hud'),
+    maxDeg: STEER_MAX,
+  });
+  let steerOverride = null;   // window.__LBM.setSteer, for tools
+  // Called once per frame: push the input to the GPU only when it moved.
+  const pollSteer = () => {
+    const s = steerOverride ?? steer.value();
+    if (s !== steerS) { steerS = s; writeSteer(); }
+    steer.drawHud();
+  };
+
+  // The marker is drawn on its own 2D overlay from the card-state READBACK,
+  // which is one to three frames old -- so it is extrapolated to the step the
+  // scene was rendered at, as ref-overlay.mjs's cardAt does for the reference
+  // marks. Without that it trails the card by ~64 steps per frame of lag.
+  let lastBody = null;
+  const comCanvas = document.getElementById('com');
+  const comCtx = comCanvas.getContext('2d');
+  const wrapN = (v, n) => ((v % n) + n) % n;
+  function drawCom() {
+    const dpr = window.devicePixelRatio || 1;
+    const w = Math.max(1, Math.round(comCanvas.clientWidth * dpr));
+    const h = Math.max(1, Math.round(comCanvas.clientHeight * dpr));
+    if (comCanvas.width !== w || comCanvas.height !== h) { comCanvas.width = w; comCanvas.height = h; }
+    comCtx.clearRect(0, 0, w, h);
+    const b = lastBody;
+    if (!b) return;
+    const k = step - b.step;
+    const th = b.th + b.om * k;
+    // Buffer -> screen, exactly as render.wgsl maps it: window position is
+    // the buffer position less the integer pan, less the pan's fraction.
+    // The pan advances with the card, so the card's own window position is
+    // (to first order) constant and extrapolation moves only its rotation.
+    const gx = wrapN(b.cx - b.offX, W) - b.subX;
+    const gy = wrapN(b.cy - b.offY, H) - b.subY;
+    const px = (x) => x / W * w, py = (y) => y / H * h;
+    const cxw = gx + b.d * Math.cos(th), cyw = gy + b.d * Math.sin(th);
+    const r = Math.max(4 * dpr, 0.15 * A / W * w);
+    // Dark on the card's own yellow, ringed in white so it reads on the
+    // field as well when it sits at the tip.
+    comCtx.lineWidth = Math.max(1.5, 1.5 * dpr);
+    comCtx.fillStyle = '#111';
+    comCtx.strokeStyle = '#fff';
+    comCtx.beginPath(); comCtx.arc(px(cxw), py(cyw), r, 0, 2 * Math.PI); comCtx.fill(); comCtx.stroke();
+    // The reach: a short tick across the chord at each end of the ballast's
+    // travel, so the dot's position reads as a fraction of what is possible.
+    comCtx.strokeStyle = 'rgba(0,0,0,0.7)';
+    comCtx.lineWidth = Math.max(1, dpr);
+    const nx = -Math.sin(th), ny = Math.cos(th), t = 1.6 * r;
+    for (const sgn of [-1, 1]) {
+      const ex = px(gx + sgn * COM_REACH * A * Math.cos(th)), ey = py(gy + sgn * COM_REACH * A * Math.sin(th));
+      comCtx.beginPath(); comCtx.moveTo(ex - nx * t, ey - ny * t); comCtx.lineTo(ex + nx * t, ey + ny * t); comCtx.stroke();
+    }
+  }
+
+  // ── Debug/benchmark surface (window.__LBM) ──────────────────────────────
+  // The minimum a CDP tool needs to time this page the way index-amr.html's
+  // window.__AMR is timed: pause the frame loop, step N synchronously in
+  // STEPS_PER_FRAME batches (N even, so useB returns to its frame-boundary
+  // value), and read the step count and the card's state. Added for
+  // tools/bench-amr-vs-dense.js; nothing on the page depends on it.
+  let liveMode = true;
+  // ONE WRITER FOR liveMode, so the pause button's label cannot disagree with
+  // the flag when a tool (window.__LBM.setLive, debugStepSync) writes it.
+  // pacer.reset() on resume: a paused frame() never reaches the pacer, so its
+  // last-timestamp would otherwise be stale by the whole pause. Same shape as
+  // main-amr.js's setLive.
+  const pauseBtn = document.getElementById('pause');
+  function setLive(v) {
+    liveMode = !!v;
+    if (liveMode) pacer.reset();
+    if (pauseBtn) {
+      pauseBtn.textContent = liveMode ? 'pause' : 'resume';
+      pauseBtn.setAttribute('aria-pressed', liveMode ? 'false' : 'true');
+    }
+  }
+  if (pauseBtn) pauseBtn.onclick = () => setLive(!liveMode);
+  const controlsEl = document.getElementById('controls');
+  if (controlsEl) for (const ev of ['input', 'change']) controlsEl.addEventListener(ev, () => { redrawWanted = true; });
+  async function debugStepSync(n) {
+    setLive(false);
+    if (paramsDirty) { updateGPUParams(); paramsDirty = false; }
+    pollSteer();
+    for (let k = 0; k < n; k += STEPS_PER_FRAME) {
+      const enc = device.createCommandEncoder();
+      const m = Math.min(STEPS_PER_FRAME, n - k);
+      for (let s = 0; s < m; s++) encodeStep(enc);
+      device.queue.submit([enc.finish()]);
+      await device.queue.onSubmittedWorkDone();
+      step += m;
+    }
+    return { step };
+  }
+  async function debugReadCardState() {
+    const buf = device.createBuffer({ size: 104, usage: U.MAP_READ | U.COPY_DST });
+    const enc = device.createCommandEncoder();
+    enc.copyBufferToBuffer(cardStateBuf, 0, buf, 0, 104);
+    device.queue.submit([enc.finish()]);
+    await buf.mapAsync(GPUMapMode.READ);
+    const d = Array.from(new Float32Array(buf.getMappedRange().slice(0)));
+    buf.unmap(); buf.destroy();
+    return d;
+  }
+  window.__LBM = {
+    setLive,
+    isLive: () => liveMode,
+    getStep: () => step,
+    getDims: () => ({ W, H }),
+    getCardParams: () => ({ A, B, TAU, U_T, RE }),
+    debugStepSync,
+    debugReadCardState,
+    // Steering, for tools/validate-steer.js: null hands control back to the
+    // page's own input.
+    setSteer: (s) => { steerOverride = s; pollSteer(); },
+    getSteerParams: () => ({ COM_REACH, COM_FRAME, COM_SLEW, STEER_MAX, reach: COM_REACH * A, slew: COM_SLEW * U_T, fb: MASS * (G_LU - G_EFF) }),
+    debugReadSteer: async () => {
+      const buf = device.createBuffer({ size: STEER_BYTES, usage: U.MAP_READ | U.COPY_DST });
+      const enc = device.createCommandEncoder();
+      enc.copyBufferToBuffer(steerBuf, 0, buf, 0, STEER_BYTES);
+      device.queue.submit([enc.finish()]);
+      await buf.mapAsync(GPUMapMode.READ);
+      const v = Array.from(new Float32Array(buf.getMappedRange().slice(0)));
+      buf.unmap(); buf.destroy();
+      return { input: v[0], reach: v[1], mode: v[2], slew: v[3], fb: v[4], d: v[5] };
+    },
+    steerDiag: () => steer.diag(),
+  };
+
+  // The scene's render pass, shared by the live frame and the paused repaint.
+  function encodeSceneRender(enc) {
+    const rp = enc.beginRenderPass({ colorAttachments: [{ view: ctx.getCurrentTexture().createView(), clearValue: { r:0.07, g:0.07, b:0.1, a:1 }, loadOp: 'clear', storeOp: 'store' }]});
+    rp.setPipeline(renPL); rp.setBindGroup(0, renBG); rp.draw(6); rp.end();
+  }
+
+  async function frame() {
+    try {
+      if (liveMode) pollSteer(); else steer.drawHud();
+      if (paramsDirty) {
+        updateGPUParams();
+        paramsDirty = false;
+        redrawWanted = true;
+      }
+      if (!liveMode) {
+        // Paused: no step, but repaint when something asked for it -- a
+        // resize (which cleared the canvas) or a control change.
+        if (redrawWanted) {
+          redrawWanted = false;
+          const enc = device.createCommandEncoder();
+          encodeSceneRender(enc);
+          device.queue.submit([enc.finish()]);
+          drawRef();
+          trail.draw(2 * A, trailOpacity);
+          drawCom();
+        }
+        requestAnimationFrame(() => frame().catch(handleErr));
+        return;
+      }
+      
+      const stage = stages[currentStageIdx];
+      // Backpressure: if the oldest stage is still in flight, we must wait.
+      // With 3 buffers and STEPS_PER_FRAME=64, this should be rare.
+      if (stage.inFlight) {
+        requestAnimationFrame(() => frame().catch(handleErr));
+        return;
+      }
+
+      const enc = device.createCommandEncoder();
+      
+      if (hasTimestamp) {
+        enc.writeTimestamp(querySet, 0);
+      }
+
+      // Paced, not fixed: however many steps this frame's wall-clock interval
+      // is worth, capped at STEPS_PER_FRAME. Always even (sim-rate.mjs), so
+      // useB returns to its initial value at every frame boundary.
+      const nSteps = pacer.stepsForFrame(performance.now(), A / U_T);
+      for (let s = 0; s < nSteps; s++) encodeStep(enc);
+      step += nSteps;
+
+      if (hasTimestamp) {
+        enc.writeTimestamp(querySet, 1);
+        enc.resolveQuerySet(querySet, 0, 2, queryResolveBuffer, 0);
+        enc.copyBufferToBuffer(queryResolveBuffer, 0, stage.query, 0, 16);
+      }
+
+      encodeSceneRender(enc);
+      drawRef();
+      trail.draw(2 * A, trailOpacity);
+      drawCom();
+      
+      enc.copyBufferToBuffer(cardStateBuf, 0, stage.card, 0, 104);
+      enc.copyBufferToBuffer(steerBuf, STEER_D_OFFSET, stage.card, 104, 4);
+      
+      const tSubmit = performance.now();
+      device.queue.submit([enc.finish()]);
+
+      // Start asynchronous readback
+      stage.inFlight = true;
+      stage.step = step;
+      // Steps THIS frame actually dispatched -- the MLUPS readout divides
+      // the GPU span by it, and it is no longer a constant.
+      stage.steps = nSteps;
+      
+      const processReadback = async (st) => {
+        const pCard = st.card.mapAsync(GPUMapMode.READ);
+        const pQuery = hasTimestamp ? st.query.mapAsync(GPUMapMode.READ) : Promise.resolve();
+        
+        await Promise.all([pCard, pQuery]);
+        
+        const d = new Float32Array(st.card.getMappedRange());
+        let gpuTime = 0;
+        if (hasTimestamp) {
+          const timestamps = new BigUint64Array(st.query.getMappedRange());
+          gpuTime = Number(timestamps[1] - timestamps[0]) / 1e6;
+          st.query.unmap();
+        } else {
+          // Without native timestamps, we measure CPU submission-to-read completion
+          gpuTime = performance.now() - tSubmit;
+        }
+
+        // d[21]/d[20] are the WRAPPED accumulators; unwrap once here so
+        // every consumer below sees one true, monotonic total.
+        const { x: xTotal, y: yTotal } = totals.unwrap(d[21], d[20]);
+
+        // Update trajectory from this specific completed step
+        if (st.step < 100000) {
+          // Record: step, cx, cy_total, cx_total, theta, vx, vy, omega, fx, fy, tz, com_d
+          trajectory.push([st.step, d[0], yTotal, xTotal, d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[26]]);
+        }
+        // The card's UNWRAPPED path. The wrapped cx/cy cannot be used: they
+        // never leave the buffer centre.
+        trail.push(xTotal, yTotal, 2 * A);
+        lastCard = { x: xTotal, y: yTotal, vx: d[3], vy: d[4], step: st.step };
+        lastBody = { cx: d[0], cy: d[1], th: d[2], vx: d[3], vy: d[4], om: d[5],
+          offX: d[22], offY: d[23], subX: xTotal - Math.floor(xTotal), subY: yTotal - Math.floor(yTotal),
+          d: d[26], step: st.step };
+        
+        if (performance.now() - lastT > 250) {
+          const mlups = (NCELLS * (st.steps || 0)) / (gpuTime * 1e3);
+          mlupsEl.textContent = mlups.toFixed(1);
+          gpuMsEl.textContent = gpuTime.toFixed(2);
+          syncMsEl.textContent = (performance.now() - tSubmit).toFixed(2);
+          statusEl.textContent = `step ${st.step}  y=${yTotal.toFixed(1)}  x=${xTotal.toFixed(1)}  vy=${d[4].toFixed(4)}  θ=${d[2].toFixed(2)}  com=${(d[26] / A).toFixed(2)}a  s=${steerS.toFixed(2)}`;
+          lastT = performance.now();
+        }
+        
+        st.card.unmap();
+        st.inFlight = false;
+      };
+
+      processReadback(stage);
+      
+      currentStageIdx = (currentStageIdx + 1) % STAGES;
+      requestAnimationFrame(() => frame().catch(handleErr));
+    } catch (e) {
+      handleErr(e);
+    }
+  }
+  frame().catch(handleErr);
+}
+init().catch(handleErr);

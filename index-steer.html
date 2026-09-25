@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>getting-air: steer</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #111;
+      color: #eee;
+      font-family: monospace;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      height: 100dvh;
+    }
+    #canvas-container {
+      flex: 1;
+      position: relative;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #000;
+      overflow: hidden;
+      container-type: size; /* enable cqw/cqh inside */
+    }
+    canvas {
+      display: block;
+      width:  min(100cqw, 100cqh);
+      height: min(100cqw, 100cqh);
+    }
+    /* Trajectory trail overlay -- a 2D canvas sharing the WebGPU canvas's
+       box. The `canvas` rule above sizes both identically; this one lifts it
+       out of flow and centres it on top. pointer-events:none so it never
+       intercepts a click meant for the page. */
+    #trail, #ref, #com {
+      position: absolute; left: 50%; top: 50%;
+      transform: translate(-50%, -50%);
+      pointer-events: none;
+    }
+    /* The steering wheel HUD and its button, bottom centre and one row up --
+       clear of #pause, the about button and #ui-toggle along the bottom edge
+       (on a phone the three of them span it) -- and NOT hidden
+       with the rest of the chrome: it is the control. The id selectors
+       out-rank the bare `canvas` sizing rule above. */
+    #steer-box {
+      position: absolute; bottom: 44px; left: 50%; transform: translateX(-50%);
+      display: flex; flex-direction: column; align-items: center; gap: 4px;
+    }
+    #steer-hud { width: 72px; height: 72px; cursor: pointer; }
+    #steer-btn {
+      font-size: 12px; color: #bbb; background: rgba(0,0,0,0.55);
+      padding: 4px 10px; border: 1px solid #444; border-radius: 3px;
+      cursor: pointer; font-family: monospace;
+    }
+    #steer-btn[aria-pressed="true"] { color: #ffd76a; border-color: #7a6520; }
+    #status {
+      position: absolute; top: 8px; left: 8px;
+      font-size: 12px; color: #7f7; background: rgba(0,0,0,0.6);
+      padding: 4px 8px; border-radius: 3px; pointer-events: none;
+    }
+    #perf {
+      position: absolute; top: 40px; left: 8px;
+      font-size: 11px; color: #0cf; background: rgba(0,0,0,0.6);
+      padding: 4px 8px; border-radius: 3px; pointer-events: none;
+      display: flex; flex-direction: column; gap: 2px;
+    }
+    .perf-label { color: #888; margin-right: 4px; }
+    #download {
+      position: absolute; top: 8px; right: 8px;
+      font-size: 12px; color: #eee; background: rgba(0,0,0,0.6);
+      padding: 4px 8px; border: 1px solid #555; border-radius: 3px;
+      cursor: pointer; font-family: monospace;
+    }
+    #download:hover { background: rgba(50,50,50,0.8); }
+    /* Bottom left of the canvas; never hidden. Stopping the sim is what you
+       reach for when something on screen needs a closer look. */
+    #pause {
+      position: absolute; bottom: 8px; left: 8px;
+      font-size: 12px; color: #bbb; background: rgba(0,0,0,0.55);
+      padding: 4px 10px; border: 1px solid #444; border-radius: 3px;
+      cursor: pointer; font-family: monospace; opacity: 0.55;
+      transition: opacity 0.15s ease;
+      min-width: 5.5em;  /* so "pause"/"resume" does not resize the button */
+    }
+    #pause:hover, #pause:focus-visible { opacity: 1; background: rgba(50,50,50,0.8); }
+    #pause[aria-pressed="true"] { opacity: 1; color: #ffd76a; border-color: #7a6520; }
+    /* The one control that is never hidden -- it is the way back. Bottom
+       right, clear of #status/#perf (top left), #download (top right) and
+       #pause (bottom left). Same as index-amr.html. */
+    #ui-toggle {
+      position: absolute; bottom: 8px; right: 8px;
+      font-size: 12px; color: #bbb; background: rgba(0,0,0,0.55);
+      padding: 4px 10px; border: 1px solid #444; border-radius: 3px;
+      cursor: pointer; font-family: monospace; opacity: 0.55;
+      transition: opacity 0.15s ease;
+    }
+    #ui-toggle:hover, #ui-toggle:focus-visible { opacity: 1; background: rgba(50,50,50,0.8); }
+    /* Collapsed chrome, keyed off one class on <body> -- see ui-chrome.mjs.
+       Set in the markup, as on index-amr.html, so the page comes up collapsed
+       rather than flashing the full UI for a frame.
+       #canvas-container and #fatal-overlay are deliberately NOT listed: a
+       fatal error must stay visible, and showFatal() clears the class. */
+    body.ui-hidden #controls,
+    body.ui-hidden #status,
+    body.ui-hidden #perf,
+    body.ui-hidden #download { display: none; }
+    #controls {
+      flex-shrink: 0;
+      background: rgba(0,0,0,0.85);
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      border-top: 1px solid #444;
+    }
+    .control-row { display: flex; align-items: center; gap: 10px; }
+    .control-row label { width: 100px; font-size: 11px; color: #aaa; }
+    .control-row input { flex-grow: 1; cursor: pointer; }
+    .control-row span { width: 50px; text-align: right; font-size: 11px; color: #fff; }
+  </style>
+</head>
+<body class="ui-hidden">
+  <div id="canvas-container">
+    <canvas id="c"></canvas>
+    <canvas id="ref"></canvas>
+    <canvas id="trail"></canvas>
+    <canvas id="com"></canvas>
+    <div id="status">initializing...</div>
+    <div id="perf">
+      <div><span class="perf-label">MLUPS:</span> <span id="val-mlups">0.0</span></div>
+      <div><span class="perf-label">GPU:</span> <span id="val-gpu-ms">0.0</span> ms</div>
+      <div><span class="perf-label">SYNC:</span> <span id="val-sync-ms">0.0</span> ms</div>
+    </div>
+    <button id="download">Download CSV</button>
+    <button id="pause" aria-pressed="false">pause</button>
+    <div id="steer-box">
+      <canvas id="steer-hud" title="tap to recentre"></canvas>
+      <button id="steer-btn" aria-pressed="false">steer with phone</button>
+    </div>
+    <button id="ui-toggle" aria-expanded="false" aria-controls="controls">controls</button>
+  </div>
+
+  <div id="controls">
+    <div class="control-row">
+      <label>Centre of mass (&larr;/&rarr;)</label>
+      <input type="range" id="slider-STEER" min="-1" max="1" step="0.01" value="0">
+      <span id="val-STEER">0.00</span>
+    </div>
+    <div class="control-row">
+      <label>Resolution</label>
+      <input type="range" id="slider-RES" min="5" max="11" step="1" value="8">
+      <span id="val-RES">256</span>
+    </div>
+    <div class="control-row">
+      <label>Blockage (H/chord)</label>
+      <input type="range" id="slider-BLOCKAGE" min="1.0" max="16" step="0.1" value="8.0">
+      <span id="val-BLOCKAGE">8.0 (A=16.0)</span>
+    </div>
+    <div class="control-row">
+      <label>e (aspect B/A)</label>
+      <input type="range" id="slider-ASPECT" min="0.02" max="0.5" step="0.005" value="0.125">
+      <span id="val-ASPECT">0.125 (B=2.0)</span>
+    </div>
+    <div class="control-row">
+      <label>I* (inertia)</label>
+      <input type="range" id="slider-I_STAR" min="0.05" max="1.0" step="0.01" value="0.17">
+      <span id="val-I_STAR">0.17</span>
+    </div>
+    <div class="control-row">
+      <label>Re (Reynolds)</label>
+      <input type="range" id="slider-RE" min="50" max="3000" step="10" value="1100">
+      <span id="val-RE">1100</span>
+    </div>
+    <div class="control-row">
+      <label>τ (viscosity)</label>
+      <input type="range" id="slider-TAU" min="0.5005" max="0.6" step="0.0001" value="0.5044">
+      <span id="val-TAU">0.5044</span>
+    </div>
+    <div class="control-row">
+      <label>Ut (gravity)</label>
+      <input type="range" id="slider-U_T" min="0.01" max="0.15" step="0.005" value="0.05">
+      <span id="val-U_T">0.05</span>
+    </div>
+    <div class="control-row">
+      <label>Sim speed (a/u<sub>t</sub> per s)</label>
+      <input type="range" id="slider-SIM_RATE" min="0.25" max="12" step="0.05" value="2.3">
+      <span id="val-SIM_RATE">2.30</span>
+    </div>
+    <div class="control-row">
+      <label>Position reference (r)</label>
+      <select id="select-REF">
+        <option value="off">off</option>
+        <option value="grid">grid</option>
+        <option value="stars">stars</option>
+        <option value="crosses">crosses</option>
+      </select>
+    </div>
+    <div class="control-row">
+      <label>Trajectory trail</label>
+      <input type="range" id="slider-TRAIL" min="0" max="1" step="0.05" value="1">
+      <span id="val-TRAIL">1.00</span>
+    </div>
+    <div class="control-row">
+      <label>Vorticity scale</label>
+      <input type="range" id="slider-VORT_SCALE" min="10" max="400" step="5" value="40">
+      <span id="val-VORT_SCALE">40</span>
+    </div>
+    <div class="control-row">
+      <label>Vorticity &gamma;</label>
+      <input type="range" id="slider-VORT_GAMMA" min="0.3" max="1.5" step="0.05" value="1.2">
+      <span id="val-VORT_GAMMA">1.20</span>
+    </div>
+  </div>
+
+  <script type="module" src="main-steer.js"></script>
+</body>
+</html>

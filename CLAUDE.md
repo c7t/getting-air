@@ -13,6 +13,12 @@ step** — the source *is* the artifact; GitHub Pages serves it directly.
   slice view, with a 6-DOF rigid body. **One page, five scenarios** via
   `?scenario=duct|beltrami|tgv|sphere|spin`. Shaders: `shaders/d3_*.wgsl`.
   See "The 3D fork" below.
+- `index-steer.html` / `main-steer.js` — `index.html` forked with a movable
+  centre of mass, steered by holding the phone as a wheel (`steer-imu.mjs`:
+  gyro+accelerometer fusion, drift-free, `rotationRate` axis mapping detected
+  at runtime because Chrome's is not the spec's). Own physics kernel
+  `shaders/physics_steer.wgsl`; at input 0 it is `index.html` exactly
+  (`tools/validate-steer.js`, opt-in).
 - `index-3d-spike.html` / `main-3d-spike.js` — 3D bench page, the M0
   milestone of `plans/3D.md`. Not a solver: dense periodic grid, no body,
   no AMR, no render.

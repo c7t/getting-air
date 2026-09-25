@@ -111,6 +111,15 @@ function defaultConfigs(baseUrl) {
       url: `${baseUrl}/index-amr.html`,
       checkBoots: true,
     },
+    // index-steer.html forks main.js with its own physics bind group (a third
+    // binding for the steering state) -- a page nothing else visits, so it
+    // is smoked from the day it exists. Its physics gate is
+    // tools/validate-steer.js (opt-in: five page loads).
+    {
+      name: 'steer-boot',
+      url: `${baseUrl}/index-steer.html`,
+      checkBoots: true,
+    },
     // The reentry pages are the last consumers of shaders/lbm_*.wgsl and
     // shaders/amr_*.wgsl with no other coverage here -- they have no
     // analytic check of their own (prescribed kinematics, not a validated
