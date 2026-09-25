@@ -68,6 +68,21 @@
       transition: opacity 0.15s ease;
     }
     #ui-toggle:hover, #ui-toggle:focus-visible { opacity: 1; background: rgba(50,50,50,0.8); }
+    /* Also never hidden, for the same reason #ui-toggle is not: stopping the
+       sim is the thing you reach for when something on screen needs a closer
+       look, and needing to open the controls first defeats that. Bottom LEFT,
+       which is the one corner nothing else uses (#status/#perf are top left,
+       #download top right, #ui-toggle bottom right). */
+    #pause {
+      position: absolute; bottom: 8px; left: 8px;
+      font-size: 12px; color: #bbb; background: rgba(0,0,0,0.55);
+      padding: 4px 10px; border: 1px solid #444; border-radius: 3px;
+      cursor: pointer; font-family: monospace; opacity: 0.55;
+      transition: opacity 0.15s ease;
+      min-width: 5.5em;  /* so "pause"/"resume" does not resize the button */
+    }
+    #pause:hover, #pause:focus-visible { opacity: 1; background: rgba(50,50,50,0.8); }
+    #pause[aria-pressed="true"] { opacity: 1; color: #ffd76a; border-color: #7a6520; }
     /* Collapsed chrome. One class on the body element, set in the markup so the page
        comes up hidden rather than flashing the full UI for a frame -- see
        ui-chrome.mjs. #canvas-container and #fatal-overlay are deliberately
@@ -103,6 +118,7 @@
       <div><span class="perf-label">SYNC:</span> <span id="val-sync-ms">0.0</span> ms</div>
     </div>
     <button id="download">Download CSV</button>
+    <button id="pause" aria-pressed="false">pause</button>
     <button id="ui-toggle" aria-expanded="false" aria-controls="controls">controls</button>
   </div>
 

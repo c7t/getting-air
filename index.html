@@ -58,6 +58,38 @@
       cursor: pointer; font-family: monospace;
     }
     #download:hover { background: rgba(50,50,50,0.8); }
+    /* Bottom left of the canvas; never hidden. Stopping the sim is what you
+       reach for when something on screen needs a closer look. */
+    #pause {
+      position: absolute; bottom: 8px; left: 8px;
+      font-size: 12px; color: #bbb; background: rgba(0,0,0,0.55);
+      padding: 4px 10px; border: 1px solid #444; border-radius: 3px;
+      cursor: pointer; font-family: monospace; opacity: 0.55;
+      transition: opacity 0.15s ease;
+      min-width: 5.5em;  /* so "pause"/"resume" does not resize the button */
+    }
+    #pause:hover, #pause:focus-visible { opacity: 1; background: rgba(50,50,50,0.8); }
+    #pause[aria-pressed="true"] { opacity: 1; color: #ffd76a; border-color: #7a6520; }
+    /* The one control that is never hidden -- it is the way back. Bottom
+       right, clear of #status/#perf (top left), #download (top right) and
+       #pause (bottom left). Same as index-amr.html. */
+    #ui-toggle {
+      position: absolute; bottom: 8px; right: 8px;
+      font-size: 12px; color: #bbb; background: rgba(0,0,0,0.55);
+      padding: 4px 10px; border: 1px solid #444; border-radius: 3px;
+      cursor: pointer; font-family: monospace; opacity: 0.55;
+      transition: opacity 0.15s ease;
+    }
+    #ui-toggle:hover, #ui-toggle:focus-visible { opacity: 1; background: rgba(50,50,50,0.8); }
+    /* Collapsed chrome, keyed off one class on <body> -- see ui-chrome.mjs.
+       This page ships EXPANDED (no class in the markup), unlike
+       index-amr.html; add class="ui-hidden" to <body> to ship it collapsed.
+       #canvas-container and #fatal-overlay are deliberately NOT listed: a
+       fatal error must stay visible, and showFatal() clears the class. */
+    body.ui-hidden #controls,
+    body.ui-hidden #status,
+    body.ui-hidden #perf,
+    body.ui-hidden #download { display: none; }
     #controls {
       flex-shrink: 0;
       background: rgba(0,0,0,0.85);
@@ -84,6 +116,8 @@
       <div><span class="perf-label">SYNC:</span> <span id="val-sync-ms">0.0</span> ms</div>
     </div>
     <button id="download">Download CSV</button>
+    <button id="pause" aria-pressed="false">pause</button>
+    <button id="ui-toggle" aria-expanded="true" aria-controls="controls">hide</button>
   </div>
 
   <div id="controls">

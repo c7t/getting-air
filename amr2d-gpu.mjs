@@ -42,6 +42,8 @@ import {
   denseL0ToRootVel,
   activeSlotsFromFreeCount,
 } from './amr2d.mjs';
+import { unpackF } from './f-pack.mjs';
+import { EX, EY } from './lattice-2d.mjs';
 
 // Every level's blockSlot, copied in one command encoder and one submit, so
 // all levels come from the SAME GPU state. Returns { [level]: Set("bx,by") }.
@@ -2631,4 +2633,120 @@ export async function checkSlotQuadrantsOnGPU(device, pools, nLevels) {
     q.unmap(); s2b.unmap(); q.destroy(); s2b.destroy();
   }
   return { ok: violations.length === 0, checked, violations };
+}
+
+
+// IS THE FLUID STILL A FLUID? Ported from amr2d/backport's B6-9b (ad46a2a),
+// a dead-end branch whose finding outlived it.
+//
+// THE GAP. The AMR invariant sweep's `field` column is debugReadCardState --
+// the rigid BODY's six numbers -- and those cannot go NaN whatever the fluid
+// does: safeFixed maps a NaN force to 0 and clamps it, every moment divides by
+// max(rho, 1e-6), and the integrated velocity is clamped to v_max. Each is
+// correct containment; together they guarantee a finite card over an
+// arbitrarily wrecked flow. Measured on that branch: 100% of every active tile
+// NaN at step 1024 and after, card finite throughout, the index gates green.
+// Every other check in the sweep reads blockSlot/slotToBlock, never `f`.
+//
+// GATES ON FINITENESS AND A DELIBERATELY LOOSE rho BAND. Healthy runs here sit
+// at rho = 1 +/- 0.01; [0.1, 10] cannot false-positive on one and still caught
+// the rho ~ 1e3 that preceded that NaN by a few hundred steps. max|u| is
+// REPORTED, not gated: the reentry pages run genuinely fast, and a gate that
+// needs a per-page exception gets widened until it means nothing.
+//
+// INTERIOR CELLS ONLY, at every level. A tile's ring is a DELIVERY BUFFER under
+// explode/coalesce -- its non-delivered directions are zero on purpose -- so a
+// ring cell's "density" is not a density. The root pool has no ring; its tile
+// side is 2*RB and every slot is live. Levels >= 1 have side 2*RB + 2*ghost and
+// only blockSlot's live slots are scanned.
+//
+// ALL LEVELS IN ONE SUBMIT, for the reason this file's header gives for the
+// balance check: separate readbacks of a live page can straddle a frame.
+// Call it paused (every tool here does), when f_a is authoritative.
+//
+// THE FORCE REDUCTION'S CONTAINMENT COUNTER rides along when the page has a
+// body (`forceBuf`): safeFixed counts every substitution into forces[3], and
+// any count fails `ok`. GATED, not reported: a NaN reaching the force
+// reduction means the run is already wrong. Bodyless pages pass no forceBuf
+// and get `laundered: null`.
+export async function checkFieldFinite(device, pools, nLevels, { RB, f16 = 0, forceBuf = null, rhoLo = 0.1, rhoHi = 10 }) {
+  const U = GPUBufferUsage;
+  const enc = device.createCommandEncoder();
+  const legs = [];
+  for (let m = 0; m < nLevels; m++) {
+    const pool = pools[m];
+    const f = device.createBuffer({ size: pool.finePoolF_a.size, usage: U.MAP_READ | U.COPY_DST });
+    enc.copyBufferToBuffer(pool.finePoolF_a, 0, f, 0, pool.finePoolF_a.size);
+    let bs = null;
+    if (m > 0) {
+      bs = device.createBuffer({ size: pool.NBLOCKS * 4, usage: U.MAP_READ | U.COPY_DST });
+      enc.copyBufferToBuffer(pool.blockSlotBuf, 0, bs, 0, pool.NBLOCKS * 4);
+    }
+    legs.push({ m, pool, f, bs });
+  }
+  let fst = null;
+  if (forceBuf) {
+    fst = device.createBuffer({ size: 16, usage: U.MAP_READ | U.COPY_DST });
+    enc.copyBufferToBuffer(forceBuf, 0, fst, 0, 16);
+  }
+  device.queue.submit([enc.finish()]);
+  if (fst) await fst.mapAsync(GPUMapMode.READ);
+  await Promise.all(legs.flatMap(l => [l.f.mapAsync(GPUMapMode.READ), l.bs && l.bs.mapAsync(GPUMapMode.READ)].filter(Boolean)));
+
+  let nonFinite = 0, cells = 0, rhoMin = Infinity, rhoMax = -Infinity, maxU2 = 0;
+  let worst = null;
+  const perLevel = [];
+  for (const { m, pool, f, bs } of legs) {
+    const npool = pool.MAX_FINE_BLOCKS * pool.cellsPerSlot;
+    const raw = f.getMappedRange();
+    const arr = f16 ? unpackF(new Uint32Array(raw), npool, f16) : new Float32Array(raw);
+    const side = Math.round(Math.sqrt(pool.cellsPerSlot));
+    const ghost = (side - 2 * RB) / 2;
+    let slots;
+    if (bs) {
+      const blockSlot = new Int32Array(bs.getMappedRange());
+      slots = [];
+      for (let b = 0; b < pool.NBLOCKS; b++) if (blockSlot[b] >= 0) slots.push(blockSlot[b]);
+    } else {
+      slots = Array.from({ length: pool.MAX_FINE_BLOCKS }, (_, i) => i);
+    }
+    let lvCells = 0, lvBad = 0;
+    for (const slot of slots) {
+      for (let ly = ghost; ly < side - ghost; ly++) for (let lx = ghost; lx < side - ghost; lx++) {
+        const c = slot * pool.cellsPerSlot + ly * side + lx;
+        let rho = 0, mx = 0, my = 0, bad = 0;
+        for (let i = 0; i < 9; i++) {
+          const v = arr[i * npool + c];
+          if (!Number.isFinite(v)) bad++;
+          rho += v; mx += v * EX[i]; my += v * EY[i];
+        }
+        cells++; lvCells++;
+        if (bad) {
+          nonFinite += bad; lvBad += bad;
+          if (!worst) worst = { level: m, slot, lx, ly, rho };
+          continue;
+        }
+        if (rho < rhoMin) rhoMin = rho;
+        if (rho > rhoMax) rhoMax = rho;
+        if ((rho < rhoLo || rho > rhoHi) && !worst) worst = { level: m, slot, lx, ly, rho };
+        const u2 = (mx * mx + my * my) / (rho * rho);
+        if (u2 > maxU2) maxU2 = u2;
+      }
+    }
+    perLevel.push({ level: m, slots: slots.length, cells: lvCells, nonFinite: lvBad });
+  }
+  for (const l of legs) { l.f.unmap(); l.f.destroy(); if (l.bs) { l.bs.unmap(); l.bs.destroy(); } }
+  let laundered = null;
+  if (fst) { laundered = new Int32Array(fst.getMappedRange())[3]; fst.unmap(); fst.destroy(); }
+
+  // cells === 0 is a FAIL, not a pass: a scan that found nothing to read says
+  // nothing about the fluid, and this gate exists because of vacuous greens.
+  const ok = cells > 0 && nonFinite === 0 && rhoMin >= rhoLo && rhoMax <= rhoHi
+    && !(laundered > 0);
+  return {
+    ok, nonFinite, cells, perLevel, laundered,
+    rhoMin: Number.isFinite(rhoMin) ? rhoMin : null,
+    rhoMax: Number.isFinite(rhoMax) ? rhoMax : null,
+    maxU: Math.sqrt(maxU2), worst,
+  };
 }
