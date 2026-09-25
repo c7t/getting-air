@@ -55,6 +55,25 @@
       cursor: pointer; font-family: monospace;
     }
     #steer-btn[aria-pressed="true"] { color: #ffd76a; border-color: #7a6520; }
+    /* LANDSCAPE: the field is a square of side 100cqh centred in the
+       container, so there is an empty gutter (100cqw - 100cqh)/2 wide on each
+       side. Put the wheel in the LEFT one, centred, and size it to the gutter
+       instead of stacking it over the field. Keyed on the container's aspect,
+       not the device's orientation, so a wide desktop window gets it too and
+       a nearly square one (gutter too narrow to hold it) keeps the portrait
+       layout. */
+    @container (min-aspect-ratio: 4/3) {
+      #steer-box {
+        bottom: auto; top: 50%;
+        left: calc((100cqw - 100cqh) / 4);
+        transform: translate(-50%, -50%);
+        gap: 10px;
+      }
+      #steer-hud {
+        width: min(calc((100cqw - 100cqh) * 0.36), 45cqh);
+        height: min(calc((100cqw - 100cqh) * 0.36), 45cqh);
+      }
+    }
     #status {
       position: absolute; top: 8px; left: 8px;
       font-size: 12px; color: #7f7; background: rgba(0,0,0,0.6);

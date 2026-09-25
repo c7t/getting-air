@@ -11,16 +11,25 @@
 // screen.orientation.lock -- which matter here more than they look. Turning a
 // phone like a wheel is exactly the motion that trips AUTO-ROTATE at ~45 deg,
 // and the page would flip under your hands mid-turn. Locking the orientation
-// needs fullscreen on Android Chrome. The wheel angle itself is measured in
-// the DEVICE frame against a calibrated neutral, so it does not care which
-// way the display is drawn; the lock is for the person holding it.
+// needs fullscreen on Android Chrome.
+//
+// THE ZERO IS GRAVITY, NOT YOUR HANDS. The wheel is centred when the SCREEN is
+// level -- its own "up" pointing away from the ground -- for whichever
+// orientation the display is in when steering starts: portrait 0, landscape
+// +-90 deg of device roll. It is read from screen.orientation.angle
+// (window.orientation on older iOS) and NOT from the pose the phone happens to
+// be in at the tap, which is what this did first: tap while tilted and the
+// page steered forever. The zero is taken ONCE, at the start (and again on a
+// tap of the wheel), deliberately not on every orientation change: if the
+// lock is refused and the display auto-rotates at 45 deg mid-turn, following
+// it would flip the steering under your hands.
 
 import { createSteerFilter, steerInput, wrapAngle, motionSample, createAxisDetector, MAPPINGS } from './steer-imu.mjs';
 
 export function installSteerInput({ slider, valEl, button, hud, maxDeg = 45, deadDeg = 2 }) {
   const filter = createSteerFilter();
   let sensorOn = false, neutral = null, lastT = null, psi = 0, sensorS = 0;
-  let events = 0, pendingCalib = 0;
+  let events = 0, signChecked = false, accelInverted = false;
   // The rotationRate axis mapping (steer-imu.mjs's MAPPINGS): browsers do not
   // agree on it, so it is DETECTED from the first ~25 deg of turning and the
   // verdict remembered for this browser. Until then, Chrome's -- the one this
@@ -54,12 +63,19 @@ export function installSteerInput({ slider, valEl, button, hud, maxDeg = 45, dea
     }
     filter.update(smp.omega, smp.accel, dt);
     if (!filter.ready()) return;
-    // Calibrate a moment after starting, not on the first sample: the first
-    // sample is the accelerometer alone, and the tap that started it shook
-    // the phone.
-    if (neutral === null && ++pendingCalib > 20) neutral = filter.roll();
     if (neutral === null) return;
-    psi = wrapAngle(filter.roll() - neutral);
+    // THE ACCELEROMETER'S SIGN, once. iOS has reported
+    // accelerationIncludingGravity negated relative to the spec, which the
+    // filter cannot see (u and -u obey the same equation) and which a
+    // RELATIVE zero cancelled. An absolute zero does not: negated, level would
+    // read 180 deg. So assume the one thing a person starting to steer
+    // certainly does -- holds the phone within 90 deg of level -- and flip the
+    // reading if the first one says otherwise.
+    if (!signChecked) {
+      signChecked = true;
+      accelInverted = Math.abs(wrapAngle(filter.roll() - neutral)) > Math.PI / 2;
+    }
+    psi = wrapAngle(filter.roll() + (accelInverted ? Math.PI : 0) - neutral);
     // Screen facing the sky: the wheel angle is undefined there (gravity has
     // no component in the screen plane) and unobservable, so fade to centre
     // rather than steer on a gyro-only estimate that is free to drift.
@@ -68,7 +84,17 @@ export function installSteerInput({ slider, valEl, button, hud, maxDeg = 45, dea
     sensorS = steerInput(psi, { maxDeg, deadDeg }) * fade;
   };
 
-  const recenter = () => { neutral = null; pendingCalib = 0; };
+  // The display's rotation from the device's natural (portrait) orientation,
+  // degrees, as screen.orientation reports it: 90 when the phone is turned
+  // counter-clockwise onto its side. In this module's CLOCKWISE-positive roll
+  // that pose is -90 deg, so level is the negative of the screen angle.
+  const screenAngle = () => {
+    let a = 0;
+    if (typeof screen !== 'undefined' && screen.orientation && Number.isFinite(screen.orientation.angle)) a = screen.orientation.angle;
+    else if (typeof window.orientation === 'number') a = window.orientation;
+    return ((a % 360) + 360) % 360;
+  };
+  const recenter = () => { neutral = wrapAngle(-screenAngle() * Math.PI / 180); };
 
   async function start() {
     if (sensorOn) { stop(); return; }
@@ -79,7 +105,7 @@ export function installSteerInput({ slider, valEl, button, hud, maxDeg = 45, dea
       }
     } catch (e) { if (button) button.textContent = 'no motion access'; return; }
     window.addEventListener('devicemotion', onMotion);
-    sensorOn = true; recenter();
+    sensorOn = true; signChecked = false; recenter();
     if (button) { button.textContent = 'steering: tilt'; button.setAttribute('aria-pressed', 'true'); }
     // Best effort; each can refuse (desktop, iOS, an embedded view).
     try {
@@ -98,7 +124,8 @@ export function installSteerInput({ slider, valEl, button, hud, maxDeg = 45, dea
     try { if (screen.orientation && screen.orientation.unlock) screen.orientation.unlock(); } catch (e) { /* */ }
   }
   if (button) button.onclick = start;
-  // Tap the wheel to recentre: the neutral is wherever you are holding it.
+  // Tap the wheel to re-read the screen's orientation -- the way back to a
+  // correct zero after the display turned without the lock.
   if (hud) hud.onclick = () => { if (sensorOn) recenter(); else if (slider) { slider.value = 0; slider.oninput && slider.oninput(); } };
 
   if (slider) slider.oninput = () => { if (valEl) valEl.textContent = manual().toFixed(2); };
@@ -153,7 +180,8 @@ export function installSteerInput({ slider, valEl, button, hud, maxDeg = 45, dea
     drawHud,
     sensorActive: () => sensorOn,
     // For tools and the console: the fused state.
-    diag: () => ({ sensorOn, events, mapping, axesKnown, axesEvidence: axes.errors(), psiDeg: psi * 180 / Math.PI, s: value(),
+    diag: () => ({ sensorOn, events, mapping, axesKnown, axesEvidence: axes.errors(),
+      screenAngle: screenAngle(), neutralDeg: neutral === null ? null : neutral * 180 / Math.PI, accelInverted, psiDeg: psi * 180 / Math.PI, s: value(),
       inPlane: filter.inPlane(), accelWeight: filter.accelWeight(), bias: filter.bias(), up: filter.up() }),
   };
 }
