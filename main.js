@@ -1,6 +1,7 @@
 import { reportFatal, refuseConfig, reportNoWebGPU, reportNoAdapter } from './error-overlay.mjs';
 import { installVortControls } from './vort-controls.mjs';
 import { createTrail } from './trajectory-trail.mjs';
+import { createRefOverlay, cardAt, REF_MODES } from './ref-overlay.mjs';
 import { createTotalUnwrapper } from './card-total.mjs';
 import { createSimPacer, parseSimRate, DEFAULT_TU_PER_SEC } from './sim-rate.mjs';
 import { loadShader } from './shader-loader.mjs';
@@ -67,6 +68,21 @@ const VORT_GAMMA = parseFloat(urlParams.get('vortGamma')) || 1.2;
 
 let resLog2 = parseResLog2(urlParams, DENSE_DEFAULT_RES_LOG2);
 { const why = resLog2Problem(resLog2); if (why) refuseConfig(statusEl, why); }
+
+// WHERE THE CARD SITS IN THE WINDOW (?cardY=, fraction of the window height
+// from the top; default 0.6 -- a little below centre, chosen by eye
+// 2026-09-25 -- where 0.5 is the centre). The window scrolls by the card's
+// TRAVEL, so the card stays wherever it STARTED relative to the window -- and
+// to the sponge band at its edges, which is anchored to the window. So this is
+// just the initial buffer cy. Below centre (> 0.5) shows more of the wake,
+// which trails above a falling card, at the cost of room ahead of it.
+// Refused outside [0.2, 0.8] rather than clamped: much further and the card's
+// own chord reaches the sponge.
+const CARD_Y = urlParams.has('cardY') ? parseFloat(urlParams.get('cardY')) : 0.6;
+if (!(CARD_Y >= 0.2 && CARD_Y <= 0.8)) refuseConfig(statusEl, `?cardY=${urlParams.get('cardY')} invalid -- must be in [0.2, 0.8] (fraction of the window height from the top)`);
+// Whole cells, as W/2 always was, so a moved card keeps the same sub-cell
+// phase against the lattice.
+const cardY0 = () => Math.round(H * CARD_Y);
 
 // Fixed simulation RATE (sim-rate.mjs). STEPS_PER_FRAME below is now a
 // CEILING, not a target: the pacer asks for however many steps a wall-clock
@@ -216,13 +232,13 @@ async function init() {
   const cardStateBuf   = device.createBuffer({ size: 104, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
 
   const cardInit = new Float32Array([
-    W/2, H/2, 0.2,   // cx, cy, theta
+    W/2, cardY0(), 0.2,   // cx, cy, theta
     0, 0, 0,         // vx, vy, omega
     0, 0, 0,         // fx, fy, tz
     MASS, I_BODY, G_EFF,
     A, B,
     0.3, 0.025,      // v_max, o_max
-    W/2, H/2, 0.2,   // cx_old, cy_old, th_old
+    W/2, cardY0(), 0.2,   // cx_old, cy_old, th_old
     TAU,             // tau
     0, 0,            // y_total, x_total
     0, 0, 0, 0       // off_x, off_y, off_x_old, off_y_old
@@ -400,6 +416,34 @@ async function init() {
   // the full run; only the trail's own buffer rolls, since it needs just
   // enough history to draw one window of descent.
   const trail = createTrail(document.getElementById('trail'));
+  // WORLD-FIXED POSITION REFERENCE (ref-overlay.mjs): grid / stars / crosses,
+  // so the card's speed can be read off the screen. ?ref= picks the initial
+  // mode, the Position reference control or the `r` key switch it live.
+  // Spacing is in CHORDS so it means the same at every resolution: grid and
+  // stars every half chord, crosses every chord (reseau-style, sparser),
+  // all times ?refSpacing= (default 3).
+  const refOverlay = createRefOverlay(document.getElementById('ref'));
+  // Defaults chosen by eye (2026-09-24): crosses, three chords apart.
+  let refMode = REF_MODES.includes(urlParams.get('ref')) ? urlParams.get('ref') : 'crosses';
+  const REF_SCALE = parseFloat(urlParams.get('refSpacing')) || 3;
+  let lastCard = null;   // { x, y, vx, vy, step } from the latest readback
+  const refSelect = document.getElementById('select-REF');
+  const setRefMode = (m) => { refMode = m; if (refSelect) refSelect.value = m; redrawWanted = true; };
+  if (refSelect) { refSelect.value = refMode; refSelect.onchange = () => setRefMode(refSelect.value); }
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'r' || e.ctrlKey || e.metaKey || e.altKey) return;
+    const t = e.target && e.target.tagName;
+    if (t === 'INPUT' || t === 'SELECT' || t === 'TEXTAREA') return;
+    setRefMode(REF_MODES[(REF_MODES.indexOf(refMode) + 1) % REF_MODES.length]);
+  });
+  const drawRef = () => {
+    const c = cardAt(lastCard, step);
+    const chord = 2 * A;
+    // The overlay maps the SCREEN CENTRE; the card sits cardY0() - H/2 cells
+    // below it (?cardY=), so the centre's world y is that much above the card.
+    refOverlay.draw(refMode, c ? { cx: c.x, cy: c.y + (H / 2 - cardY0()), spanX: W, spanY: H,
+      spacing: (refMode === 'crosses' ? chord : 0.5 * chord) * REF_SCALE } : {});
+  };
   // The shaders keep x_total/y_total wrapped so their f32 precision stops
   // decaying with run length; this turns them back into true float64 totals.
   // Everything below reads xTotal/yTotal, never d[21]/d[20] -- see
@@ -531,6 +575,7 @@ async function init() {
           const enc = device.createCommandEncoder();
           encodeSceneRender(enc);
           device.queue.submit([enc.finish()]);
+          drawRef();
           trail.draw(2 * A, trailOpacity);
         }
         requestAnimationFrame(() => frame().catch(handleErr));
@@ -565,6 +610,7 @@ async function init() {
       }
 
       encodeSceneRender(enc);
+      drawRef();
       trail.draw(2 * A, trailOpacity);
       
       enc.copyBufferToBuffer(cardStateBuf, 0, stage.card, 0, 104);
@@ -608,6 +654,7 @@ async function init() {
         // The card's UNWRAPPED path. The wrapped cx/cy cannot be used: they
         // never leave the buffer centre.
         trail.push(xTotal, yTotal, 2 * A);
+        lastCard = { x: xTotal, y: yTotal, vx: d[3], vy: d[4], step: st.step };
         
         if (performance.now() - lastT > 250) {
           const mlups = (NCELLS * (st.steps || 0)) / (gpuTime * 1e3);
