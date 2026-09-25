@@ -287,13 +287,26 @@ plausible numbers. See the webgpu-verify skill's section 0.
   crossflow, time-averaged Cd/Strouhal vs. literature values in
   `benchmarks/cylinder.json`. Assumes a Chrome + page are already up (see
   `webgpu-verify`) — `validate-all.js` is the one-command version.
+- **The `fluid` invariant (`debugCheckFieldFinite`, 2026-09-24) is the only
+  one that reads `f`.** Every other invariant reads blockSlot/slotToBlock, and
+  `field` is the card body's numbers, which stay finite over a completely NaN
+  fluid (measured: level 2 poisoned via a snapshot, NaN on every level 256
+  steps later, card state finite throughout). It scans every level's interior
+  cells for non-finite values and a rho band of [0.1, 10], and fails on any
+  `safeFixed` substitution in the force reduction (`laundered`, counted in
+  `forces[3]`). **`x != x` IS NOT A NaN TEST IN WGSL HERE** -- the spec lets
+  the compiler assume finite floats, and it did: the old `select(x, 0, x != x)`
+  containment in `amr_force1.wgsl`/`lbm_force.wgsl` never fired. Test the
+  exponent bits (`(bitcast<u32>(x) & 0x7f800000u) == 0x7f800000u`). 3D's
+  `common_d3_force*.wgsl` still use `x != x`.
 - **`tools/validate-amr-invariants.js`** — AMR structural invariants,
   asserted periodically through a run (not just at the end, so a transient
   violation can't slip past). **Seven gates as of 2026-09-14, all gating:**
   2:1 balance (`debugCheck21Balance`), CORNER 2:1 balance (same call — gating
   only since the closure made it satisfiable), geometry-forced refinement
   (`debugCheckGeometryCoverage` — every leaf near the body already at the
-  finest level), field-finite (NaN/blowup), pool starvation (refines refused
+  finest level), field-finite (NaN/blowup -- **but see `fluid` below: this
+  one reads the card BODY's numbers, which cannot go NaN**), pool starvation (refines refused
   for want of a slot; needs `?diag=1` or it reads vacuously true — and needs
   the page to expose `debugReadDiag`, which the channel, TGV and reentry pages
   did NOT until 2026-09-22, so this gate was absent rather than green on

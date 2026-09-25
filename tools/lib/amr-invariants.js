@@ -92,6 +92,13 @@ async function runInvariantSweep(Runtime, opts) {
   // a skipped check is REPORTED as skipped, never as OK.
   const hasDiag = await has('debugReadDiag');
   const hasCardState = await has('debugReadCardState');
+  // IS THE FLUID STILL A FLUID? The one check here that reads `f`. Every
+  // other one reads blockSlot/slotToBlock, and `field` below is the rigid
+  // BODY's numbers, which safeFixed, the max(rho,1e-6) floors and the v_max
+  // clamp keep finite however wrecked the flow is -- measured on amr2d/backport
+  // (B6-9b): 100% of every active tile NaN, card finite, index gates green.
+  // See amr2d-gpu.mjs's checkFieldFinite.
+  const hasFluid = await has('debugCheckFieldFinite');
 
   await evalExpr(Runtime, `${G}.setLive(false)`);
   // Deterministic, reproducible baseline -- debugStepSync's own return value
@@ -119,6 +126,7 @@ async function runInvariantSweep(Runtime, opts) {
   const quadrantViolations = [];
   const coverageViolations = [];
   const fieldViolations = [];
+  const fluidViolations = [];
   let stepsDone = 0;
 
   while (stepsDone < steps) {
@@ -178,12 +186,23 @@ async function runInvariantSweep(Runtime, opts) {
       if (bad.length) fieldViolations.push({ step: stepsDone, fields: bad, state: state.result.value });
     }
 
-    // cov/bad are null (not empty) when this page doesn't expose that check,
-    // so a caller renders "n/a" rather than the "OK" an empty result would
-    // otherwise read as.
-    if (onCheckpoint) onCheckpoint(stepsDone, { diag, bal: bal.result.value, cov, closure, quad, bad: hasCardState ? bad : null });
+    let fluid = null;
+    if (hasFluid) {
+      const r = await evalExpr(Runtime, `${G}.debugCheckFieldFinite()`, 120000);
+      if (r.exceptionDetails) throw new Error(`debugCheckFieldFinite failed at step ${stepsDone}: ${r.exceptionDetails.text}`);
+      fluid = r.result.value;
+      if (!fluid.ok) fluidViolations.push({ step: stepsDone, nonFinite: fluid.nonFinite, cells: fluid.cells,
+                                            rhoMin: fluid.rhoMin, rhoMax: fluid.rhoMax, laundered: fluid.laundered, worst: fluid.worst, perLevel: fluid.perLevel });
+    }
 
-    if (bad.length) break;
+    // cov/bad/fluid are null (not empty) when this page doesn't expose that
+    // check, so a caller renders "n/a" rather than the "OK" an empty result
+    // would otherwise read as.
+    if (onCheckpoint) onCheckpoint(stepsDone, { diag, bal: bal.result.value, cov, closure, quad, fluid, bad: hasCardState ? bad : null });
+
+    // A dead fluid does not recover; spending the rest of the budget stepping
+    // it only buries the first bad checkpoint under later ones.
+    if (bad.length || (fluid && !fluid.ok)) break;
   }
 
   const cornerFails = requireCornerBalance ? cornerViolations.length > 0 : false;
@@ -192,12 +211,13 @@ async function runInvariantSweep(Runtime, opts) {
   // unconditionally -- but only when ?diag=1 actually made the counters live.
   const ok = balanceViolations.length === 0 && coverageViolations.length === 0
     && fieldViolations.length === 0 && !cornerFails && starvationViolations.length === 0
-    && closureViolations.length === 0 && quadrantViolations.length === 0;
+    && closureViolations.length === 0 && quadrantViolations.length === 0
+    && fluidViolations.length === 0;
   return { ok, stepsDone, balanceViolations, cornerViolations, requireCornerBalance,
     starvationViolations, starvationChecked: hasDiag && diagEnabled,
     coverageViolations,
     closureViolations,
-    quadrantViolations, fieldViolations, hasCoverage, hasCardState };
+    quadrantViolations, fieldViolations, fluidViolations, hasFluid, hasCoverage, hasCardState };
 }
 
 module.exports = { evalExpr, checkFinite, runInvariantSweep };

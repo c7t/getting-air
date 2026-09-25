@@ -22,7 +22,7 @@ import {
   tauAtLevel as tauAtLevelOf,
 } from './card-params.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
-import { check21BalanceOnGPU, allocLevelPool, writePoolInitialState, checkRootPoolIdentity, readConservedTotals, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState, checkGeometryCoverageOnGPU, makeRefusalWatch , checkRefinementClosureOnGPU , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU, makeRenderBindGroup, renderPoolLevels, MAX_RENDER_POOL_LEVELS, makeAMRLayouts, makeCouplingPipelines, makeLevelBindGroups, withActiveList, force1Entries, makeActiveLists, makeManageBindGroups, makeScheduler, makeRefineRound, allocRootPool, makeRootPool, encodeRootCapture, readRootCapture, restoreRootCapture, seedRootFromDense, readDiag, readInterfaceMode, readCellCentre, makeExplodeCoalesce } from './amr2d-gpu.mjs';
+import { check21BalanceOnGPU, allocLevelPool, writePoolInitialState, checkRootPoolIdentity, readConservedTotals, readPoolIndirection as readPoolIndirectionOn, listActiveBlocks, readCardState, checkGeometryCoverageOnGPU, makeRefusalWatch , checkRefinementClosureOnGPU, checkFieldFinite , makeCascadePipelines, encodeCascade, cascadeRoundTrip, makeCascadeSeeds, checkSlotQuadrantsOnGPU, makeRenderBindGroup, renderPoolLevels, MAX_RENDER_POOL_LEVELS, makeAMRLayouts, makeCouplingPipelines, makeLevelBindGroups, withActiveList, force1Entries, makeActiveLists, makeManageBindGroups, makeScheduler, makeRefineRound, allocRootPool, makeRootPool, encodeRootCapture, readRootCapture, restoreRootCapture, seedRootFromDense, readDiag, readInterfaceMode, readCellCentre, makeExplodeCoalesce } from './amr2d-gpu.mjs';
 import { poolSlotsFor, tauChainSingularity, tauSingularityMessage, rootPoolSpec, rootCellIndex, cellUpdatesPerMacroStep, activeSlotList } from './amr2d.mjs';
 import { EX, EY, WT } from './lattice-2d.mjs';
 import { makeCanvasFit } from './canvas-fit.mjs';
@@ -2954,6 +2954,8 @@ async function init() {
   // per-pass tests and only the VETO half of the refine cascade exists,
   // so this is expected to be nonzero until plans/2D-backport.md B2.
   const debugCheckRefinementClosure = () => checkRefinementClosureOnGPU(device, pools, N_LEVELS);
+  // Reads the FLUID, which no other invariant does -- see checkFieldFinite.
+  const debugCheckFieldFinite = () => checkFieldFinite(device, pools, N_LEVELS, { RB, f16: F16, forceBuf });
   // A slot's quadrant is `slot % 4` by construction -- amr2d.mjs's
   // quadrantOfSlot. This scores the stored buffer against that rule over
   // live ACTIVE slots, which is what lets the pool manager stop writing it.
@@ -3590,6 +3592,7 @@ async function init() {
     debugPerturbLevelVel,
     debugCheck21Balance,
     debugCheckRefinementClosure,
+    debugCheckFieldFinite,
     debugCheckSlotQuadrants,
     debugCascadeRoundTrip,
     debugCheckGeometryCoverage,

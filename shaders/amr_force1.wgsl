@@ -274,8 +274,35 @@ fn get_chi(phi: f32) -> f32 {
     return chiFromPhiEps(phi, levelParams.kEps * levelParams.dxL);
 }
 
+// CONTAINMENT THAT COUNTS ITSELF. Ported from amr2d/backport's B6-9c (1677fb8).
+//
+// The substitution is correct and the SILENCE was not. NaN is never a valid
+// force, and neither is one past the fixed-point range, so both branches below
+// are "cannot happen" guards -- and they returned a plausible number when it
+// did. Zero force is the worst plausible number available: it is exactly what a
+// body in still fluid feels, so a wrecked flow reads as a calm one. Measured on
+// that branch: the whole level-2 pool NaN, and the only gate watching the body
+// reported OK at every checkpoint for 8192 steps.
+//
+// So keep the containment -- one sick cell must not stream Inf through the
+// field or make the float->i32 cast implementation-defined -- and RECORD that
+// it fired, in forces[3]: the accumulator's fourth slot, which nothing else
+// reads or clears, so the count is sticky from the host's reset (which zeroes
+// all four). Counted per call, i.e. per reduced partial, not per cell: nonzero
+// means the force reduction substituted a value, and never anything else.
+// Read back by amr2d-gpu.mjs's checkFieldFinite.
+//
+// THE NaN TEST IS ON THE BITS, NOT `x != x`. WGSL lets an implementation
+// assume floats are finite, so `x != x` may be folded to false -- and measured
+// on this machine's Dawn/Vulkan it was: with every population on level 2 set
+// to NaN and 256 steps run, the `x != x` form counted ZERO substitutions. That
+// means the NaN branch of this containment had never done anything either. An
+// exponent of all ones is NaN or Inf, and an integer test cannot be assumed
+// away. Healthy runs never take the branch, so they are bit-identical.
 fn safeFixed(x: f32) -> i32 {
-    let s = select(x, 0.0f, x != x);
+    let nonFinite = (bitcast<u32>(x) & 0x7f800000u) == 0x7f800000u;
+    if (nonFinite || x > 2.0e9f || x < -2.0e9f) { atomicAdd(&forces[3], 1); }
+    let s = select(x, 0.0f, nonFinite);
     return i32(clamp(s, -2.0e9f, 2.0e9f));
 }
 
