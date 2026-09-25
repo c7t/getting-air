@@ -15,6 +15,7 @@ import { createTrail } from './trajectory-trail.mjs';
 import { createTotalUnwrapper } from './card-total.mjs';
 import { createSimPacer, parseSimRate, DEFAULT_TU_PER_SEC } from './sim-rate.mjs';
 import { installChromeToggle } from './ui-chrome.mjs';
+import { installAboutCard } from './about-card.mjs';
 import { loadShader } from './shader-loader.mjs';
 import {
   deriveCardParams, parseCardParams, parseResLog2, resLog2Problem, reynoldsFromTau,
@@ -39,6 +40,9 @@ const statusEl = document.getElementById('status');
 // from the GPU. (error-overlay.mjs also force-reveals on any fatal, so the
 // two paths are independent -- neither relies on the other having run.)
 installChromeToggle(document.getElementById('ui-toggle'));
+// The about/references card -- see about-card.mjs. Top level for the same
+// reason as the toggle: it needs no GPU.
+installAboutCard(document.getElementById('canvas-container'));
 
 const urlParams = new URLSearchParams(window.location.search);
 

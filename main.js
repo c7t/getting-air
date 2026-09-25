@@ -8,6 +8,7 @@ import { packF, unpackF, fWords } from './f-pack.mjs';
 import { EX, EY, WT } from './lattice-2d.mjs';
 import { makeCanvasFit } from './canvas-fit.mjs';
 import { installChromeToggle } from './ui-chrome.mjs';
+import { installAboutCard } from './about-card.mjs';
 import {
   deriveCardParams, parseCardParams, parseResLog2, resLog2Problem, reynoldsFromTau,
   DENSE_DEFAULT_RES_LOG2,
@@ -21,6 +22,9 @@ const statusEl = document.getElementById('status');
 // there would strand a collapsed page. Same as main-amr.js; error-overlay.mjs
 // also force-reveals on any fatal.
 installChromeToggle(document.getElementById('ui-toggle'));
+// The about/references card -- see about-card.mjs. Top level for the same
+// reason as the toggle: it needs no GPU.
+installAboutCard(document.getElementById('canvas-container'));
 
 const urlParams = new URLSearchParams(window.location.search);
 
