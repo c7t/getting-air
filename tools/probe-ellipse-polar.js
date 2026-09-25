@@ -41,6 +41,12 @@ function parseArgs(argv) {
     alphas: '0,5,10,15,20,30,45,60,90',
     configs: 'diffuse-1.5:kEps=1.5;diffuse-0.75:kEps=0.75;diffuse-0.375:kEps=0.375;bounceback:bounceback=1',
     res: 10, blockage: 32, re: 1100, u0: 0.05, aspect: 0.125, transient: 30, window: 30, out: '',
+    // --early=T: ALSO report the force averaged over T +- 0.25 convective
+    // times after the (impulsive) start. Wang, Birch & Dickinson (2004) read
+    // their 2D translating-ellipse coefficients at t = 2 on a "temporary
+    // plateau after the initial transients", not as a long-time mean, and at
+    // high alpha the two differ by the whole stall.
+    early: 0,
   };
   for (const a of argv) {
     const i = a.indexOf('='); const k = a.slice(2, i), v = a.slice(i + 1);
@@ -96,9 +102,15 @@ async function main() {
         const cd = mean(win.map(r => r[3])), cl = mean(win.map(r => r[4])), clsd = sd(win.map(r => r[4]));
         const cm = mean(win.map(r => r[5]));
         const row = { config: cfg.name, alpha, cd, cl, cm, ld: cl / cd, clsd, dead, tau: p.TAU, chord: p.D, secs: (Date.now() - t0) / 1000 };
+        if (o.early > 0) {
+          const ew = history.filter(r => Math.abs(r[0] / tConv - o.early) <= 0.25);
+          row.early = { t: o.early, cd: mean(ew.map(r => r[3])), cl: mean(ew.map(r => r[4])), n: ew.length };
+        }
         results.push(row);
         console.log(`  ${cfg.name.padEnd(14)} alpha ${String(alpha).padStart(4)}  Cd ${cd.toFixed(4)}  Cl ${cl.toFixed(4)}  Cm ${cm.toFixed(4)}  L/D ${(cl / cd).toFixed(3).padStart(7)}`
-          + `  Cl sd ${clsd.toFixed(4)}  (tau ${p.TAU.toFixed(5)}, chord ${p.D.toFixed(1)}, ${row.secs.toFixed(0)} s)${dead ? '  FLUID DIED -- read nothing' : ''}`);
+          + `  Cl sd ${clsd.toFixed(4)}`
+          + (row.early ? `  | t=${o.early}: Cd ${row.early.cd.toFixed(4)} Cl ${row.early.cl.toFixed(4)}` : '')
+          + `  (tau ${p.TAU.toFixed(5)}, chord ${p.D.toFixed(1)}, ${row.secs.toFixed(0)} s)${dead ? '  FLUID DIED -- read nothing' : ''}`);
       }
     }
   } finally {
