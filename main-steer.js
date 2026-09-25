@@ -675,7 +675,7 @@ async function init() {
       await buf.mapAsync(GPUMapMode.READ);
       const v = Array.from(new Float32Array(buf.getMappedRange().slice(0)));
       buf.unmap(); buf.destroy();
-      return { input: v[0], reach: v[1], mode: v[2], slew: v[3], fb: v[4], d: v[5] };
+      return { input: v[0], reach: v[1], mode: v[2], slew: v[3], fb: v[4], d: v[5], dd: v[6] };
     },
     steerDiag: () => steer.diag(),
   };
