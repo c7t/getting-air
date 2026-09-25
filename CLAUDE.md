@@ -298,7 +298,8 @@ plausible numbers. See the webgpu-verify skill's section 0.
   the compiler assume finite floats, and it did: the old `select(x, 0, x != x)`
   containment in `amr_force1.wgsl`/`lbm_force.wgsl` never fired. Test the
   exponent bits (`(bitcast<u32>(x) & 0x7f800000u) == 0x7f800000u`). 3D's
-  `common_d3_force*.wgsl` still use `x != x`.
+  `common_d3_force*.wgsl` got the same fix 2026-09-25; nothing in `shaders/`
+  uses `x != x` any more.
 - **`tools/validate-amr-invariants.js`** — AMR structural invariants,
   asserted periodically through a run (not just at the end, so a transient
   violation can't slip past). **Seven gates as of 2026-09-14, all gating:**

@@ -156,8 +156,17 @@ const FSCALE = 10000000f;
 
 // NaN -> 0 and clamp into the fixed-point range, so the f32 -> i32 cast is
 // well-defined on every backend (parity with the 2D force kernels).
+//
+// THE NaN TEST IS ON THE BITS, NOT `x != x`. WGSL lets the compiler assume
+// floats are finite, and on this machine's Dawn/Vulkan it folded `x != x` to
+// false -- measured on the 2D kernels (amr_force1.wgsl's safeFixed header): an
+// all-NaN fluid, zero substitutions. So the NaN -> 0 branch here had never
+// fired either, and a NaN force reached the i32 cast. An all-ones exponent is
+// NaN or Inf, and an integer test cannot be assumed away. Healthy runs never
+// take the branch, so they are bit-identical.
 fn safeFixed(x: f32) -> i32 {
-  let s = select(x, 0.0f, x != x);
+  let nonFinite = (bitcast<u32>(x) & 0x7f800000u) == 0x7f800000u;
+  let s = select(x, 0.0f, nonFinite);
   return i32(clamp(s, -2.0e9f, 2.0e9f));
 }
 
