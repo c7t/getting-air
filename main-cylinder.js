@@ -108,6 +108,27 @@ let R = W / (2 * BLOCKAGE);
 // override, so changing it takes a page reload, same convention as the
 // RES slider. TAU is dynamic (like main.js) so Re can be explored live
 // without recompiling pipelines.
+// ?aspect= / ?alpha= -- THE ELLIPSE POLAR HARNESS (tools/probe-ellipse-polar.js).
+// The pinned body becomes an ellipse with semi-major axis R (so D = 2R is its
+// CHORD, and Re, Cd and Cl keep the chord as their length: Cd is the force
+// along the inflow, Cl across it, both per chord) and semi-minor axis
+// aspect * R, rotated to angle of attack alpha (degrees). get_phi has always
+// taken a rotated ellipse; this page only ever passed a circle. Defaults 1 and
+// 0 write the SAME floats as before, so every recorded cylinder baseline is
+// untouched.
+//
+// Sign convention: the flow is +x; theta = alpha puts the TRAILING end at +y,
+// so the flow is turned toward +y and the body feels -y. Cl is reported as
+// -2 fy / (U0^2 D) so that positive alpha gives positive lift -- a mirror
+// convention only (the ellipse is symmetric), stated so a sign is never
+// guessed. The circle's Cl flips sign with it, which no Cd/St check reads.
+const ASPECT = urlParams.has('aspect') ? parseFloat(urlParams.get('aspect')) : 1;
+const ALPHA_DEG = urlParams.has('alpha') ? parseFloat(urlParams.get('alpha')) : 0;
+if (!(ASPECT > 0 && ASPECT <= 1)) throw new Error(`?aspect=${urlParams.get('aspect')} must be in (0, 1] (b/a)`);
+if (!Number.isFinite(ALPHA_DEG)) throw new Error(`?alpha=${urlParams.get('alpha')} must be a number of degrees`);
+const ALPHA = ALPHA_DEG * Math.PI / 180;
+const LIFT_SIGN = (ASPECT === 1 && ALPHA_DEG === 0) ? 1 : -1;   // the circle keeps its historical sign
+
 let U0 = parseFloat(urlParams.get('u0')) || 0.04;
 let RE = parseFloat(urlParams.get('re')) || 100;
 
@@ -222,7 +243,15 @@ async function init() {
   if (!navigator.gpu) { reportNoWebGPU(statusEl); return; }
   const adapter = await navigator.gpu.requestAdapter();
   if (!adapter) { reportNoAdapter(statusEl); return; }
-  const device = await adapter.requestDevice();
+  // res 11's f buffer is 2048^2 * 9 * 4 B = 144 MiB, past the DEFAULT
+  // maxStorageBufferBindingSize (128 MiB), and requestDevice() with no limits
+  // gets the defaults -- so ?res=11 never booted, with no error beyond
+  // window.__CYL never appearing. Ask for what the adapter actually has;
+  // raising a ceiling changes nothing below it.
+  const device = await adapter.requestDevice({ requiredLimits: {
+    maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
+    maxBufferSize: adapter.limits.maxBufferSize,
+  } });
 
   device.pushErrorScope('validation');
 
@@ -256,13 +285,13 @@ async function init() {
   const CY0 = H / 2;
   function cardInit() {
     return new Float32Array([
-      CX0, CY0, 0,     // cx, cy, theta
+      CX0, CY0, ALPHA, // cx, cy, theta
       0, 0, 0,         // vx, vy, omega -- pinned (v_max/o_max = 0 below)
       0, 0, 0,         // fx, fy, tz
       1, 1, 0,         // mass, i_body, g_eff (no gravity, body is fixed)
-      R, R,            // a, b (circle)
+      R, ASPECT * R,   // a, b (a circle unless ?aspect=)
       0, 0,            // v_max, o_max -- 0 freezes the body exactly
-      CX0, CY0, 0,     // cx_old, cy_old, th_old
+      CX0, CY0, ALPHA, // cx_old, cy_old, th_old
       TAU,             // tau
       0, 0,            // y_total, x_total
       0, 0, 0, 0        // off_x, off_y, off_x_old, off_y_old
@@ -435,7 +464,7 @@ async function init() {
       const d = new Float32Array(stage.getMappedRange());
       const fx = d[6], fy = d[7];
       const Cd = 2 * fx / (U0 * U0 * D);
-      const Cl = 2 * fy / (U0 * U0 * D);
+      const Cl = LIFT_SIGN * 2 * fy / (U0 * U0 * D);
       trajectory.push([step, fx, fy, Cd, Cl]);
       stage.unmap();
     }
@@ -503,7 +532,8 @@ async function init() {
     setRe,
     getStep: () => step,
     getDims: () => ({ W, H }),
-    getParams: () => ({ R, D: 2 * R, U0, Re: RE, TAU, blockage: BLOCKAGE, upstream: UPSTREAM, perturb: PERTURB, seed: SEED, W, H }),
+    getParams: () => ({ R, D: 2 * R, U0, Re: RE, TAU, blockage: BLOCKAGE, upstream: UPSTREAM, perturb: PERTURB, seed: SEED, W, H,
+      aspect: ASPECT, alphaDeg: ALPHA_DEG, bounceback: USE_BOUNCEBACK, kEps: K_EPS }),
     getForceHistory: () => trajectory.slice(),
     debugRunAndCollect,
     debugSnapshotSave,
@@ -541,7 +571,7 @@ async function init() {
         const d = new Float32Array(st.card.getMappedRange());
         const fx = d[6], fy = d[7];
         const Cd = 2 * fx / (U0 * U0 * D);
-        const Cl = 2 * fy / (U0 * U0 * D);
+        const Cl = LIFT_SIGN * 2 * fy / (U0 * U0 * D);
         if (st.step < 500000) trajectory.push([st.step, fx, fy, Cd, Cl]);
 
         if (performance.now() - lastT > 250) {
