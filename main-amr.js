@@ -1039,7 +1039,12 @@ async function init() {
   // which carries the reasoning for the changed-size guard (it was ten
   // identical copies of it).
   const resize = makeCanvasFit({ canvas, ctx, device, format: fmt });
-  window.addEventListener('resize', resize);
+  // A PAUSED page must repaint after a resize: assigning canvas.width/height
+  // CLEARS the drawing buffer, and a paused frame() never reaches the render
+  // pass on its own -- so the picture went blank (or stale) until resume.
+  // See redrawWanted in frame().
+  let redrawWanted = false;
+  window.addEventListener('resize', () => { resize(); redrawWanted = true; });
   resize();
 
   const U = GPUBufferUsage;
@@ -1762,6 +1767,40 @@ async function init() {
   let step = 0, lastT = performance.now();
   let useB = false;
   let liveMode = true;
+
+  // ── PAUSE ───────────────────────────────────────────────────────────────
+  // ONE WRITER FOR liveMode, and that is the whole point of this function
+  // rather than a two-line onclick. The flag has several callers -- the
+  // button, window.__AMR.setLive (CDP/tooling), debugStepSync/debugStepOne,
+  // the profiler and runBenchSweep's restores -- and a button whose label is
+  // maintained separately from the flag it reports is a second source of
+  // truth that goes stale the first time anything else writes it.
+  // `node tools/validate-all.js` pauses every page it visits; the label has
+  // to survive that.
+  //
+  // pacer.reset() on RESUME only: frame() returns early while paused without
+  // ever reaching the pacer, so its last-timestamp would otherwise be stale by
+  // the whole pause and the first live frame would try to catch up across it.
+  // (MAX_FRAME_DT_MS and the accumulator cap already bound the damage to one
+  // frame; this makes it exactly zero.)
+  //
+  // Ported from amr2d/backport af1a31e, a dead-end branch, plus the paused
+  // redraw (redrawWanted) that version lacked.
+  const pauseBtn = document.getElementById('pause');
+  function setLive(v) {
+    liveMode = !!v;
+    if (liveMode) pacer.reset();
+    if (pauseBtn) {
+      pauseBtn.textContent = liveMode ? 'pause' : 'resume';
+      pauseBtn.setAttribute('aria-pressed', liveMode ? 'false' : 'true');
+    }
+  }
+  if (pauseBtn) pauseBtn.onclick = () => setLive(!liveMode);
+  // Any control can change what the renderer draws (view mode, overlays,
+  // parameters that feed the render uniforms), so while paused, any input
+  // asks for one repaint. Cheap: one render pass, only when something moved.
+  const controlsEl = document.getElementById('controls');
+  if (controlsEl) for (const ev of ['input', 'change']) controlsEl.addEventListener(ev, () => { redrawWanted = true; });
   let autoRefine = true; // Milestone 4b: on by default so refinement (and its coverage overlay) is visible without a console command; setAutoRefine(false) to disable for manual debugActivateBlock/debugDeactivateBlock testing
   let macroStepCounter = 0;
 
@@ -2980,7 +3019,7 @@ async function init() {
   // locked to STEPS_PER_FRAME=64-step batches), for bisecting exactly which
   // macro-step a divergence first appears on.
   async function debugStepOne() {
-    liveMode = false;
+    setLive(false);
     const enc = device.createCommandEncoder();
     dispatchMacroStep(enc);
     device.queue.submit([enc.finish()]);
@@ -2990,7 +3029,7 @@ async function init() {
   }
 
   async function debugStepSync(n) {
-    liveMode = false;
+    setLive(false);
     // This path bypasses frame() entirely, so it has to flush pending
     // parameter changes itself -- otherwise a headless driver that sets a
     // slider and then steps would silently run the old values.
@@ -3210,7 +3249,7 @@ async function init() {
       // with the live loop's. Restored in the finally below.
       const wasLive = liveMode;
       try {
-        liveMode = false;
+        setLive(false);
         await device.queue.onSubmittedWorkDone();
         const p = await debugProfileMacroStep(6);
         body.profile = { totalMs: +p.totalMs.toFixed(4), reps: p.reps,
@@ -3222,7 +3261,7 @@ async function init() {
       } catch (e) {
         body.profileError = String(e && e.message || e);
       } finally {
-        liveMode = wasLive;
+        setLive(wasLive);
       }
     }
     try {
@@ -3310,7 +3349,7 @@ async function init() {
     } finally {
       benchSkip.clear();
       if (wasAuto && !autoRefine) await setAutoRefine(true);
-      liveMode = true;
+      setLive(true);
     }
   }
   async function runBenchSweepBody(wasAuto) {
@@ -3407,7 +3446,7 @@ async function init() {
     benchSkip.clear();
     document.removeEventListener('visibilitychange', onVis);
     if (wasAuto) await setAutoRefine(true);
-    liveMode = true; // debugStepSync cleared it; the page must resume after the sweep
+    setLive(true); // debugStepSync cleared it; the page must resume after the sweep
     const base = results.find(r => r.cfg === 'none');
     for (const r of results) {
       r.deltaMs = (base && base.medianMs != null && r.medianMs != null)
@@ -3527,11 +3566,9 @@ async function init() {
     runBenchSweep,
     hasTimestamp: () => hasTimestamp,
     debugProfileMacroStep,
-    // reset() on resume: frame() returns early while paused without ever
-    // reaching the pacer, so its last-timestamp would otherwise be stale by
-    // the whole pause. (MAX_FRAME_DT_MS and the accumulator cap already
-    // bound the damage to one frame; this makes it exactly zero.)
-    setLive: (v) => { liveMode = !!v; if (liveMode) pacer.reset(); },
+    // Delegates rather than writing liveMode itself, so the pause button's
+    // label cannot disagree with the flag -- see setLive's own header.
+    setLive,
     isLive: () => liveMode,
     reset: resetSim,
     getStep: () => step,
@@ -3614,8 +3651,18 @@ async function init() {
       if (paramsDirty) {
         updateGPUParams();
         paramsDirty = false;
+        redrawWanted = true;
       }
       if (!liveMode) {
+        // Paused: no step, but repaint when something asked for it -- a
+        // resize (which cleared the canvas) or a control change.
+        if (redrawWanted) {
+          redrawWanted = false;
+          const enc = device.createCommandEncoder();
+          encodeSceneRender(enc);
+          device.queue.submit([enc.finish()]);
+          trail.draw(2 * A, trailOpacity);
+        }
         requestAnimationFrame(() => frame().catch(handleErr));
         return;
       }

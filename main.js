@@ -169,7 +169,11 @@ async function init() {
   // which carries the reasoning for the changed-size guard (it was ten
   // identical copies of it).
   const resize = makeCanvasFit({ canvas, ctx, device, format: fmt });
-  window.addEventListener('resize', resize);
+  // A PAUSED page must repaint after a resize: assigning canvas.width/height
+  // CLEARS the drawing buffer, and a paused frame() never reaches the render
+  // pass on its own. See redrawWanted in frame().
+  let redrawWanted = false;
+  window.addEventListener('resize', () => { resize(); redrawWanted = true; });
   resize();
 
   const U = GPUBufferUsage;
@@ -438,8 +442,25 @@ async function init() {
   // value), and read the step count and the card's state. Added for
   // tools/bench-amr-vs-dense.js; nothing on the page depends on it.
   let liveMode = true;
+  // ONE WRITER FOR liveMode, so the pause button's label cannot disagree with
+  // the flag when a tool (window.__LBM.setLive, debugStepSync) writes it.
+  // pacer.reset() on resume: a paused frame() never reaches the pacer, so its
+  // last-timestamp would otherwise be stale by the whole pause. Same shape as
+  // main-amr.js's setLive.
+  const pauseBtn = document.getElementById('pause');
+  function setLive(v) {
+    liveMode = !!v;
+    if (liveMode) pacer.reset();
+    if (pauseBtn) {
+      pauseBtn.textContent = liveMode ? 'pause' : 'resume';
+      pauseBtn.setAttribute('aria-pressed', liveMode ? 'false' : 'true');
+    }
+  }
+  if (pauseBtn) pauseBtn.onclick = () => setLive(!liveMode);
+  const controlsEl = document.getElementById('controls');
+  if (controlsEl) for (const ev of ['input', 'change']) controlsEl.addEventListener(ev, () => { redrawWanted = true; });
   async function debugStepSync(n) {
-    liveMode = false;
+    setLive(false);
     if (paramsDirty) { updateGPUParams(); paramsDirty = false; }
     for (let k = 0; k < n; k += STEPS_PER_FRAME) {
       const enc = device.createCommandEncoder();
@@ -462,7 +483,7 @@ async function init() {
     return d;
   }
   window.__LBM = {
-    setLive: (v) => { liveMode = !!v; if (liveMode) pacer.reset(); },
+    setLive,
     isLive: () => liveMode,
     getStep: () => step,
     getDims: () => ({ W, H }),
@@ -471,13 +492,29 @@ async function init() {
     debugReadCardState,
   };
 
+  // The scene's render pass, shared by the live frame and the paused repaint.
+  function encodeSceneRender(enc) {
+    const rp = enc.beginRenderPass({ colorAttachments: [{ view: ctx.getCurrentTexture().createView(), clearValue: { r:0.07, g:0.07, b:0.1, a:1 }, loadOp: 'clear', storeOp: 'store' }]});
+    rp.setPipeline(renPL); rp.setBindGroup(0, renBG); rp.draw(6); rp.end();
+  }
+
   async function frame() {
     try {
       if (paramsDirty) {
         updateGPUParams();
         paramsDirty = false;
+        redrawWanted = true;
       }
       if (!liveMode) {
+        // Paused: no step, but repaint when something asked for it -- a
+        // resize (which cleared the canvas) or a control change.
+        if (redrawWanted) {
+          redrawWanted = false;
+          const enc = device.createCommandEncoder();
+          encodeSceneRender(enc);
+          device.queue.submit([enc.finish()]);
+          trail.draw(2 * A, trailOpacity);
+        }
         requestAnimationFrame(() => frame().catch(handleErr));
         return;
       }
@@ -509,8 +546,7 @@ async function init() {
         enc.copyBufferToBuffer(queryResolveBuffer, 0, stage.query, 0, 16);
       }
 
-      const rp = enc.beginRenderPass({ colorAttachments: [{ view: ctx.getCurrentTexture().createView(), clearValue: { r:0.07, g:0.07, b:0.1, a:1 }, loadOp: 'clear', storeOp: 'store' }]});
-      rp.setPipeline(renPL); rp.setBindGroup(0, renBG); rp.draw(6); rp.end();
+      encodeSceneRender(enc);
       trail.draw(2 * A, trailOpacity);
       
       enc.copyBufferToBuffer(cardStateBuf, 0, stage.card, 0, 104);
