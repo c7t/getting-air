@@ -34,7 +34,7 @@
        box. The `canvas` rule above sizes both identically; this one lifts it
        out of flow and centres it on top. pointer-events:none so it never
        intercepts a click meant for the page. */
-    #trail {
+    #trail, #ref {
       position: absolute; left: 50%; top: 50%;
       transform: translate(-50%, -50%);
       pointer-events: none;
@@ -108,6 +108,7 @@
 <body class="ui-hidden">
   <div id="canvas-container">
     <canvas id="c"></canvas>
+    <canvas id="ref"></canvas>
     <canvas id="trail"></canvas>
     <div id="status">initializing...</div>
     <div id="perf">
@@ -160,6 +161,15 @@
       <label>Sim speed (a/u<sub>t</sub> per s)</label>
       <input type="range" id="slider-SIM_RATE" min="0.25" max="12" step="0.05" value="2.3">
       <span id="val-SIM_RATE">2.30</span>
+    </div>
+    <div class="control-row">
+      <label>Position reference (r)</label>
+      <select id="select-REF">
+        <option value="off">off</option>
+        <option value="grid">grid</option>
+        <option value="stars">stars</option>
+        <option value="crosses">crosses</option>
+      </select>
     </div>
     <div class="control-row">
       <label>Trajectory trail</label>

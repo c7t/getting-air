@@ -1,6 +1,7 @@
 import { reportFatal, refuseConfig, reportNoWebGPU, reportNoAdapter } from './error-overlay.mjs';
 import { installVortControls } from './vort-controls.mjs';
 import { createTrail } from './trajectory-trail.mjs';
+import { createRefOverlay, cardAt, REF_MODES } from './ref-overlay.mjs';
 import { createTotalUnwrapper } from './card-total.mjs';
 import { createSimPacer, parseSimRate, DEFAULT_TU_PER_SEC } from './sim-rate.mjs';
 import { loadShader } from './shader-loader.mjs';
@@ -400,6 +401,31 @@ async function init() {
   // the full run; only the trail's own buffer rolls, since it needs just
   // enough history to draw one window of descent.
   const trail = createTrail(document.getElementById('trail'));
+  // WORLD-FIXED POSITION REFERENCE (ref-overlay.mjs): grid / stars / crosses,
+  // so the card's speed can be read off the screen. ?ref= picks the initial
+  // mode, the Position reference control or the `r` key switch it live.
+  // Spacing is in CHORDS so it means the same at every resolution: grid and
+  // stars every half chord, crosses every chord (reseau-style, sparser).
+  // ?refSpacing= scales both.
+  const refOverlay = createRefOverlay(document.getElementById('ref'));
+  let refMode = REF_MODES.includes(urlParams.get('ref')) ? urlParams.get('ref') : 'off';
+  const REF_SCALE = parseFloat(urlParams.get('refSpacing')) || 1;
+  let lastCard = null;   // { x, y, vx, vy, step } from the latest readback
+  const refSelect = document.getElementById('select-REF');
+  const setRefMode = (m) => { refMode = m; if (refSelect) refSelect.value = m; redrawWanted = true; };
+  if (refSelect) { refSelect.value = refMode; refSelect.onchange = () => setRefMode(refSelect.value); }
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'r' || e.ctrlKey || e.metaKey || e.altKey) return;
+    const t = e.target && e.target.tagName;
+    if (t === 'INPUT' || t === 'SELECT' || t === 'TEXTAREA') return;
+    setRefMode(REF_MODES[(REF_MODES.indexOf(refMode) + 1) % REF_MODES.length]);
+  });
+  const drawRef = () => {
+    const c = cardAt(lastCard, step);
+    const chord = 2 * A;
+    refOverlay.draw(refMode, c ? { cx: c.x, cy: c.y, spanX: W, spanY: H,
+      spacing: (refMode === 'crosses' ? chord : 0.5 * chord) * REF_SCALE } : {});
+  };
   // The shaders keep x_total/y_total wrapped so their f32 precision stops
   // decaying with run length; this turns them back into true float64 totals.
   // Everything below reads xTotal/yTotal, never d[21]/d[20] -- see
@@ -531,6 +557,7 @@ async function init() {
           const enc = device.createCommandEncoder();
           encodeSceneRender(enc);
           device.queue.submit([enc.finish()]);
+          drawRef();
           trail.draw(2 * A, trailOpacity);
         }
         requestAnimationFrame(() => frame().catch(handleErr));
@@ -565,6 +592,7 @@ async function init() {
       }
 
       encodeSceneRender(enc);
+      drawRef();
       trail.draw(2 * A, trailOpacity);
       
       enc.copyBufferToBuffer(cardStateBuf, 0, stage.card, 0, 104);
@@ -608,6 +636,7 @@ async function init() {
         // The card's UNWRAPPED path. The wrapped cx/cy cannot be used: they
         // never leave the buffer centre.
         trail.push(xTotal, yTotal, 2 * A);
+        lastCard = { x: xTotal, y: yTotal, vx: d[3], vy: d[4], step: st.step };
         
         if (performance.now() - lastT > 250) {
           const mlups = (NCELLS * (st.steps || 0)) / (gpuTime * 1e3);
