@@ -18,7 +18,7 @@
 //
 // A CAVEAT THAT REMAINS, and it is not small. Refinement allocation is
 // nondeterministic: blocks race on `atomicSub(&freeCount, 1)` in
-// amr_manage.wgsl, so which blocks win slots differs run to run even with
+// amr_manage_pool.wgsl, so which blocks win slots differs run to run even with
 // identical code and inputs. Two page loads therefore freeze at different
 // active-block counts (measured 148 vs 162 for the same config), and that
 // is a real workload difference, not measurement error. So:
@@ -52,18 +52,35 @@
 // Usage:
 //   node tools/bench-amr.js --warm=20000 --steps=20000 --reps=5 \
 //        'res=8&levels=3&blockage=3.3' 'res=8&levels=3&blockage=3.3&sdfFar=1e9'
+//
+// A PHONE, over adb (--remote). Chrome for Android exposes CDP on a unix
+// socket; forward it, open the page on the phone once (its tab is reused, never
+// closed), and point --baseUrl at the address the PHONE uses for this dev
+// server -- the page is navigated there, and the phone cannot reach localhost:
+//
+//   adb forward tcp:9229 localabstract:chrome_devtools_remote
+//   node tools/bench-amr.js --remote --port=9229 --baseUrl=https://era:4471 \
+//        --warm=2048 --steps=512 --reps=3 --skip=none,step1,force \
+//        'interface=explode&res=5&levels=4&spongeW=2&detslots=1'
+//
+// --remote starts no server and no Chrome, runs no browser-health teardown (it
+// reads the local Chrome's log), and needs Chrome FOREGROUNDED on the phone --
+// backgrounded, the socket drops with a bare "socket hang up". Every connect
+// passes `local: true`: a GET of /json/protocol crashes Chrome for Android
+// (tools/test-cdp-local.js).
 
 const path = require('path');
 const CDP = require('/usr/lib/node_modules/chrome-remote-interface');
 const REPO_ROOT = path.join(__dirname, '..');
 const BL = require('./lib/browser-lifecycle');
 
-const BASE_URL = 'https://localhost:4444';
-const PORT = 9333;
-
 function parseArgs(argv) {
-  const o = { warm: 20000, steps: 20000, reps: 5, page: 'index-amr.html', global: 'window.__AMR', configs: [], keepOpen: false, skip: null };
+  const o = { warm: 20000, steps: 20000, reps: 5, page: 'index-amr.html', global: 'window.__AMR', configs: [], keepOpen: false, skip: null,
+              baseUrl: 'https://localhost:4444', port: 9333, remote: false };
   for (const a of argv) {
+    if (a.startsWith('--baseUrl=')) { o.baseUrl = a.slice(10); continue; }
+    if (a.startsWith('--port=')) { o.port = Number(a.slice(7)); continue; }
+    if (a === '--remote') { o.remote = true; continue; }
     if (a.startsWith('--warm=')) o.warm = Number(a.slice(7));
     else if (a.startsWith('--steps=')) o.steps = Number(a.slice(8));
     else if (a.startsWith('--reps=')) o.reps = Number(a.slice(7));
@@ -100,10 +117,22 @@ function printHelp() {
 
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
-  const server = await BL.ensureServer(BASE_URL, REPO_ROOT);
-  const chrome = await BL.ensureChrome(PORT);
-  const tabId = await BL.openTab(PORT, 'about:blank');
-  const client = await CDP({ port: PORT, target: tabId });
+  const BASE_URL = opts.baseUrl, PORT = opts.port;
+  const { cellUpdatesPerMacroStep } = await import('../amr2d.mjs');
+  let server = null, chrome = null, tabId;
+  if (opts.remote) {
+    // Reuse the phone's own tab: one already on this dev server, else fail
+    // with the instruction rather than guessing at another tab.
+    const tabs = await CDP.List({ port: PORT });
+    const t = tabs.find(x => x.type === 'page' && x.url.startsWith(BASE_URL));
+    if (!t) throw new Error(`--remote: no tab on ${BASE_URL} at port ${PORT} -- open the page on the device first (and keep Chrome in the foreground)`);
+    tabId = t.id;
+  } else {
+    server = await BL.ensureServer(BASE_URL, REPO_ROOT);
+    chrome = await BL.ensureChrome(PORT);
+    tabId = await BL.openTab(PORT, 'about:blank');
+  }
+  const client = await CDP({ local: true, port: PORT, target: tabId });
   const { Page, Runtime } = client;
   await Page.enable(); await Runtime.enable();
   const ev = async (expr, t) => {
@@ -199,9 +228,10 @@ async function main() {
       ts.sort((a, b) => a - b);
       const med = ts[Math.floor(ts.length / 2)];
 
-      // Honest work metric: L0 plus every level's own substeps.
-      let cells = W * W;
-      for (let m = 1; m < nLevels; m++) cells += (active[m] || 0) * dims.FB * dims.FB * (2 ** m);
+      // Honest work metric: L0 plus every level's own substeps -- amr2d.mjs's
+      // cellUpdatesPerMacroStep, the unit the page's MLUPS readout and
+      // tools/lib/amr-cost.js use (interior cells; the ring is bookkeeping).
+      const cells = cellUpdatesPerMacroStep({ rootCells: W * W, rb: dims.RB, activeByLevel: active });
       const mcups = (cells * opts.steps) / (med * 1e3);
 
       rows.push({ cfg, med, spread: (ts[ts.length - 1] - ts[0]) / med, active, mcups });
@@ -222,7 +252,7 @@ async function main() {
     }
   } finally {
     await client.close();
-    await BL.teardown({ port: PORT, tabId, chrome, server, keepOpen: opts.keepOpen });
+    if (!opts.remote) await BL.teardown({ port: PORT, tabId, chrome, server, keepOpen: opts.keepOpen });
   }
 }
 

@@ -15,14 +15,32 @@
 // window.__CYL is the CDP-tooling surface (see tools/validate-cylinder.js),
 // modeled directly on main-amr.js's window.__AMR.
 
-import { reportFatal, reportNoWebGPU, reportNoAdapter } from './error-overlay.mjs';
-import { assembleShader } from './shader-loader.mjs';
+import { reportFatal, refuseConfig, reportNoWebGPU, reportNoAdapter } from './error-overlay.mjs';
+import { loadShader } from './shader-loader.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
+import { EX, EY, WT } from './lattice-2d.mjs';
+import { makeCanvasFit } from './canvas-fit.mjs';
 
 const canvas   = document.getElementById('c');
 const statusEl = document.getElementById('status');
 
 const urlParams = new URLSearchParams(window.location.search);
+
+
+// THE DIFFUSE BAND'S WIDTH, in units of a level's own cell size:
+// epsilon = K_EPS * dx_level (plans/2D-backport.md B7). Threaded into every
+// shader that evaluates chi -- step, force and render, at every level -- so
+// the band can be swept without touching a literal in nine files.
+//
+// Default 1.5 is the value every one of those sites already hardcoded, so
+// this build is byte-identical to the previous one. ?kEps=0.75 halves it.
+//
+// It is a BAND ladder, not a resolution ladder, that settles the standing
+// Cd red cells: CLAUDE.md diagnoses them as diffuse-interface width (the
+// effective body radius exceeds the nominal one, so Cd converges from ABOVE),
+// and a resolution ladder moves the band and everything else at once.
+const K_EPS = urlParams.has('kEps') ? parseFloat(urlParams.get('kEps')) : 1.5;
+if (!(K_EPS > 0)) throw new Error(`?kEps=${urlParams.get('kEps')} must be > 0`);
 let resLog2 = parseInt(urlParams.get('res')) || 9;
 if (resLog2 < 7) resLog2 = 7;
 if (resLog2 > 11) resLog2 = 11;
@@ -33,6 +51,14 @@ if (resLog2 > 11) resLog2 = 11;
 // method. Default off (0) reproduces today's exact behavior; main.js never
 // sets this at all, so the falling-card scenario is untouched either way.
 const USE_BOUNCEBACK = urlParams.has('bounceback') ? 1 : 0;
+
+// ?solideq=0 restores the pre-B8 behaviour: cells INSIDE the body evolve as
+// ordinary fluid under bounce-back, with chi forced to 0 and nothing damping
+// them. Default 1 holds them at the local solid equilibrium. See
+// shaders/lbm_step.wgsl's SOLID_EQ header -- on a PINNED body this cannot
+// move a number either way, which is why it ships on by default rather than
+// waiting for a re-baseline.
+const SOLID_EQ = urlParams.has('solideq') ? (parseInt(urlParams.get('solideq')) ? 1 : 0) : 1;
 
 // ?f16=1 / ?f16=2: real packed-half storage for `f` -- see
 // shaders/common_fpack.wgsl for the layout and f-pack.mjs for the host side.
@@ -62,7 +88,18 @@ let NCELLS = W * H;
 // a valid resolution sweep: blockage and fetch length in D-units stay
 // fixed, only the diffuse-interface width relative to D shrinks.
 let BLOCKAGE = parseFloat(urlParams.get('blockage')) || 24;
-let UPSTREAM = parseFloat(urlParams.get('upstream')) || 8;
+// UPSTREAM's default is 12, NOT the 8 this used to say, and the difference
+// is documentation catching up with reality rather than a change of
+// configuration. physics.wgsl step 5 overwrote cx with W/2 every step, so
+// CX0 was discarded and the cylinder ran at W/2 whatever this said --
+// ?upstream=4, 8 and 20 all measured Cd 1.951 / St 0.1260, bit-identical
+// (plans/2D-backport.md B5-2/B5-3). At the default BLOCKAGE = 24,
+// CX0 = UPSTREAM * 2 * R = UPSTREAM * W / BLOCKAGE, so UPSTREAM = 12 IS
+// exactly W/2, for any W and any `res`. Setting the default to 12 therefore
+// keeps every recorded baseline bit-identical while the knob becomes real.
+// It is real relative to the CYLINDER's diameter, so at a non-default
+// ?blockage= the body no longer lands at W/2 -- which is the knob working.
+let UPSTREAM = parseFloat(urlParams.get('upstream')) || 12;
 let R = W / (2 * BLOCKAGE);
 
 // U0: freestream speed in lattice units/step (kept small so Ma = U0/cs
@@ -107,9 +144,12 @@ u0Slider.oninput = () => {
   u0Val.textContent = parseFloat(u0Slider.value).toFixed(3);
 };
 
-const EX = [0, 1, 0,-1, 0, 1,-1,-1, 1];
-const EY = [0, 0, 1, 0,-1, 1, 1,-1,-1];
-const WT = [4/9, 1/9, 1/9, 1/9, 1/9, 1/36, 1/36, 1/36, 1/36];
+// The D2Q9 basis, from the ONE place it is derived -- lattice-2d.mjs, which
+// also generates shaders/common_lattice.wgsl. Typed out here (and in nine
+// sibling pages) until 2026-09-14, in f64 EXACT FRACTIONS while the shader
+// held eight-digit f32 decimals: the host built its initial condition from
+// weights the GPU did not have. WT is now the shader's own f32 values.
+// EX/EY were already identical everywhere and are unchanged.
 
 function feq(rho, ux, uy, i) {
   const eu = EX[i]*ux + EY[i]*uy;
@@ -158,15 +198,6 @@ function initF() {
   return f;
 }
 
-async function loadShader(device, path) {
-  const code = await assembleShader(path, async (p) => {
-    const r = await fetch(p + '?v=' + Date.now());
-    if (!r.ok) throw new Error(`failed to load ${p} (HTTP ${r.status} ${r.statusText})`);
-    return r.text();
-  });
-  return device.createShaderModule({ code });
-}
-
 function handleErr(e) {
   // Status line AND a legible on-page overlay -- see error-overlay.mjs for why
   // the 12px status line alone was not enough.
@@ -198,35 +229,10 @@ async function init() {
   const ctx = canvas.getContext('webgpu');
   const fmt = navigator.gpu.getPreferredCanvasFormat();
 
-  // Reconfigure ONLY on a real size change. This used to run unconditionally
-  // on every `resize` event, and both halves of it are destructive:
-  // assigning canvas.width/height resets the drawing buffer even when the
-  // value is unchanged, and ctx.configure() replaces the swapchain,
-  // invalidating textures that in-flight command buffers still reference
-  // (this page keeps up to STAGES frames in flight).
-  //
-  // On desktop `resize` fires when you resize the window, so the cost was
-  // invisible. On a PHONE it fires constantly -- the URL bar hides and shows
-  // on any scroll or drag, which includes touching the control sliders --
-  // so the swapchain was being torn down and rebuilt underneath frames that
-  // were already submitted. Reported symptom: the view "twitches back" a few
-  // frames, correlated with moving sliders or switching away and back.
-  //
-  // Also guards the degenerate case: clientWidth/Height read 0 during some
-  // layout transitions (and while hidden), and a 0-sized canvas is not a
-  // valid configuration.
-  let cfgW = 0, cfgH = 0;
-  function resize() {
-    const dpr = window.devicePixelRatio || 1;
-    const w = Math.round(canvas.clientWidth * dpr);
-    const h = Math.round(canvas.clientHeight * dpr);
-    if (w <= 0 || h <= 0) return;      // mid-layout / hidden: nothing to configure
-    if (w === cfgW && h === cfgH) return; // same size: reconfiguring is pure damage
-    cfgW = w; cfgH = h;
-    canvas.width = w;
-    canvas.height = h;
-    ctx.configure({ device, format: fmt, alphaMode: 'opaque' });
-  }
+  // Canvas sizing and swapchain reconfiguration -- see canvas-fit.mjs,
+  // which carries the reasoning for the changed-size guard (it was ten
+  // identical copies of it).
+  const resize = makeCanvasFit({ canvas, ctx, device, format: fmt });
   window.addEventListener('resize', resize);
   resize();
 
@@ -326,7 +332,7 @@ async function init() {
     { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } }
   ]});
 
-  const stepConstants = { W, H, SPONGE_UX: U0, SPONGE_UY: 0, USE_BOUNCEBACK };
+  const stepConstants = { W, H, SPONGE_UX: U0, SPONGE_UY: 0, USE_BOUNCEBACK, K_EPS, SOLID_EQ };
   const constants     = { W, H };
 
   const stepPL = device.createComputePipeline({
@@ -335,7 +341,7 @@ async function init() {
   });
   const frcPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [frcBGL] }),
-    compute: { module: frcSM, entryPoint: 'main', constants: { ...constants, USE_BOUNCEBACK, F16 } }
+    compute: { module: frcSM, entryPoint: 'main', constants: { ...constants, USE_BOUNCEBACK, F16, K_EPS } }
   });
   const phyPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [phyBGL] }),
@@ -344,7 +350,7 @@ async function init() {
   const renPL = device.createRenderPipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [renBGL] }),
     vertex: { module: renSM, entryPoint: 'vs_main', constants },
-    fragment: { module: renSM, entryPoint: 'fs_main', targets: [{ format: fmt }], constants },
+    fragment: { module: renSM, entryPoint: 'fs_main', targets: [{ format: fmt }], constants: { ...constants, K_EPS } },
     primitive: { topology: 'triangle-list' },
   });
 

@@ -29,6 +29,21 @@ override TOTAL_WRAP_SCREENS : u32 = 16u;
 override KINEMATIC : u32 = 0u;
 override VY_FIXED : f32 = 0.0f;
 override OMEGA_FIXED : f32 = 0.0f;
+// BODY_DT: the body's time step as a fraction of a ROOT step. 1 is the
+// once-per-macro-step update every page ran until 2026-09-23, and stays the
+// default, so a page that does not set it is byte-identical. main-amr.js sets
+// 2^-(levels-1) and dispatches this kernel before EVERY finest-level substep
+// (makeScheduler's `bodySubstep`): the body lives on the finest level, so that
+// is the scale the fluid/body exchange happens at. Once per root step, a card
+// only one or two root cells long went unstable in rotation -- the torque over
+// a whole root step overshoots I*omega and omega flips sign every step,
+// pinned at +-o_max (plans/uniform-levels.md S8-6).
+//
+// Units do not change: the force pass returns a force in root units
+// (momentum per root step), velocities are lattice velocities (the same at
+// every level under acoustic scaling), and v_max/o_max are RATES, so every
+// increment simply takes a factor BODY_DT.
+override BODY_DT : f32 = 1.0f;
 
 @compute @workgroup_size(1)
 fn main() {
@@ -53,9 +68,9 @@ fn main() {
     state.omega = OMEGA_FIXED;
   } else {
     // 2. Newton integration
-    state.vx    += fx_fluid / state.mass;
-    state.vy    += (fy_fluid + state.mass * state.g_eff) / state.mass;
-    state.omega += tz_fluid / state.i_body;
+    state.vx    += fx_fluid / state.mass * BODY_DT;
+    state.vy    += (fy_fluid + state.mass * state.g_eff) / state.mass * BODY_DT;
+    state.omega += tz_fluid / state.i_body * BODY_DT;
 
     // 3. Clamping
     state.vx    = clamp(state.vx, -state.v_max, state.v_max);
@@ -64,9 +79,9 @@ fn main() {
   }
 
   // 4. Position update (absolute)
-  state.y_total += state.vy;
-  state.x_total += state.vx;
-  state.theta   += state.omega;
+  state.y_total += state.vy * BODY_DT;
+  state.x_total += state.vx * BODY_DT;
+  state.theta   += state.omega * BODY_DT;
 
   // 4b. Keep the accumulators bounded. These grow without limit otherwise,
   // and they are f32, so their ULP grows with them -- which eats the
@@ -91,19 +106,30 @@ fn main() {
   if (state.y_total >= wrap_y) { state.y_total -= wrap_y; }
   else if (state.y_total <= -wrap_y) { state.y_total += wrap_y; }
 
-  // 5. Moving Window Panning
-  // We want to keep (cx, cy) near (W/2, H*2/3)
-  let initial_cx = f32(W) / 2.0f;
-  let initial_cy = f32(H) / 2.0f;
-
+  // 5. THE BODY'S POSITION, AND THE VIEW, ARE NOW SEPARATE THINGS.
+  //
+  // The body is integrated in BUFFER coordinates and wrapped into
+  // [0, W) x [0, H) every step, so its magnitude -- and therefore the ULP of
+  // its sub-cell position, which get_phi and the whole solid coupling inherit
+  // -- is bounded by the domain, not by how long the page has been running.
+  //
+  // THE VIEW TRACKS TRAVEL, NOT POSITION, and that distinction cost a
+  // measurement to find. Deriving off from the body's absolute position
+  // (floor(cx - W/2)) assumes the view is centred on the body. It is not:
+  // main-cylinder.js places its cylinder UPSTREAM diameters in, at cx = 170.67
+  // with W = 512, so that put off_x at 426, the sponge band landed mid-domain
+  // and Cd came back 808.897 against a literature 1.35. off therefore keeps
+  // deriving from x_total, and only its INTEGER part is ever consulted.
+  //
+  // So x_total/y_total are still load-bearing for the VIEW (and for the trail
+  // and CSV export, via card-total.mjs) but no longer for the BODY. That is
+  // the half of card-total.mjs's rationale that B5 retired -- see its header.
+  state.cx = wrapf(state.cx + state.vx * BODY_DT, f32(W));
+  state.cy = wrapf(state.cy + state.vy * BODY_DT, f32(H));
   let shift_x = i32(floor(state.x_total));
   let shift_y = i32(floor(state.y_total));
-
   state.off_x = f32((shift_x % i32(W) + i32(W)) % i32(W));
   state.off_y = f32((shift_y % i32(H) + i32(H)) % i32(H));
-
-  state.cx = initial_cx + (state.x_total - f32(shift_x));
-  state.cy = initial_cy + (state.y_total - f32(shift_y));
 
   state.fx = fx_fluid;
   state.fy = fy_fluid;

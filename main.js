@@ -1,12 +1,14 @@
-import { reportFatal, reportNoWebGPU, reportNoAdapter } from './error-overlay.mjs';
+import { reportFatal, refuseConfig, reportNoWebGPU, reportNoAdapter } from './error-overlay.mjs';
 import { installVortControls } from './vort-controls.mjs';
 import { createTrail } from './trajectory-trail.mjs';
 import { createTotalUnwrapper } from './card-total.mjs';
 import { createSimPacer, parseSimRate, DEFAULT_TU_PER_SEC } from './sim-rate.mjs';
-import { assembleShader } from './shader-loader.mjs';
+import { loadShader } from './shader-loader.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
+import { EX, EY, WT } from './lattice-2d.mjs';
+import { makeCanvasFit } from './canvas-fit.mjs';
 import {
-  deriveCardParams, parseCardParams, parseResLog2, reynoldsFromTau,
+  deriveCardParams, parseCardParams, parseResLog2, resLog2Problem, reynoldsFromTau,
   DENSE_DEFAULT_RES_LOG2,
 } from './card-params.mjs';
 
@@ -14,6 +16,28 @@ const canvas   = document.getElementById('c');
 const statusEl = document.getElementById('status');
 
 const urlParams = new URLSearchParams(window.location.search);
+
+// THE DIFFUSE BAND'S WIDTH, in units of a level's own cell size:
+// epsilon = K_EPS * dx_level (plans/2D-backport.md B7). Threaded into every
+// shader that evaluates chi -- step, force and render, at every level -- so
+// the band can be swept without touching a literal in nine files.
+//
+// Default 1.5 is the value every one of those sites already hardcoded, so
+// this build is byte-identical to the previous one. ?kEps=0.75 halves it.
+//
+// It is a BAND ladder, not a resolution ladder, that settles the standing
+// Cd red cells: CLAUDE.md diagnoses them as diffuse-interface width (the
+// effective body radius exceeds the nominal one, so Cd converges from ABOVE),
+// and a resolution ladder moves the band and everything else at once.
+const K_EPS = urlParams.has('kEps') ? parseFloat(urlParams.get('kEps')) : 1.5;
+// ?spongeW= -- the far-field sponge's ramp width in THIS page's cells
+// (lbm_step.wgsl's SPONGE_W; default 4, the shader's own default). index-amr.html
+// measures its ?spongeW= in ROOT cells, i.e. 2^(levels-1) finest cells, so a
+// same-physics comparison against it passes spongeW = its value x 2^(levels-1)
+// here (tools/bench-amr-vs-dense.js).
+const SPONGE_W = urlParams.has('spongeW') ? parseFloat(urlParams.get('spongeW')) : 4;
+if (!(SPONGE_W >= 0)) throw new Error(`?spongeW=${urlParams.get('spongeW')} must be >= 0`);
+if (!(K_EPS > 0)) throw new Error(`?kEps=${urlParams.get('kEps')} must be > 0`);
 // ?f16=1 / ?f16=2: real packed-half storage for `f` -- see shaders/common_fpack.wgsl
 // and f-pack.mjs. Wired on EVERY page that consumes those shaders, including
 // the ones with no accuracy check of their own: a page that quietly ignored
@@ -31,6 +55,7 @@ const VORT_SCALE = parseFloat(urlParams.get('vortScale')) || 40.0;
 const VORT_GAMMA = parseFloat(urlParams.get('vortGamma')) || 1.2;
 
 let resLog2 = parseResLog2(urlParams, DENSE_DEFAULT_RES_LOG2);
+{ const why = resLog2Problem(resLog2); if (why) refuseConfig(statusEl, why); }
 
 // Fixed simulation RATE (sim-rate.mjs). STEPS_PER_FRAME below is now a
 // CEILING, not a target: the pacer asks for however many steps a wall-clock
@@ -84,9 +109,12 @@ recalculate();
 // to avoid 32-bit integer overflow when summing 1000s of cells.
 const FSCALE  = 1e7;
 
-const EX = [0, 1, 0,-1, 0, 1,-1,-1, 1];
-const EY = [0, 0, 1, 0,-1, 1, 1,-1,-1];
-const WT = [4/9, 1/9, 1/9, 1/9, 1/9, 1/36, 1/36, 1/36, 1/36];
+// The D2Q9 basis, from the ONE place it is derived -- lattice-2d.mjs, which
+// also generates shaders/common_lattice.wgsl. Typed out here (and in nine
+// sibling pages) until 2026-09-14, in f64 EXACT FRACTIONS while the shader
+// held eight-digit f32 decimals: the host built its initial condition from
+// weights the GPU did not have. WT is now the shader's own f32 values.
+// EX/EY were already identical everywhere and are unchanged.
 
 function feq(rho, ux, uy, i) {
   const eu = EX[i]*ux + EY[i]*uy;
@@ -101,15 +129,6 @@ function initF() {
     }
   }
   return f;
-}
-
-async function loadShader(device, path) {
-  const code = await assembleShader(path, async (p) => {
-    const r = await fetch(p + '?v=' + Date.now());
-    if (!r.ok) throw new Error(`failed to load ${p} (HTTP ${r.status} ${r.statusText})`);
-    return r.text();
-  });
-  return device.createShaderModule({ code });
 }
 
 function handleErr(e) {
@@ -146,35 +165,10 @@ async function init() {
   const ctx = canvas.getContext('webgpu');
   const fmt = navigator.gpu.getPreferredCanvasFormat();
   
-  // Reconfigure ONLY on a real size change. This used to run unconditionally
-  // on every `resize` event, and both halves of it are destructive:
-  // assigning canvas.width/height resets the drawing buffer even when the
-  // value is unchanged, and ctx.configure() replaces the swapchain,
-  // invalidating textures that in-flight command buffers still reference
-  // (this page keeps up to STAGES frames in flight).
-  //
-  // On desktop `resize` fires when you resize the window, so the cost was
-  // invisible. On a PHONE it fires constantly -- the URL bar hides and shows
-  // on any scroll or drag, which includes touching the control sliders --
-  // so the swapchain was being torn down and rebuilt underneath frames that
-  // were already submitted. Reported symptom: the view "twitches back" a few
-  // frames, correlated with moving sliders or switching away and back.
-  //
-  // Also guards the degenerate case: clientWidth/Height read 0 during some
-  // layout transitions (and while hidden), and a 0-sized canvas is not a
-  // valid configuration.
-  let cfgW = 0, cfgH = 0;
-  function resize() {
-    const dpr = window.devicePixelRatio || 1;
-    const w = Math.round(canvas.clientWidth * dpr);
-    const h = Math.round(canvas.clientHeight * dpr);
-    if (w <= 0 || h <= 0) return;      // mid-layout / hidden: nothing to configure
-    if (w === cfgW && h === cfgH) return; // same size: reconfiguring is pure damage
-    cfgW = w; cfgH = h;
-    canvas.width = w;
-    canvas.height = h;
-    ctx.configure({ device, format: fmt, alphaMode: 'opaque' });
-  }
+  // Canvas sizing and swapchain reconfiguration -- see canvas-fit.mjs,
+  // which carries the reasoning for the changed-size guard (it was ten
+  // identical copies of it).
+  const resize = makeCanvasFit({ canvas, ctx, device, format: fmt });
   window.addEventListener('resize', resize);
   resize();
 
@@ -302,17 +296,17 @@ async function init() {
   const constants = { W, H };
   // Separate dict for the pipelines whose shaders @include common_fpack.wgsl;
   // phy/render don't declare F16 and WebGPU makes that a hard error.
-  const fConstants = { W, H, F16 };
+  const fConstants = { W, H, F16, K_EPS };
   // Likewise the render fragment needs its own dict: only render.wgsl declares
   // VORT_SCALE/VORT_GAMMA (via common_vortcolor.wgsl), and supplying an
   // override a pipeline's shader does not declare is the same hard error.
   // The two VORT_* values are supplied by makeRenderPipeline below, which is
   // the only thing that ever varies them.
-  const renderConstants = { W, H };
+  const renderConstants = { W, H, K_EPS };
 
   const stepPL = device.createComputePipeline({ 
     layout: device.createPipelineLayout({ bindGroupLayouts: [stepBGL] }), 
-    compute: { module: stepSM, entryPoint: 'main', constants: fConstants } 
+    compute: { module: stepSM, entryPoint: 'main', constants: { ...fConstants, SPONGE_W } } 
   });
   const frcPL = device.createComputePipeline({ 
     layout: device.createPipelineLayout({ bindGroupLayouts: [frcBGL] }), 
@@ -426,11 +420,66 @@ async function init() {
   const gpuMsEl = document.getElementById('val-gpu-ms');
   const syncMsEl = document.getElementById('val-sync-ms');
 
+  // ONE STEP, as both the frame loop and debugStepSync encode it -- one
+  // function so a benchmark times exactly what the page runs.
+  function encodeStep(enc) {
+    const stepBG = useB ? stepBG_ba : stepBG_ab;
+    const frcBG  = useB ? frcBG_b  : frcBG_a;
+    const frc = enc.beginComputePass(); frc.setPipeline(frcPL); frc.setBindGroup(0, frcBG); frc.dispatchWorkgroups(WGX, WGY); frc.end();
+    const phy = enc.beginComputePass(); phy.setPipeline(phyPL); phy.setBindGroup(0, phyBG); phy.dispatchWorkgroups(1); phy.end();
+    const stp = enc.beginComputePass(); stp.setPipeline(stepPL); stp.setBindGroup(0, stepBG); stp.dispatchWorkgroups(WGX, WGY); stp.end();
+    useB = !useB;
+  }
+
+  // ── Debug/benchmark surface (window.__LBM) ──────────────────────────────
+  // The minimum a CDP tool needs to time this page the way index-amr.html's
+  // window.__AMR is timed: pause the frame loop, step N synchronously in
+  // STEPS_PER_FRAME batches (N even, so useB returns to its frame-boundary
+  // value), and read the step count and the card's state. Added for
+  // tools/bench-amr-vs-dense.js; nothing on the page depends on it.
+  let liveMode = true;
+  async function debugStepSync(n) {
+    liveMode = false;
+    if (paramsDirty) { updateGPUParams(); paramsDirty = false; }
+    for (let k = 0; k < n; k += STEPS_PER_FRAME) {
+      const enc = device.createCommandEncoder();
+      const m = Math.min(STEPS_PER_FRAME, n - k);
+      for (let s = 0; s < m; s++) encodeStep(enc);
+      device.queue.submit([enc.finish()]);
+      await device.queue.onSubmittedWorkDone();
+      step += m;
+    }
+    return { step };
+  }
+  async function debugReadCardState() {
+    const buf = device.createBuffer({ size: 104, usage: U.MAP_READ | U.COPY_DST });
+    const enc = device.createCommandEncoder();
+    enc.copyBufferToBuffer(cardStateBuf, 0, buf, 0, 104);
+    device.queue.submit([enc.finish()]);
+    await buf.mapAsync(GPUMapMode.READ);
+    const d = Array.from(new Float32Array(buf.getMappedRange().slice(0)));
+    buf.unmap(); buf.destroy();
+    return d;
+  }
+  window.__LBM = {
+    setLive: (v) => { liveMode = !!v; if (liveMode) pacer.reset(); },
+    isLive: () => liveMode,
+    getStep: () => step,
+    getDims: () => ({ W, H }),
+    getCardParams: () => ({ A, B, TAU, U_T, RE }),
+    debugStepSync,
+    debugReadCardState,
+  };
+
   async function frame() {
     try {
       if (paramsDirty) {
         updateGPUParams();
         paramsDirty = false;
+      }
+      if (!liveMode) {
+        requestAnimationFrame(() => frame().catch(handleErr));
+        return;
       }
       
       const stage = stages[currentStageIdx];
@@ -451,16 +500,7 @@ async function init() {
       // is worth, capped at STEPS_PER_FRAME. Always even (sim-rate.mjs), so
       // useB returns to its initial value at every frame boundary.
       const nSteps = pacer.stepsForFrame(performance.now(), A / U_T);
-      for (let s = 0; s < nSteps; s++) {
-        const stepBG = useB ? stepBG_ba : stepBG_ab;
-        const frcBG  = useB ? frcBG_b  : frcBG_a;
-        
-        const frc = enc.beginComputePass(); frc.setPipeline(frcPL); frc.setBindGroup(0, frcBG); frc.dispatchWorkgroups(WGX, WGY); frc.end();
-        const phy = enc.beginComputePass(); phy.setPipeline(phyPL); phy.setBindGroup(0, phyBG); phy.dispatchWorkgroups(1); phy.end();
-        const stp = enc.beginComputePass(); stp.setPipeline(stepPL); stp.setBindGroup(0, stepBG); stp.dispatchWorkgroups(WGX, WGY); stp.end();
-        
-        useB = !useB;
-      }
+      for (let s = 0; s < nSteps; s++) encodeStep(enc);
       step += nSteps;
 
       if (hasTimestamp) {

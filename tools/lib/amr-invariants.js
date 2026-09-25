@@ -37,7 +37,20 @@ function checkFinite(state) {
 // a pass, so this can't quietly look greener than it is.
 async function runInvariantSweep(Runtime, opts) {
   const { steps, checkEvery, timeout = 300, onCheckpoint, global: G = 'window.__CYL',
-          requireCornerBalance = false } = opts;
+          // DEFAULT TRUE SINCE B2-2d. Corner 2:1 balance was reported and not
+          // gated from B0 until then, for a good reason: the default ring path
+          // tolerates a missing diagonal parent (interp fills the corner ghost
+          // from the parent when the corner tile is absent), and the shipped
+          // per-pass cascade covered only the four FACES -- so the count was
+          // reliably nonzero, 13 on index-amr.html, and gating it would have
+          // failed every run for a defect that was already written down.
+          //
+          // The closure covers all nine offsets, so it is now zero at every
+          // checkpoint. A check that had to be non-gating because the code
+          // could not satisfy it becomes a gate the moment the code can --
+          // and leaving it reporting-only after that is how a fixed invariant
+          // silently regresses.
+          requireCornerBalance = true } = opts;
 
   const has = async (fn) => {
     const r = await evalExpr(Runtime, `typeof ${G}.${fn} === 'function'`);
@@ -47,11 +60,36 @@ async function runInvariantSweep(Runtime, opts) {
     throw new Error(`${G}.debugCheck21Balance is not available -- wrong page, or it failed to initialize`);
   }
   const hasCoverage = await has('debugCheckGeometryCoverage');
-  // Refinement convergence. Only meaningful with ?diag=1: at DIAG=0 every
-  // counter stays 0 and `converged` reads TRUE VACUOUSLY, so asserting it
-  // without the flag would be a silent false pass -- exactly the failure mode
-  // that let a dead ?ghostfree path sit behind green checks. hasDiag gates the
-  // assertion, and a skipped check is REPORTED as skipped, never as OK.
+  // GATED SINCE B2-2d. This runs amr2d.mjs's `cascade21` -- the 2:1 rule as one
+  // closure -- on the live PRESENT set and counts what the rule says must
+  // exist and does not. It was reported-only for exactly as long as the code
+  // could not satisfy it (the per-pass manager left 13 standing on
+  // index-amr.html); the closure satisfies it by construction, so it is zero at
+  // every checkpoint and there is no reason left not to gate.
+  const hasClosure = await has('debugCheckRefinementClosure');
+  // A CHECK THAT EXISTS AND NEVER RUNS IS WORSE THAN ONE THAT REPORTS.
+  // amr2d.mjs's quadrantOfSlot says a slot's quadrant is `slot % 4`, and
+  // B2-2b0 removed a whole binding on the strength of it -- but the scorer it
+  // added was only ever driven by a one-off probe, so nothing in the standing
+  // suite would notice if a future writer broke the rule (debugSnapshotLoad
+  // writes whatever a snapshot recorded). Cheap, exact, and gated.
+  const hasQuadrants = await has('debugCheckSlotQuadrants');
+  // THE TILE-ORIGIN GATE WAS HERE AND IS GONE ON PURPOSE (B3-5). It scored the
+  // live originX/originY buffers against amr2d.mjs's closed form, and existed
+  // to justify taking the kernels off those buffers; B3-5 then deleted the
+  // buffers, so there was nothing left for it to read. A checker left pointing
+  // at deleted state is how this project collected three vacuous gates -- so it
+  // went in the same commit as its subject, not later. Back to seven.
+  // POOL STARVATION -- refines refused for want of a slot. This used to be
+  // "refinement convergence", asking whether the fixed-point loop had stopped
+  // creating tiles when its iteration budget ran out; B2 deleted the loop and
+  // B2-2d found that what remained of `converged` was an always-true clause
+  // AND'd with this one, so the name went and the real check stayed.
+  //
+  // Still only meaningful with ?diag=1: at DIAG=0 every counter stays 0 and
+  // this would read TRUE VACUOUSLY, which is the failure mode that let a dead
+  // ?ghostfree path sit behind green checks. hasDiag gates the assertion, and
+  // a skipped check is REPORTED as skipped, never as OK.
   const hasDiag = await has('debugReadDiag');
   const hasCardState = await has('debugReadCardState');
 
@@ -75,8 +113,10 @@ async function runInvariantSweep(Runtime, opts) {
   // fixed iteration count ran out. Not "still creating tiles" -- a
   // criterion-driven grant in the final iteration is normal operation. See
   // debugReadDiag()'s own comment on why gating on `granted` was wrong.
-  const convergenceViolations = [];
+  const starvationViolations = [];
   let diagEnabled = false;
+  const closureViolations = [];
+  const quadrantViolations = [];
   const coverageViolations = [];
   const fieldViolations = [];
   let stepsDone = 0;
@@ -100,9 +140,9 @@ async function runInvariantSweep(Runtime, opts) {
       if (d.exceptionDetails) throw new Error(`debugReadDiag failed at step ${stepsDone}: ${d.exceptionDetails.text}`);
       diag = d.result.value;
       diagEnabled = diagEnabled || !!diag.diagEnabled;
-      if (diag.diagEnabled && !diag.converged) {
-        convergenceViolations.push({ step: stepsDone, granted: diag.refineGrantedLastIter,
-          byCascade: diag.refineByCascadeLastIter, poolExhausted: diag.refinePoolExhausted });
+      if (diag.diagEnabled && !diag.poolOk) {
+        starvationViolations.push({ step: stepsDone, granted: diag.refineGranted,
+          starved: diag.refineStarved });
       }
     }
 
@@ -112,6 +152,22 @@ async function runInvariantSweep(Runtime, opts) {
       if (c.exceptionDetails) throw new Error(`debugCheckGeometryCoverage failed at step ${stepsDone}: ${c.exceptionDetails.text}`);
       cov = c.result.value;
       if (!cov.ok) coverageViolations.push({ step: stepsDone, violations: cov.violations });
+    }
+
+    let quad = null;
+    if (hasQuadrants) {
+      const r = await evalExpr(Runtime, `${G}.debugCheckSlotQuadrants()`, 30000);
+      if (r.exceptionDetails) throw new Error(`debugCheckSlotQuadrants failed at step ${stepsDone}: ${r.exceptionDetails.text}`);
+      quad = r.result.value;
+      if (!quad.ok) quadrantViolations.push({ step: stepsDone, violations: quad.violations });
+    }
+
+    let closure = null;
+    if (hasClosure) {
+      const r = await evalExpr(Runtime, `${G}.debugCheckRefinementClosure()`, 30000);
+      if (r.exceptionDetails) throw new Error(`debugCheckRefinementClosure failed at step ${stepsDone}: ${r.exceptionDetails.text}`);
+      closure = r.result.value;
+      if (!closure.ok) closureViolations.push({ step: stepsDone, missing: closure.missing, byReason: closure.byReason });
     }
 
     let bad = [];
@@ -125,7 +181,7 @@ async function runInvariantSweep(Runtime, opts) {
     // cov/bad are null (not empty) when this page doesn't expose that check,
     // so a caller renders "n/a" rather than the "OK" an empty result would
     // otherwise read as.
-    if (onCheckpoint) onCheckpoint(stepsDone, { diag, bal: bal.result.value, cov, bad: hasCardState ? bad : null });
+    if (onCheckpoint) onCheckpoint(stepsDone, { diag, bal: bal.result.value, cov, closure, quad, bad: hasCardState ? bad : null });
 
     if (bad.length) break;
   }
@@ -135,10 +191,13 @@ async function runInvariantSweep(Runtime, opts) {
   // converged=true at every checkpoint through 4096 steps), so it is asserted
   // unconditionally -- but only when ?diag=1 actually made the counters live.
   const ok = balanceViolations.length === 0 && coverageViolations.length === 0
-    && fieldViolations.length === 0 && !cornerFails && convergenceViolations.length === 0;
+    && fieldViolations.length === 0 && !cornerFails && starvationViolations.length === 0
+    && closureViolations.length === 0 && quadrantViolations.length === 0;
   return { ok, stepsDone, balanceViolations, cornerViolations, requireCornerBalance,
-    convergenceViolations, convergenceChecked: hasDiag && diagEnabled,
-    coverageViolations, fieldViolations, hasCoverage, hasCardState };
+    starvationViolations, starvationChecked: hasDiag && diagEnabled,
+    coverageViolations,
+    closureViolations,
+    quadrantViolations, fieldViolations, hasCoverage, hasCardState };
 }
 
 module.exports = { evalExpr, checkFinite, runInvariantSweep };

@@ -32,12 +32,28 @@ const FSCALE = 10000000f;
 // separate buffer-timing bookkeeping required.
 override USE_BOUNCEBACK : u32 = 0u;
 
+// THE DIFFUSE BAND'S WIDTH, as a multiple of THIS level's own cell size --
+// epsilon = K_EPS * dx_level. It was a bare literal here and an override only
+// on the pool path, so the one number that sets how sharp the solid boundary
+// is could not be swept across the whole solver (plans/2D-backport.md B7).
+//
+// 1.5 is the value every one of these sites already had, so the default is
+// byte-identical to the previous build. ?kEps= moves all of them together.
+//
+// WHY IT IS WORTH A KNOB. CLAUDE.md records `dense-reference` and
+// `amr-N2-diffuse` failing Cd at Re=100 and diagnoses it as diffuse-interface
+// width -- the band is a fixed number of cells regardless of resolution, so
+// the effective body radius exceeds the nominal one and Cd converges from
+// ABOVE. The instrument that settles that is a BAND ladder at fixed
+// resolution, not a resolution ladder (which moves the band and everything
+// else at once), and a band ladder needs this to be a parameter.
+override K_EPS : f32 = 1.5f;
 fn get_chi(phi: f32) -> f32 {
-    return chiFromPhiEps(phi, 1.5f);
+    return chiFromPhiEps(phi, K_EPS);
 }
 
 // Sanitize NaN to 0 and clamp to the fixed-point range so the float->i32 force
-// cast is well-defined on every backend (parity with amr_force.wgsl).
+// cast is well-defined on every backend (parity with amr_force1.wgsl).
 fn safeFixed(x: f32) -> i32 {
     let s = select(x, 0.0f, x != x);
     return i32(clamp(s, -2.0e9f, 2.0e9f));
@@ -52,18 +68,31 @@ fn main(
   @builtin(global_invocation_id) gid: vec3<u32>,
   @builtin(local_invocation_index) lid: u32
 ) {
-  let x = gid.x; let y = gid.y;
+  // A THREAD OWNS A BUFFER CELL. This was the last kernel in the tree still
+  // dispatched in WINDOW coordinates, converting to buffer at every load --
+  // and converting back out again for every neighbour, which composed a shift
+  // with its own inverse once per direction per cell:
+  //
+  //   window:  wx_src = (x - e) mod W,  bx_src = (wx_src + off) mod W
+  //   buffer:  bx_src = (bx - e) mod W          with bx = (x + off) mod W
+  //
+  // Provably the same integer. This kernel touches no sponge and no walls, so
+  // with the body buffer-native since B5 it needs NO window coordinate at all:
+  // `state.off_x`/`off_y` do not appear in this file any more. That matters
+  // beyond tidiness -- "only the render does raw off_x/off_y arithmetic" is
+  // the audit that finds a kernel silently stuck in the wrong frame, and it
+  // was false by exactly this one file (see plans/2D-backport.md B5-5, where
+  // being in the wrong frame here read 226x wrong and no gate could see it).
+  let bx = gid.x; let by = gid.y;
   
   var fx_body = 0.0f;
   var fy_body = 0.0f;
   var tz_body = 0.0f;
 
-  if (x < W && y < H) {
-    let bx   = (x + u32(state.off_x)) % W;
-    let by   = (y + u32(state.off_y)) % H;
+  if (bx < W && by < H) {
     let cell = by * W + bx;
-    let base = cell * 9u;
-    let p    = vec2<f32>(f32(x), f32(y));
+    // The body's frame is this cell's own buffer position.
+    let p = vec2<f32>(f32(bx), f32(by));
 
     let phi = get_phi(p, state);
     let chi = get_chi(phi);
@@ -81,9 +110,9 @@ fn main(
         let usy = state.vy + state.omega * rx;
 
         for (var i = 0u; i < 9u; i++) {
-          let wx_src = (x + W - u32(ex[i])) % W;
-          let wy_src = (y + H - u32(ey[i])) % H;
-          if (get_phi(vec2<f32>(f32(wx_src), f32(wy_src)), state) < 0f) {
+          let bx_nb = (bx + W - u32(ex[i])) % W;
+          let by_nb = (by + H - u32(ey[i])) % H;
+          if (get_phi(vec2<f32>(f32(bx_nb), f32(by_nb)), state) < 0f) {
             let f_opp = fUnpack(f_in[fIdx(opp[i], (W * H), cell)], opp[i]);
             let corr = 2f * wt[i] * (f32(ex[i]) * usx + f32(ey[i]) * usy) / CS2;
             fx_body += -f32(ex[i]) * (2f * f_opp + corr);
@@ -104,10 +133,8 @@ fn main(
       // applied to the fluid.
       var rho = 0f; var ux_star = 0f; var uy_star = 0f;
       for (var i = 0u; i < 9u; i++) {
-        let wx_src = (x + W - u32(ex[i])) % W;
-        let wy_src = (y + H - u32(ey[i])) % H;
-        let bx_src = (wx_src + u32(state.off_x)) % W;
-        let by_src = (wy_src + u32(state.off_y)) % H;
+        let bx_src = (bx + W - u32(ex[i])) % W;
+        let by_src = (by + H - u32(ey[i])) % H;
         let fi = fUnpack(f_in[fIdx(i, (W * H), (by_src * W + bx_src))], i);
         rho     += fi;
         ux_star += fi * f32(ex[i]);

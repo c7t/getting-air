@@ -24,15 +24,55 @@
 // own (debugSnapshotSave produces the same layout:'flat' shape
 // tools/lib/field-reconstruct.js's loadDenseFields already decodes).
 
-import { reportFatal, reportNoWebGPU, reportNoAdapter } from './error-overlay.mjs';
+import { reportFatal, refuseConfig, reportNoWebGPU, reportNoAdapter } from './error-overlay.mjs';
 import { createTotalUnwrapper } from './card-total.mjs';
-import { assembleShader } from './shader-loader.mjs';
+import { loadShader } from './shader-loader.mjs';
 import { packF, unpackF, fWords } from './f-pack.mjs';
+import { EX, EY, WT } from './lattice-2d.mjs';
+import { makeCanvasFit } from './canvas-fit.mjs';
 
 const canvas   = document.getElementById('c');
 const statusEl = document.getElementById('status');
 
 const urlParams = new URLSearchParams(window.location.search);
+
+
+// ?wrapScreens=N -- domain-heights of accumulated travel before x_total/
+// y_total wrap; default 16, matching card-total.mjs. Same shape as B7's
+// ?kEps= ladder, and byte-identical when absent.
+//
+// WHAT IT SETTLED (B5-4). The body's sub-cell position USED to be
+// frac(y_total), so the accumulator's magnitude was the body's precision --
+// and that magnitude is set by this constant, not by the window/buffer choice
+// B5 was about. Sweeping the two separately showed they were the same
+// mechanism: 262144 steps against an exact prescribed trajectory gave 8.5
+// cells of error at 16 screens, 0.71 at 1 screen, and 0.72 under the buffer
+// convention. B5 was taken for its kernel simplification, and this knob is
+// why that was the honest reason rather than precision.
+//
+// Since B5 the body no longer reads the accumulator at all, so what this now
+// bounds is the TRAIL and the CSV export, not the physics. card-total.mjs must
+// still be handed the SAME value -- a mismatch silently re-reads every wrap as
+// motion -- which is why both consumers below take this one variable.
+const WRAP_SCREENS = urlParams.has('wrapScreens') ? parseInt(urlParams.get('wrapScreens')) : 16;
+if (!Number.isFinite(WRAP_SCREENS) || WRAP_SCREENS < 1) {
+  refuseConfig(statusEl, `?wrapScreens=${urlParams.get('wrapScreens')} invalid -- must be an integer >= 1 (domain-heights of travel before the accumulator wraps).`);
+}
+
+// THE DIFFUSE BAND'S WIDTH, in units of a level's own cell size:
+// epsilon = K_EPS * dx_level (plans/2D-backport.md B7). Threaded into every
+// shader that evaluates chi -- step, force and render, at every level -- so
+// the band can be swept without touching a literal in nine files.
+//
+// Default 1.5 is the value every one of those sites already hardcoded, so
+// this build is byte-identical to the previous one. ?kEps=0.75 halves it.
+//
+// It is a BAND ladder, not a resolution ladder, that settles the standing
+// Cd red cells: CLAUDE.md diagnoses them as diffuse-interface width (the
+// effective body radius exceeds the nominal one, so Cd converges from ABOVE),
+// and a resolution ladder moves the band and everything else at once.
+const K_EPS = urlParams.has('kEps') ? parseFloat(urlParams.get('kEps')) : 1.5;
+if (!(K_EPS > 0)) throw new Error(`?kEps=${urlParams.get('kEps')} must be > 0`);
 // ?f16=1 / ?f16=2: real packed-half storage for `f` -- see shaders/common_fpack.wgsl
 // and f-pack.mjs. Wired on EVERY page that consumes those shaders, including
 // the ones with no accuracy check of their own: a page that quietly ignored
@@ -74,9 +114,12 @@ resSlider.oninput = () => {
   resVal.textContent = 1 << parseInt(resSlider.value);
 };
 
-const EX = [0, 1, 0,-1, 0, 1,-1,-1, 1];
-const EY = [0, 0, 1, 0,-1, 1, 1,-1,-1];
-const WT = [4/9, 1/9, 1/9, 1/9, 1/9, 1/36, 1/36, 1/36, 1/36];
+// The D2Q9 basis, from the ONE place it is derived -- lattice-2d.mjs, which
+// also generates shaders/common_lattice.wgsl. Typed out here (and in nine
+// sibling pages) until 2026-09-14, in f64 EXACT FRACTIONS while the shader
+// held eight-digit f32 decimals: the host built its initial condition from
+// weights the GPU did not have. WT is now the shader's own f32 values.
+// EX/EY were already identical everywhere and are unchanged.
 
 function feq(rho, ux, uy, i) {
   const eu = EX[i]*ux + EY[i]*uy;
@@ -96,15 +139,6 @@ function initF() {
     }
   }
   return f;
-}
-
-async function loadShader(device, path) {
-  const code = await assembleShader(path, async (p) => {
-    const r = await fetch(p + '?v=' + Date.now());
-    if (!r.ok) throw new Error(`failed to load ${p} (HTTP ${r.status} ${r.statusText})`);
-    return r.text();
-  });
-  return device.createShaderModule({ code });
 }
 
 function handleErr(e) {
@@ -138,35 +172,10 @@ async function init() {
   const ctx = canvas.getContext('webgpu');
   const fmt = navigator.gpu.getPreferredCanvasFormat();
 
-  // Reconfigure ONLY on a real size change. This used to run unconditionally
-  // on every `resize` event, and both halves of it are destructive:
-  // assigning canvas.width/height resets the drawing buffer even when the
-  // value is unchanged, and ctx.configure() replaces the swapchain,
-  // invalidating textures that in-flight command buffers still reference
-  // (this page keeps up to STAGES frames in flight).
-  //
-  // On desktop `resize` fires when you resize the window, so the cost was
-  // invisible. On a PHONE it fires constantly -- the URL bar hides and shows
-  // on any scroll or drag, which includes touching the control sliders --
-  // so the swapchain was being torn down and rebuilt underneath frames that
-  // were already submitted. Reported symptom: the view "twitches back" a few
-  // frames, correlated with moving sliders or switching away and back.
-  //
-  // Also guards the degenerate case: clientWidth/Height read 0 during some
-  // layout transitions (and while hidden), and a 0-sized canvas is not a
-  // valid configuration.
-  let cfgW = 0, cfgH = 0;
-  function resize() {
-    const dpr = window.devicePixelRatio || 1;
-    const w = Math.round(canvas.clientWidth * dpr);
-    const h = Math.round(canvas.clientHeight * dpr);
-    if (w <= 0 || h <= 0) return;      // mid-layout / hidden: nothing to configure
-    if (w === cfgW && h === cfgH) return; // same size: reconfiguring is pure damage
-    cfgW = w; cfgH = h;
-    canvas.width = w;
-    canvas.height = h;
-    ctx.configure({ device, format: fmt, alphaMode: 'opaque' });
-  }
+  // Canvas sizing and swapchain reconfiguration -- see canvas-fit.mjs,
+  // which carries the reasoning for the changed-size guard (it was ten
+  // identical copies of it).
+  const resize = makeCanvasFit({ canvas, ctx, device, format: fmt });
   window.addEventListener('resize', resize);
   resize();
 
@@ -272,7 +281,7 @@ async function init() {
   // (Brinkman/Guo) body coupling. See this file's own header.
   const constants = { W, H };
   // See main.js: only the f-touching pipelines may be given F16.
-  const fConstants = { W, H, F16 };
+  const fConstants = { W, H, F16, K_EPS };
 
   const stepPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [stepBGL] }),
@@ -286,12 +295,12 @@ async function init() {
   // main-reentry-amr.js's identical phyPL construction.
   const phyPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [phyBGL] }),
-    compute: { module: phySM, entryPoint: 'main', constants: { W, H, KINEMATIC: 1, VY_FIXED: VY, OMEGA_FIXED: OMEGA } }
+    compute: { module: phySM, entryPoint: 'main', constants: { W, H, KINEMATIC: 1, VY_FIXED: VY, OMEGA_FIXED: OMEGA, TOTAL_WRAP_SCREENS: WRAP_SCREENS } }
   });
   const renPL = device.createRenderPipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [renBGL] }),
     vertex: { module: renSM, entryPoint: 'vs_main', constants },
-    fragment: { module: renSM, entryPoint: 'fs_main', targets: [{ format: fmt }], constants },
+    fragment: { module: renSM, entryPoint: 'fs_main', targets: [{ format: fmt }], constants: { ...constants, K_EPS } },
     primitive: { topology: 'triangle-list' },
   });
 
@@ -322,7 +331,7 @@ async function init() {
   const trajectory = [];
   // Restores true totals from the shaders' wrapped x_total/y_total --
   // see card-total.mjs.
-  const totals = createTotalUnwrapper(W, H);
+  const totals = createTotalUnwrapper(W, H, WRAP_SCREENS);
 
   function dispatchMacroStep(enc) {
     const stepBG = useB ? stepBG_ba : stepBG_ab;

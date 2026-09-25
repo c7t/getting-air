@@ -70,7 +70,7 @@ async function leg(fb) {
   await L.waitFor(async () => !(await L.chromeDebugOk(PORT)), 20000, 250);
   await L.ensureChrome(PORT);
   const tab = await L.firstTab(PORT);
-  const c = await CDP({ port: PORT, target: tab.id });
+  const c = await CDP({ local: true, port: PORT, target: tab.id });
   await Promise.all([c.Page.enable(), c.Runtime.enable()]);
   await L.navigateTo(c.Page, BASE_URL + '/index-3d.html?' + BASE + '&' + FLAG + '=' + fb);
   await L.waitForGlobal(c.Runtime, 'window.__D3', 120000);

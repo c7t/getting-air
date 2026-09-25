@@ -2,13 +2,16 @@
 // that does NOT depend on where the four parent samples came from.
 // Included via `// @include "common_interp.wgsl"`.
 //
-// WHY THIS EXISTS. amr_interp_dense_parent.wgsl and
-// amr_interp_pool_parent.wgsl differ in exactly one thing: how they FETCH a
-// parent cell. The dense one reads the L0 grid at wrapped buffer coordinates
-// (sampleCoarse); the pool one reads a parent tile at parent-local interior
-// coordinates (sampleParentPool). Everything after those four fetches --
-// the bilinear blend, the Dupuis-Chopard rescale, the reconstruction of f --
-// was character-for-character identical in both, and is now here once.
+// WHY THIS EXISTS. There were two interp entry files until U7-6f --
+// amr_interp_dense_parent.wgsl and amr_interp_pool_parent.wgsl -- differing in
+// exactly one thing: how they FETCH a parent cell. The dense one read the L0
+// grid at wrapped buffer coordinates (sampleCoarse); the pool one reads a
+// parent tile at parent-local interior coordinates (sampleParentPool).
+// Everything after those four fetches -- the bilinear blend, the
+// Dupuis-Chopard rescale, the reconstruction of f -- was
+// character-for-character identical in both, and is here once. The dense one
+// is gone and this stays shared: the STEP kernels run the same reconstruction
+// inline for the ghost-free work (plans/ghost-free.md).
 //
 // It is a fragment, so per shader-loader.mjs it must not itself @include.
 // It depends on `feqD2Q9` from common_lattice.wgsl; every file that includes
@@ -28,21 +31,50 @@ struct CoarseSample {
   fneq: array<f32, 9>,
 }
 
-// Dupuis-Chopard non-equilibrium rescale, coarse->fine. The factor is
-// (tau_fine/tau_coarse) * (dx_fine/dx_coarse) = (tau_fine/tau_coarse) * (1/n),
-// with refinement ratio n=2. fneq scales as tau * (velocity gradient per
-// lattice cell); the same physical shear spans 2x as many fine cells, so the
-// per-cell gradient (and hence fneq) is halved on the fine grid. Omitting the
-// 1/n factor leaves an O(1) (2x) non-equilibrium stress discontinuity at every
-// fine<->coarse interface, injecting spurious vorticity there.
+// ── ?dcpre=1 -- the legacy PRE-collision Dupuis-Chopard factor ──────────────
+// 0 (default) is the POST-collision factor, which is the one this solver
+// needs; 1 restores the factor that shipped until plans/2D-backport.md B1.
+// Both live in one build so the defect can be RE-MEASURED rather than
+// reconstructed from a checkout -- the same reason ?ghostcopy= and ?f16= are
+// still here. Folded at pipeline creation, so ?dcpre=1 is exactly the old
+// computation and not a second code path carrying a runtime branch.
+override DC_PRE : u32 = 0u;
+
+// Dupuis-Chopard non-equilibrium rescale, coarse->fine.
+//
+// THE TEXTBOOK FACTOR IS FOR PRE-COLLISION f AND THIS SOLVER DOES NOT HAVE
+// ANY. Dupuis-Chopard gives
+//
+//   fneq_pre,fine = (tau_f/tau_c) * (dx_f/dx_c) * fneq_pre,coarse
+//                 = (tau_f/tau_c) * (1/n) * fneq_pre,coarse,   n = 2
+//
+// because fneq scales as tau * (velocity gradient per lattice cell) and the
+// same physical shear spans 2x as many fine cells, halving the per-cell
+// gradient. But the step kernel is a FUSED pull-stream + collide, so every
+// buffer on both sides of this transfer holds f AFTER collision. BGK gives
+// fneq* = ((tau - 1)/tau) * fneq_pre at whichever level it is evaluated, and
+// composing decollide -> the relation above -> recollide cancels both tau's
+// in the middle:
+//
+//   fneq*_fine = (1/2) * (tau_f - 1)/(tau_c - 1) * fneq*_coarse
+//
+// At tau_c = 0.8 the two differ in magnitude AND SIGN (-0.25 against
+// +0.6875). Near tau = 0.5 they agree to a few percent, which is why this
+// survived on the pages that have a Cd/St number -- see amr2d.mjs's
+// dcRescaleCoarseToFine, which is the host statement of both forms and what
+// tools/test-amr2d.js scores them against.
+//
+// TAU = 1 MAKES THIS 0/0 and is refused at init, not divided by: at omega = 1
+// the post-collision populations ARE the equilibrium and carry no stress for
+// a post-collision transfer to move. See amr2d.mjs's tauChainSingularity.
 //
 // tauCoarse is the PARENT's own tau, which is not the same thing at every
 // level: L0's is state.tau, but a mid-chain parent (L1 acting as parent to L2)
 // has its own, tau_fine = 2*tau_coarse - 0.5 applied recursively -- see
-// main-amr.js's tauAtLevel() and amr_interp_pool_parent.wgsl's levelParams.
-fn dupuisChopardRescale(tauCoarse: f32) -> f32 {
-  let tauFine = 2.0f * tauCoarse - 0.5f;
-  return 0.5f * tauFine / tauCoarse;
+// card-params.mjs's tauAtLevel() and amr_interp_pool_parent.wgsl's levelParams.
+fn dcRescaleCoarseToFine(tauCoarse: f32, tauFine: f32) -> f32 {
+  if (DC_PRE != 0u) { return 0.5f * tauFine / tauCoarse; }
+  return 0.5f * (tauFine - 1.0f) / (tauCoarse - 1.0f);
 }
 
 // Bilinearly blend four parent samples into one fine cell's distribution.
@@ -66,7 +98,7 @@ fn interpCoarseToFine(
   let ux  = w00*s00.ux  + w10*s10.ux  + w01*s01.ux  + w11*s11.ux;
   let uy  = w00*s00.uy  + w10*s10.uy  + w01*s01.uy  + w11*s11.uy;
 
-  let rescale = dupuisChopardRescale(tauCoarse);
+  let rescale = dcRescaleCoarseToFine(tauCoarse, 2.0f * tauCoarse - 0.5f);
 
   var fo: array<f32, 9>;
   for (var i = 0u; i < 9u; i++) {

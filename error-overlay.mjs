@@ -56,9 +56,56 @@ export function reportFatal(statusEl, e) {
   if (statusEl) {
     statusEl.textContent = `error: ${msg}`;
     statusEl.style.color = '#f77';
+    // LATCH IT. See setStatus below.
+    statusEl.dataset.fatal = '1';
   }
   console.error('[getting-air] error:', e, (e && e.stack) ? '\n' + e.stack : '');
   showFatal('Error: ' + msg + ((e && e.stack) ? '\n\n' + e.stack : ''));
+}
+
+// A PERIODIC STATUS WRITE THAT CANNOT OVERWRITE A FATAL.
+//
+// Every live page rewrites #status every ~250ms from an ASYNC readback
+// callback. A fatal raised between two of those writes therefore appears for
+// a fraction of a second and is then replaced by a step counter that never
+// advances again -- so the page looks merely frozen, and the reason is lost.
+//
+// Found by exactly that: plans/2D-backport.md B4-4's pool-exhaustion refusal
+// fired correctly, wrote its message, and was overwritten ~250ms later by an
+// in-flight readback. validate-all reported "the page kept running (status
+// [AMR] step 832...)" for a page that had in fact already stopped, which is
+// the most misleading possible rendering of a working guard. Same failure
+// class as the refusal that could not be heard (refuseConfig below), one
+// layer up.
+//
+// This makes the latch explicit, and it protects EVERY fatal rather than just
+// the one that found it.
+export function setStatus(statusEl, text) {
+  if (!statusEl || statusEl.dataset.fatal === '1') return;
+  statusEl.textContent = text;
+}
+
+// A CONFIGURATION REFUSAL, at module scope, reported where a fatal is
+// expected to appear.
+//
+// WHY THIS IS NOT JUST `throw`. Every page's guards (?levels, ?bounceback with
+// too many levels, a margin past SDF_FAR) run at MODULE SCOPE, and
+// `init().catch(handleErr)` cannot catch those -- module evaluation has
+// already failed, so init() never runs and its .catch never attaches. The
+// result is a page that refuses correctly and says nothing: #status sits at
+// "initializing..." forever, the real reason only in the devtools console.
+// Live-verified on index-tgv-amr.html?levels=1, which is the defect
+// plans/2D-backport.md B0b recorded (and misattributed to resetSim
+// dereferencing pools[1] -- the guard was already there, it just could not be
+// heard).
+//
+// A refusal nobody can hear is indistinguishable from a hang, which is the
+// same failure class as degrading silently. This reports first and throws
+// second, so the page still stops dead -- the point is that it stops LOUDLY.
+export function refuseConfig(statusEl, msg) {
+  const e = new Error(msg);
+  reportFatal(statusEl, e);
+  throw e;
 }
 
 // navigator.gpu missing. The secure-context case is the one worth diagnosing by

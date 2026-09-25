@@ -1,5 +1,8 @@
 # Performance characterization: the two target devices have opposite bottlenecks
 
+> **For the current numbers and cost model see `plans/performance-snapshot.md`**
+> (2026-09-24). This document is the history of how they were reached.
+
 Measured 2026-09-07 on `index-amr.html?res=8&blockage=3.3`, levels=2, 66
 active L1 blocks, `MAX_FINE_BLOCKS=128`, `STEPS_PER_FRAME=64`.
 
@@ -100,8 +103,8 @@ rather than silently reporting ~0% -- a mistyped entry used to be
 indistinguishable from a real measurement, which is unrecoverable on a device
 that gets one sweep per session.
 
-**The phone DOES have a CDP endpoint, over adb -- and it is still not the way
-to measure it (2026-09-08).** `adb forward tcp:9222
+**The phone DOES have a CDP endpoint, over adb (2026-09-08; usable since
+2026-09-24 -- see below).** `adb forward tcp:9222
 localabstract:chrome_devtools_remote` exposes Chrome for Android's DevTools
 endpoint, so `tools/`-style CDP driving is possible in principle. Two things
 found the hard way:
@@ -110,20 +113,29 @@ found the hard way:
   `/json/list` stops responding and any attached socket drops, which surfaces
   as a bare `socket hang up` with no other clue.
 - driving `debugStepSync` through it **killed Chrome outright**, twice
-  (`pidof com.android.chrome` empty afterwards, socket refused). NOT isolated:
-  three WebGPU tabs were alive at the time, so memory pressure is as good a
-  candidate as the long synchronous call. Not worth chasing, because the
-  in-page `?bench=1` sweep worked first time on the same device and is
-  purpose-built for it.
+  (`pidof com.android.chrome` empty afterwards, socket refused). NOT isolated
+  at the time -- **and it was not `debugStepSync` (2026-09-24).** Chrome for
+  Android 153.0.8010.52 crashes its whole browser process (a SIGTRAP CHECK on
+  the main thread) on a single `GET /json/protocol`: reproduced with a bare
+  `curl`, while `/json/version` and `/json/list` are fine. chrome-remote-interface
+  fetches that endpoint on every `CDP({...})` unless given `local: true`, so
+  every tool here crashed the phone the moment it connected. With
+  `local: true` the same attach, `Runtime.evaluate`, and a 640-step
+  `debugStepSync` all ran with Chrome staying up. Every connect in `tools/`
+  now passes it, and `tools/test-cdp-local.js` (in `make test`) fails a new one
+  that does not.
 
-So adb is genuinely useful here -- for launching a parameterised URL
-(`am start -a android.intent.action.VIEW -d '<url>'`), for keeping the screen
-on (`svc power stayon usb`), and for confirming Chrome stayed foregrounded for
-the whole sweep -- but the measurement itself should still be `?bench=1` +
-`?telemetry=1`, read out of `telemetry.log` locally. Earlier text in this
-document saying the phone "has no CDP endpoint" is what this corrects; what it
-was really saying, and what is still true, is that the phone cannot be driven
-the way `tools/bench-amr.js` drives the desktop.
+**So the phone CAN be driven the way `tools/bench-amr.js` drives the desktop**
+(2026-09-24), which retires the 2026-09-08 conclusion quoted at the end of
+this paragraph. adb is still how to launch a parameterised URL
+(`am start -a android.intent.action.VIEW -d '<url>'`), keep the screen on
+(`svc power stayon usb`), and bring Chrome back to the foreground
+(`am start -n com.android.chrome/com.google.android.apps.chrome.Main`) -- CDP
+answers only while it is foregrounded. `?bench=1` + `?telemetry=1` remain the
+way to measure a phone that is NOT on USB. What the 2026-09-08 text concluded,
+superseded: "the measurement itself should still be `?bench=1` +
+`?telemetry=1` ... the phone cannot be driven the way `tools/bench-amr.js`
+drives the desktop."
 
 **Do not trust per-pass timestamps on mobile.** The PowerVR part's timestamp
 counter ticks at 65536 ns. A macro-step is ~1125 µs — about 17 ticks spread
@@ -202,6 +214,77 @@ Confirmed independently by an earlier sweep: at fixed physics (~66 active
 blocks) desktop frame time went 2.78 ms at `maxFineBlocks=128` and 4.24 ms at
 256, so dispatch width is not free — but it is second-order next to pass
 count.
+
+### ...but it IS the answer at depth: an empty slot costs ~14 ns (2026-09-24)
+
+Everything above was measured at `?levels=2` with 128 slots. It does not
+extrapolate, because an empty slot's cost scales with slots x 2^m substeps, and
+the pool defaults grew with `POOL_PEAKS` (608 / 960 / 1164 slots at `?levels=4`).
+
+**Measured on the phone (img-tec, Chrome 153) with a bare early-return kernel**
+over CDP -- one storage read of `slotToBlock`, `< 0`, return -- so nothing else
+is in the number:
+
+    8x8 workgroup      13.4-15.3 ns each   (50-200 passes, 1164-4096 slots)
+    16x16 workgroup    60-70 ns each
+    dependent pass     ~30 us marginal     (1-800 passes, 16 slots)
+
+So the cost is per THREAD launched (~0.23 ns), not per workgroup: changing the
+workgroup shape does not make an empty slot cheaper, only not launching it does.
+
+**On the shipped page it is the largest item.** `index-amr.html?interface=
+explode&res=5&levels=4`: one root macro-step launches ~305k workgroups, ~13k of
+them on a live tile (16/48/48 active against 16/64/256 blocks that EXIST at
+res=5 -- the pools are sized from res=8 peaks and never clamped to the level's
+own block count). Rough split of the measured 9.4 ms: ~4 ms empty launches,
+~1.5 ms pass floor (~52 passes), ~3.5-4 ms real work. A/B'd on the phone,
+interleaved against thermal drift: default pools 9.42 / 9.38 / 9.54 ms per
+macro-step, `?maxFineBlocks=64&maxFineBlocks2=256&maxFineBlocks3=512` 6.59 /
+6.49 -- 1.45x, and ~190k fewer launches x 15 ns predicts the 2.9 ms saved.
+Clamping to EXACTLY the block count (16/64/256) trips the geometry-refusal
+watch at ~1024 steps; why the allocator needs slack past NBLOCKS is not yet
+known. Launching only live slots (indirect dispatch over a compacted list) is
+estimated at ~5.4 ms, UNMEASURED.
+
+Why 2026-09-07 saw nothing: 62 empty slots x 9 workgroups x a few passes x 2
+substeps is ~3k launches, ~45 us, under 1% of that frame.
+
+### The fix is a STRIDE over an active-slot list -- NOT indirect dispatch (2026-09-24)
+
+**Indirect dispatch was built first and loses on both devices.** Each pool
+level's in-use slots are compacted into a list (`shaders/amr_active_list.wgsl`,
+one deterministic single-workgroup scan per level per macro-step), and the
+obvious consumer is `dispatchWorkgroupsIndirect` off its count. It was
+bit-identical and SLOWER, because each indirect call carries a large fixed cost
+in this Chrome -- measured with an isolated early-return kernel:
+
+    per dispatch      direct     indirect
+    phone (img-tec)   ~29 us     ~233 us
+    desktop (4080)    ~5 us      ~390 us
+
+and it is per DISPATCH, not per pass (400 indirect dispatches in one pass cost
+the same as in 400). On the page, same topology both arms: phone 10.3 -> 13.2
+ms per root step, desktop 0.55 -> 21.5 ms. That build is commit 8e67789; the
+code is gone.
+
+**What ships is `?stride=1` (index-amr.html's default).** A DIRECT dispatch of
+K workgroups in z, each walking the list at stride K up to its count (each
+kernel's `mainStride`), so no empty slot is launched and no indirect call is
+made. K comes from the lists' own counts, read back lagged (+25% + 4); it sets
+only the parallelism, so a stale K is slower, never wrong. `?stride=0` is the
+control and `tools/validate-stride.js` gates the two BIT-FOR-BIT (`?detslots=1`,
+including a K=3 leg where every workgroup walks many entries). Phone, same
+topology both arms, min of three 512-step runs, interleaved:
+
+    config                         ?stride=0    ?stride=1
+    default (interp, L3, res 8)    4.94 ms      4.45 ms    -10%
+    explode, L3                    5.87 ms      5.33 ms     -9%
+    explode, res 5, L4             10.29 ms     6.50 ms    -37%
+
+K swept on the last row: 8 -> 10.0 ms, 24 -> 7.6, 48 -> 6.8, lagged-count
+default 6.50, 96 -> 6.51, 200 -> 6.62. The default is at the optimum. Desktop:
+-19% at res 5 L4, within its noise at the L3 defaults -- it is pass-bound, and
+this removes launches, not passes.
 
 ## RE-MEASURED at current defaults (2026-09-07) -- the fusion case is gone
 
@@ -372,7 +455,8 @@ accumulator (~0%). Indirect dispatch was already ruled out twice.
 own header named it: AGAL "addresses neighbor blocks directly during streaming
 instead of materializing ghost cells in a padded buffer". Shipped as the
 `DIRECT_GHOST` override in `shaders/amr_step1.wgsl` /
-`shaders/amr_step1_pool.wgsl` (one new read-only `blockSlot` binding each, no
+`shaders/amr_step1_pool.wgsl` (since B3-1 both are one file,
+`shaders/amr_step1.wgsl`; one new read-only `blockSlot` binding each, no
 new data buffers -- `f_in` was already the whole pool, so the neighbour tile's
 data was always in scope). The between-substep fine-fine ghost COPY pass is no
 longer encoded at all. `?ghostcopy=1` restores the old path on every AMR page,
@@ -688,3 +772,38 @@ measurements), not a defect. But it does mean "make the refinement follow the
 flow" is a question about the halo/criterion BALANCE, not about tuning the
 criterion alone, which is where several sessions of threshold sweeps kept
 running aground.
+
+## Does AMR win in 2D? Only once the finest grid is large (2026-09-24)
+
+`tools/bench-amr-vs-dense.js`: index-amr.html against index.html at the SAME
+body resolution (flat `res = R + L - 1`), same card, same finest-level tau
+(checked, refused if not), same physical sponge band (flat `spongeW` = AMR's x
+2^(L-1) -- the pages measure it in different cells), scored in simulated time
+(a/u_t) per wall second. AMR is timed at 2 / 10 / 40 a/u_t into one
+`?detslots=1` fall, because its cost grows with the wake; the flat page is
+timed before and after the AMR leg and scored on the faster reading, so any
+thermal drift is charged to AMR. AMR on `?stride=1`.
+
+    AMR vs flat, speed ratio at t = 2 / 10 / 40 a/u_t (>1: AMR faster)
+    pair (finest grid)              desktop (RTX 4080)      phone (img-tec)
+    res5 L4 explode   (256^2)       0.73 / 0.77 / 0.84      0.79 / 0.78 / 0.67
+    res6 L3           (256^2)       0.95 / 0.97 / 1.01      0.81 / 0.78 / 0.72
+    res7 L2           (256^2)       1.01 / 0.96 / 0.98      0.81 / 0.85 / 0.71
+    res8 L3 defaults  (1024^2)      2.99 / 2.91 / 3.11      7.04 / 4.54 / 3.86
+    res8 L3 explode   (1024^2)      2.82 / 2.67 / 2.64      5.89 / 3.82 / 3.34
+
+    flat index.html, synchronous stepping: desktop 256^2 ~1500 MLUPS, 1024^2
+    ~6000; phone 256^2 ~115-120, 1024^2 168 (6.26 ms/step -- 0.12 a/u_t/s).
+
+So at a 256^2 finest grid AMR LOSES on the phone (1.2-1.5x slower) and ties
+on the desktop, and at 1024^2 it wins 3-7x on both. The mechanism is the ratio
+of two numbers the rest of this document measures separately. AMR's cost per
+cell update is ~2-3x flat's (coupling is 32-34% of a phone root step, steps
+42%, force + body 13-14% -- `tools/bench-amr.js --remote --skip`, both
+interfaces), so it has to cut the cell count by more than that to win. At 256^2
+it cannot: with 8-cell root tiles and margins in root cells, levels 1-2 cover
+most of a 32^2 or 64^2 root grid (res5 L4 holds 16 of 16 level-1 blocks), and
+AMR still does ~45% of flat's cell updates. At 1024^2 the refined set is
+~7% of the domain at the finest level, ~11% of flat's updates. The advantage
+also shrinks through a fall on the phone (7.0x -> 3.9x) as the wake refines.
+

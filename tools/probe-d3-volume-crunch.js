@@ -267,7 +267,7 @@ async function measureLeg(o, legName) {
   const url = `${o.baseUrl}/index-3d.html?${mergeQuery(BASE, LEGS[legName])}`;
   await freshChrome(o);
   const tab = await firstTab(o.port);
-  const client = await CDP({ port: o.port, target: tab.id });
+  const client = await CDP({ local: true, port: o.port, target: tab.id });
   await Promise.all([client.Page.enable(), client.Runtime.enable()]);
   await navigateTo(client.Page, url);
   await waitForGlobal(client.Runtime, 'window.__D3', 120000);

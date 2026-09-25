@@ -26,3 +26,25 @@ export async function assembleShader(entryPath, readFile) {
   }
   return out.join('\n');
 }
+
+// Fetch a WGSL entry file, splice its `@include`s, and compile it.
+//
+// TEN IDENTICAL COPIES before plans/2D-backport.md B3a -- one per main*.js
+// page, byte for byte. It belongs here because `assembleShader` above is the
+// thing it exists to wrap, and because the cache-buster is a decision
+// (`?v=Date.now()`: these pages are served by a dev server with no cache
+// headers, and a stale shader after an edit is indistinguishable from a
+// shader that does not work).
+//
+// The HTTP status check is load-bearing: without it a 404 returns the dev
+// server's HTML error page, which reaches the WGSL front end as a syntax
+// error pointing at `<!DOCTYPE`, several steps removed from "that path is
+// wrong".
+export async function loadShader(device, path) {
+  const code = await assembleShader(path, async (p) => {
+    const r = await fetch(p + '?v=' + Date.now());
+    if (!r.ok) throw new Error(`failed to load ${p} (HTTP ${r.status} ${r.statusText})`);
+    return r.text();
+  });
+  return device.createShaderModule({ code });
+}
