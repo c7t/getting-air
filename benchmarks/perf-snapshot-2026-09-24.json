@@ -1,0 +1,28 @@
+{
+  "_note": "Inputs to tools/fit-cost-model.js and the tables in plans/performance-snapshot.md. Build 8aea1e9 (amr2d/b6-explode), ?stride=1 (the default), ?detslots=1. msPerRootStep is the minimum of three timed debugStepSync runs of 1 a/u_t, at t a/u_t into one fall from reset (tools/bench-amr-vs-dense.js). tiles is the active tile count per pool level 1..levels-1 at that moment.",
+  "devices": {
+    "desktop": "RTX 4080, Linux, Chrome (Vulkan), debug-port Chrome launched by tools/lib/browser-lifecycle.js",
+    "phone": "Pixel 11 Pro XL (img-tec), Chrome 153.0.8010.52, over adb CDP"
+  },
+  "amr": [
+    { "config": "interface=explode&res=5&levels=4&spongeW=2", "levels": 4, "rootW": 32,  "interface": "explode", "t": 2,  "tiles": [16, 52, 52],  "ms": { "desktop": 0.483, "phone": 5.841 } },
+    { "config": "interface=explode&res=5&levels=4&spongeW=2", "levels": 4, "rootW": 32,  "interface": "explode", "t": 10, "tiles": [16, 60, 56],  "ms": { "desktop": 0.458, "phone": 5.906 } },
+    { "config": "interface=explode&res=5&levels=4&spongeW=2", "levels": 4, "rootW": 32,  "interface": "explode", "t": 40, "tiles": [16, 56, 84],  "ms": { "desktop": 0.419, "phone": 6.859 } },
+    { "config": "res=6&levels=3&spongeW=4",                   "levels": 3, "rootW": 64,  "interface": "interp",  "t": 2,  "tiles": [48, 48],      "ms": { "desktop": 0.177, "phone": 2.666 } },
+    { "config": "res=6&levels=3&spongeW=4",                   "levels": 3, "rootW": 64,  "interface": "interp",  "t": 10, "tiles": [48, 56],      "ms": { "desktop": 0.173, "phone": 2.773 } },
+    { "config": "res=6&levels=3&spongeW=4",                   "levels": 3, "rootW": 64,  "interface": "interp",  "t": 40, "tiles": [56, 76],      "ms": { "desktop": 0.166, "phone": 2.984 } },
+    { "config": "res=7&levels=2&spongeW=4",                   "levels": 2, "rootW": 128, "interface": "interp",  "t": 2,  "tiles": [44],          "ms": { "desktop": 0.084, "phone": 1.371 } },
+    { "config": "res=7&levels=2&spongeW=4",                   "levels": 2, "rootW": 128, "interface": "interp",  "t": 10, "tiles": [60],          "ms": { "desktop": 0.089, "phone": 1.309 } },
+    { "config": "res=7&levels=2&spongeW=4",                   "levels": 2, "rootW": 128, "interface": "interp",  "t": 40, "tiles": [96],          "ms": { "desktop": 0.086, "phone": 1.568 } },
+    { "config": "res=8&levels=3&spongeW=4",                   "levels": 3, "rootW": 256, "interface": "interp",  "t": 2,  "tiles": [80, 116],     "ms": { "desktop": 0.233, "phone": 3.555 } },
+    { "config": "res=8&levels=3&spongeW=4",                   "levels": 3, "rootW": 256, "interface": "interp",  "t": 10, "tiles": [136, 244],    "ms": { "desktop": 0.239, "phone": 5.518 } },
+    { "config": "res=8&levels=3&spongeW=4",                   "levels": 3, "rootW": 256, "interface": "interp",  "t": 40, "tiles": [212, 272],    "ms": { "desktop": 0.223, "phone": 6.484 } },
+    { "config": "res=8&levels=3&interface=explode&spongeW=4", "levels": 3, "rootW": 256, "interface": "explode", "t": 2,  "tiles": [84, 120],     "ms": { "desktop": 0.248, "phone": 4.246 } },
+    { "config": "res=8&levels=3&interface=explode&spongeW=4", "levels": 3, "rootW": 256, "interface": "explode", "t": 10, "tiles": [136, 252],    "ms": { "desktop": 0.262, "phone": 6.542 } },
+    { "config": "res=8&levels=3&interface=explode&spongeW=4", "levels": 3, "rootW": 256, "interface": "explode", "t": 40, "tiles": [216, 260],    "ms": { "desktop": 0.266, "phone": 7.493 } }
+  ],
+  "flat": [
+    { "res": 8,  "W": 256,  "ms": { "desktop": 0.042, "phone": 0.553 } },
+    { "res": 10, "W": 1024, "ms": { "desktop": 0.174, "phone": 6.260 } }
+  ]
+}

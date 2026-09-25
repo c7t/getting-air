@@ -409,7 +409,10 @@ is a `CreateBindGroupLayout` error at init, i.e. a page that does not boot, not
 a warning.
 
 ## Performance work
-Read `plans/perf-characterization.md` BEFORE optimizing anything here. The
+**Current numbers: `plans/performance-snapshot.md`** — per-device constants, the
+passes in a root step, a fitted cost model (`tools/fit-cost-model.js`, ±10–25% on
+totals) and AMR vs flat. Read `plans/perf-characterization.md` BEFORE optimizing
+anything here: it is the history, dead ends included. The
 two target devices have **opposite** bottlenecks — the desktop is
 pass-count/latency bound, the mobile PowerVR is memory-bandwidth bound — and
 the obvious optimization (indirect dispatch off the active block count) was

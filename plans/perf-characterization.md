@@ -1,5 +1,8 @@
 # Performance characterization: the two target devices have opposite bottlenecks
 
+> **For the current numbers and cost model see `plans/performance-snapshot.md`**
+> (2026-09-24). This document is the history of how they were reached.
+
 Measured 2026-09-07 on `index-amr.html?res=8&blockage=3.3`, levels=2, 66
 active L1 blocks, `MAX_FINE_BLOCKS=128`, `STEPS_PER_FRAME=64`.
 
