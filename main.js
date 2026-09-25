@@ -405,11 +405,12 @@ async function init() {
   // so the card's speed can be read off the screen. ?ref= picks the initial
   // mode, the Position reference control or the `r` key switch it live.
   // Spacing is in CHORDS so it means the same at every resolution: grid and
-  // stars every half chord, crosses every chord (reseau-style, sparser).
-  // ?refSpacing= scales both.
+  // stars every half chord, crosses every chord (reseau-style, sparser),
+  // all times ?refSpacing= (default 3).
   const refOverlay = createRefOverlay(document.getElementById('ref'));
-  let refMode = REF_MODES.includes(urlParams.get('ref')) ? urlParams.get('ref') : 'off';
-  const REF_SCALE = parseFloat(urlParams.get('refSpacing')) || 1;
+  // Defaults chosen by eye (2026-09-24): crosses, three chords apart.
+  let refMode = REF_MODES.includes(urlParams.get('ref')) ? urlParams.get('ref') : 'crosses';
+  const REF_SCALE = parseFloat(urlParams.get('refSpacing')) || 3;
   let lastCard = null;   // { x, y, vx, vy, step } from the latest readback
   const refSelect = document.getElementById('select-REF');
   const setRefMode = (m) => { refMode = m; if (refSelect) refSelect.value = m; redrawWanted = true; };
