@@ -69,6 +69,20 @@ const VORT_GAMMA = parseFloat(urlParams.get('vortGamma')) || 1.2;
 let resLog2 = parseResLog2(urlParams, DENSE_DEFAULT_RES_LOG2);
 { const why = resLog2Problem(resLog2); if (why) refuseConfig(statusEl, why); }
 
+// WHERE THE CARD SITS IN THE WINDOW (?cardY=, fraction of the window height
+// from the top; default 0.5, the centre). The window scrolls by the card's
+// TRAVEL, so the card stays wherever it STARTED relative to the window -- and
+// to the sponge band at its edges, which is anchored to the window. So this is
+// just the initial buffer cy. Below centre (> 0.5) shows more of the wake,
+// which trails above a falling card, at the cost of room ahead of it.
+// Refused outside [0.2, 0.8] rather than clamped: much further and the card's
+// own chord reaches the sponge.
+const CARD_Y = urlParams.has('cardY') ? parseFloat(urlParams.get('cardY')) : 0.5;
+if (!(CARD_Y >= 0.2 && CARD_Y <= 0.8)) refuseConfig(statusEl, `?cardY=${urlParams.get('cardY')} invalid -- must be in [0.2, 0.8] (fraction of the window height from the top)`);
+// Whole cells, as W/2 always was, so a moved card keeps the same sub-cell
+// phase against the lattice.
+const cardY0 = () => Math.round(H * CARD_Y);
+
 // Fixed simulation RATE (sim-rate.mjs). STEPS_PER_FRAME below is now a
 // CEILING, not a target: the pacer asks for however many steps a wall-clock
 // interval is worth, so the physics runs at the same speed on every device
@@ -217,13 +231,13 @@ async function init() {
   const cardStateBuf   = device.createBuffer({ size: 104, usage: U.STORAGE | U.COPY_DST | U.COPY_SRC });
 
   const cardInit = new Float32Array([
-    W/2, H/2, 0.2,   // cx, cy, theta
+    W/2, cardY0(), 0.2,   // cx, cy, theta
     0, 0, 0,         // vx, vy, omega
     0, 0, 0,         // fx, fy, tz
     MASS, I_BODY, G_EFF,
     A, B,
     0.3, 0.025,      // v_max, o_max
-    W/2, H/2, 0.2,   // cx_old, cy_old, th_old
+    W/2, cardY0(), 0.2,   // cx_old, cy_old, th_old
     TAU,             // tau
     0, 0,            // y_total, x_total
     0, 0, 0, 0       // off_x, off_y, off_x_old, off_y_old
@@ -424,7 +438,9 @@ async function init() {
   const drawRef = () => {
     const c = cardAt(lastCard, step);
     const chord = 2 * A;
-    refOverlay.draw(refMode, c ? { cx: c.x, cy: c.y, spanX: W, spanY: H,
+    // The overlay maps the SCREEN CENTRE; the card sits cardY0() - H/2 cells
+    // below it (?cardY=), so the centre's world y is that much above the card.
+    refOverlay.draw(refMode, c ? { cx: c.x, cy: c.y + (H / 2 - cardY0()), spanX: W, spanY: H,
       spacing: (refMode === 'crosses' ? chord : 0.5 * chord) * REF_SCALE } : {});
   };
   // The shaders keep x_total/y_total wrapped so their f32 precision stops

@@ -17,8 +17,10 @@
 //
 // THE MAPPING. render.wgsl draws the pixel at screen fraction (u, v) (v down)
 // from window coordinate (u*W + subX, v*H + subY), with the card exactly at
-// the centre -- so the world point at the centre of the screen IS the card's
-// (x_total, y_total), and one screen width is W lattice units. Nothing here
+// the centre by default -- so the world point at the centre of the screen is
+// the card's (x_total, y_total), and one screen width is W lattice units. A
+// page that starts the card off-centre (?cardY=) passes the centre's world
+// position, not the card's. Nothing here
 // knows about off_x/off_y: the overlay moves with x_total smoothly, exactly as
 // the rendered field does since the sub-cell pan.
 //
