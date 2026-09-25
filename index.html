@@ -82,8 +82,8 @@
     }
     #ui-toggle:hover, #ui-toggle:focus-visible { opacity: 1; background: rgba(50,50,50,0.8); }
     /* Collapsed chrome, keyed off one class on <body> -- see ui-chrome.mjs.
-       This page ships EXPANDED (no class in the markup), unlike
-       index-amr.html; add class="ui-hidden" to <body> to ship it collapsed.
+       Set in the markup, as on index-amr.html, so the page comes up collapsed
+       rather than flashing the full UI for a frame.
        #canvas-container and #fatal-overlay are deliberately NOT listed: a
        fatal error must stay visible, and showFatal() clears the class. */
     body.ui-hidden #controls,
@@ -105,7 +105,7 @@
     .control-row span { width: 50px; text-align: right; font-size: 11px; color: #fff; }
   </style>
 </head>
-<body>
+<body class="ui-hidden">
   <div id="canvas-container">
     <canvas id="c"></canvas>
     <canvas id="trail"></canvas>
@@ -117,7 +117,7 @@
     </div>
     <button id="download">Download CSV</button>
     <button id="pause" aria-pressed="false">pause</button>
-    <button id="ui-toggle" aria-expanded="true" aria-controls="controls">hide</button>
+    <button id="ui-toggle" aria-expanded="false" aria-controls="controls">controls</button>
   </div>
 
   <div id="controls">
